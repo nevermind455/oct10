@@ -1,0 +1,8 @@
+# The trading-file baseline in tests_dashboard/tests_feeds hashes file BYTES,
+# so a CRLF working copy on Windows and an LF one on Linux disagree and the
+# guard fires on a checkout rather than on a real edit. Pin every text file
+# to LF in the working tree so the hash means the same thing on both.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.ico binary

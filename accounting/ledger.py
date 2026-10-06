@@ -1,0 +1,1557 @@
+"""Position ledger and PnL.
+
+Everything here is built from fills the VENUE reported (user socket, or the
+REST reconcile backup), never from what the bot intended to do. An order that
+was sent is not a fill; a fill at the limit price is not a fill at the fill
+price.
+
+Accuracy rules:
+
+* Realized PnL exists only for markets the venue has RESOLVED. Everything
+  else is PENDING and reported separately. No settling on a BTC close.
+* Unrealized is marked to the live BID (what you could actually get out at),
+  not the mid, and is labelled as a mark rather than a result.
+* Fees are charged on every fill, taker rate. A missing fee is not a zero fee.
+* The ledger persists, so a restart does not lose dedup state and make the
+  reconcile backup re-report every historical trade as newly recovered.
+* `reconcile_balance()` checks the whole thing against the venue's own USDC
+  balance movement. That is the only claim here that does not rest on our own
+  bookkeeping being right.
+"""
+from __future__ import annotations
+
+import json
+import math
+import operator
+import os
+import copy
+import tempfile
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field, fields
+
+from . import fees as fee_mod
+
+# MATCHED and MINED are non-terminal. They can still transition to FAILED,
+# so inventory and P&L must only use the terminal successful state.
+COUNTED_STATUSES = ("CONFIRMED",)
+RECOVERY_LOOKBACK_SECONDS = 2 * 60 * 60
+MARKET_WINDOW_SECONDS = 5 * 60
+
+
+def _fsync_directory(path) -> None:
+    """Flush directory metadata after ``os.replace``.
+
+    POSIX can open a directory fd and fsync it. Windows, and synced folders
+    such as OneDrive, reject that open with PermissionError. The payload
+    file is already fsynced and replaced; skip directory fsync there.
+    """
+    try:
+        directory_fd = os.open(os.fspath(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(directory_fd)
+    except OSError:
+        return
+    finally:
+        os.close(directory_fd)
+
+
+@dataclass
+class Lot:
+    trade_id: str
+    token_id: str
+    condition_id: str | None
+    side: str
+    shares: float
+    price: float
+    fee: float
+    status: str
+    wall: float
+    source: str = ""
+    order_id: str | None = None
+    # Shares of this BUY lot already consumed by a later SELL. The lot itself
+    # is never mutated away or removed: `lots` stays an append-only journal of
+    # what actually happened, and FIFO basis is derived from what is left open.
+    consumed: float = 0.0
+
+    @property
+    def open_shares(self) -> float:
+        return max(0.0, self.shares - self.consumed)
+
+    @property
+    def notional(self) -> float:
+        return self.shares * self.price
+
+    @property
+    def cost(self) -> float:
+        return self.notional + self.fee
+
+
+@dataclass
+class Position:
+    token_id: str
+    condition_id: str | None = None
+    shares: float = 0.0
+    cost: float = 0.0                 # notional + fees
+    fees: float = 0.0
+    lots: list = field(default_factory=list)
+    settled: bool = False
+    payout_per_share: float | None = None
+    realized: float | None = None
+    settled_wall: float | None = None
+    # PnL already banked by selling before resolution, net of the fee paid on
+    # the way out. Settlement adds this to the payout on whatever is still
+    # held, so a partially-sold position reports one honest number.
+    realized_from_sales: float = 0.0
+    sell_fees: float = 0.0
+
+    @property
+    def avg_price(self) -> float | None:
+        return (self.cost - self.fees) / self.shares if self.shares else None
+
+
+class Ledger:
+    # Must stay aligned with the explicit ``after`` bound in the CLOB REST
+    # reconciliation query. This is a recent-loss recovery window, not an
+    # unbounded historical wallet scan.
+    RECOVERY_LOOKBACK_SECONDS = RECOVERY_LOOKBACK_SECONDS
+    MARKET_WINDOW_SECONDS = MARKET_WINDOW_SECONDS
+
+    def __init__(self, path: str | None = None, category: str = "crypto",
+                 fee_resolver=None, allow_sells: bool = False) -> None:
+        self._lock = threading.RLock()
+        self._save_lock = threading.Lock()
+        self.path = path or os.environ.get("LEDGER_PATH", "ledger.json")
+        self.category = category
+        self.fee_resolver = fee_resolver
+        # Exits are opt-in. With this off the ledger keeps its original
+        # contract - buy-and-hold only - so every existing caller behaves
+        # exactly as before and a stray SELL still cannot enter PnL.
+        self.allow_sells = bool(allow_sells)
+        self.positions: dict[str, Position] = {}
+        # key -> (fingerprint, JSON text) of each position as last saved; see
+        # _position_texts_locked.
+        self._pos_text: dict = {}
+        # The sorted, encoded `seen` list, keyed by the set's identity, size and
+        # a revision bumped on every add/discard (size alone is not enough: a
+        # rolled-back fill followed by a different one leaves the size equal).
+        self._seen_rev = 0
+        self._seen_text = None
+        self.seen: set[str] = set()          # trade ids, survives restart
+        self.skipped_status: int = 0
+        self.skipped_side: int = 0
+        self.skipped_unauthorized: int = 0
+        self.skipped_authorization_mismatch: int = 0
+        self.duplicates: int = 0
+        # order id -> non-secret placement metadata.  The metadata both
+        # prevents a mismapped user-stream fill entering PnL and preserves
+        # accepted round exposure across a restart.
+        self.authorized_orders: dict[str, dict] = {}
+        self.reported_unauthorized: set[str] = set()
+        self.reported_mismatch: set[str] = set()
+        self.opened_wall = time.time()
+        # A path is only a location, not an identity.  Keep a random identity
+        # inside the ledger so a paired paper account remains valid when its
+        # directory is moved, while a missing/replaced ledger still fails
+        # closed instead of silently resetting PnL.
+        self.ledger_id = uuid.uuid4().hex
+        self.schema_version: int | None = None
+        self.loaded_from_disk = False
+        self.balance_marks: list = []        # (wall, balance) from the venue
+        self.last_persistence_error: str | None = None
+        self.last_ingest_error: str | None = None
+        self.last_mark_error: str | None = None
+        if os.path.exists(self.path) and not self.load():
+            raise RuntimeError(
+                f"ledger {self.path!r} exists but is unreadable or invalid; "
+                "refusing to start with empty accounting")
+
+    def authorize_order(self, order_id, receipt: dict | None = None, *,
+                        venue_min_shares: float | None = None,
+                        price_cap: float | None = None) -> bool:
+        """Authorize one bot order and retain its non-secret risk metadata.
+
+        ``venue_min_shares`` and ``price_cap`` snapshot the sizing limits used
+        by the strategy.  Supplying them adds a conservative all-in cash
+        reservation to the durable authorization, so a restart restores the
+        same gross risk bound even while the accepted order is still pending.
+        """
+        oid = str(order_id or "")
+        if not _safe_identifier(oid):
+            return False
+        metadata = _authorization_metadata(receipt)
+        if venue_min_shares is not None or price_cap is not None:
+            metadata = _with_authorization_reservation(
+                metadata, venue_min_shares=venue_min_shares,
+                price_cap=price_cap)
+        _validate_authorization_metadata(metadata)
+        with self._lock:
+            existing = self.authorized_orders.get(oid)
+            if existing is not None and metadata and existing and existing != metadata:
+                raise RuntimeError("order authorization metadata changed")
+            was_new = existing is None
+            if existing is None or (not existing and metadata):
+                self.authorized_orders[oid] = metadata
+        return was_new
+
+    def authorized_notional_for_window(self, window_start: int) -> float:
+        """Raw accepted order notional (legacy reporting compatibility)."""
+        end = int(window_start) + 300
+        with self._lock:
+            total = sum(
+                float(meta.get("requested_notional") or 0.0)
+                for meta in self.authorized_orders.values()
+                if isinstance(meta, dict) and int(meta.get("window_end") or 0) == end
+            )
+            if not math.isfinite(total) or total < 0:
+                raise RuntimeError("authorized order exposure is invalid")
+            return total
+
+    def authorized_cost_for_window(self, window_start: int) -> float:
+        """Conservative all-in accepted exposure, including pending orders.
+
+        New authorizations carry an explicit reservation based on the venue
+        minimum, the strategy price cap, and the venue's fee rate.  Older V3/V4
+        authorizations remain usable when their durable fee rate proves a safe
+        upper bound.  A row for this window without either proof fails closed;
+        counting only its requested notional could admit another order after a
+        restart even though fees have already consumed the remaining budget.
+        """
+        end = int(window_start) + self.MARKET_WINDOW_SECONDS
+        with self._lock:
+            total = 0.0
+            for metadata in self.authorized_orders.values():
+                if (not isinstance(metadata, dict)
+                        or int(metadata.get("window_end") or 0) != end):
+                    continue
+                total += _conservative_authorization_cost(metadata)
+            if not math.isfinite(total) or total < 0:
+                raise RuntimeError("authorized order all-in exposure is invalid")
+            return total
+
+    def authorized_tokens_for_window(self, window_start: int) -> frozenset[str]:
+        """Token legs accepted in a live round, including pending fills."""
+        end = int(window_start) + self.MARKET_WINDOW_SECONDS
+        with self._lock:
+            return frozenset(
+                str(metadata["token_id"])
+                for metadata in self.authorized_orders.values()
+                if (metadata
+                    and int(metadata.get("window_end") or 0) == end
+                    and _safe_identifier(metadata.get("token_id")))
+            )
+
+    def confirmed_notional_for_condition(self, condition_id: str | None) -> float:
+        condition = str(condition_id or "")
+        if not condition:
+            return 0.0
+        with self._lock:
+            return sum(
+                lot.notional for position in self.positions.values()
+                if position.condition_id == condition for lot in position.lots
+            )
+
+    def confirmed_cost_for_condition(self, condition_id: str | None) -> float:
+        """Actual confirmed PAPER cash exposure, including every fill fee."""
+        condition = str(condition_id or "")
+        if not condition:
+            return 0.0
+        with self._lock:
+            total = sum(
+                lot.cost for position in self.positions.values()
+                if position.condition_id == condition for lot in position.lots
+            )
+            if not math.isfinite(total) or total < 0:
+                raise RuntimeError("confirmed all-in exposure is invalid")
+            return total
+
+    def unsettled_cost(self) -> float:
+        """Cash committed to positions the venue has not resolved yet.
+
+        This is capital that is neither spendable nor lost - it returns in
+        full at settlement, or converts to a payout. It spans every open
+        round, which is exactly what per-round exposure cannot see: when
+        venue resolution stalls, each new round passes its own budget check
+        while the total frozen across rounds keeps climbing. Observed doing
+        precisely that - 20 open rounds holding 103% of a $300 wallet while
+        settlement was backed up upstream.
+        """
+        with self._lock:
+            total = sum(position.cost for position in self.positions.values()
+                        if not position.settled and position.shares > 0)
+        if not math.isfinite(total) or total < 0:
+            raise RuntimeError("unsettled exposure is invalid")
+        return float(total)
+
+    def held_tokens_for_condition(self, condition_id: str | None) -> frozenset[str]:
+        """Unsettled paper inventory legs for one discovered condition."""
+        condition = str(condition_id or "")
+        if not condition:
+            return frozenset()
+        with self._lock:
+            return frozenset(
+                position.token_id for position in self.positions.values()
+                if (position.condition_id == condition and position.shares > 0
+                    and not position.settled)
+            )
+
+    def open_leg_shares(self, condition_id: str | None,
+                        token_id: str | None) -> float:
+        """Confirmed open shares of one leg, or 0.0.
+
+        An exit has to be sized from what is actually owned. Selling a
+        requested or authorized quantity instead is how a paper run invents
+        inventory it never held and a live one is rejected by the venue.
+        """
+        condition = str(condition_id or "")
+        token = str(token_id or "")
+        if not condition or not token:
+            return 0.0
+        with self._lock:
+            for position in self.positions.values():
+                if (position.condition_id != condition
+                        or position.token_id != token
+                        or position.settled or position.shares <= 0):
+                    continue
+                shares = float(position.shares)
+                return shares if math.isfinite(shares) and shares > 0 else 0.0
+        return 0.0
+
+    def open_leg_basis(self, condition_id: str | None,
+                       token_id: str | None) -> tuple[float, float] | None:
+        """Entry price and paid fee-per-share for one unsettled leg.
+
+        Returns ``(avg_price, fee_per_share)`` with the price excluding fees,
+        or ``None`` when this condition holds no open shares of that token.
+        The pair-lock guard needs both halves: what the held leg cost and the
+        fee already sunk into it, because a matched pair only redeems for
+        $1.00 and every cent paid on either leg comes out of that.
+        """
+        condition = str(condition_id or "")
+        token = str(token_id or "")
+        if not condition or not token:
+            return None
+        with self._lock:
+            for position in self.positions.values():
+                if (position.condition_id != condition
+                        or position.token_id != token
+                        or position.settled or position.shares <= 0):
+                    continue
+                price = position.avg_price
+                fee_per_share = position.fees / position.shares
+                # A basis the guard cannot trust must read as "no basis", never
+                # as a cheap one: the caller treats None as a refusal.
+                if (price is None or not math.isfinite(price) or price <= 0
+                        or not math.isfinite(fee_per_share)
+                        or fee_per_share < 0):
+                    return None
+                return float(price), float(fee_per_share)
+        return None
+
+    def recovery_conditions(self, *, now: float | None = None,
+                            lookback_s: float = RECOVERY_LOOKBACK_SECONDS,
+                            ) -> tuple[str, ...]:
+        """Return recent condition IDs that this ledger can authenticate.
+
+        The feed hub only remembers markets discovered in the current process.
+        After a restart that list begins empty, but V3+ order authorizations
+        durably retain the condition whose fills the bot is allowed to count.
+        Those conditions are therefore the authoritative restart-recovery
+        filters. The default horizon is explicitly two hours, matching the
+        venue query in ``run_feeds.fetch_trades``. A condition is retained only
+        while its full five-minute order window fits inside that lookback;
+        older authorizations expire from this recovery path. Metadata-free
+        legacy authorizations are deliberately skipped: they cannot prove a
+        market boundary and must not broaden a wallet query.
+        """
+        sampled = time.time() if now is None else float(now)
+        horizon = float(lookback_s)
+        if (not math.isfinite(sampled) or sampled <= 0
+                or not math.isfinite(horizon) or horizon <= 0):
+            raise ValueError("recovery time and lookback must be finite and positive")
+        # REST's `after` is measured from trade time, while authorization keeps
+        # round end. Require round_start = window_end - 300 to be within the
+        # same strict lookback so selecting a condition never promises rows the
+        # query is already incapable of returning.
+        cutoff = sampled - horizon + self.MARKET_WINDOW_SECONDS
+        with self._lock:
+            candidates = []
+            for metadata in self.authorized_orders.values():
+                if not metadata:
+                    # V2 authorizations contain only the order id.  Querying
+                    # without a condition would admit unrelated wallet trades.
+                    continue
+                condition = metadata.get("condition_id")
+                window_end = metadata.get("window_end")
+                if (not _safe_identifier(condition)
+                        or isinstance(window_end, bool)
+                        or not isinstance(window_end, (int, float))
+                        or not math.isfinite(float(window_end))
+                        or float(window_end) < cutoff):
+                    continue
+                candidates.append((float(window_end), str(condition)))
+
+        # Sorting makes the REST filter set stable across JSON reloads and
+        # concurrent authorization insertion order.  Deduplicate conditions
+        # because one order can have multiple venue fill records.
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for _window_end, condition in sorted(candidates):
+            if condition not in seen:
+                seen.add(condition)
+                ordered.append(condition)
+        return tuple(ordered)
+
+    def has_seen_trade(self, trade_id) -> bool:
+        """Thread-safe durable dedup check for restart reconciliation."""
+        tid = str(trade_id or "")
+        with self._lock:
+            return tid in self.seen
+
+    def rest_trade_is_booked(self, row: dict) -> bool:
+        """Verify that a REST replay agrees with its durable ledger lot.
+
+        Returning ``True`` lets reconciliation suppress an ordinary restart
+        replay. A reused trade ID with contradictory terminal status or
+        identity is accounting corruption and raises instead of being hidden
+        by ID-only deduplication.
+        """
+        if not isinstance(row, dict):
+            return False
+        trade_id = str(row.get("id") or row.get("trade_id") or "")
+        if not trade_id:
+            return False
+        with self._lock:
+            lot = next((candidate for position in self.positions.values()
+                        for candidate in position.lots
+                        if candidate.trade_id == trade_id), None)
+        if lot is None:
+            return False
+
+        conflicts = []
+
+        def compare_text(label, raw, expected, *, upper=False):
+            if raw in (None, ""):
+                return
+            actual = str(raw)
+            wanted = str(expected or "")
+            if upper:
+                actual, wanted = actual.upper(), wanted.upper()
+            if actual != wanted:
+                conflicts.append(label)
+
+        compare_text("token", row.get("asset_id"), lot.token_id)
+        compare_text("condition", row.get("market"), lot.condition_id)
+        compare_text("side", row.get("side"), lot.side, upper=True)
+        compare_text("order", row.get("taker_order_id")
+                     or row.get("takerOrderId"), lot.order_id)
+        status = str(row.get("status") or "").upper()
+        if status.endswith("FAILED") or status.endswith("CONFLICT"):
+            conflicts.append("terminal status")
+        for label, raw, expected in (
+                ("price", row.get("price"), lot.price),
+                ("size", row.get("size"), lot.shares)):
+            if raw in (None, ""):
+                continue
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                conflicts.append(label)
+                continue
+            if (not math.isfinite(value)
+                    or not math.isclose(value, float(expected),
+                                        rel_tol=1e-9, abs_tol=1e-9)):
+                conflicts.append(label)
+        if conflicts:
+            raise RuntimeError(
+                f"REST replay conflicts with durable fill {trade_id[-12:]} "
+                f"({', '.join(conflicts)})")
+        return True
+
+    # -------------------------------------------------------------- ingest
+    def record_fill(self, trade_id, token_id, *, shares, price, side="BUY",
+                    condition_id=None, status="CONFIRMED", theta=None,
+                    source="user_ws", fee=None, fee_exponent: int = 1,
+                    order_id=None) -> bool:
+        """Idempotent. Returns True only if this trade id was new."""
+        tid = str(trade_id or "")
+        token = str(token_id or "")
+        condition = _s(condition_id)
+        order_side = str(side or "").upper()
+        source_text = str(source or "")
+        order_text = _s(order_id)
+        if (not _safe_identifier(tid) or not _safe_identifier(token)
+                or not _safe_identifier(condition)
+                or len(source_text) > 256 or not source_text.isprintable()
+                or (order_text is not None and not _safe_identifier(order_text))):
+            return False
+        st = str(status or "").upper()
+        with self._lock:
+            if tid in self.seen:
+                self.duplicates += 1
+                return False
+            if st not in COUNTED_STATUSES:
+                # RETRYING is not a fill yet; FAILED never was one.
+                self.skipped_status += 1
+                return False
+            if order_side == "SELL":
+                if not self.allow_sells:
+                    self.skipped_side += 1
+                    return False
+            elif order_side != "BUY":
+                # Treating an unrelated order as newly acquired long shares
+                # inverts PnL, so anything that is not a recognised side is
+                # refused outright.
+                self.skipped_side += 1
+                return False
+            try:
+                sh, px = float(shares), float(price)
+            except (TypeError, ValueError):
+                return False
+            if not math.isfinite(sh) or not math.isfinite(px) or sh <= 0 or not (0.0 < px <= 1.0):
+                return False
+            try:
+                f = (fee_mod.taker_fee(
+                    sh, px, theta, self.category, exponent=fee_exponent)
+                     if fee is None else float(fee))
+            except (TypeError, ValueError):
+                return False
+            if not math.isfinite(f) or f < 0:
+                return False
+            pos = self.positions.get(token)
+            if pos is None:
+                pos = self.positions[token] = Position(
+                    token_id=token, condition_id=condition)
+            if pos.condition_id and pos.condition_id != condition:
+                return False
+            if not pos.condition_id:
+                pos.condition_id = condition
+            if pos.settled:
+                # A fill arriving after settlement means our settlement was
+                # premature. Surface it rather than folding it in silently.
+                pos.settled = False
+                pos.payout_per_share = None
+                pos.realized = None
+                pos.settled_wall = None
+            if order_side == "SELL":
+                # An exit can only ever reduce inventory we actually hold.
+                # Probing FIFO first means a short is refused before any lot
+                # is mutated, so a rejected sell leaves the ledger untouched.
+                available = sum(l.open_shares for l in pos.lots
+                                if str(l.side or "").upper() == "BUY")
+                if sh > available + 1e-9 or sh > pos.shares + 1e-9:
+                    self.skipped_side += 1
+                    return False
+                notional_basis, fee_basis, shortfall = _consume_fifo(pos, sh)
+                if shortfall > 1e-9:
+                    # Unreachable given the check above; refuse rather than
+                    # book a partially-consumed sale if it ever is reached.
+                    self.skipped_side += 1
+                    return False
+                basis = notional_basis + fee_basis
+                proceeds = sh * px - f
+                pos.lots.append(Lot(tid, token, condition, order_side,
+                                    sh, px, f, st, time.time(), source_text,
+                                    order_text))
+                pos.shares -= sh
+                pos.cost -= basis
+                pos.fees -= fee_basis
+                pos.sell_fees += f
+                pos.realized_from_sales += proceeds - basis
+                if pos.shares <= 1e-9:
+                    # Nothing left to resolve. Close it here, or settlement -
+                    # which only visits positions still holding shares - would
+                    # never report the PnL banked by the sales.
+                    pos.shares = 0.0
+                    pos.cost = 0.0
+                    pos.fees = 0.0
+                    pos.settled = True
+                    pos.payout_per_share = None
+                    pos.realized = pos.realized_from_sales
+                    pos.settled_wall = time.time()
+                self.seen.add(tid)
+                self._seen_rev += 1
+                return True
+            pos.lots.append(Lot(tid, token, condition, order_side,
+                                sh, px, f, st, time.time(), source_text,
+                                order_text))
+            pos.shares += sh
+            pos.fees += f
+            pos.cost += sh * px + f
+            self.seen.add(tid)
+            self._seen_rev += 1
+            return True
+
+    def record_fill_durable(self, trade_id, token_id, **kwargs) -> bool:
+        """Record one fill and its dedup key as a single durable transaction.
+
+        A confirmed venue fill must not exist only in RAM: a crash in that
+        state causes the REST/user-stream replay to be counted differently
+        after restart.  The save lock is acquired before the ledger lock, the
+        same order used by :meth:`save` and :meth:`settle`, so persistence,
+        fills, and settlement cannot interleave into an impossible snapshot.
+        """
+        token = str(token_id or "")
+        tid = str(trade_id or "")
+        with self._save_lock:
+            with self._lock:
+                previous = copy.deepcopy(self.positions.get(token))
+                had_position = token in self.positions
+                inserted = self.record_fill(trade_id, token_id, **kwargs)
+                if not inserted:
+                    return False
+                payload = self._payload_locked()
+                if self._write_payload(payload):
+                    return True
+                if had_position:
+                    self.positions[token] = previous
+                else:
+                    self.positions.pop(token, None)
+                self.seen.discard(tid)
+                self._seen_rev += 1
+                raise RuntimeError("confirmed fill could not be persisted")
+
+    def ingest_fill_store(self, store) -> int:
+        """Pull everything from the feeds FillStore. Safe to call repeatedly."""
+        n = 0
+        store_lock = getattr(store, "_lock", None)
+        if store_lock is None:
+            fills = list(store.fills.values())
+        else:
+            with store_lock:
+                # Copy the records, not just the dict values: the feed mutates
+                # lifecycle objects in place during reconnect/reconcile.
+                fills = [copy.deepcopy(fill) for fill in store.fills.values()]
+        for fill in fills:
+            # Do not turn ordinary pending lifecycle updates into a growing
+            # skipped-status counter on every ingest pass.
+            if str(fill.status or "").upper() not in COUNTED_STATUSES:
+                continue
+            trade_id = str(getattr(fill, "trade_id", None) or "")
+            order_id = str(getattr(fill, "order_id", None) or "")
+            with self._lock:
+                authorization = copy.deepcopy(self.authorized_orders.get(order_id))
+            if not order_id or authorization is None:
+                with self._lock:
+                    if trade_id not in self.reported_unauthorized:
+                        self.skipped_unauthorized += 1
+                        self.reported_unauthorized.add(trade_id)
+                continue
+            if not self._fill_matches_authorization(fill, order_id, authorization):
+                with self._lock:
+                    if trade_id not in self.reported_mismatch:
+                        self.skipped_authorization_mismatch += 1
+                        self.reported_mismatch.add(trade_id)
+                continue
+            # V2's trade ``fee_rate_bps`` is a legacy/base-fee field and is
+            # commonly zero even when the public market ``fd`` curve is
+            # enabled. Only the CLOB market-info cache is authoritative.
+            live_theta = authorization.get("fee_rate") if authorization else None
+            fee_exponent = int((authorization or {}).get("fee_exponent") or 1)
+            if live_theta is None and self.fee_resolver is not None:
+                try:
+                    resolved = self.fee_resolver(fill.asset_id)
+                    if isinstance(resolved, dict):
+                        live_theta = resolved.get("rate")
+                        fee_exponent = int(resolved.get("exponent") or 1)
+                    elif isinstance(resolved, (tuple, list)) and len(resolved) >= 2:
+                        live_theta, fee_exponent = resolved[0], int(resolved[1])
+                    else:
+                        live_theta = resolved
+                    self.last_ingest_error = None
+                except Exception as exc:
+                    self.last_ingest_error = (
+                        f"fee resolver failed for token {str(fill.asset_id)[-12:]}: "
+                        f"{type(exc).__name__}: {exc}")[:300]
+            if self.record_fill_durable(
+                    fill.trade_id, fill.asset_id, shares=fill.size,
+                    price=fill.price, side=fill.side,
+                    condition_id=fill.market, status=fill.status,
+                    theta=live_theta, fee_exponent=fee_exponent,
+                    order_id=order_id,
+                    source="+".join(sorted(fill.sources)) or "user_ws"):
+                n += 1
+        return n
+
+    def _fill_matches_authorization(self, fill, order_id: str,
+                                    authorization: dict) -> bool:
+        """Reject wrong-market/token and overfilled lifecycle records."""
+        # Old v2 ledgers contain only an order id and cannot prove which
+        # market/token/notional the bot authorized.  Accepting such a fill can
+        # turn an unrelated wallet trade into bot inventory, so fail closed.
+        if not authorization:
+            return False
+        if (str(fill.asset_id or "") != str(authorization.get("token_id") or "")
+                or str(fill.market or "") != str(authorization.get("condition_id") or "")
+                or str(fill.side or "").upper() != "BUY"):
+            return False
+        try:
+            requested = float(authorization["requested_notional"])
+            # What the trade really cost, from its maker legs when the feed carried
+            # them: one taker match can cross several price levels and the venue's
+            # headline price is not their average, so price x size overstated a
+            # $1.00 buy of 10.322 shares as $1.0322 and refused our own fill.
+            paid = getattr(fill, "paid", None)
+            candidate = float(paid) if paid is not None else float(fill.size) * float(fill.price)
+        except (KeyError, TypeError, ValueError):
+            return False
+        with self._lock:
+            already = sum(
+                lot.notional for position in self.positions.values()
+                for lot in position.lots if lot.order_id == order_id
+            )
+        return (math.isfinite(candidate) and candidate > 0
+                and already + candidate <= requested + 0.02)
+
+    # ------------------------------------------------------------- settle
+    def settle(self, resolution) -> list:
+        """Apply a venue resolution. Only RESOLVED settles anything."""
+        if not getattr(resolution, "resolved", False):
+            return []
+        condition, payouts = _validated_resolution(resolution)
+        done: list[Position] = []
+        # Save lock first is the global lock order. Holding the ledger lock
+        # through the atomic replace prevents a late fill from reopening a
+        # position between mutation and persistence.
+        with self._save_lock:
+            with self._lock:
+                targets = [
+                    pos for pos in self.positions.values()
+                    if not pos.settled and pos.shares > 0
+                    and pos.condition_id == condition
+                ]
+                if not targets:
+                    return []
+                missing = [pos.token_id for pos in targets if pos.token_id not in payouts]
+                if missing:
+                    raise ValueError(
+                        f"resolution omitted held token(s): {', '.join(missing[:3])}")
+                settled_wall = time.time()
+                for pos in targets:
+                    pay = payouts[pos.token_id]
+                    pos.payout_per_share = pay
+                    pos.realized = (pos.shares * pay - pos.cost
+                                    + pos.realized_from_sales)
+                    pos.settled = True
+                    pos.settled_wall = settled_wall
+                    done.append(pos)
+                if not self._write_payload(self._payload_locked()):
+                    # Do not leave volatile state claiming settlement that was
+                    # not durably recorded. The worker retries the resolution.
+                    for pos in done:
+                        pos.payout_per_share = None
+                        pos.realized = None
+                        pos.settled = False
+                        pos.settled_wall = None
+                    raise RuntimeError("settlement could not be persisted")
+        return done
+
+    # -------------------------------------------------------------- reads
+    def unrealized(self, mark) -> tuple[float, int]:
+        """Mark open positions to `mark(token_id) -> exit price or None`.
+
+        Marked to the bid: the price you could actually exit at. Positions
+        with no usable bid are counted as unmarkable rather than assumed
+        worthless or assumed whole.
+        """
+        total, unmarkable = 0.0, 0
+        with self._lock:
+            open_snapshot = [
+                (pos.token_id, pos.shares, pos.cost)
+                for pos in self.positions.values()
+                if not pos.settled and pos.shares > 0
+            ]
+        cycle_error = None
+        for token, shares, cost in open_snapshot:
+            px, error = _safe_mark(mark, token)
+            if error:
+                cycle_error = error
+            if px is None:
+                unmarkable += 1
+                continue
+            total += shares * px - cost
+        with self._lock:
+            self.last_mark_error = cycle_error
+        return total, unmarkable
+
+    def summary(self, mark=None) -> dict:
+        with self._lock:
+            settled = [p for p in self.positions.values() if p.settled]
+            open_ = [p for p in self.positions.values() if not p.settled and p.shares > 0]
+            realized = sum(p.realized or 0.0 for p in settled)
+            # Grade one market once. If the strategy bought both outcomes in
+            # a round, counting the winner token as a win and the loser token
+            # as a loss makes the reported win rate meaningless; the round's
+            # net PnL is the result that matters.
+            market_results: dict[str, float] = {}
+            for p in settled:
+                key = p.condition_id or f"token:{p.token_id}"
+                market_results[key] = market_results.get(key, 0.0) + (p.realized or 0.0)
+            wins = sum(1 for pnl in market_results.values() if pnl > 0)
+            losses = sum(1 for pnl in market_results.values() if pnl <= 0)
+            staked = sum(p.cost for p in self.positions.values())
+            out = {
+                "realized_pnl": realized,
+                "settled_positions": len(settled),
+                "settled_markets": len(market_results),
+                "open_positions": len(open_),
+                "pending_cost": sum(p.cost for p in open_),
+                "wins": wins,
+                "losses": losses,
+                "win_rate": (wins / (wins + losses)) if (wins + losses) else None,
+                "fees_paid": sum(p.fees for p in self.positions.values()),
+                "total_cost": staked,
+                "fills_counted": len(self.seen),
+                "duplicates_suppressed": self.duplicates,
+                "skipped_not_a_fill": self.skipped_status,
+                "skipped_non_buy": self.skipped_side,
+                "skipped_unauthorized": self.skipped_unauthorized,
+                "skipped_authorization_mismatch": self.skipped_authorization_mismatch,
+                "persistence_error": self.last_persistence_error,
+                "ingest_error": self.last_ingest_error,
+                "open_position_details": [
+                    {
+                        "token_id": p.token_id,
+                        "condition_id": p.condition_id,
+                        "shares": p.shares,
+                        "average_entry_price": p.avg_price,
+                        "cost": p.cost,
+                        "fees": p.fees,
+                        "latest_fill_wall": max(
+                            (lot.wall for lot in p.lots), default=None),
+                    }
+                    for p in open_
+                ],
+            }
+            out["realized_after_fees"] = realized   # fees already inside cost
+        if mark is not None:
+            u, unmarkable, cycle_error = 0.0, 0, None
+            # Sample every token exactly once. Calling a moving book twice made
+            # the aggregate equity disagree with its displayed components.
+            for detail in out["open_position_details"]:
+                bid, error = _safe_mark(mark, detail["token_id"])
+                if error:
+                    cycle_error = error
+                detail["mark_bid"] = bid
+                detail["unrealized_to_bid"] = (
+                    None if bid is None else
+                    detail["shares"] * bid - detail["cost"])
+                if bid is None:
+                    unmarkable += 1
+                else:
+                    u += detail["unrealized_to_bid"]
+            with self._lock:
+                self.last_mark_error = cycle_error
+            out["unrealized_mark_to_bid"] = u
+            out["unmarkable_positions"] = unmarkable
+            # A partial mark is not total equity. Returning a number here
+            # silently treated every unmarkable position as exactly flat.
+            out["equity_pnl"] = None if unmarkable else out["realized_pnl"] + u
+            out["mark_error"] = cycle_error
+        else:
+            out["unrealized_mark_to_bid"] = None
+            out["equity_pnl"] = None
+            out["mark_error"] = None
+        return out
+
+    # --------------------------------------------------- accuracy check
+    def mark_balance(self, balance) -> None:
+        try:
+            b = float(balance)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(b) or b < 0:
+            return
+        with self._lock:
+            self.balance_marks.append((time.time(), b))
+            if len(self.balance_marks) > 500:
+                del self.balance_marks[:250]
+
+    def reconcile_balance(self, tolerance: float = 0.02) -> dict:
+        """Compare our books against the venue's own USDC movement.
+
+        Resolution changes the value of outcome tokens but does not itself
+        redeem them into pUSD. Therefore the only deterministic wallet movement
+        this ledger can predict is the cost of confirmed BUY fills that landed
+        between the two balance observations. Redemptions, deposits, manual
+        activity, or missing fills correctly appear as a mismatch.
+        """
+        try:
+            tolerance = float(tolerance)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("balance reconciliation tolerance is invalid") from exc
+        if not math.isfinite(tolerance) or tolerance < 0:
+            raise ValueError("balance reconciliation tolerance is invalid")
+        with self._lock:
+            if len(self.balance_marks) < 2:
+                return {"status": "NO_DATA",
+                        "detail": "need at least two balance reads"}
+            (t0, b0), (t1, b1) = self.balance_marks[0], self.balance_marks[-1]
+            observed = b1 - b0
+            purchased = sum(
+                lot.cost for position in self.positions.values()
+                for lot in position.lots if t0 <= lot.wall <= t1
+            )
+            expected = -purchased
+            diff = observed - expected
+            ok = abs(diff) <= max(tolerance, abs(expected) * 0.01)
+            return {
+                "status": "OK" if ok else "MISMATCH",
+                "window_s": t1 - t0,
+                "balance_observed_delta": observed,
+                "expected_delta": expected,
+                "confirmed_buy_cost_in_window": purchased,
+                "difference": diff,
+                "detail": "" if ok else
+                          "wallet movement includes missing fills, redemption, "
+                          "deposit/withdrawal, or unrelated activity; investigate",
+            }
+
+    # ---------------------------------------------------------- persistence
+    def _payload_locked(self) -> dict:
+        """Build an ownership-independent JSON snapshot under ``_lock``."""
+        return {
+            "version": 4,
+            "ledger_id": self.ledger_id,
+            "opened_wall": self.opened_wall,
+            "category": self.category,
+            "seen": self._seen_json(),
+            "duplicates": self.duplicates,
+            "skipped_status": self.skipped_status,
+            "skipped_side": self.skipped_side,
+            "skipped_unauthorized": self.skipped_unauthorized,
+            "skipped_authorization_mismatch": self.skipped_authorization_mismatch,
+            "reported_unauthorized": sorted(self.reported_unauthorized),
+            "reported_mismatch": sorted(self.reported_mismatch),
+            # Nested authorization dicts used to remain shared with live
+            # state after releasing _lock, allowing json.dump to see a
+            # concurrent mutation or raise "dictionary changed size".
+            "authorized_orders": copy.deepcopy(self.authorized_orders),
+            "positions": self._position_texts_locked(),
+            "balance_marks": list(self.balance_marks[-50:]),
+        }
+
+    def _position_texts_locked(self) -> "_PositionTexts":
+        """Every position as JSON text, re-encoding only those that changed.
+
+        Every fill and every settlement rewrites the whole file, and encoding
+        thousands of settled positions that never change again held the GIL
+        for longer each day - over 100ms a write on the VPS after four days,
+        freezing the event loop each time. A position's text is reused while
+        its fingerprint is unchanged. The fingerprint covers everything this
+        module ever mutates on a position: its scalar fields, the number of
+        lots (lots are append-only) and each lot's `consumed`, plus the
+        identities of the objects, so a replaced position is always re-encoded.
+        """
+        out, keep = _PositionTexts(), {}
+        for k, v in self.positions.items():
+            lots = v.lots
+            fp = (id(v), id(lots), _get_scalars(v), len(lots), tuple(map(_get_consumed, lots)))
+            hit = self._pos_text.get(k)
+            entry = (hit[1] if hit is not None and hit[0] == fp
+                     else f"{json.dumps(k)}: {json.dumps(_pos_dict(v), allow_nan=False)}")
+            keep[k] = (fp, entry)
+            out.append(entry)
+        self._pos_text = keep
+        return out
+
+    def _seen_json(self) -> "_RawJSON":
+        """json.dumps(sorted(self.seen)), re-done only when the set changed."""
+        key = (id(self.seen), len(self.seen), self._seen_rev)
+        if self._seen_text is None or self._seen_text[0] != key:
+            self._seen_text = (key, _RawJSON(json.dumps(sorted(self.seen))))
+        return self._seen_text[1]
+
+    def _write_payload(self, payload: dict) -> bool:
+        """Write one already-snapshotted payload; caller owns ``_save_lock``."""
+        tmp = None
+        try:
+            d = os.path.dirname(os.path.abspath(self.path)) or "."
+            os.makedirs(d, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
+            # dumps, not dump: json.dump streams through the pure-Python
+            # encoder, several times slower than the C one dumps uses, and
+            # every fill rewrites the whole ledger - so the save grew with
+            # every lot and froze the process (same bytes either way).
+            text = _encode_payload(payload)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(text)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.path)
+            tmp = None
+            _fsync_directory(d)
+            self.schema_version = 4
+            self.loaded_from_disk = True
+            self.last_persistence_error = None
+            return True
+        except Exception as exc:
+            self.last_persistence_error = (
+                f"ledger save failed: {type(exc).__name__}: {exc}")[:300]
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError as cleanup_exc:
+                    self.last_persistence_error += (
+                        f"; temp cleanup failed: {type(cleanup_exc).__name__}: "
+                        f"{cleanup_exc}")[:200]
+            return False
+
+    def save(self) -> bool:
+        """Atomic write. A half-written ledger is worse than a stale one."""
+        with self._save_lock:
+            with self._lock:
+                payload = self._payload_locked()
+            return self._write_payload(payload)
+
+    def load(self) -> bool:
+        try:
+            with open(self.path, encoding="utf-8") as fh:
+                data = json.load(
+                    fh,
+                    parse_constant=_reject_json_constant,
+                )
+        except Exception as exc:
+            self.last_persistence_error = (
+                f"ledger load failed: {type(exc).__name__}: {exc}")[:300]
+            return False
+        try:
+            if (not isinstance(data, dict)
+                    or type(data.get("version")) is not int
+                    or data.get("version") not in (2, 3, 4)):
+                raise ValueError("unsupported ledger schema version")
+            schema_version = int(data["version"])
+            if schema_version == 4:
+                ledger_id = str(data.get("ledger_id") or "")
+                if not _valid_ledger_id(ledger_id):
+                    raise ValueError("invalid ledger identity")
+            else:
+                # V2/V3 ledgers predate durable identity.  Retain the random
+                # ID allocated by __init__; the next successful save upgrades
+                # the file atomically to V4.
+                ledger_id = self.ledger_id
+            opened_wall = float(data.get("opened_wall", self.opened_wall))
+            category = data.get("category", self.category)
+            if (not math.isfinite(opened_wall) or opened_wall <= 0
+                    or not isinstance(category, str) or not category.strip()
+                    or len(category) > 64):
+                raise ValueError("invalid ledger header")
+
+            raw_seen = data.get("seen") or []
+            if not isinstance(raw_seen, list):
+                raise ValueError("invalid ledger seen registry")
+            seen_list = [str(value) for value in raw_seen]
+            if (len(seen_list) != len(set(seen_list))
+                    or any(not _safe_identifier(value) for value in seen_list)):
+                raise ValueError("invalid ledger seen registry")
+            seen = set(seen_list)
+
+            def counter(name):
+                value = int(data.get(name) or 0)
+                if value < 0:
+                    raise ValueError(f"negative ledger counter {name}")
+                return value
+
+            duplicates = counter("duplicates")
+            skipped_status = counter("skipped_status")
+            skipped_side = counter("skipped_side")
+            skipped_unauthorized = counter("skipped_unauthorized")
+            skipped_authorization_mismatch = counter(
+                "skipped_authorization_mismatch")
+
+            def identifier_set(name):
+                raw = data.get(name) or []
+                if not isinstance(raw, list):
+                    raise ValueError(f"invalid {name}")
+                values = {str(value) for value in raw}
+                if len(values) != len(raw) or any(
+                        not _safe_identifier(value) for value in values):
+                    raise ValueError(f"invalid {name}")
+                return values
+
+            reported_unauthorized = identifier_set("reported_unauthorized")
+            reported_mismatch = identifier_set("reported_mismatch")
+
+            raw_authorized = data.get("authorized_orders") or {}
+            authorized_orders: dict[str, dict] = {}
+            if isinstance(raw_authorized, list):
+                for oid in raw_authorized:
+                    order_id = str(oid or "")
+                    if not _safe_identifier(order_id) or order_id in authorized_orders:
+                        raise ValueError("invalid legacy authorized order entry")
+                    authorized_orders[order_id] = {}
+            elif isinstance(raw_authorized, dict):
+                for oid, meta in raw_authorized.items():
+                    order_id = str(oid or "")
+                    if not _safe_identifier(order_id) or not isinstance(meta, dict):
+                        raise ValueError("invalid authorized order entry")
+                    normalized = _authorization_metadata(meta)
+                    required = {
+                        "condition_id", "token_id", "window_end",
+                        "requested_notional",
+                    }
+                    # Incomplete v2 legacy metadata stays a non-authorizing
+                    # marker. New malformed v3 metadata is corruption.
+                    if normalized and not required.issubset(normalized):
+                        if data.get("version") == 2:
+                            normalized = {}
+                        else:
+                            raise ValueError("incomplete authorization risk metadata")
+                    _validate_authorization_metadata(normalized)
+                    authorized_orders[order_id] = normalized
+            else:
+                raise ValueError("invalid authorized order registry")
+
+            balance_marks = []
+            raw_marks = data.get("balance_marks") or []
+            if not isinstance(raw_marks, list) or len(raw_marks) > 500:
+                raise ValueError("invalid balance mark registry")
+            for mark in raw_marks:
+                if not isinstance(mark, (list, tuple)) or len(mark) != 2:
+                    raise ValueError("invalid balance mark")
+                wall, balance = float(mark[0]), float(mark[1])
+                if (not math.isfinite(wall) or wall <= 0
+                        or not math.isfinite(balance) or balance < 0):
+                    raise ValueError("invalid balance mark")
+                if balance_marks and wall < balance_marks[-1][0]:
+                    raise ValueError("balance marks are out of order")
+                balance_marks.append((wall, balance))
+
+            raw_positions = data.get("positions") or {}
+            if not isinstance(raw_positions, dict):
+                raise ValueError("invalid position registry")
+            positions: dict[str, Position] = {}
+            all_lot_ids: list[str] = []
+            for k, v in raw_positions.items():
+                if not isinstance(v, dict):
+                    raise ValueError("invalid position entry")
+                position_data = dict(v)
+                raw_lots = position_data.pop("lots", [])
+                if not isinstance(raw_lots, list):
+                    raise ValueError("invalid position lots")
+                lots = [Lot(**lot) for lot in raw_lots]
+                position = Position(lots=lots, **position_data)
+                key = str(k)
+                _validate_loaded_position(key, position)
+                positions[key] = position
+                all_lot_ids.extend(lot.trade_id for lot in lots)
+            if len(all_lot_ids) != len(set(all_lot_ids)):
+                raise ValueError("duplicate trade id appears in multiple positions")
+            if set(all_lot_ids) != seen:
+                raise ValueError("ledger seen set does not match persisted lots")
+
+            # Commit only after the complete file passes validation. Explicit
+            # reloads therefore cannot partially destroy a running ledger.
+            with self._lock:
+                self.opened_wall = opened_wall
+                self.ledger_id = ledger_id
+                self.schema_version = schema_version
+                self.loaded_from_disk = True
+                self.category = category
+                self.seen = seen
+                self.duplicates = duplicates
+                self.skipped_status = skipped_status
+                self.skipped_side = skipped_side
+                self.skipped_unauthorized = skipped_unauthorized
+                self.skipped_authorization_mismatch = skipped_authorization_mismatch
+                self.reported_unauthorized = reported_unauthorized
+                self.reported_mismatch = reported_mismatch
+                self.authorized_orders = authorized_orders
+                self.balance_marks = balance_marks
+                self.positions = positions
+                self.last_persistence_error = None
+            return True
+        except Exception as exc:
+            self.last_persistence_error = (
+                f"ledger validation failed: {type(exc).__name__}: {exc}")[:300]
+            return False
+
+
+def _consume_fifo(pos, shares: float):
+    """Consume `shares` from the oldest open BUY lots, oldest first.
+
+    Returns ``(notional_basis, fee_basis, shortfall)``. A non-zero shortfall
+    means the position does not hold that many shares, and the caller must
+    refuse the fill rather than book a short: this ledger has no concept of
+    negative inventory and inventing one would invert PnL.
+    """
+    remaining = float(shares)
+    notional = fees = 0.0
+    for lot in pos.lots:
+        if remaining <= 1e-12:
+            break
+        if str(lot.side or "").upper() != "BUY":
+            continue
+        open_sh = lot.open_shares
+        if open_sh <= 1e-12:
+            continue
+        take = min(open_sh, remaining)
+        fee_per_share = (lot.fee / lot.shares) if lot.shares else 0.0
+        notional += take * lot.price
+        fees += take * fee_per_share
+        lot.consumed += take
+        remaining -= take
+    return notional, fees, remaining
+
+
+def _pos_dict(p: Position) -> dict:
+    # Same dict asdict() built, without its recursive deep copy: every field
+    # but `lots` is an immutable scalar and Lot has no mutable fields, so
+    # fresh dicts and a fresh list are an equally safe snapshot, ~5x faster.
+    d = {name: getattr(p, name) for name in _POSITION_FIELDS}
+    d["lots"] = [{name: getattr(l, name) for name in _LOT_FIELDS} for l in p.lots]
+    return d
+
+
+_POSITION_FIELDS = tuple(f.name for f in fields(Position))
+_POS_SCALARS = tuple(n for n in _POSITION_FIELDS if n != "lots")
+_get_scalars = operator.attrgetter(*_POS_SCALARS)
+_get_consumed = operator.attrgetter("consumed")
+
+
+class _PositionTexts(list):
+    """'"key": {...}' entries of the payload's "positions" object, already encoded."""
+
+
+class _RawJSON(str):
+    """A payload value that is already JSON text."""
+
+
+def _encode_payload(payload: dict) -> str:
+    """Byte for byte what json.dumps(payload, allow_nan=False) writes, with
+    positions that are already encoded spliced in where they belong.
+
+    The encoder is compositional: an object is "{" + '"key": value' pairs
+    joined by ", " + "}" in insertion order, so encoding each top-level value
+    on its own and joining them with the same separators reproduces the
+    single-call output exactly - same keys, same order, same bytes."""
+    parts = []
+    for key, value in payload.items():
+        if isinstance(value, _PositionTexts):
+            text = "{" + ", ".join(value) + "}"
+        elif isinstance(value, _RawJSON):
+            text = str(value)
+        else:
+            text = json.dumps(value, allow_nan=False)
+        parts.append(f"{json.dumps(key)}: {text}")
+    return "{" + ", ".join(parts) + "}"
+
+
+_LOT_FIELDS = tuple(f.name for f in fields(Lot))
+
+
+def _s(v):
+    return None if v is None else str(v)
+
+
+def _safe_identifier(value, *, max_length: int = 256) -> bool:
+    return (isinstance(value, str) and 0 < len(value) <= max_length
+            and value.isprintable() and not any(ch.isspace() for ch in value))
+
+
+def _valid_ledger_id(value: str) -> bool:
+    """Return True only for the canonical random identity written by V4."""
+    if not isinstance(value, str) or len(value) != 32:
+        return False
+    try:
+        return uuid.UUID(hex=value).hex == value
+    except (ValueError, AttributeError):
+        return False
+
+
+def _authorization_metadata(receipt: dict | None) -> dict:
+    if not isinstance(receipt, dict):
+        return {}
+    out = {}
+    for key in ("condition_id", "token_id", "validation"):
+        if receipt.get(key) not in (None, ""):
+            value = str(receipt[key])
+            if not _safe_identifier(value):
+                raise ValueError(f"invalid authorization {key}")
+            out[key] = value
+    for key in (
+            "window_end", "requested_notional", "estimated_fee", "fee_rate",
+            "fee_exponent", "venue_min_shares", "price_cap",
+            "reserved_total_cost"):
+        if receipt.get(key) not in (None, ""):
+            if isinstance(receipt[key], bool):
+                raise ValueError(f"invalid authorization {key}")
+            value = float(receipt[key])
+            if not math.isfinite(value):
+                raise ValueError(f"non-finite authorization {key}")
+            if key in ("window_end", "fee_exponent"):
+                if not value.is_integer():
+                    raise ValueError(f"non-integral authorization {key}")
+                out[key] = int(value)
+            else:
+                out[key] = value
+    return out
+
+
+def _validate_authorization_metadata(metadata: dict) -> None:
+    if not metadata:
+        return
+    required = {"condition_id", "token_id", "window_end", "requested_notional"}
+    if not required.issubset(metadata):
+        raise ValueError("incomplete authorization risk metadata")
+    has_minimum = "venue_min_shares" in metadata
+    has_cap = "price_cap" in metadata
+    estimated_fee = metadata.get("estimated_fee", 0.0)
+    reserved = metadata.get("reserved_total_cost")
+    if (not _safe_identifier(metadata["condition_id"])
+            or not _safe_identifier(metadata["token_id"])
+            or metadata["requested_notional"] <= 0
+            or metadata["window_end"] <= 0
+            or metadata["window_end"] % 300
+            or estimated_fee < 0
+            or ("fee_rate" in metadata
+                and not 0 < metadata["fee_rate"] <= 1)
+            or ("fee_exponent" in metadata
+                and not 1 <= metadata["fee_exponent"] <= 8)
+            or has_minimum != has_cap
+            or (has_minimum and metadata["venue_min_shares"] <= 0)
+            or (has_cap and not 0 < metadata["price_cap"] <= 1)
+            or (reserved is not None
+                and (not has_minimum or "fee_rate" not in metadata))
+            or (reserved is not None
+                and reserved + 1e-9 < _minimum_authorization_reservation(metadata))):
+        raise ValueError("invalid authorization risk metadata")
+
+
+def _minimum_authorization_reservation(metadata: dict) -> float:
+    """Return the lowest all-in reserve justified by durable metadata."""
+    requested = float(metadata["requested_notional"])
+    required = requested + float(metadata.get("estimated_fee") or 0.0)
+    fee_rate = metadata.get("fee_rate")
+    if fee_rate is not None:
+        principal = requested
+        if ("venue_min_shares" in metadata and "price_cap" in metadata):
+            principal = max(
+                principal,
+                float(metadata["venue_min_shares"]) * float(metadata["price_cap"]),
+            )
+        # For fee = shares * rate * (p * (1-p)) ** exponent, fee/notional
+        # is rate * (1-p) ** exponent and can never exceed ``rate``.
+        required = max(required, principal * (1.0 + float(fee_rate)))
+    if not math.isfinite(required) or required <= 0:
+        raise ValueError("invalid authorization reservation inputs")
+    return required
+
+
+def _with_authorization_reservation(metadata: dict, *,
+                                    venue_min_shares, price_cap) -> dict:
+    """Snapshot strategy limits and their conservative cash reservation."""
+    if not metadata:
+        raise ValueError("cannot reserve exposure without authorization metadata")
+    if venue_min_shares is None or price_cap is None:
+        raise ValueError("venue minimum and price cap must be supplied together")
+    if "fee_rate" not in metadata:
+        raise ValueError("cannot reserve exposure without a durable fee rate")
+    try:
+        minimum = float(venue_min_shares)
+        cap = float(price_cap)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid authorization reservation inputs") from exc
+    if (not math.isfinite(minimum) or minimum <= 0
+            or not math.isfinite(cap) or not 0 < cap <= 1):
+        raise ValueError("invalid authorization reservation inputs")
+    out = dict(metadata)
+    out["venue_min_shares"] = minimum
+    out["price_cap"] = cap
+    out["reserved_total_cost"] = _minimum_authorization_reservation(out)
+    return out
+
+
+def _conservative_authorization_cost(metadata: dict) -> float:
+    """Recover one accepted order's safe gross cost or fail closed."""
+    if "fee_rate" not in metadata:
+        raise RuntimeError(
+            "active authorization lacks conservative all-in reservation metadata")
+    reserved = metadata.get("reserved_total_cost")
+    if reserved is not None:
+        value = float(reserved)
+    else:
+        # Backward-compatible V3/V4 path. Live market BUYs post exactly the
+        # requested dollar amount (they reject, rather than resize, below the
+        # venue minimum), so requested * (1 + rate) safely bounds their cost.
+        value = _minimum_authorization_reservation(metadata)
+    if not math.isfinite(value) or value <= 0:
+        raise RuntimeError("authorized order all-in exposure is invalid")
+    return value
+
+
+def _safe_mark(mark, token_id: str) -> tuple[float | None, str | None]:
+    try:
+        raw = mark(token_id)
+    except Exception as exc:
+        return None, (
+            f"mark failed for {token_id[-12:]}: {type(exc).__name__}: {exc}")[:300]
+    if raw is None:
+        return None, None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        return None, f"invalid mark for {token_id[-12:]}: {type(exc).__name__}"[:300]
+    if not math.isfinite(value) or not 0 <= value <= 1:
+        return None, f"out-of-range mark for {token_id[-12:]}: {raw!r}"[:300]
+    return value, None
+
+
+def _validated_resolution(resolution) -> tuple[str, dict[str, float]]:
+    condition = str(getattr(resolution, "condition_id", "") or "")
+    raw = getattr(resolution, "payouts", None)
+    if not _safe_identifier(condition) or not isinstance(raw, dict) or len(raw) != 2:
+        raise ValueError("resolved market has invalid condition/payout shape")
+    payouts: dict[str, float] = {}
+    for token, payout in raw.items():
+        token_id = str(token or "")
+        if not _safe_identifier(token_id) or token_id in payouts:
+            raise ValueError("resolved market has invalid payout token mapping")
+        try:
+            value = float(payout)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("resolved market has unparsable payout") from exc
+        if not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError("resolved market has out-of-range payout")
+        payouts[token_id] = value
+    values = sorted(payouts.values())
+    final_binary = (abs(values[0]) <= 1e-9 and abs(values[1] - 1) <= 1e-9)
+    final_half = all(abs(value - 0.5) <= 1e-9 for value in values)
+    if abs(sum(values) - 1) > 1e-9 or not (final_binary or final_half):
+        raise ValueError("resolved market payouts are not final binary/50-50 values")
+    return condition, payouts
+
+
+def _reject_json_constant(value: str):
+    raise ValueError(f"non-finite JSON constant {value}")
+
+
+def _replay_realized_from_sales(position: "Position") -> float:
+    """Independently recompute realized_from_sales from the lot journal.
+
+    `Position.realized_from_sales` is trusted at load time rather than
+    derived, so a corrupted or hand-edited file can carry any number there as
+    long as it stays self-consistent with `realized` - a settled sell-to-close
+    position, for example, only checked `realized == realized_from_sales`
+    against itself, never against what the recorded SELL lots actually paid
+    out. This replays the same oldest-lot-first FIFO consumption
+    `_consume_fifo` performs live, off a private per-lot open-shares counter
+    so it never mutates the lots it is validating, and returns the total
+    proceeds-minus-basis a faithful replay would produce.
+    """
+    open_shares: dict[int, float] = {
+        i: lot.shares for i, lot in enumerate(position.lots)
+        if str(lot.side or "").upper() == "BUY"
+    }
+    realized = 0.0
+    for lot in position.lots:
+        if str(lot.side or "").upper() != "SELL":
+            continue
+        remaining = lot.shares
+        notional = fees = 0.0
+        for j, buy_lot in enumerate(position.lots):
+            if remaining <= 1e-12:
+                break
+            if str(buy_lot.side or "").upper() != "BUY":
+                continue
+            avail = open_shares.get(j, 0.0)
+            if avail <= 1e-12:
+                continue
+            take = min(avail, remaining)
+            fee_per_share = (buy_lot.fee / buy_lot.shares) if buy_lot.shares else 0.0
+            notional += take * buy_lot.price
+            fees += take * fee_per_share
+            open_shares[j] = avail - take
+            remaining -= take
+        basis = notional + fees
+        proceeds = lot.shares * lot.price - lot.fee
+        realized += proceeds - basis
+    return realized
+
+
+def _validate_loaded_position(key: str, position: Position) -> None:
+    """Reject corrupted state instead of letting NaN/negative cash bypass risk."""
+    if (not _safe_identifier(key) or str(position.token_id) != key
+            or not _safe_identifier(position.condition_id)
+            or not isinstance(position.settled, bool)):
+        raise ValueError("invalid position identity")
+    for value in (position.shares, position.cost, position.fees):
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError("invalid position amount")
+    if position.fees > position.cost + 1e-9:
+        raise ValueError("position fees exceed cost")
+    seen_lots: set[str] = set()
+    shares = cost = fees = 0.0
+    for lot in position.lots:
+        lot_side = str(lot.side).upper()
+        if (not lot.trade_id or lot.trade_id in seen_lots
+                or not _safe_identifier(lot.trade_id)
+                or str(lot.token_id) != key
+                or lot.condition_id != position.condition_id
+                or lot_side not in ("BUY", "SELL")
+                or str(lot.status).upper() != "CONFIRMED"):
+            raise ValueError("invalid persisted lot identity")
+        if (not isinstance(lot.source, str) or len(lot.source) > 256
+                or not lot.source.isprintable()
+                or (lot.order_id is not None and not _safe_identifier(lot.order_id))):
+            raise ValueError("invalid persisted lot metadata")
+        seen_lots.add(lot.trade_id)
+        numeric = (lot.shares, lot.price, lot.fee, lot.wall, lot.consumed)
+        if (any(not isinstance(value, (int, float)) or not math.isfinite(value)
+                for value in numeric)
+                or lot.shares <= 0 or not 0 < lot.price <= 1
+                or lot.fee < 0 or lot.wall <= 0
+                or lot.consumed < 0 or lot.consumed > lot.shares + 1e-9):
+            raise ValueError("invalid persisted lot amount")
+        if lot_side == "SELL":
+            # A sale is journalled but holds nothing: its PnL was banked into
+            # realized_from_sales when it happened, and the BUY lots it
+            # consumed already carry the reduction. Counting it into the
+            # aggregates here would double-count the exit.
+            if lot.consumed:
+                raise ValueError("a SELL lot cannot itself be consumed")
+            continue
+        open_shares = lot.shares - lot.consumed
+        fee_per_share = (lot.fee / lot.shares) if lot.shares else 0.0
+        open_fee = fee_per_share * open_shares
+        shares += open_shares
+        fees += open_fee
+        cost += open_shares * lot.price + open_fee
+    tolerance = 1e-8
+    if (abs(position.shares - shares) > tolerance
+            or abs(position.fees - fees) > tolerance
+            or abs(position.cost - cost) > tolerance):
+        raise ValueError("position aggregates do not match lots")
+    if abs(position.realized_from_sales
+           - _replay_realized_from_sales(position)) > tolerance:
+        raise ValueError("realized_from_sales does not match the recorded SELL lots")
+    for value in (position.realized_from_sales, position.sell_fees):
+        if not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError("invalid position sales amount")
+    if position.sell_fees < 0:
+        raise ValueError("invalid position sales amount")
+    if position.settled:
+        payout = position.payout_per_share
+        realized = position.realized
+        if (not isinstance(realized, (int, float)) or not math.isfinite(realized)
+                or not isinstance(position.settled_wall, (int, float))
+                or not math.isfinite(position.settled_wall)
+                or position.settled_wall <= 0):
+            raise ValueError("invalid settled position")
+        if payout is None:
+            # Closed by selling out rather than by resolution: there is no
+            # payout, and everything realised came from the sales.
+            if (position.shares > tolerance
+                    or abs(realized - position.realized_from_sales) > tolerance):
+                raise ValueError("invalid settled position")
+        elif (not isinstance(payout, (int, float)) or not math.isfinite(payout)
+                or not 0 <= payout <= 1
+                or abs(realized - (position.shares * payout - position.cost
+                                   + position.realized_from_sales)) > tolerance):
+            raise ValueError("invalid settled position")
+    elif (position.payout_per_share is not None or position.realized is not None
+          or position.settled_wall is not None):
+        raise ValueError("unsettled position carries settlement values")
