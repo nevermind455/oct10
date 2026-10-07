@@ -1,5 +1,5 @@
 """Checks before the sniper's LIVE CANARY - run on the VPS with the canary
-wallet's keys in .env, before the first `run_feeds.py --live`:
+wallet's keys in .env, before the first `run.py --live`:
 
     .venv/bin/python live_preflight.py
         places NO order: settings, key/funder/credentials, the order
@@ -50,7 +50,7 @@ def check_settings(config) -> None:
     print("\n1. SETTINGS (.env)")
     mark("PASS" if sniper_mode.only() else "FAIL", "SNIPER_ONLY=1", "" if sniper_mode.only() else "not set")
     mark("PASS" if sniper_mode.live_canary() else "FAIL", "SNIPER_LIVE_CANARY=1",
-         "" if sniper_mode.live_canary() else "not set: run_feeds --live refuses SNIPER_ONLY without it")
+         "" if sniper_mode.live_canary() else "not set: run.py --live refuses SNIPER_ONLY without it")
     user_ws = (os.environ.get("USER_WS") or "on").lower()
     mark("PASS" if user_ws == "on" else "FAIL", "USER_WS=on (fills arrive on the private channel)", user_ws)
     delay = float(config.ASSUMED_MATCH_DELAY_SECONDS)
@@ -224,7 +224,7 @@ async def run(args) -> int:
           ("READY" + (f" (warnings: {'; '.join(warns)})" if warns else "")))
     if not fails:
         print("start the canary (stop the paper bot first - one bot per vCPU):")
-        print("    tmux new -s live '.venv/bin/python -u run_feeds.py --live --dash'")
+        print("    tmux new -s live '.venv/bin/python -u run.py --live --dash'")
         print("stop new orders at once:  touch STOP_LIVE   (restart to trade again after removing it)")
     return 1 if fails else 0
 

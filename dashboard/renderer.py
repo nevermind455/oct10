@@ -287,25 +287,13 @@ class PlainRenderer:
     def __exit__(self, *exc):
         return False
 
-    def status(self, snap: dict) -> None:
+    def status(self, line: str) -> None:
+        """Write one preformatted status line, at most once every `every` seconds."""
         now = time.monotonic()
         if now - self._last < self.every:
             return
         self._last = now
-        spot = f"${snap['spot']:,.2f}" if snap["spot"] else "--"
-        price_to_beat = (f"${snap['start_chainlink']:,.2f}"
-                         if snap["start_chainlink"] is not None else "--")
-        running_price = (f"${snap['chainlink']:,.2f}"
-                         if snap["chainlink"] is not None else "--")
-        secs = snap["seconds_left"]
         try:
-            line = (
-                f"[DASH] {snap['round_label']} T-{secs if secs is not None else '???'} "
-                f"ptb={price_to_beat} running={running_price} spot={spot} "
-                f"side={snap['decision'] or '--'} "
-                f"ok={snap['orders_ok']} fail={snap['orders_fail']} "
-                f"feed={snap['spot_status']} book={snap['book_status']}"
-            )
             self.stream.write(terminal_text(line, max_chars=2000) + "\n")
             self.stream.flush()
         except Exception as exc:

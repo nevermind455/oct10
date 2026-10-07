@@ -35,7 +35,7 @@ def _f(x):
 
 
 def state_path(env_file: Path, name: str, default: str) -> Path:
-    """A state file the way run_feeds resolves it: the shell's value, else the
+    """A state file the way run.py resolves it: the shell's value, else the
     .env's (any key - sniper_check.read_env keeps only PAPER_*/SNIPER_* lines,
     so LEDGER_PATH set in .env was missed), else the default; relative paths
     are relative to the code."""

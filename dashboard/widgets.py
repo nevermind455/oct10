@@ -84,7 +84,9 @@ def panel(title: str, body: Sequence[Row], cols: int, rows: int, g: Glyphs,
     inner_w = cols - 2
     cap = f" {title[: max(0, inner_w - 4)]} "
     note = f" {right_note} " if right_note else ""
-    fill = inner_w - len(cap) - len(note)
+    # -1 for the rule segment between the corner and the title: without it the
+    # top border came out one cell too wide and pad() cut off the right corner.
+    fill = inner_w - 1 - len(cap) - len(note)
     cap_style = title_style or Style("ink", "cream", bold=True)
     top: Row = [(g.tl, accent), (g.h, accent), (cap, cap_style)]
     if fill > 0:
