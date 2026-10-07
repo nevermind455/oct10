@@ -687,8 +687,11 @@ class OldPathAudit(unittest.TestCase):
             e = S.Settings()
         say(f".env.example values:        k_bp={e.k_bp} window={e.window_ms} type={e.order_type} slip={e.slip} "
             f"cooldown={e.cooldown_ms} shares={e.shares} max_target={e.max_target_shares}")
+        import exec_latency
+        frozen = {attr: value for attr, _var, value, _label, _fmt in exec_latency.FROZEN_SPEC}
         self.assertEqual((e.k_bp, e.window_ms, e.order_type, e.slip, e.cooldown_ms, e.shares, e.max_target_shares),
-                         (0.5, 250, "FAK", 0.05, 300, 10, 20))
+                         tuple(frozen[k] for k in ("k_bp", "window_ms", "order_type", "slip", "cooldown_ms", "shares",
+                                                   "max_target_shares")))      # .env.example is the frozen spec
         with patch.dict(os.environ, {"SNIPER_ONLY": "1", "SNIPER_K_BP": "0.8", "SNIPER_SLIP": "0.45",
                                      "SNIPER_COOLDOWN_MS": "1000", "SNIPER_ORDER_TYPE": "FOK"}, clear=True):
             old = S.Settings()

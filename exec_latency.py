@@ -29,16 +29,18 @@ import math
 import os
 
 # ---------------------------------------------------------------- the frozen spec
-# The sniper as specified (2026-10-07). LIVE refuses to start when a resolved
-# setting differs: an old .env value used to win silently. Changing the
-# strategy means changing this table (reviewed), not an environment variable.
+# The sniper as specified. LIVE refuses to start when a resolved setting
+# differs: an old .env value used to win silently. Changing the strategy means
+# changing this table (reviewed), not an environment variable.
+# 2026-10-07: 0.50bp / ask+$0.05 -> 1.00bp / ask+$0.04 (the operator's change):
+# one IOC that buys what is offered up to the reference ask + 4c, never more.
 FROZEN_SPEC = (
     # (Settings attribute, environment variable, frozen value, label, format)
     ("primary_feed", "SNIPER_PRIMARY_FEED", "binance", "trigger feed", "{}"),
-    ("k_bp", "SNIPER_K_BP", 0.5, "trigger", "{:.2f} bp"),
+    ("k_bp", "SNIPER_K_BP", 1.0, "trigger", "{:.2f} bp"),
     ("window_ms", "SNIPER_WINDOW_MS", 250.0, "window", "{:.0f} ms"),
     ("order_type", "SNIPER_ORDER_TYPE", "FAK", "execution", "{}"),
-    ("slip", "SNIPER_SLIP", 0.05, "slip", "${:.2f}"),
+    ("slip", "SNIPER_SLIP", 0.04, "slip", "${:.2f}"),
     ("cooldown_ms", "SNIPER_COOLDOWN_MS", 300.0, "cooldown", "{:.0f} ms / side"),
     ("shares", "SNIPER_SHARES", 10.0, "base_target", "{:g}"),
     ("max_target_shares", "SNIPER_MAX_TARGET_SHARES", 20.0, "max_target", "{:g}"),

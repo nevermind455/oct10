@@ -587,7 +587,7 @@ class RunGateTests(unittest.TestCase):
         # The opt-in still clears the Kraken check; the frozen spec (exec_latency.FROZEN_SPEC)
         # then refuses LIVE on any trigger feed but Binance.
         with env(SNIPER_PRIMARY_FEED="kraken", SNIPER_KRAKEN_LIVE="1", SNIPER_ONLY="1", SNIPER_LIVE_CANARY="1",
-                 SNIPER_K_BP="0.5", SNIPER_SLIP="0.05"), \
+                 SNIPER_K_BP="1.0", SNIPER_SLIP="0.04"), \
                 self.assertRaisesRegex(RuntimeError, "(?s)frozen spec.*trigger feed: resolved kraken"):
             self.rf._live_sniper_gate(paper=False)
 

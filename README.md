@@ -13,7 +13,7 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
 
 ## The strategy
 
-- **Trigger.** The BTC mid moves at least `SNIPER_K_BP` within `SNIPER_WINDOW_MS`.
+- **Trigger.** The BTC mid moves at least `SNIPER_K_BP` (1.0bp) within `SNIPER_WINDOW_MS` (250ms).
   The mid comes from Binance BTCUSDT bookTicker by default, or Kraken BTC/USD.
   The move is measured against the last price at or before the lookback, and
   that reference must be no more than 2s old. Kraken heartbeats carry the price
@@ -30,7 +30,8 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
 - **Order.** An IOC limit order (Polymarket's FAK) with a share target:
   - **Target.** 10 shares, plus whatever this side's last order in this market
     did not fill, capped at 20 shares.
-  - **Limit.** The freshest best ask + `SNIPER_SLIP`. It is fixed at the decision,
+  - **Limit.** The freshest best ask + `SNIPER_SLIP` ($0.04). One order buys what is
+    offered from the ask up to +4c, and nothing above. It is fixed at the decision,
     never recomputed from a later ask, and clipped at `MAX_BUY_PRICE`.
   - **Sizing.** The stake buys the target on the book the decision saw, walking
     the levels from the ask up to the limit. It is at least $1, and at least the
@@ -69,10 +70,10 @@ is left of trigger -> ACK is outside the process:
   end-of-round cutoff 0.1s later, which is why it is your choice, not a default.
 
 **The frozen spec.** `--live` refuses to start unless the resolved settings are
-exactly the frozen spec (`exec_latency.FROZEN_SPEC`: Binance, 0.50bp in 250ms, FAK,
-ask+$0.05, 300ms per side, 10 shares, carry to 20) and `SNIPER_CANARY_MAX_SHARES`
+exactly the frozen spec (`exec_latency.FROZEN_SPEC`: Binance, 1.00bp in 250ms, FAK,
+ask+$0.04, 300ms per side, 10 shares, carry to 20) and `SNIPER_CANARY_MAX_SHARES`
 admits the 20-share carried target. A missing `.env` value used to fall back
-silently to an old code default (`SNIPER_K_BP=1.0`, `SNIPER_SLIP=0.02`). Every
+silently to a code default (`SNIPER_SLIP=0.02`, `SNIPER_K_BP=1.0`). Every
 start prints the resolved configuration and which ECDSA backend signs (install
 `coincurve`: ~0.1ms per order against ~1.4ms in pure Python).
 
@@ -168,11 +169,11 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | --- | --- | --- |
 | `SNIPER_ONLY` | 1 | required: this build is the sniper only |
 | `SNIPER_PRIMARY_FEED` | binance | trigger feed: `binance` or `kraken` |
-| `SNIPER_K_BP` / `SNIPER_WINDOW_MS` | 0.5 / 250 | trigger: a move of >= 0.5bp within 250ms |
+| `SNIPER_K_BP` / `SNIPER_WINDOW_MS` | 1.0 / 250 | trigger: a move of >= 1bp within 250ms |
 | `SNIPER_SHARES` | 10 | base target shares per order (at least $1) |
 | `SNIPER_MAX_TARGET_SHARES` | 20 | cap on base + same-side unfilled carry |
 | `SNIPER_ORDER_TYPE` | FAK | IOC limit: partial fills kept, the rest cancelled; FOK is all-or-nothing |
-| `SNIPER_SLIP` | 0.05 | limit = the ask seen + 0.05, clipped at `MAX_BUY_PRICE`: never pays more |
+| `SNIPER_SLIP` | 0.04 | limit = the ask seen + 0.04, clipped at `MAX_BUY_PRICE`: never pays more |
 | `SNIPER_COOLDOWN_MS` | 300 | per side: an order starts a pause on ITS side only, from its submission |
 | `SNIPER_MIN_LEFT_S` | 10 | no order with fewer seconds left in the round |
 | `SNIPER_MAX_FILLS_ROUND` / `SNIPER_MAX_SIDE_SHARES` | 20 / 200 | per-round caps |

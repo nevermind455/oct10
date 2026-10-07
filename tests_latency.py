@@ -53,23 +53,45 @@ def move_mid(ref: float, bp: float) -> float:
 
 # =========================================================================== trigger
 class TriggerBoundaries(unittest.TestCase):
+    K = float(dict((a, v) for a, _n, v, _l, _f in X.FROZEN_SPEC)["k_bp"])   # 1.0bp
+
     def fire(self, bp: float, age_ms: float = 260.0):
-        t = S.Trigger(0.5, 250)
+        t = S.Trigger(self.K, 250)
         t.update(0.0, 60_000.0)
         return t.update(age_ms, move_mid(60_000.0, bp))[0]
 
-    def test_049_no_050_and_051_trigger_both_ways(self):
-        for bp, want in ((0.49, None), (0.50, 1), (0.51, 1), (-0.49, None), (-0.50, -1), (-0.51, -1)):
+    def test_099_no_100_and_101_trigger_both_ways(self):
+        self.assertEqual(self.K, 1.0)
+        for bp, want in ((0.99, None), (1.00, 1), (1.01, 1), (-0.99, None), (-1.00, -1), (-1.01, -1),
+                         (0.50, None), (-0.50, None)):                      # the old 0.5bp no longer fires
             self.assertEqual(self.fire(bp), want, bp)
 
+    def test_an_exact_1bp_move_always_triggers(self):
+        from decimal import Decimal as D
+        rng, missed, n = random.Random(3), [], 0
+        for _ in range(200_000):
+            ref = D(rng.randrange(3_000_000, 15_000_000)) / D(100)
+            mid = ref + ref * D("0.0001")
+            if mid != mid.quantize(D("0.005")):
+                continue
+            n += 1
+            for sign in (1, -1):
+                t = S.Trigger(self.K, 250)
+                t.update(0.0, float(ref))
+                m = float(mid) if sign > 0 else float(ref - ref * D("0.0001"))
+                if t.update(260.0, m)[0] != sign:
+                    missed.append((str(ref), sign))
+        self.assertGreater(n, 100)
+        self.assertEqual(missed, [])
+
     def test_the_250ms_window(self):
-        t = S.Trigger(0.5, 250)
+        t = S.Trigger(self.K, 250)
         t.update(0.0, 60_000.0)
-        self.assertIsNone(t.update(200.0, move_mid(60_000.0, 0.6))[0])      # no price 250ms old yet
-        t = S.Trigger(0.5, 250)
+        self.assertIsNone(t.update(200.0, move_mid(60_000.0, 1.2))[0])      # no price 250ms old yet
+        t = S.Trigger(self.K, 250)
         t.update(0.0, 60_000.0)
-        t.update(100.0, move_mid(60_000.0, 0.6))
-        self.assertIsNone(t.update(400.0, move_mid(60_000.0, 0.6))[0])      # moved >250ms ago, flat since
+        t.update(100.0, move_mid(60_000.0, 1.2))
+        self.assertIsNone(t.update(400.0, move_mid(60_000.0, 1.2))[0])      # moved >250ms ago, flat since
 
 
 # =========================================================================== cooldown
@@ -92,8 +114,8 @@ class CooldownBoundary(unittest.TestCase):
 
 # =========================================================================== config fail-fast
 class FrozenSpec(unittest.TestCase):
-    FROZEN = {"SNIPER_ONLY": "1", "SNIPER_LIVE_CANARY": "1", "SNIPER_PRIMARY_FEED": "binance", "SNIPER_K_BP": "0.5",
-              "SNIPER_WINDOW_MS": "250", "SNIPER_ORDER_TYPE": "FAK", "SNIPER_SLIP": "0.05",
+    FROZEN = {"SNIPER_ONLY": "1", "SNIPER_LIVE_CANARY": "1", "SNIPER_PRIMARY_FEED": "binance", "SNIPER_K_BP": "1.0",
+              "SNIPER_WINDOW_MS": "250", "SNIPER_ORDER_TYPE": "FAK", "SNIPER_SLIP": "0.04",
               "SNIPER_COOLDOWN_MS": "300", "SNIPER_SHARES": "10", "SNIPER_MAX_TARGET_SHARES": "20",
               "SNIPER_CANARY_MAX_SHARES": "25"}
 
@@ -107,7 +129,8 @@ class FrozenSpec(unittest.TestCase):
         self.assertTrue(self.gate())
 
     def test_an_old_env_value_refuses_live_and_names_it(self):
-        for var, value, word in (("SNIPER_K_BP", "1.0", "trigger"), ("SNIPER_SLIP", "0.02", "slip"),
+        for var, value, word in (("SNIPER_K_BP", "0.5", "trigger"), ("SNIPER_SLIP", "0.05", "slip"),
+                                 ("SNIPER_SLIP", "0.02", "slip"),
                                  ("SNIPER_ORDER_TYPE", "FOK", "execution"), ("SNIPER_COOLDOWN_MS", "1000", "cooldown"),
                                  ("SNIPER_WINDOW_MS", "500", "window"), ("SNIPER_SHARES", "5", "base_target"),
                                  ("SNIPER_MAX_TARGET_SHARES", "30", "max_target")):
@@ -118,9 +141,9 @@ class FrozenSpec(unittest.TestCase):
 
     def test_a_missing_value_falling_back_to_an_old_default_refuses_live(self):
         with self.assertRaises(RuntimeError) as ctx:
-            self.gate(SNIPER_K_BP=None, SNIPER_SLIP=None)            # code defaults: 1.0bp, $0.02
+            self.gate(SNIPER_K_BP=None, SNIPER_SLIP=None)            # code defaults: 1.0bp (the spec), $0.02 (not)
         msg = str(ctx.exception)
-        self.assertIn("SNIPER_K_BP unset (code default)", msg)
+        self.assertNotIn("SNIPER_K_BP", msg)
         self.assertIn("SNIPER_SLIP unset (code default)", msg)
 
     def test_a_canary_cap_below_the_carried_target_refuses_live(self):
@@ -130,7 +153,7 @@ class FrozenSpec(unittest.TestCase):
 
     def test_paper_only_warns_and_the_config_lines_hold_no_secret(self):
         import run
-        env = dict(self.FROZEN, SNIPER_K_BP="1.0", POLY_PRIVATE_KEY="0x" + "ab" * 32, POLY_FUNDER="0x" + "cd" * 20)
+        env = dict(self.FROZEN, SNIPER_K_BP="0.5", POLY_PRIVATE_KEY="0x" + "ab" * 32, POLY_FUNDER="0x" + "cd" * 20)
         with patch.dict(os.environ, env, clear=True):
             self.assertFalse(run._live_sniper_gate(paper=True))
             s = S.Settings()
@@ -138,8 +161,8 @@ class FrozenSpec(unittest.TestCase):
             bad = X.spec_violations(s, 25)
         text = "\n".join(lines)
         self.assertIn("trigger", text)
-        self.assertIn("1.00 bp", text)
-        self.assertIn("<- frozen spec 0.50 bp", text)
+        self.assertIn("0.50 bp", text)
+        self.assertIn("<- frozen spec 1.00 bp", text)
         self.assertNotIn("ab" * 32, text)
         self.assertNotIn("cd" * 20, text)
         self.assertEqual(len(bad), 1)
@@ -188,7 +211,7 @@ class LiveFast(unittest.TestCase):
         self.fake.script.append(("sleep", delay_s, action) if delay_s else action)
         return oid, tid
 
-    def raw(self, side: str, bp: float = 0.6) -> str:
+    def raw(self, side: str, bp: float = 1.2) -> str:
         mid = move_mid(60_000.0, bp if side == "UP" else -bp)
         return json.dumps({"b": f"{mid - 0.005:.3f}", "a": f"{mid + 0.005:.3f}"})
 
@@ -294,9 +317,9 @@ class LiveFast(unittest.TestCase):
                 raw = self.raw("UP")
                 self.sn.on_tick(raw)
                 self.sn.on_tick(raw)                                   # the same message delivered twice
-                trig = S.Trigger(0.5, 250)                             # and a second feed seeing the same move
+                trig = S.Trigger(1.0, 250)                             # and a second feed seeing the same move
                 trig.update(time.monotonic() * 1000.0 - 300.0, 60_000.0)
-                self.sn._signal("coinbase", trig, move_mid(60_000.0, 0.6), time.monotonic() * 1000.0,
+                self.sn._signal("coinbase", trig, move_mid(60_000.0, 1.2), time.monotonic() * 1000.0,
                                 time.perf_counter_ns())
                 await self.settle("UP")
                 await asyncio.sleep(0.05)
@@ -399,7 +422,7 @@ class LiveFast(unittest.TestCase):
                 self.sn.on_tick(self.raw("UP"))
                 await self.settle("UP")
                 caps = [r["cap"] for r in self.rows("refused")]
-                self.assertEqual(caps, [0.6, 0.63])                          # ask + 0.05 at each decision
+                self.assertEqual(caps, [0.59, 0.62])                         # ask + 0.04 at each decision
                 for body, cap in zip(self.posted(), caps):
                     o = body["order"]
                     price = int(o["makerAmount"]) / int(o["takerAmount"])
@@ -611,7 +634,7 @@ def replay_steps(seed: int, n: int):
         dt = rng.choice((40, 80, 120, 200, 260, 320))
         jump = rng.random()
         if jump < 0.15:
-            mid *= 1 + rng.choice((-1, 1)) * rng.uniform(0.45, 1.2) / 1e4     # a move near the threshold
+            mid *= 1 + rng.choice((-1, 1)) * rng.uniform(0.8, 2.0) / 1e4      # a move near the 1bp threshold
         else:
             mid *= 1 + rng.uniform(-0.05, 0.05) / 1e4
         ask_up = round(rng.choice((0.30, 0.45, 0.52, 0.55, 0.61, 0.97)), 2)
