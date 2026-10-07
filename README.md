@@ -30,8 +30,8 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
 - **Order.** An IOC limit order (Polymarket's FAK) with a share target:
   - **Target.** 10 shares, plus whatever this side's last order in this market
     did not fill, capped at 20 shares.
-  - **Limit.** The freshest best ask + `SNIPER_SLIP` ($0.04). One order buys what is
-    offered from the ask up to +4c, and nothing above. It is fixed at the decision,
+  - **Limit.** The freshest best ask + `SNIPER_SLIP` ($0.05). One order buys what is
+    offered from the ask up to +5c, and nothing above. It is fixed at the decision,
     never recomputed from a later ask, and clipped at `MAX_BUY_PRICE`.
   - **Sizing.** The stake buys the target on the book the decision saw, walking
     the levels from the ask up to the limit. It is at least $1, and at least the
@@ -71,9 +71,9 @@ is left of trigger -> ACK is outside the process:
 
 **The frozen spec.** `--live` refuses to start unless the resolved settings are
 exactly the frozen spec (`exec_latency.FROZEN_SPEC`: Binance, 0.50bp in 250ms, FAK,
-ask+$0.04, 300ms per side, 10 shares, carry to 20) and `SNIPER_CANARY_MAX_SHARES`
+ask+$0.05, 300ms per side, 10 shares, carry to 20) and `SNIPER_CANARY_MAX_SHARES`
 admits the 20-share carried target. A missing `.env` value falls back to a code
-default; for the trigger and the limit those are the spec (0.5bp, ask+$0.04). Every
+default; for the trigger and the limit those are the spec (0.5bp, ask+$0.05). Every
 start prints the resolved configuration and which ECDSA backend signs (install
 `coincurve`: ~0.1ms per order against ~1.4ms in pure Python).
 
@@ -228,7 +228,7 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | `SNIPER_SHARES` | 10 | base target shares per order (at least $1) |
 | `SNIPER_MAX_TARGET_SHARES` | 20 | cap on base + same-side unfilled carry |
 | `SNIPER_ORDER_TYPE` | FAK | IOC limit: partial fills kept, the rest cancelled; FOK is all-or-nothing |
-| `SNIPER_SLIP` | 0.04 | limit = the ask seen + 0.04, clipped at `MAX_BUY_PRICE`: never pays more |
+| `SNIPER_SLIP` | 0.05 | limit = the ask seen + 0.05, clipped at `MAX_BUY_PRICE`: never pays more |
 | `SNIPER_COOLDOWN_MS` | 300 | per side: an order starts a pause on ITS side only, from its submission |
 | `SNIPER_MIN_LEFT_S` | 10 | no order with fewer seconds left in the round |
 | `SNIPER_MAX_FILLS_ROUND` / `SNIPER_MAX_SIDE_SHARES` | 20 / 200 | per-round caps |

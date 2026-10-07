@@ -37,7 +37,7 @@ untouched:
     SNIPER_LIVE_CANARY=1        LIVE only, with SNIPER_ONLY: real orders under the
                                 SNIPER_CANARY_* limits (see sniper_live.limits_from_env)
     SNIPER_K_BP=0.5             SNIPER_WINDOW_MS=250
-    SNIPER_SHARES=10            SNIPER_SLIP=0.04
+    SNIPER_SHARES=10            SNIPER_SLIP=0.05
     SNIPER_LATENCY_MS=(unset)   SNIPER_COOLDOWN_MS=300 (per side, from the order's submission)
     SNIPER_MIN_LEFT_S=10        SNIPER_MAX_FILLS_ROUND=20
     SNIPER_MAX_SIDE_SHARES=200  SNIPER_STALE_MS=2000
@@ -564,8 +564,8 @@ class Settings:
         self.k_bp = _env_float("SNIPER_K_BP", 0.5)
         self.window_ms = _env_float("SNIPER_WINDOW_MS", 250)
         self.shares = _env_float("SNIPER_SHARES", 10)
-        # the frozen spec's limit (exec_latency.FROZEN_SPEC): the ask seen + $0.04 at most
-        self.slip = _env_float("SNIPER_SLIP", 0.04)
+        # the frozen spec's limit (exec_latency.FROZEN_SPEC): the ask seen + $0.05 at most
+        self.slip = _env_float("SNIPER_SLIP", 0.05)
         # Set -> the old fixed delay, no signing. Unset -> live-like.
         self.fixed_latency = bool(str(os.environ.get("SNIPER_LATENCY_MS", "")).strip())
         self.latency_ms = _env_float("SNIPER_LATENCY_MS", 200)

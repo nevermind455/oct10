@@ -36,13 +36,16 @@ import os
 # one IOC that buys what is offered up to the reference ask + 4c, never more.
 # 2026-10-07 (later): 1.00bp -> 0.50bp (the operator's change); still one FAK
 # limit order up to the reference ask + $0.04.
+# 2026-10-07 (later): ask + $0.04 -> ask + $0.05 (the operator's spec): one IOC per
+# signal up to the reference ask + 5c, partial fills kept, the unfilled rest carried
+# to the next same-side signal (cap 20). No retry, no chasing.
 FROZEN_SPEC = (
     # (Settings attribute, environment variable, frozen value, label, format)
     ("primary_feed", "SNIPER_PRIMARY_FEED", "binance", "trigger feed", "{}"),
     ("k_bp", "SNIPER_K_BP", 0.5, "trigger", "{:.2f} bp"),
     ("window_ms", "SNIPER_WINDOW_MS", 250.0, "window", "{:.0f} ms"),
     ("order_type", "SNIPER_ORDER_TYPE", "FAK", "execution", "{}"),
-    ("slip", "SNIPER_SLIP", 0.04, "slip", "${:.2f}"),
+    ("slip", "SNIPER_SLIP", 0.05, "slip", "${:.2f}"),
     ("cooldown_ms", "SNIPER_COOLDOWN_MS", 300.0, "cooldown", "{:.0f} ms / side"),
     ("shares", "SNIPER_SHARES", 10.0, "base_target", "{:g}"),
     ("max_target_shares", "SNIPER_MAX_TARGET_SHARES", 20.0, "max_target", "{:g}"),

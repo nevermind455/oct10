@@ -115,7 +115,7 @@ class CooldownBoundary(unittest.TestCase):
 # =========================================================================== config fail-fast
 class FrozenSpec(unittest.TestCase):
     FROZEN = {"SNIPER_ONLY": "1", "SNIPER_LIVE_CANARY": "1", "SNIPER_PRIMARY_FEED": "binance", "SNIPER_K_BP": "0.5",
-              "SNIPER_WINDOW_MS": "250", "SNIPER_ORDER_TYPE": "FAK", "SNIPER_SLIP": "0.04",
+              "SNIPER_WINDOW_MS": "250", "SNIPER_ORDER_TYPE": "FAK", "SNIPER_SLIP": "0.05",
               "SNIPER_COOLDOWN_MS": "300", "SNIPER_SHARES": "10", "SNIPER_MAX_TARGET_SHARES": "20",
               "SNIPER_CANARY_MAX_SHARES": "25"}
 
@@ -129,7 +129,7 @@ class FrozenSpec(unittest.TestCase):
         self.assertTrue(self.gate())
 
     def test_an_old_env_value_refuses_live_and_names_it(self):
-        for var, value, word in (("SNIPER_K_BP", "1.0", "trigger"), ("SNIPER_SLIP", "0.05", "slip"),
+        for var, value, word in (("SNIPER_K_BP", "1.0", "trigger"), ("SNIPER_SLIP", "0.04", "slip"),
                                  ("SNIPER_SLIP", "0.02", "slip"),
                                  ("SNIPER_ORDER_TYPE", "FOK", "execution"), ("SNIPER_COOLDOWN_MS", "1000", "cooldown"),
                                  ("SNIPER_WINDOW_MS", "500", "window"), ("SNIPER_SHARES", "5", "base_target"),
@@ -140,11 +140,11 @@ class FrozenSpec(unittest.TestCase):
             self.assertIn(var, str(ctx.exception))
 
     def test_a_missing_trigger_or_slip_falls_back_to_the_spec(self):
-        # the code defaults ARE the spec: 0.5bp, ask + $0.04 (the slip default was $0.02)
+        # the code defaults ARE the spec: 0.5bp, ask + $0.05 (the slip default was $0.02)
         self.assertTrue(self.gate(SNIPER_K_BP=None, SNIPER_SLIP=None))
         with patch.dict(os.environ, {"SNIPER_ONLY": "1"}, clear=True):
             s = S.Settings()
-        self.assertEqual((s.k_bp, s.slip), (0.5, 0.04))
+        self.assertEqual((s.k_bp, s.slip), (0.5, 0.05))
 
     def test_a_missing_value_falling_back_to_a_non_spec_default_is_named(self):
         with patch.dict(os.environ, {}, clear=True):                  # without SNIPER_ONLY the default is FOK
@@ -427,7 +427,7 @@ class LiveFast(unittest.TestCase):
                 self.sn.on_tick(self.raw("UP"))
                 await self.settle("UP")
                 caps = [r["cap"] for r in self.rows("refused")]
-                self.assertEqual(caps, [0.59, 0.62])                         # ask + 0.04 at each decision
+                self.assertEqual(caps, [0.60, 0.63])                         # ask + 0.05 at each decision
                 for body, cap in zip(self.posted(), caps):
                     o = body["order"]
                     price = int(o["makerAmount"]) / int(o["takerAmount"])
