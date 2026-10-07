@@ -53,7 +53,7 @@ import sniper_live as L  # noqa: E402
 import sniper_mode as S  # noqa: E402
 import tests_sniper_live as T  # noqa: E402  (FakeH2Clob, live_book, rules_fetch, paper_rules, UP/DN/COND)
 
-BENCH_ENV = {"SNIPER_ONLY": "1", "SNIPER_K_BP": "1.0", "SNIPER_WINDOW_MS": "250", "SNIPER_ORDER_TYPE": "FAK",
+BENCH_ENV = {"SNIPER_ONLY": "1", "SNIPER_K_BP": "0.5", "SNIPER_WINDOW_MS": "250", "SNIPER_ORDER_TYPE": "FAK",
              "SNIPER_SLIP": "0.04", "SNIPER_SHARES": "10", "SNIPER_MAX_TARGET_SHARES": "20",
              "SNIPER_COOLDOWN_MS": "300", "SNIPER_SHADOW_MS": "", "SNIPER_STALL_MS": "0",
              # the per-round caps would stop a 1000-order run after 20 fills; they are
@@ -229,7 +229,7 @@ async def bench_live(m: int, matched_every: int = 5, with_pm: bool = False, pm_s
         sn.trigger.q.clear()
         ref = 60_000.0
         sn.trigger.q.append((now - 300.0, ref))
-        mid = ref * (1 + (1.2 if side == "UP" else -1.2) / 1e4)        # past the 1bp trigger
+        mid = ref * (1 + (0.6 if side == "UP" else -0.6) / 1e4)        # past the 0.5bp trigger
         sn.on_tick(json.dumps({"b": f"{mid - 0.005:.3f}", "a": f"{mid + 0.005:.3f}"}))
         return oid, tid, n_order % matched_every == 0
 

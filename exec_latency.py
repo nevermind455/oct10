@@ -34,10 +34,12 @@ import os
 # changing this table (reviewed), not an environment variable.
 # 2026-10-07: 0.50bp / ask+$0.05 -> 1.00bp / ask+$0.04 (the operator's change):
 # one IOC that buys what is offered up to the reference ask + 4c, never more.
+# 2026-10-07 (later): 1.00bp -> 0.50bp (the operator's change); still one FAK
+# limit order up to the reference ask + $0.04.
 FROZEN_SPEC = (
     # (Settings attribute, environment variable, frozen value, label, format)
     ("primary_feed", "SNIPER_PRIMARY_FEED", "binance", "trigger feed", "{}"),
-    ("k_bp", "SNIPER_K_BP", 1.0, "trigger", "{:.2f} bp"),
+    ("k_bp", "SNIPER_K_BP", 0.5, "trigger", "{:.2f} bp"),
     ("window_ms", "SNIPER_WINDOW_MS", 250.0, "window", "{:.0f} ms"),
     ("order_type", "SNIPER_ORDER_TYPE", "FAK", "execution", "{}"),
     ("slip", "SNIPER_SLIP", 0.04, "slip", "${:.2f}"),

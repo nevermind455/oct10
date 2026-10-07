@@ -265,7 +265,7 @@ def hourly(env_path: str, last_h: float = 48.0, live: bool = False) -> int:
         print(f"(Binance klines unavailable: {type(exc).__name__}; BTC columns blank)")
         vol = {}
     print("HOUR BY HOUR (UTC): BTC's own 1-minute volatility (Binance) beside the sniper's pipeline")
-    print("  signals = BTC moves >=1bp in 250ms seen by the bot; cooldown = signals inside 1s of the last decision;"
+    print("  signals = BTC moves past SNIPER_K_BP in 250ms seen by the bot; cooldown = signals inside 1s of the last decision;"
           " decisions = reached the order checks")
     print("  the hour with a restart undercounts signals and cooldown (the counters start again from zero)")
     print(f"  {'hour':11s} {'BTC 1m bp':>9s} {'min>=5bp':>8s} {'signals':>8s} {'cooldown':>8s} {'in-flight':>9s} "

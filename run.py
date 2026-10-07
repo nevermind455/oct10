@@ -572,7 +572,7 @@ def _live_sniper_gate(paper: bool) -> bool:
                            "until its paper/replay results are reviewed (replay_ab.py). Unset it; with "
                            "POSITION_MANAGER_ENABLED=1 the manager runs shadow-only in LIVE (decisions, no orders).")
     # The resolved settings must be the frozen spec: an old .env value (or a
-    # missing one, falling back to a code default such as SNIPER_K_BP=1.0)
+    # missing one, falling back to a code default that is not the spec)
     # used to change the strategy silently.
     import exec_latency
     import sniper_live

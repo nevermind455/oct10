@@ -248,7 +248,7 @@ class KrakenSignalTests(unittest.TestCase):
         self.assertEqual(fired, [("DOWN", -1.67, "kraken")])
 
     def test_a_move_under_the_threshold_is_no_signal(self):
-        sn, fired = self.run_ticks([(0, 3000.0), (100, 3000.0), (200, 3000.25)])         # +0.83bp
+        sn, fired = self.run_ticks([(0, 3000.0), (100, 3000.0), (200, 3000.12)])         # +0.40bp
         self.assertEqual(fired, [])
         self.assertEqual(sn.n["signals"], 0)
 
@@ -518,7 +518,7 @@ class SettingsTests(unittest.TestCase):
         with env(**BTC):
             st = S.Settings()
         self.assertEqual(st.primary_feed, "binance")
-        self.assertTrue(st.lines()[0].startswith("SNIPER paper-only: spot mid >= 1.0bp within 250ms"), st.lines()[0])
+        self.assertTrue(st.lines()[0].startswith("SNIPER paper-only: spot mid >= 0.5bp within 250ms"), st.lines()[0])
         self.assertNotIn("Kraken", st.lines()[0])
 
     def test_the_kraken_start_line_names_the_trigger(self):
@@ -526,7 +526,7 @@ class SettingsTests(unittest.TestCase):
             st = S.Settings()
         self.assertEqual((st.primary_feed, st.kraken_url), ("kraken", "wss://ws.kraken.com/v2"))
         self.assertTrue(st.lines()[0].startswith(
-            "SNIPER paper-only [triggered by Kraken BTC/USD ticker (bbo), not Binance]: spot mid >= 1.0bp"),
+            "SNIPER paper-only [triggered by Kraken BTC/USD ticker (bbo), not Binance]: spot mid >= 0.5bp"),
             st.lines()[0])
 
     def test_only_binance_or_kraken(self):
@@ -587,7 +587,7 @@ class RunGateTests(unittest.TestCase):
         # The opt-in still clears the Kraken check; the frozen spec (exec_latency.FROZEN_SPEC)
         # then refuses LIVE on any trigger feed but Binance.
         with env(SNIPER_PRIMARY_FEED="kraken", SNIPER_KRAKEN_LIVE="1", SNIPER_ONLY="1", SNIPER_LIVE_CANARY="1",
-                 SNIPER_K_BP="1.0", SNIPER_SLIP="0.04"), \
+                 SNIPER_K_BP="0.5", SNIPER_SLIP="0.04"), \
                 self.assertRaisesRegex(RuntimeError, "(?s)frozen spec.*trigger feed: resolved kraken"):
             self.rf._live_sniper_gate(paper=False)
 

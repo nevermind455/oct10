@@ -53,32 +53,32 @@ def move_mid(ref: float, bp: float) -> float:
 
 # =========================================================================== trigger
 class TriggerBoundaries(unittest.TestCase):
-    K = float(dict((a, v) for a, _n, v, _l, _f in X.FROZEN_SPEC)["k_bp"])   # 1.0bp
+    K = float(dict((a, v) for a, _n, v, _l, _f in X.FROZEN_SPEC)["k_bp"])   # 0.5bp
 
     def fire(self, bp: float, age_ms: float = 260.0):
         t = S.Trigger(self.K, 250)
         t.update(0.0, 60_000.0)
         return t.update(age_ms, move_mid(60_000.0, bp))[0]
 
-    def test_099_no_100_and_101_trigger_both_ways(self):
-        self.assertEqual(self.K, 1.0)
-        for bp, want in ((0.99, None), (1.00, 1), (1.01, 1), (-0.99, None), (-1.00, -1), (-1.01, -1),
-                         (0.50, None), (-0.50, None)):                      # the old 0.5bp no longer fires
+    def test_049_no_050_and_051_trigger_both_ways(self):
+        self.assertEqual(self.K, 0.5)
+        for bp, want in ((0.49, None), (0.50, 1), (0.51, 1), (-0.49, None), (-0.50, -1), (-0.51, -1),
+                         (1.00, 1), (-1.00, -1)):                           # 1bp (the previous spec) fires too
             self.assertEqual(self.fire(bp), want, bp)
 
-    def test_an_exact_1bp_move_always_triggers(self):
+    def test_an_exact_half_bp_move_always_triggers(self):
         from decimal import Decimal as D
         rng, missed, n = random.Random(3), [], 0
-        for _ in range(200_000):
-            ref = D(rng.randrange(3_000_000, 15_000_000)) / D(100)
-            mid = ref + ref * D("0.0001")
+        for _ in range(2_000):
+            ref = D(rng.randrange(1_500, 7_500) * 2_000) / D(100)          # exact 0.5bp lands on the 0.001 grid
+            mid = ref + ref * D("0.00005")
             if mid != mid.quantize(D("0.005")):
                 continue
             n += 1
             for sign in (1, -1):
                 t = S.Trigger(self.K, 250)
                 t.update(0.0, float(ref))
-                m = float(mid) if sign > 0 else float(ref - ref * D("0.0001"))
+                m = float(mid) if sign > 0 else float(ref - ref * D("0.00005"))
                 if t.update(260.0, m)[0] != sign:
                     missed.append((str(ref), sign))
         self.assertGreater(n, 100)
@@ -114,7 +114,7 @@ class CooldownBoundary(unittest.TestCase):
 
 # =========================================================================== config fail-fast
 class FrozenSpec(unittest.TestCase):
-    FROZEN = {"SNIPER_ONLY": "1", "SNIPER_LIVE_CANARY": "1", "SNIPER_PRIMARY_FEED": "binance", "SNIPER_K_BP": "1.0",
+    FROZEN = {"SNIPER_ONLY": "1", "SNIPER_LIVE_CANARY": "1", "SNIPER_PRIMARY_FEED": "binance", "SNIPER_K_BP": "0.5",
               "SNIPER_WINDOW_MS": "250", "SNIPER_ORDER_TYPE": "FAK", "SNIPER_SLIP": "0.04",
               "SNIPER_COOLDOWN_MS": "300", "SNIPER_SHARES": "10", "SNIPER_MAX_TARGET_SHARES": "20",
               "SNIPER_CANARY_MAX_SHARES": "25"}
@@ -129,7 +129,7 @@ class FrozenSpec(unittest.TestCase):
         self.assertTrue(self.gate())
 
     def test_an_old_env_value_refuses_live_and_names_it(self):
-        for var, value, word in (("SNIPER_K_BP", "0.5", "trigger"), ("SNIPER_SLIP", "0.05", "slip"),
+        for var, value, word in (("SNIPER_K_BP", "1.0", "trigger"), ("SNIPER_SLIP", "0.05", "slip"),
                                  ("SNIPER_SLIP", "0.02", "slip"),
                                  ("SNIPER_ORDER_TYPE", "FOK", "execution"), ("SNIPER_COOLDOWN_MS", "1000", "cooldown"),
                                  ("SNIPER_WINDOW_MS", "500", "window"), ("SNIPER_SHARES", "5", "base_target"),
@@ -140,11 +140,11 @@ class FrozenSpec(unittest.TestCase):
             self.assertIn(var, str(ctx.exception))
 
     def test_a_missing_trigger_or_slip_falls_back_to_the_spec(self):
-        # the code defaults ARE the spec: 1.0bp, ask + $0.04 (the slip default was $0.02)
+        # the code defaults ARE the spec: 0.5bp, ask + $0.04 (the slip default was $0.02)
         self.assertTrue(self.gate(SNIPER_K_BP=None, SNIPER_SLIP=None))
         with patch.dict(os.environ, {"SNIPER_ONLY": "1"}, clear=True):
             s = S.Settings()
-        self.assertEqual((s.k_bp, s.slip), (1.0, 0.04))
+        self.assertEqual((s.k_bp, s.slip), (0.5, 0.04))
 
     def test_a_missing_value_falling_back_to_a_non_spec_default_is_named(self):
         with patch.dict(os.environ, {}, clear=True):                  # without SNIPER_ONLY the default is FOK
@@ -158,7 +158,7 @@ class FrozenSpec(unittest.TestCase):
 
     def test_paper_only_warns_and_the_config_lines_hold_no_secret(self):
         import run
-        env = dict(self.FROZEN, SNIPER_K_BP="0.5", POLY_PRIVATE_KEY="0x" + "ab" * 32, POLY_FUNDER="0x" + "cd" * 20)
+        env = dict(self.FROZEN, SNIPER_K_BP="1.0", POLY_PRIVATE_KEY="0x" + "ab" * 32, POLY_FUNDER="0x" + "cd" * 20)
         with patch.dict(os.environ, env, clear=True):
             self.assertFalse(run._live_sniper_gate(paper=True))
             s = S.Settings()
@@ -166,8 +166,8 @@ class FrozenSpec(unittest.TestCase):
             bad = X.spec_violations(s, 25)
         text = "\n".join(lines)
         self.assertIn("trigger", text)
-        self.assertIn("0.50 bp", text)
-        self.assertIn("<- frozen spec 1.00 bp", text)
+        self.assertIn("1.00 bp", text)
+        self.assertIn("<- frozen spec 0.50 bp", text)
         self.assertNotIn("ab" * 32, text)
         self.assertNotIn("cd" * 20, text)
         self.assertEqual(len(bad), 1)
@@ -639,7 +639,7 @@ def replay_steps(seed: int, n: int):
         dt = rng.choice((40, 80, 120, 200, 260, 320))
         jump = rng.random()
         if jump < 0.15:
-            mid *= 1 + rng.choice((-1, 1)) * rng.uniform(0.8, 2.0) / 1e4      # a move near the 1bp threshold
+            mid *= 1 + rng.choice((-1, 1)) * rng.uniform(0.4, 1.0) / 1e4      # a move near the 0.5bp threshold
         else:
             mid *= 1 + rng.uniform(-0.05, 0.05) / 1e4
         ask_up = round(rng.choice((0.30, 0.45, 0.52, 0.55, 0.61, 0.97)), 2)

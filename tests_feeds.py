@@ -1471,7 +1471,8 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # lat (T0..T7, exec_latency), signal_mid and the outcome counts, all after the send.
     # Re-approved: the SNIPER_SLIP code default is the frozen spec's $0.04 (was $0.02), so a
     # missing .env line no longer runs paper at ask + 2c; a set value still wins.
-    "sniper_mode.py": "93f3fa0c39914f7bbda2c3edca1c515a7f94b0f44fac2651c9d914993bde0000",
+    # Re-approved: the SNIPER_K_BP code default is the frozen spec's 0.5bp (was 1.0bp).
+    "sniper_mode.py": "8d72593207a1c46ef1b5c9f2b4946e54f469f0faf6d1c01d0bc197a7de7deef2",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.

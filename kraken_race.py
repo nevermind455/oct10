@@ -1,6 +1,6 @@
 """Kraken vs Binance, live: which one tells THIS machine first that BTC moved?
 
-    .venv/bin/python kraken_race.py                  # 10 minutes, the bot's rule (1bp within 250ms)
+    .venv/bin/python kraken_race.py                  # 10 minutes, the bot's rule (0.5bp within 250ms)
     .venv/bin/python kraken_race.py --seconds 1800 --k-bp 0.7
 
 Read-only: two public sockets, no keys, no orders. Safe beside a running bot.
@@ -158,7 +158,7 @@ async def main_async(args):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--seconds", type=float, default=600.0)
-    ap.add_argument("--k-bp", type=float, default=1.0)
+    ap.add_argument("--k-bp", type=float, default=0.5)
     ap.add_argument("--window-ms", type=float, default=250.0)
     ap.add_argument("--pair-ms", type=float, default=1000.0)
     args = ap.parse_args()
