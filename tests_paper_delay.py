@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import testing_env  # noqa: E402,F401 - first: tests never read the bot's .env
 import sniper_mode as S
 
 

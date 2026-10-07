@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import unittest
 from unittest.mock import patch
 
+import testing_env  # noqa: E402,F401 - first: tests never read the bot's .env
 import websockets
 
 import sniper_mode as S
@@ -568,14 +569,14 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(sn.n["signals"], 1)
 
 
-class RunFeedsGateTests(unittest.TestCase):
+class RunGateTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         try:
-            import run_feeds
+            import run
         except Exception as exc:  # noqa: BLE001 - optional SDKs missing on this machine
-            raise unittest.SkipTest(f"run_feeds is not importable here: {type(exc).__name__}: {exc}")
-        cls.rf = run_feeds
+            raise unittest.SkipTest(f"run is not importable here: {type(exc).__name__}: {exc}")
+        cls.rf = run
 
     def test_kraken_refuses_live(self):
         with env(SNIPER_PRIMARY_FEED="kraken", SNIPER_ONLY="1", SNIPER_LIVE_CANARY="1"), \

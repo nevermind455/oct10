@@ -11,6 +11,7 @@ import types
 import unittest
 from decimal import Decimal as D
 
+import testing_env  # noqa: E402,F401 - first: tests never read the bot's .env
 import sniper_live as L
 import sniper_mode as S
 import tests_sniper_live as T

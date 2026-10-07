@@ -25,6 +25,7 @@ import types
 ROOT = pathlib.Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
+import testing_env  # noqa: E402,F401 - first: tests never read the bot's .env
 import websockets  # noqa: E402
 
 from feeds import (BookState, FillStore, PolyMarketFeed, PolyUserFeed,  # noqa: E402
@@ -276,7 +277,7 @@ def t_backoff_ladder():
 
 
 def t_process_lock_rejects_duplicates_without_truncating():
-    from run_feeds import _ProcessLock
+    from run import _ProcessLock
     with tempfile.TemporaryDirectory() as tmp:
         path = pathlib.Path(tmp) / "bot.lock"
         path.write_text("sentinel\n", encoding="utf-8")
@@ -1189,11 +1190,11 @@ async def t_timed_out_old_fetch_cannot_acknowledge_new_subscription():
 
 
 async def t_rest_reconcile_keeps_explicit_two_hour_market_boundary():
-    import run_feeds
+    import run
 
     old_poly = sys.modules.get("polymarket_trade")
     old_sdk = sys.modules.get("py_clob_client_v2")
-    old_time = run_feeds.time.time
+    old_time = run.time.time
     requests = []
 
     class TradeParams:
@@ -1215,9 +1216,9 @@ async def t_rest_reconcile_keeps_explicit_two_hour_market_boundary():
     poly._get_client = lambda: Client()
     sys.modules["py_clob_client_v2"] = sdk
     sys.modules["polymarket_trade"] = poly
-    run_feeds.time.time = lambda: 900_000.0
+    run.time.time = lambda: 900_000.0
     try:
-        rows = run_feeds.fetch_trades(("0xold", "0xcurrent", "0xold"))
+        rows = run.fetch_trades(("0xold", "0xcurrent", "0xold"))
         expected_after = 900_000 - 2 * 60 * 60
         check("REST audit sends one stable explicit request per condition",
               requests == [("0xold", expected_after),
@@ -1233,12 +1234,12 @@ async def t_rest_reconcile_keeps_explicit_two_hour_market_boundary():
         poly._get_client = lambda: BrokenClient()
         failed = False
         try:
-            run_feeds.fetch_trades(("0xold",))
+            run.fetch_trades(("0xold",))
         except RuntimeError:
             failed = True
         check("REST transport failure is retryable, not an empty success", failed)
     finally:
-        run_feeds.time.time = old_time
+        run.time.time = old_time
         if old_poly is None:
             sys.modules.pop("polymarket_trade", None)
         else:
@@ -1251,11 +1252,11 @@ async def t_rest_reconcile_keeps_explicit_two_hour_market_boundary():
 
 async def t_startup_reconcile_uses_durable_and_current_filters_safely():
     from accounting.ledger import Ledger
-    import run_feeds
+    import run
 
     refused = False
     try:
-        run_feeds._require_live_fill_coverage(
+        run._require_live_fill_coverage(
             paper=False, user_ws="off")
     except RuntimeError:
         refused = True
@@ -1263,9 +1264,9 @@ async def t_startup_reconcile_uses_durable_and_current_filters_safely():
           refused)
     # PAPER records its own simulated fills synchronously, and a healthy user
     # socket remains an independent live fill source.
-    run_feeds._require_live_fill_coverage(
+    run._require_live_fill_coverage(
         paper=True, user_ws="off")
-    run_feeds._require_live_fill_coverage(
+    run._require_live_fill_coverage(
         paper=False, user_ws="on")
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -1301,7 +1302,7 @@ async def t_startup_reconcile_uses_durable_and_current_filters_safely():
             recent_markets=lambda: (old_condition, current_condition,
                                     current_condition),
         )
-        selected = run_feeds._reconcile_markets(ledger, hub)
+        selected = run._reconcile_markets(ledger, hub)
         check("startup filter stably unions durable old and current markets",
               selected == (old_condition, current_condition), str(selected))
 
@@ -1329,7 +1330,7 @@ async def t_startup_reconcile_uses_durable_and_current_filters_safely():
         calls = []
 
         def fetch():
-            calls.append(run_feeds._reconcile_markets(ledger, hub))
+            calls.append(run._reconcile_markets(ledger, hub))
             return rows
 
         user = types.SimpleNamespace(
@@ -1340,7 +1341,7 @@ async def t_startup_reconcile_uses_durable_and_current_filters_safely():
         rec = RestReconciler(
             hub.fill_store, fetch, user_feed=user,
             known_trade=ledger.rest_trade_is_booked)
-        recovered, ingested = await run_feeds._recover_startup_fills(
+        recovered, ingested = await run._recover_startup_fills(
             rec, ledger, hub.fill_store)
         check("startup audit executes the stable old+current filter union",
               calls == [selected], str(calls))
@@ -1392,7 +1393,7 @@ async def t_startup_reconcile_uses_durable_and_current_filters_safely():
             "late-confirmed", order_id="late-order", asset_id=token,
             market=old_condition, side="BUY", price="0.5", size="4",
             status="CONFIRMED", source="user_ws")
-        drained = run_feeds._persist_fill_drain(ledger, late_store)
+        drained = run._persist_fill_drain(ledger, late_store)
         after_shutdown = Ledger(path=path)
         check("final fill-store drain survives clean shutdown",
               drained == 1 and after_shutdown.has_seen_trade("late-confirmed")
@@ -1401,17 +1402,16 @@ async def t_startup_reconcile_uses_durable_and_current_filters_safely():
 
 
 # ============================================================== REGRESSION ==
-def t_paper_state_paths_include_isolated_trade_log():
+def t_paper_state_paths_are_isolated_and_configurable():
     import os
 
     _stub_sdks()
-    import run_feeds
+    import run
 
     names = {
         "PAPER_LEDGER_PATH": "ledger-v1.json",
         "PAPER_ACCOUNT_PATH": "account-v1.json",
         "PAPER_AUDIT_PATH": "orders-v1.jsonl",
-        "PAPER_TRADE_LOG_PATH": "trades-v1.csv",
     }
     before = {name: os.environ.get(name) for name in names}
     try:
@@ -1422,17 +1422,18 @@ def t_paper_state_paths_include_isolated_trade_log():
                 target = base / filename
                 os.environ[env_name] = str(target)
                 expected[env_name] = target
-            paths = run_feeds._paper_state_paths()
+            paths = run._paper_state_paths()
             check("paper profile resolves every mutable artifact",
                   paths == {
                       "ledger": expected["PAPER_LEDGER_PATH"],
                       "account": expected["PAPER_ACCOUNT_PATH"],
                       "audit": expected["PAPER_AUDIT_PATH"],
-                      "trade_log": expected["PAPER_TRADE_LOG_PATH"],
                   }, str(paths))
-            check("paper trade log honors its isolated configured path",
-                  paths["trade_log"] == base / "trades-v1.csv",
-                  str(paths["trade_log"]))
+        for name in names:
+            os.environ.pop(name, None)
+        paths = run._paper_state_paths()
+        check("defaults live beside the bot, not in another install",
+              all(p.parent == run.ROOT for p in paths.values()), str(paths))
     finally:
         for name, value in before.items():
             if value is None:
@@ -1441,290 +1442,33 @@ def t_paper_state_paths_include_isolated_trade_log():
                 os.environ[name] = value
 
 
-async def t_stop_loss_does_not_resubmit_unconfirmed_shares():
-    """A lagging private-fill confirmation must not cause a duplicate exit.
-
-    _stop_loss_loop used to gate resubmission on a fixed grace timer: once it
-    expired, the next poll saw the ledger's still-stale `shares` and fired a
-    fresh sell for the FULL amount, even though the earlier FAK submission had
-    already been accepted by the venue. This drives the loop directly and
-    checks that a stale ledger never produces a second sell for shares an
-    earlier attempt already covers, while genuinely new exposure on the same
-    token still gets sold on its own.
-    """
-    import run_feeds
-    import config
-    import timer
-
-    orig_unix = timer.unix
-    orig = {
-        "arm": config.STOP_LOSS_ARM_SECONDS,
-        "cutoff": config.STOP_LOSS_EXIT_CUTOFF_SECONDS,
-        "price": config.STOP_LOSS_PRICE,
-        "floor": config.STOP_LOSS_FLOOR_PRICE,
-        "poll": config.STOP_LOSS_POLL_SECONDS,
-    }
-    try:
-        window = timer.window_start(timer.unix())
-        sampled = window + 100.0  # remain = 200s: inside the arm window below
-        timer.unix = lambda ts=None: (sampled if ts is None else float(ts))
-        config.STOP_LOSS_ARM_SECONDS = 250.0
-        config.STOP_LOSS_EXIT_CUTOFF_SECONDS = 20.0
-        config.STOP_LOSS_PRICE = 0.5
-        config.STOP_LOSS_FLOOR_PRICE = 0.1
-        config.STOP_LOSS_POLL_SECONDS = 0.002
-
-        token, condition = "T1", "C1"
-        pos = types.SimpleNamespace(settled=False, shares=10.0, condition_id=condition)
-
-        class FakeLedger:
-            _lock = threading.Lock()
-            positions = {token: pos}
-
-        class FakeView:
-            best_bid = 0.3
-
-        class FakeBook:
-            def view(self, tok):
-                return FakeView()
-
-        class FakeHub:
-            condition_id = condition
-            book = FakeBook()
-
-        sells: list[tuple[str, float]] = []
-
-        class FakeBroker:
-            last_error = None
-
-            def sell_shares(self, tok, shares, **_kw):
-                sells.append((tok, round(float(shares), 6)))
-                if len(sells) == 1:
-                    # Accepted by the venue, but the private stream lags -
-                    # the ledger is deliberately left stale.
-                    return shares
-                pos.shares = 0.0  # second attempt settles synchronously
-                return shares
-
-        stop = asyncio.Event()
-        task = asyncio.create_task(
-            run_feeds._stop_loss_loop(FakeHub(), FakeBroker(), FakeLedger(),
-                                      stop, lambda *a, **k: None))
-        try:
-            await asyncio.sleep(0.05)
-            check("first poll submits the full held position",
-                  sells == [(token, 10.0)], str(sells))
-
-            await asyncio.sleep(0.05)
-            check("a lagging ledger does not trigger a resubmission",
-                  sells == [(token, 10.0)], str(sells))
-
-            pos.shares = 0.0  # private stream confirms the earlier fill
-            await asyncio.sleep(0.05)
-            check("confirming the fill still does not resubmit",
-                  sells == [(token, 10.0)], str(sells))
-
-            pos.shares = 3.0  # fresh exposure appears on the same token
-            await asyncio.sleep(0.05)
-            check("new exposure is sold on its own, not the stale full amount",
-                  sells == [(token, 10.0), (token, 3.0)], str(sells))
-
-            await asyncio.sleep(0.05)
-            check("once flat and fired, no further attempts follow",
-                  sells == [(token, 10.0), (token, 3.0)], str(sells))
-        finally:
-            stop.set()
-            await asyncio.wait_for(task, timeout=2.0)
-    finally:
-        timer.unix = orig_unix
-        config.STOP_LOSS_ARM_SECONDS = orig["arm"]
-        config.STOP_LOSS_EXIT_CUTOFF_SECONDS = orig["cutoff"]
-        config.STOP_LOSS_PRICE = orig["price"]
-        config.STOP_LOSS_FLOOR_PRICE = orig["floor"]
-        config.STOP_LOSS_POLL_SECONDS = orig["poll"]
-
-
-async def t_live_exit_broker_flags_a_submission_that_crossed_the_cutoff():
-    """LIVE has no PAPER-style post-latency abort; it must at least flag one.
-
-    PaperBroker.sell_shares re-checks the exit cutoff after its modeled
-    latency and refuses to fill if it has passed. _LiveExitBroker cannot do
-    that symmetric check before submitting - the real network round trip IS
-    the latency, and the FAK has already resolved at the venue by the time
-    sell_shares() returns - so nothing previously re-validated the clock
-    afterward. This checks that a submission whose round trip ate the whole
-    cutoff budget is now flagged via `last_late`, and that an ordinary
-    well-inside-the-cutoff submission is not.
-    """
-    _stub_sdks()
-    import run_feeds
-    import polymarket_trade
-    import timer
-
-    broker = run_feeds._LiveExitBroker()
-    orig_sell = polymarket_trade.sell_shares
-    orig_error = polymarket_trade.last_order_error
-    orig_unix = timer.unix
-    try:
-        window_end = timer.window_start(timer.unix()) + 300.0
-        cutoff_seconds = 20.0
-
-        # Simulate a slow network round trip: by the time sell_shares()
-        # would return, real wall-clock time has crossed the cutoff.
-        calls = {"n": 0}
-
-        def slow_sell(*_a, **_k):
-            calls["n"] += 1
-            timer.unix = lambda ts=None: (
-                (window_end - cutoff_seconds + 1.0) if ts is None else float(ts))
-            polymarket_trade.last_order_error = None
-            return 4.0
-
-        timer.unix = lambda ts=None: (
-            (window_end - cutoff_seconds - 5.0) if ts is None else float(ts))
-        polymarket_trade.sell_shares = slow_sell
-        sold = broker.sell_shares("tok", 4.0, condition_id="cond",
-                                  window_end=window_end,
-                                  exit_cutoff_seconds=cutoff_seconds)
-        check("the late-arriving fill is still reported as sold",
-              sold == 4.0, str(sold))
-        check("a round trip that crossed the cutoff is flagged",
-              broker.last_late is True)
-        check("one submission attempt was made", calls["n"] == 1, str(calls))
-
-        # An ordinary fast round trip, well inside the cutoff, is not flagged.
-        def fast_sell(*_a, **_k):
-            polymarket_trade.last_order_error = None
-            return 4.0
-
-        timer.unix = lambda ts=None: (
-            (window_end - cutoff_seconds - 60.0) if ts is None else float(ts))
-        polymarket_trade.sell_shares = fast_sell
-        sold = broker.sell_shares("tok", 4.0, condition_id="cond",
-                                  window_end=window_end,
-                                  exit_cutoff_seconds=cutoff_seconds)
-        check("an ordinary in-time fill is not flagged as late",
-              broker.last_late is False)
-        check("still reports the sold shares", sold == 4.0, str(sold))
-    finally:
-        polymarket_trade.sell_shares = orig_sell
-        polymarket_trade.last_order_error = orig_error
-        timer.unix = orig_unix
-
-
-TRADING_FILES = ["main_bot.py", "strategy.py", "polymarket_trade.py", "orderbook.py",
-                 "market_discovery.py", "price_ws.py", "timer.py",
-                 "config.py"]
+# The files that decide, size, price, send and book an order. Carved out of
+# spe8 at b314d70 byte-for-byte, so these are spe8 HEAD's digests: the guard
+# also proves the carve-out changed nothing. polymarket_trade.py, orderbook.py,
+# market_discovery.py, timer.py and config.py carry the same digests spe8's own
+# baseline approved. An intentional change to any of them needs review and a
+# new digest here (and in tests_dashboard, which reads this table).
+TRADING_FILES = ["sniper_mode.py", "sniper_live.py", "paper_trade.py", "polymarket_trade.py",
+                 "orderbook.py", "market_discovery.py", "timer.py", "config.py", "fast_h2.py",
+                 "accounting/ledger.py", "accounting/fees.py", "accounting/settlement.py",
+                 "accounting/resolution.py", "feeds/book.py", "feeds/poly_user.py", "feeds/reconcile.py"]
 BASELINE_SHA = {  # approved trading-file baseline; intentional changes require review
-    # Re-approved 2026-09-07 after normalising line endings to LF.
-    # These hashes are over raw BYTES, so a CRLF working copy on Windows and
-    # an LF one on Linux produce different digests for identical source. The
-    # previous set was recorded on Windows where three files still carried
-    # CRLF, and they failed on a Linux checkout - the guard firing on a
-    # platform difference rather than on an edit, which is exactly the noise
-    # that made it useless before. .gitattributes now pins text files to LF
-    # so the digest means the same thing on both.
-    # main_bot.py, polymarket_trade.py, orderbook.py re-approved 2026-09-09:
-    # SIGNAL_MINORITY_RULE guard fix, venue-minimum sizing dedup (see
-    # orderbook.venue_minimum_stake). main_bot.py, config.py re-approved again
-    # same day: TAPER_HEDGE_ENABLED (PAPER-only tapering entry + growing
-    # hedge, backtested against 102 real settled rounds - see the entry-cap
-    # analysis).
-    # main_bot.py re-approved 2026-09-09: the taper cycle now follows the
-    # signal - a flip away from the side a cycle was built on retires that
-    # cycle and restarts from entry 1 on the new side, instead of holding
-    # the original anchor for the rest of the round.
-    # main_bot.py, config.py re-approved 2026-09-09: PRIMARY_ENTRY_MIN/MAX_PRICE
-    # - a tighter price band for primary phase-2 entries, with taper hedge legs
-    # left on the account bounds. Measured over 620 settled fills: primary paid
-    # 0.577 for a 52% hit rate (edge -0.058), hedge paid 0.418 for 54% (+0.118).
-    # main_bot.py, config.py re-approved 2026-09-09: SIGNAL_DECISION_RULE
-    # (price | minority | final) chooses the order side, read in exactly one
-    # place - _authority_side - which the phase-2 chooser and all three
-    # re-validation gates now share, so a gate can no longer evaluate a
-    # different rule from the chooser and reject its orders.
-    # main_bot.py re-approved 2026-09-09: a signal flip re-anchors the taper
-    # cycle to the new side but keeps its position. Resetting the count
-    # starved the opposite-side slot to 1-in-5.7 fills instead of 1-in-3.
-    # main_bot.py, config.py re-approved 2026-09-09: MAX_UNSETTLED_EXPOSURE,
-    # a cap on cash committed to rounds the venue has not resolved. Default 0
-    # (off). Per-round exposure could not see a settlement stall freezing 103%
-    # of a wallet across 20 open rounds.
-    # main_bot.py, config.py re-approved 2026-09-10: REQUIRE_SIGNAL_UNANIMITY,
-    # a phase-2 filter refusing contested reads. Default off. Measured over 894
-    # settled fills: contested 46% of positions won vs 60% unanimous, but both
-    # groups lost - it is a turnover brake, not an edge.
-    # main_bot.py, config.py re-approved 2026-09-10: TAPER_ADVANCE_AFTER_SKIPS,
-    # stepping the taper cycle past a slot whose side has priced out of the
-    # band. Default 0 (wait, as before).
-    # main_bot.py, config.py re-approved 2026-09-10: TAPER_PRIMARY_SLOTS makes
-    # the signal:opposite ratio configurable (default 2, the original shape).
-    # main_bot.py, config.py re-approved 2026-09-10: TAPER_PRIMARY_LADDER /
-    # TAPER_HEDGE_LADDER give each cycle slot its own size, with the list
-    # lengths setting the slot counts. Unset keeps the old scheme.
-    # main_bot.py, config.py re-approved 2026-09-10: the opening-print REST
-    # recovery now retries (BOUNDARY_BACKFILL_RETRIES) instead of running once.
-    # A single timeout used to leave a round with no strike, and 10% of rounds
-    # the bot was up for produced no trade at all.
-    # main_bot.py, config.py re-approved 2026-09-12: entry_cost_ceiling now
-    # charges the slot's real stake. It always charged BET_SIZE, which merely
-    # over-charged until a taper ladder staked $5 per slot - then the round cap
-    # under-counted by 19%.
-    # main_bot.py re-approved 2026-09-12: hardening patch, NO strategy change.
-    # (1) phase 2 gained a monotonic cadence gate - _phase2_deadline - stamped
-    # on entry like phase 1's last_phase1, so all 33 of its exit paths wait a
-    # full TRADE_INTERVAL_SECONDS instead of the 14 that re-entered on a bare
-    # 0.2s sleep. Measured before: 25 CLOB /book reads in 5s on a neutral
-    # signal; after: 1. The blocking _cooldown helper is replaced by the
-    # deadline, so the loop no longer stalls across a round boundary.
-    # (2) the pre-submit guards no longer perform network I/O: SIG BOOK is
-    # pre-fetched off PaperBroker._lock and passed in as an immutable
-    # snapshot, and an unread snapshot fails closed instead of abstaining.
-    # (3) an unreadable order book is classified explicitly (_book_vote /
-    # BOOK_NO_READ) so a failed refresh can no longer be recorded as a
-    # genuine one-sided abstention at the submit gate.
-    # Entry bands, stake sizing, SIGNAL_DECISION_RULE, _authority_side, the
-    # taper cadence and the reversal epoch are all untouched; strategy.py and
-    # config.py are byte-identical.
-    # main_bot.py, config.py re-approved 2026-09-22: every complement
-    # purchase now prices the finished pair at the submit choke point
-    # (COMPLEMENT_REQUIRES_PROFIT). A matched pair pays exactly $1.00, and
-    # 72 of 89 completed pairs had cost more than that.
-    # main_bot.py, config.py re-approved 2026-09-22: execution-readiness
-    # telemetry (Finding 5) and the PAPER/LIVE strategy parity report.
-    # The LIVE readiness gate is unchanged - it is only described now.
-    "main_bot.py": "132824966b9a0fa61377b7a485c9165cea6179c1f89cdbd490b730cd9258a506",
-    "strategy.py": "069e61b18709a6f56de1b54582ffd803fb695590341fd53e1c3dd670a2df1878",
-    # config.py, polymarket_trade.py re-approved 2026-09-16: paper fill-delay
-    # probes (PAPER_FILL_DELAY_PROBES) and live POST timing. Both diagnostic:
-    # nothing reads them for a decision. Paper had assumed instant matching
-    # and live won 10.5 points less often at the same prices.
-    # polymarket_trade.py re-approved 2026-09-22: live attempt telemetry.
-    # Every intended order is journalled BEFORE submission, so orders that
-    # never fill finally exist in the record - the live fill rate was
-    # previously unknowable because only matched orders were kept.
-    # polymarket_trade.py re-approved 2026-09-22: the book's own timestamps
-    # now reach the order path (P3), so an attempt records a MEASURED age
-    # from monotonic clocks only. book_age_bound_s keeps its old meaning.
-    # polymarket_trade.py re-approved 2026-10-05: _is_no_match also knows the
-    # venue's documented FOK 500 wording and the FAK zero-fill reply ("no
-    # orders found to match with FAK order"). Classification only.
+    "sniper_mode.py": "195b19993b80daf3f115e145cd1630e503f4d8c715741745e2e2cc6f18679a5d",
+    "sniper_live.py": "d17b9858113703267949e5358fdee65e83d33a5129cbf70d0154fb2167cddfd6",
+    "paper_trade.py": "b75fa9828687069e48258f53aec2250107327d16531bd6dbbd50438ed55c1b78",
     "polymarket_trade.py": "71b5da67c456c2fb30f3578b84019b0152324bdf338c20c53941eba6b72adc94",
     "orderbook.py": "fe3decc44a8f1061c2788c1f2ae85739ade137910033031eac3138f11b22f090",
     "market_discovery.py": "23c605f678eaf1c6caf60259293b9bccf73413e7f632c0a6749c55acc571aa11",
-    "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
     "timer.py": "3ca35cc64539d45f7e4b982cbe9b6153138f87ee1be79adfae0c8eaccc875d50",
-    # config.py re-approved 2026-09-22: POSITION_SIZING/kelly_stake added.
-    # Sizing only; default stays 'fixed' and kelly refuses any band without
-    # a measured positive edge, so no path changes unless asked.
-    # config.py re-approved 2026-09-22: PAPER_ADVERSE_FILL_TICKS models the
-    # paper-to-live leak - paper filled whenever the book allowed, live only
-    # when the offer survived the round trip. PAPER-side only.
-    # config.py re-approved 2026-09-23: PAPER_ADVERSE_FILL_TICKS removed. It
-    # refused a fill when the ask ticked up, which is not what a FOK does -
-    # a signed order fills at any price up to its limit. Paper now aligns on
-    # the price limit and a stake fixed before the delay, as live does.
     "config.py": "4a1584c419e24d805c691d3bf8d7885f998c00aba2e2195f647e963154fda45d",
+    "fast_h2.py": "768b40391d3c526431997872192ceb62fe1c4371719d5753b2a588886b7a81fb",
+    "accounting/ledger.py": "959aaaea83f8c4f0f1ef3f471a1d6c61d10b6749f76372338310dd70fcb5f7a5",
+    "accounting/fees.py": "44e45be00c7c3b330ef0ff11950fa42944029ba83a61ec8066af3494c0956dc7",
+    "accounting/settlement.py": "54adb4fbbf366a8a9e6f72ddbb262d6c52f36b5306c9fdd75b5fefed154a1e63",
+    "accounting/resolution.py": "5cc1cc420811898d9e48dcfd4f1fc7e4a90035f5f63262b4e5e4931eb3c43d93",
+    "feeds/book.py": "d90704050d0e9537be5ed34fb2e60313d4ea92a2c8d0f73efcd00fd55d603246",
+    "feeds/poly_user.py": "f0dbd62bd0ef708dc15391915aab39e83802106c26af7780c81712ca42ae6b55",
+    "feeds/reconcile.py": "71dea5e832fb970e5cfac1880686cf5eff477a34c48c9b91ba961f77b3e9cb6f",
 }
 SIDES = (None, "UP", "DOWN")
 PRICES = (None, 0.0, 64_000.0, 64_894.0, 64_894.01, 1e9, -5.0)
@@ -1765,322 +1509,52 @@ def t_trading_file_baselines():
               f"{digest[:12]} != {BASELINE_SHA[name][:12]}")
 
 
-async def t_adapters_default_fail_closed_on_stale_prices():
+async def t_runner_honours_feed_thresholds():
     import os
     _stub_sdks()
-    for k in ("BTC_FEED", "PRICE_STALE_POLICY", "BOOK_SOURCE", "USER_WS", "RECONCILE"):
-        os.environ.pop(k, None)
-    os.environ.setdefault("POLY_PRIVATE_KEY", "0x" + "1" * 64)
+    import run
 
-    import orderbook
-    import strategy
-    from feeds import adapters
-
-    before_decide = {(a, b): strategy.decide(a, b) for a in PRICES for b in PRICES}
-    before_final = {t: strategy.final_decision(*t) for t in itertools.product(SIDES, SIDES, SIDES)}
-
-    rest_calls = {"n": 0}
-    sentinel_bids = [{"price": "0.47", "size": "310"}]
-    sentinel_asks = [{"price": "0.52", "size": "180"}]
-    orderbook.get_orderbook = lambda t, timeout=10.0: (
-        rest_calls.__setitem__("n", rest_calls["n"] + 1),
-        (sentinel_bids, sentinel_asks))[1]
-
-    hub = FeedHub(urls={"binance": "ws://127.0.0.1:1", "poly_market": "ws://127.0.0.1:1",
-                        "poly_user": "ws://127.0.0.1:1"})
-    cfg, agreement = adapters.install(hub)
-    try:
-        check("stale display blanking does not change the fresh decision path",
-              cfg.decisions_unchanged, cfg.describe())
-        check("default book source is shadow", cfg.book_source == "ws_shadow", cfg.book_source)
-        check("default stale policy blanks the last price",
-              cfg.price_stale_policy == "none", cfg.price_stale_policy)
-
-        after_decide = {(a, b): strategy.decide(a, b) for a in PRICES for b in PRICES}
-        after_final = {t: strategy.final_decision(*t) for t in itertools.product(SIDES, SIDES, SIDES)}
-        check("decide() truth table unchanged", before_decide == after_decide)
-        check("final_decision() truth table unchanged", before_final == after_final)
-
-        got = orderbook.get_orderbook(UP)
-        check("shadow mode still answers from REST", got == (sentinel_bids, sentinel_asks),
-              str(got))
-        check("shadow mode did call REST", rest_calls["n"] == 1, str(rest_calls))
-        check("shadow mode scored the comparison",
-              agreement.summary()["ws_unavailable"] == 1, str(agreement.summary()))
-    finally:
-        adapters.uninstall()
-
-
-async def t_ws_book_source_serves_the_socket_book():
-    import os
-    _stub_sdks()
-    os.environ["BOOK_SOURCE"] = "ws"
-    import orderbook
-    from feeds import adapters
-    rest_calls = {"n": 0}
-    orderbook.get_orderbook = lambda t, timeout=10.0: (
-        rest_calls.__setitem__("n", rest_calls["n"] + 1),
-        ([{"price": "0.1", "size": "1"}], [{"price": "0.9", "size": "1"}]))[1]
-
-    hub = FeedHub(urls={"binance": "ws://127.0.0.1:1", "poly_market": "ws://127.0.0.1:1",
-                        "poly_user": "ws://127.0.0.1:1"})
-    hub.set_round(UP, DOWN, "0xcond")
-    hub.book.connected = True
-    cfg, _ = adapters.install(hub)
-    try:
-        check("ws mode is flagged as changing inputs", not cfg.decisions_unchanged,
-              cfg.describe())
-        got = orderbook.get_orderbook(UP)
-        check("unsynced book falls back to REST", rest_calls["n"] == 1, str(rest_calls))
-        check("REST fallback counted", hub.rest_fallbacks == 1, str(hub.rest_fallbacks))
-
-        hub.book.apply_snapshot(UP, [{"price": "0.46", "size": "900"}],
-                                [{"price": "0.52", "size": "180"}])
-        got = orderbook.get_orderbook(UP)
-        check("live book answers without REST", rest_calls["n"] == 1, str(rest_calls))
-        check("ws book has the REST shape",
-              got[0] == [{"price": "0.46", "size": "900.0"}] or
-              got[0][0]["price"] == "0.46", str(got))
-        check("no live polling once the socket is healthy", rest_calls["n"] == 1)
-    finally:
-        adapters.uninstall()
-        os.environ.pop("BOOK_SOURCE", None)
-
-
-async def _install_ws_mode(audit="on"):
-    import os
-    _stub_sdks()
-    os.environ["BOOK_SOURCE"] = "ws"
-    os.environ["BOOK_AUDIT"] = audit
-    import orderbook
-    from feeds import adapters
-    rest_calls = {"n": 0}
-
-    # REST reports an ask-heavy book -> DOWN
-    def rest(token, timeout=10.0):
-        rest_calls["n"] += 1
-        return ([{"price": "0.40", "size": "10"}], [{"price": "0.60", "size": "900"}])
-    orderbook.get_orderbook = rest
-
-    hub = FeedHub(urls={"binance": "ws://127.0.0.1:1", "poly_market": "ws://127.0.0.1:1",
-                        "poly_user": "ws://127.0.0.1:1"})
-    hub.set_round(UP, DOWN, "0xcond")
-    hub.book.connected = True
-    # WS reports a bid-heavy book -> UP, i.e. the OPPOSITE side
-    hub.book.apply_snapshot(UP, [{"price": "0.40", "size": "900"}],
-                            [{"price": "0.60", "size": "10"}])
-    cfg, agreement = adapters.install(hub)
-    return adapters, orderbook, hub, cfg, agreement, rest_calls
-
-
-async def t_audit_samples_once_per_round_off_the_order_path():
-    adapters, orderbook, hub, cfg, agreement, rest_calls = await _install_ws_mode()
-    stop = threading.Event()
-    try:
-        for _ in range(8):                       # the bot calls repeatedly in-window
-            orderbook.get_orderbook(UP)
-        check("ws mode makes no REST call in the order path", rest_calls["n"] == 0,
-              str(rest_calls))
-
-        sampler = asyncio.create_task(
-            adapters.agreement_sampler(hub, cfg, agreement, stop))
-        await until(lambda: agreement.samples >= 1, 4)
-        await asyncio.sleep(0.6)
-        check("audit takes exactly one sample per round", agreement.samples == 1,
-              str(agreement.summary()))
-        check("audit made exactly one REST request", rest_calls["n"] == 1, str(rest_calls))
-
-        # The bot calls again later in the SAME round, with the sampler now
-        # drained. Without the per-round guard this re-arms and samples again,
-        # which is polling by another name.
-        for _ in range(4):
-            orderbook.get_orderbook(UP)
-            await asyncio.sleep(0.35)
-        check("later calls in the same round do not re-arm", agreement.samples == 1,
-              str(agreement.summary()))
-        check("same round still only one REST request", rest_calls["n"] == 1,
-              str(rest_calls))
-
-        hub.set_round("9991", "9992", "0xnew")   # next round
-        hub.book.connected = True
-        hub.book.apply_snapshot("9991", [{"price": "0.40", "size": "900"}],
-                                [{"price": "0.60", "size": "10"}])
-        orderbook.get_orderbook("9991")
-        await until(lambda: agreement.samples >= 2, 4)
-        check("new round re-arms the audit", agreement.samples == 2,
-              str(agreement.summary()))
-        stop.set()
-        sampler.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await sampler
-    finally:
-        adapters.uninstall()
-        import os
-        os.environ.pop("BOOK_SOURCE", None); os.environ.pop("BOOK_AUDIT", None)
-
-
-async def t_audit_actually_detects_disagreement():
-    """The instrument must compare against REAL REST.
-
-    If it accidentally called the PATCHED get_orderbook it would compare the
-    socket book against itself and report perfect agreement forever - a
-    broken instrument that reads as a clean bill of health.
-    """
-    adapters, orderbook, hub, cfg, agreement, rest_calls = await _install_ws_mode()
-    stop = threading.Event()
-    try:
-        orderbook.get_orderbook(UP)
-        sampler = asyncio.create_task(
-            adapters.agreement_sampler(hub, cfg, agreement, stop))
-        await until(lambda: agreement.samples >= 1, 4)
-        s = agreement.summary()
-        check("audit compared something", s["compared"] == 1, str(s))
-        check("audit sees the REST side", s["last_rest"] == "DOWN", str(s))
-        check("audit sees the WS side", s["last_ws"] == "UP", str(s))
-        check("audit reports the disagreement", s["agree_rate"] == 0.0, str(s))
-        check("audit records the round-trip skew", s["median_skew_ms"] is not None, str(s))
-        stop.set(); sampler.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await sampler
-    finally:
-        adapters.uninstall()
-        import os
-        os.environ.pop("BOOK_SOURCE", None); os.environ.pop("BOOK_AUDIT", None)
-
-
-async def t_audit_agrees_when_the_books_agree():
-    adapters, orderbook, hub, cfg, agreement, rest_calls = await _install_ws_mode()
-    stop = threading.Event()
-    try:
-        hub.book.apply_snapshot(UP, [{"price": "0.40", "size": "10"}],
-                                [{"price": "0.60", "size": "900"}])   # match REST
-        orderbook.get_orderbook(UP)
-        sampler = asyncio.create_task(
-            adapters.agreement_sampler(hub, cfg, agreement, stop))
-        await until(lambda: agreement.samples >= 1, 4)
-        s = agreement.summary()
-        check("matching books agree", s["agree_rate"] == 1.0, str(s))
-        check("timing-adjusted rate also reported", s["agree_rate_timed"] == 1.0, str(s))
-        stop.set(); sampler.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await sampler
-    finally:
-        adapters.uninstall()
-        import os
-        os.environ.pop("BOOK_SOURCE", None); os.environ.pop("BOOK_AUDIT", None)
-
-
-async def t_audit_can_be_disabled_and_is_idle_in_shadow():
-    adapters, orderbook, hub, cfg, agreement, rest_calls = await _install_ws_mode(audit="off")
-    stop = threading.Event()
-    try:
-        check("BOOK_AUDIT=off is reflected in the banner", "BOOK_AUDIT=off" in cfg.describe(),
-              cfg.describe())
-        orderbook.get_orderbook(UP)
-        sampler = asyncio.create_task(
-            adapters.agreement_sampler(hub, cfg, agreement, stop))
-        await asyncio.sleep(0.5)
-        check("BOOK_AUDIT=off exits the sampler immediately", sampler.done(),
-              "sampler still running")
-        # and independently: even if something armed a sample, it must not fire
-        adapters._audit["pending"] = (UP, hub.book.view(UP), time.monotonic())
-        sampler2 = asyncio.create_task(
-            adapters.agreement_sampler(hub, cfg, agreement, stop))
-        await asyncio.sleep(0.5)
-        check("BOOK_AUDIT=off ignores an armed sample", agreement.samples == 0,
-              str(agreement.summary()))
-        check("BOOK_AUDIT=off makes no REST request", rest_calls["n"] == 0, str(rest_calls))
-        sampler2.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await sampler2
-        stop.set(); sampler.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await sampler
-    finally:
-        adapters.uninstall()
-        import os
-        os.environ.pop("BOOK_SOURCE", None); os.environ.pop("BOOK_AUDIT", None)
-
-    # shadow mode compares on every call, so the sampler must not add requests
-    import os
-    _stub_sdks()
-    os.environ.pop("BOOK_SOURCE", None)
-    import orderbook as ob
-    from feeds import adapters as ad
-    calls = {"n": 0}
-    ob.get_orderbook = lambda t, timeout=10.0: (
-        calls.__setitem__("n", calls["n"] + 1),
-        ([{"price": "0.4", "size": "10"}], [{"price": "0.6", "size": "20"}]))[1]
-    hub2 = FeedHub(urls={"binance": "ws://127.0.0.1:1", "poly_market": "ws://127.0.0.1:1",
-                         "poly_user": "ws://127.0.0.1:1"})
-    cfg2, ag2 = ad.install(hub2)
-    stop2 = threading.Event()
-    try:
-        t = asyncio.create_task(ad.agreement_sampler(hub2, cfg2, ag2, stop2))
-        await asyncio.sleep(0.5)
-        check("sampler is idle in shadow mode", t.done() and ag2.samples == 0,
-              f"done={t.done()} samples={ag2.samples}")
-        stop2.set(); t.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await t
-    finally:
-        ad.uninstall()
-
-
-async def t_runner_honours_feed_thresholds_and_legacy_mode():
-    import os
-    _stub_sdks()
-    import run_feeds
-    from feeds import adapters
-
-    names = ("BTC_STALE_AFTER", "BOOK_STALE_AFTER", "BTC_FEED")
+    names = ("BTC_STALE_AFTER", "BOOK_STALE_AFTER", "USER_WS", "RECONCILE")
     old_env = {name: os.environ.get(name) for name in names}
-    old_derive = run_feeds.derive_creds
-    run_feeds.derive_creds = lambda: {
+    old_derive = run.derive_creds
+    run.derive_creds = lambda: {
         "apiKey": "test-key", "secret": "test-secret",
         "passphrase": "test-passphrase",
     }
     os.environ["BTC_STALE_AFTER"] = "1.25"
     os.environ["BOOK_STALE_AFTER"] = "4.5"
-    os.environ["BTC_FEED"] = "legacy"
     try:
-        hub, cfg, _agreement = run_feeds.build_hub()
+        hub, cfg = run.build_hub()
         check("BTC_STALE_AFTER reaches the Binance feed",
               hub.binance.stale_after == 1.25, str(hub.binance.stale_after))
         check("BOOK_STALE_AFTER reaches the book state",
               hub.book.stale_after == 4.5, str(hub.book.stale_after))
-        adapters.uninstall()
-
-        started = {"legacy": 0}
-
-        async def fake_legacy():
-            started["legacy"] += 1
-            await asyncio.Event().wait()
-
-        import price_ws
-        original_stream = price_ws.stream_price
-        price_ws.stream_price = fake_legacy
-
-        class FakeHub:
-            def start(self, *, user=True, binance=True):
-                check("runner starts private feed only when configured",
-                      user is (cfg.user_ws == "on"), str(user))
-                check("runner starts the websocket price feed only in ws mode",
-                      binance is (cfg.btc_feed == "ws"), str(binance))
-                return []
-
-        tasks = run_feeds._start_feed_tasks(FakeHub(), cfg)
-        await asyncio.sleep(0)
-        check("BTC_FEED=legacy starts the legacy price producer",
-              started["legacy"] == 1, str(started))
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        price_ws.stream_price = original_stream
+        check("live keeps the private channel and REST backup on by default",
+              cfg.user_ws == "on" and cfg.reconcile == "auto", cfg.describe())
+        os.environ["BOOK_STALE_AFTER"] = "soon"
+        try:
+            run.build_hub(paper=True)
+            check("a bad BOOK_STALE_AFTER refuses to start", False, "accepted")
+        except ValueError as exc:
+            check("a bad BOOK_STALE_AFTER refuses to start and names the value",
+                  "BOOK_STALE_AFTER='soon'" in str(exc), str(exc))
+        os.environ["BOOK_STALE_AFTER"] = "4.5"
+        os.environ["USER_WS"] = "maybe"
+        try:
+            run.build_hub(paper=True)
+            check("a bad USER_WS refuses to start", False, "accepted")
+        except ValueError as exc:
+            check("a bad USER_WS refuses to start and names the value",
+                  "USER_WS='maybe'" in str(exc), str(exc))
+        os.environ["USER_WS"] = "off"
+        os.environ["RECONCILE"] = "off"
+        try:
+            run.build_hub()
+            check("live with no fill source refuses", False, "accepted")
+        except RuntimeError as exc:
+            check("live with neither USER_WS nor RECONCILE refuses", "USER_WS" in str(exc), str(exc))
     finally:
-        if getattr(adapters, "_installed", False):
-            adapters.uninstall()
-        run_feeds.derive_creds = old_derive
+        run.derive_creds = old_derive
         for name, value in old_env.items():
             if value is None:
                 os.environ.pop(name, None)
@@ -2124,7 +1598,7 @@ async def main() -> int:
                   t_process_lock_rejects_duplicates_without_truncating,
                   t_round_transition_serializes_and_same_state_repairs,
                   t_prepare_transition_serializes_and_same_state_repairs,
-                  t_paper_state_paths_include_isolated_trade_log,
+                  t_paper_state_paths_are_isolated_and_configurable,
                   t_trading_file_baselines,
                   t_price_change_skips_unsynced_sibling]
     async_tests = [v for k, v in sorted(globals().items())

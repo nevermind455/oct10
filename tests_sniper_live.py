@@ -20,6 +20,7 @@ from decimal import Decimal as D
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import testing_env  # noqa: E402,F401 - first: tests never read the bot's .env
 import httpx  # noqa: E402,F401 - the HTTP client the lean sender is tested with
 
 import polymarket_trade as pt  # noqa: E402
@@ -825,7 +826,7 @@ async def make_canary(fake, tmp, *, limits=None, balance=100.0, user_ready=None,
     ledger = Ledger(path=os.path.join(tmp, "ledger.json"))
     receipts = []
 
-    def sink(receipt):                       # what run_feeds' journal_live_order does
+    def sink(receipt):                       # what run.py's journal_live_order does
         receipts.append(receipt)
         ledger.authorize_order(receipt["order_id"], receipt, venue_min_shares=5.0, price_cap=0.95)
         return ledger.save()

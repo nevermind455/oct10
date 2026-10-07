@@ -6,6 +6,7 @@ import time
 import types
 import unittest
 
+import testing_env  # noqa: E402,F401 - first: tests never read the bot's .env
 import sniper_mode as S
 
 

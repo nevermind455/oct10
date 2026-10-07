@@ -22,6 +22,7 @@ from decimal import Decimal
 ROOT = pathlib.Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
+import testing_env  # noqa: E402,F401 - first: tests never read the bot's .env
 from accounting.ledger import Ledger  # noqa: E402
 from accounting.resolution import PENDING, RESOLVED, Resolution  # noqa: E402
 from accounting.settlement import SettlementWorker  # noqa: E402
@@ -668,32 +669,6 @@ def t_sniper_gc_runs_only_in_the_rounds_no_trade_seconds():
           len(gcs) == 1 and 2.0 < gcs[0]["left_s"] < 8.0 and th[2] == 1000, f"{gcs} {th}")
 
 
-def t_rescore_walks_the_recorded_book_like_a_venue_fok():
-    import math
-    import numpy as np
-    import sniper_rescore as R
-    nan = float("nan")
-    cases = {
-        "fills at the best ask": R.fok([(0.50, 10), (0.51, 50)], 5.0, 0.52)[:3] == ("fill", 10.0, 0.5),
-        "walks levels up to the cap": (lambda x: x[0] == "fill" and abs(x[2] - (2.5 + 2.55) / (5 + 5)) < 1e-9)(
-            R.fok([(0.50, 5), (0.51, 5), (0.60, 50)], 5.05, 0.52)),
-        "best ask over the cap: miss (cap)": R.fok([(0.53, 100)], 5.0, 0.52) == ("miss", "cap"),
-        "not enough under the cap: miss (depth)": R.fok([(0.50, 2), (0.53, 100)], 5.0, 0.52)
-        == ("miss", "depth under cap"),
-        "recorded depth ends under the cap: unknown": R.fok([(0.50, 2), (nan, nan)], 5.0, 0.52)[0] == "unknown",
-        "under 5 shares: miss": R.fok([(0.50, 100)], 2.0, 0.52) == ("miss", "below venue minimum"),
-        "fee 0.07*p*(1-p) per share": abs(R.fok([(0.50, 10)], 5.0, 0.52)[3] - 0.175) < 1e-12,
-    }
-    v = {"asks": np.array([[[nan, nan]], [[nan, nan]]]), "ba": np.array([0.44, 1.0])}
-    cases["no ask levels on record but a best ask under $1: unknown, not a miss"] = \
-        R.walk(v, 0, 5.0, 0.46)[0] == "unknown" and R.walk(v, 1, 5.0, 1.0) == ("miss", "no asks")
-    m, se, n = R.clustered([1.0, 3.0, 2.0, 6.0], ["a", "a", "b", "b"])
-    cases["round-clustered error: two rounds (2, 4) around mean 3 -> se 1"] = \
-        abs(m - 3.0) < 1e-12 and abs(se - math.sqrt((4 + 4) / 16 * 2)) < 1e-12 and n == 4
-    bad = [k for k, ok in cases.items() if not ok]
-    check("sniper_rescore: FOK walk, missing data and clustered errors", not bad, str(bad))
-
-
 def t_sniper_visible_ask_fast_path_gives_the_same_answer():
     import sniper_mode
     from feeds.book import BookView
@@ -844,7 +819,7 @@ def t_paper_quiet_book_is_not_mistaken_for_a_stale_one():
 
     import timer
 
-    feeds = pathlib.Path(__file__).with_name("run_feeds.py").read_text(encoding="utf-8")
+    feeds = pathlib.Path(__file__).with_name("run.py").read_text(encoding="utf-8")
     check("runner wires the quiet bound into paper",
           "max_quiet_s=config.ORDERBOOK_MAX_QUIET_SECONDS" in feeds)
     check("runner wires the future-dated bound into paper",
@@ -1173,7 +1148,7 @@ def t_execution_window_covers_phase2_and_refuses_earlier_orders():
 
     with tempfile.TemporaryDirectory() as tmp:
         broker = _broker(tmp)
-        # Size the interval the way run_feeds does.
+        # Size the interval the way run.py does.
         broker.trade_window_seconds = float(config.EXECUTION_WINDOW_SECONDS)
         end = round_end()
         original_unix = timer_mod.unix
@@ -1209,16 +1184,16 @@ def t_execution_window_covers_phase2_and_refuses_earlier_orders():
         check("a timestamp before phase 2 still is refused",
               "outside the current round execution interval"
               in (broker.last_error or ""), str(broker.last_error))
-    tree = ast.parse((ROOT / "run_feeds.py").read_text(encoding="utf-8"))
+    tree = ast.parse((ROOT / "run.py").read_text(encoding="utf-8"))
     runner = next((node for node in ast.walk(tree)
                    if isinstance(node, ast.AsyncFunctionDef)
-                   and node.name == "_run_inner"), None)
+                   and node.name == "run_runtime"), None)
     check("feed runner still owns settlement startup", runner is not None)
     if runner is None:
         return
 
     # Scan the whole runner module, not just `_run_inner`: startup is split
-    # across helpers it calls, and the invariant is that run_feeds builds one
+    # across helpers it calls, and the invariant is that run.py builds one
     # worker at one second - not which function holds the call.
     constructors = [node for node in ast.walk(tree)
                     if isinstance(node, ast.Call)
@@ -1439,68 +1414,34 @@ def t_paper_install_blocks_live_client_and_rebinds_every_action():
 
 
 def t_runner_paper_build_never_derives_credentials():
-    import run_feeds
-    from feeds import adapters
+    import run
 
-    original = run_feeds.derive_creds
+    original = run.derive_creds
     calls = {"n": 0}
 
     def forbidden():
         calls["n"] += 1
         raise AssertionError("credential derivation reached")
 
-    run_feeds.derive_creds = forbidden
+    run.derive_creds = forbidden
     try:
-        _hub, cfg, _agreement = run_feeds.build_hub(paper=True)
+        _hub, cfg = run.build_hub(paper=True)
         check("paper hub never derives credentials", calls["n"] == 0, str(calls))
         check("paper user websocket forced off", cfg.user_ws == "off", cfg.describe())
         check("paper wallet reconcile forced off", cfg.reconcile == "off", cfg.describe())
+        _hub, cfg = run.build_hub(read_only=True)
+        check("health hub never derives credentials either", calls["n"] == 0, str(calls))
     finally:
-        run_feeds.derive_creds = original
-        if getattr(adapters, "_installed", False):
-            adapters.uninstall()
-
-
-def t_paper_feed_start_omits_private_user_task():
-    import run_feeds
-
-    class FakeHub:
-        def __init__(self):
-            self.user_requested = None
-            self.binance_requested = None
-
-        def start(self, *, user=True, binance=True):
-            self.user_requested = user
-            self.binance_requested = binance
-            return []
-
-    hub = FakeHub()
-    cfg = types.SimpleNamespace(user_ws="off", btc_feed="ws")
-    tasks = run_feeds._start_feed_tasks(hub, cfg)
-    check("paper start creates no private user task", hub.user_requested is False,
-          str(hub.user_requested))
-    check("paper start still runs the public price feed",
-          hub.binance_requested is True, str(hub.binance_requested))
-    check("paper start returns only enabled tasks", tasks == [], str(tasks))
+        run.derive_creds = original
 
 
 def t_paper_dashboard_renders_exact_geometry():
-    from dashboard import TerminalState, build, glyphs, snapshot
+    from dashboard import build, glyphs
 
-    state = TerminalState()
-    state.mode = "PAPER"
-    state.balance.set({"balance": 987.654321, "allowance": 987.654321,
-                       "paper": True}, source="paper ledger")
-    state.accounting = {
-        "realized_pnl": -1.25,
-        "unrealized_mark_to_bid": 0.75,
-        "total_pnl": -0.50,
-        "pending_cost": 11.10,
-        "win_rate": 2 / 3,
-        "wins": 2,
-        "losses": 1,
-    }
-    snap = snapshot(state)
+    snap = {"mode": "PAPER",
+            "account": {"kind": "PAPER", "cash": 987.654321, "equity": 988.40, "pnl": -0.50,
+                        "realized": -1.25, "open": 1, "pending_cost": 11.10, "fees": 0.2,
+                        "wins": 2, "losses": 1, "start": 1000.0}}
     for cols, rows in ((200, 60), (120, 40), (80, 24), (40, 12), (20, 4)):
         frame = build(snap, cols, rows, glyphs())
         check(f"paper dashboard row count {cols}x{rows}", len(frame) == rows,
@@ -1512,7 +1453,8 @@ def t_paper_dashboard_renders_exact_geometry():
         "".join(text for text, _style in row)
         for row in build(snap, 120, 40, glyphs()))
     check("paper dashboard visibly identifies mode", "PAPER" in full_text, full_text)
-    check("paper dashboard exposes PnL", "TOTAL PNL" in full_text, full_text)
+    check("paper dashboard exposes P&L", "P&L" in full_text and "-$0.50" in full_text, full_text)
+    check("paper dashboard shows cash", "$987.65" in full_text, full_text)
 
 
 def t_fill_delay_probes_record_later_quotes_without_touching_cash():
@@ -1988,7 +1930,6 @@ def t_sniper_order_path_uses_latency_cap_tag_and_caps():
 def t_sniper_orders_reach_the_dashboard_trades_table():
     import asyncio
     import sniper_mode
-    from dashboard.layout import _trade_sent, _trade_success
 
     class View:
         status, asks, best_ask, mid = "LIVE", ((0.52, 100.0),), 0.52, 0.515
@@ -2052,14 +1993,11 @@ def t_sniper_orders_reach_the_dashboard_trades_table():
     miss_rows = []
     asyncio.run(sniper_mode.Sniper(hub, miss_broker, settings=_fixed_sniper_settings(),
                                    trade_rows=miss_rows)._fire("UP", 1.2, 0.0))
-    from dashboard.layout import _trade_label
     r = miss_rows[-1]["result"] if miss_rows else None
-    check("a FOK killed because the price moved is a MISS (amber), not a REJECT",
-          r == "missed" and _trade_label(r, _trade_success(r), _trade_sent(r), "PAPER")[0] == "MISS",
-          str(miss_rows))
-    check("a fill renders as FILL, a refusal as REJECT (sent, not skipped)",
-          _trade_success(rows[0]["result"]) and not _trade_success(rows[1]["result"])
-          and _trade_sent(rows[1]["result"]), str(rows))
+    check("a FOK killed because the price moved is a MISS, not a REJECT",
+          r == "missed", str(miss_rows))
+    check("a fill is recorded as filled, a refusal as rejected (sent, not skipped)",
+          rows[0]["result"] == "filled" and rows[1]["result"] == "rejected", str(rows))
     check("row carries cost and an HH:MM:SS time the table can slice",
           abs(rows[0]["amount"] - 5.37) < 1e-9 and rows[0]["time_et"][-11:-3].count(":") == 2, str(rows[0]))
     rows.insert(0, {"phase": "phase2", "side": "UP", "result": "ok"})
@@ -2270,7 +2208,7 @@ def t_sniper_live_like_mode_signs_and_uses_measured_latency():
 def t_sniper_review_fixes():
     import asyncio
     import sniper_mode
-    import run_feeds
+    import run
     from feeds.book import BookView
     from paper_trade import BookSnapshot as Snap
 
@@ -2398,7 +2336,7 @@ def t_sniper_review_fixes():
                 os.environ.pop("PAPER_OWN_FILL_TTL_S", None)
             else:
                 os.environ["PAPER_OWN_FILL_TTL_S"] = raw
-            results.append(run_feeds._env_seconds("PAPER_OWN_FILL_TTL_S", 2.0))
+            results.append(run._env_seconds("PAPER_OWN_FILL_TTL_S", 2.0))
         check("bad values fall back to the default, good ones are used",
               results == [2.0, 2.0, 0.0, 1.5, 2.0], str(results))
     finally:
@@ -2502,17 +2440,25 @@ def t_sniper_end_to_end_on_the_real_paper_broker():
 
 def t_dashboard_never_waits_for_a_ledger_write():
     import threading
-    import run_feeds
+    import run
+
+    class Book:
+        def view(self, token):
+            return types.SimpleNamespace(status="UNSYNCED", best_bid=None)
 
     class Hub:
         up_token, down_token, condition_id = "up", "down", "cond"
+        book = Book()
 
     with tempfile.TemporaryDirectory() as tmp:
         broker = _broker(tmp)
         ledger = broker.ledger
-        got = run_feeds._ledger_panel_nowait(Hub(), broker, ledger, lambda t: 0.4)
-        check("free lock: the frame gets accounting, exits and held legs",
-              got is not None and "cash" in got[0], str(got))
+        rt = types.SimpleNamespace(ledger=ledger, broker=broker, hub=Hub(), live_exec=None,
+                                   journal_path=None, started=time.time())
+        view = run.DashView(rt)
+        got = view._accounting_nowait()
+        check("free lock: the frame gets the paper account",
+              got is not None and got.get("kind") == "PAPER" and got.get("cash") is not None, str(got))
         held, release = threading.Event(), threading.Event()
 
         def writer():
@@ -2523,7 +2469,7 @@ def t_dashboard_never_waits_for_a_ledger_write():
         th.start()
         held.wait(2)
         t = time.perf_counter()
-        busy = run_feeds._ledger_panel_nowait(Hub(), broker, ledger, lambda t: 0.4)
+        busy = view._accounting_nowait()
         waited = time.perf_counter() - t
         release.set()
         th.join()
@@ -2611,47 +2557,58 @@ def t_sniper_only_mode_switches_and_live_refusal():
     import asyncio
     import threading
     import sniper_mode
-    import run_feeds
-    saved = {k: os.environ.pop(k, None) for k in ("SNIPER_ENABLED", "SNIPER_ONLY", "SNIPER_LIVE_CANARY")}
+    import run
+    saved = {k: os.environ.pop(k, None) for k in ("SNIPER_ENABLED", "SNIPER_ONLY", "SNIPER_LIVE_CANARY",
+                                                  "SNIPER_PRIMARY_FEED", "SNIPER_KRAKEN_LIVE")}
     try:
-        check("SNIPER_ONLY unset -> main strategy runs", sniper_mode.only() is False)
+        check("SNIPER_ONLY unset -> sniper_mode says so", sniper_mode.only() is False)
+        try:
+            run._live_sniper_gate(True)
+            check("this build refuses to run without SNIPER_ONLY=1", False, "it was allowed")
+        except RuntimeError as exc:
+            check("this build refuses to run without SNIPER_ONLY=1 (even in paper)",
+                  "SNIPER_ONLY=1" in str(exc), str(exc))
         os.environ["SNIPER_ONLY"] = "1"
         check("SNIPER_ONLY=1 turns the sniper on by itself", sniper_mode.enabled() and sniper_mode.only())
         try:
-            asyncio.run(run_feeds._run_configured(None, None, None, paper=False))
+            asyncio.run(run.run(paper=False))
             check("LIVE with SNIPER_ONLY refuses to start", False, "it started")
         except RuntimeError as exc:
             check("LIVE with SNIPER_ONLY (no canary flag) refuses to start, before touching anything",
                   "refusing to start LIVE" in str(exc) and "SNIPER_LIVE_CANARY" in str(exc), str(exc))
         os.environ["SNIPER_LIVE_CANARY"] = "1"
-        check("LIVE + SNIPER_ONLY + SNIPER_LIVE_CANARY is the live canary", run_feeds._live_sniper_gate(False) is True)
-        check("SNIPER_LIVE_CANARY is ignored in paper", run_feeds._live_sniper_gate(True) is False)
+        check("LIVE + SNIPER_ONLY + SNIPER_LIVE_CANARY is the live canary", run._live_sniper_gate(False) is True)
+        check("SNIPER_LIVE_CANARY is ignored in paper", run._live_sniper_gate(True) is False)
         os.environ.pop("SNIPER_ONLY")
         try:
-            run_feeds._live_sniper_gate(False)
+            run._live_sniper_gate(False)
             check("the live canary without SNIPER_ONLY refuses", False, "it was allowed")
         except RuntimeError as exc:
             check("the live canary without SNIPER_ONLY refuses (it must be the only thing that trades)",
                   "SNIPER_ONLY" in str(exc), str(exc))
         os.environ.pop("SNIPER_LIVE_CANARY")
-        check("plain LIVE (no sniper flags) is not the canary", run_feeds._live_sniper_gate(False) is False)
+        try:
+            run._live_sniper_gate(False)
+            check("plain LIVE (no sniper flags) refuses", False, "it was allowed")
+        except RuntimeError as exc:
+            check("plain LIVE (no sniper flags) refuses: nothing else in this build can trade",
+                  "SNIPER_ONLY" in str(exc), str(exc))
     finally:
         for k, v in saved.items():
             os.environ.pop(k, None)
             if v is not None:
                 os.environ[k] = v
 
-    class Bot:
-        stop_event = threading.Event()
+    rt = types.SimpleNamespace(stop=threading.Event(), sniper_task=None)
 
     async def go():
-        task = asyncio.create_task(run_feeds._wait_for_stop(Bot))
+        task = asyncio.create_task(run._wait_until_stopped(rt))
         await asyncio.sleep(0.05)
         alive = not task.done()
-        Bot.stop_event.set()
-        await asyncio.wait_for(task, timeout=2)
-        return alive
-    check("the SNIPER_ONLY stand-in idles until the stop signal, then ends", asyncio.run(go()))
+        rt.stop.set()
+        result = await asyncio.wait_for(task, timeout=2)
+        return alive and result is None
+    check("the runner idles until the stop signal, then ends", asyncio.run(go()))
 
 
 def main() -> int:

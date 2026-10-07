@@ -17,6 +17,7 @@ import types
 ROOT = pathlib.Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
+import testing_env  # noqa: E402,F401 - first: tests never read the bot's .env
 from accounting import fees  # noqa: E402
 from accounting.ledger import Ledger  # noqa: E402
 from accounting.resolution import (PENDING, RESOLVED, UNKNOWN, Resolution,  # noqa: E402
