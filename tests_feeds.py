@@ -1463,9 +1463,16 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # which never crosses sides and dies with its market. FOK is unchanged.
     # Re-approved here: the cooldown is per side (an UP order never blocks DOWN, nor
     # back), 300ms by default, and starts when the order is submitted.
-    "sniper_mode.py": "49b80c77309c74c6f40228edb8a4878a380330b0d4df406233147caecb1997b3",
-    "sniper_live.py": "d17b9858113703267949e5358fdee65e83d33a5129cbf70d0154fb2167cddfd6",
-    "paper_trade.py": "b75fa9828687069e48258f53aec2250107327d16531bd6dbbd50438ed55c1b78",
+    # Re-approved: exact-threshold moves trigger (K_BP_TOLERANCE); the stake is signed in whole
+    # cents (signing_amount); one order in flight PER SIDE (inflight), per-order paper outcomes;
+    # rows carry window_ms and fill_confirmed_ms / t_signal_to_send_ms / t_send_to_response_ms.
+    "sniper_mode.py": "d5964977e15ca4393caf12809585ff47fdab710715585a935a74409a4d40dc06",
+    # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
+    # token; fills carry seen_mono (when the quantity became known).
+    "sniper_live.py": "f7776ac28957d9ef76d89727b3f8fc2e93e200d07ae1ce39753f86d64e3046fd",
+    # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
+    # atomic under _lock); last_fill / last_error / last_timing also per thread.
+    "paper_trade.py": "803f98c9c739b75d94eb1954f1d5158b5112f5224c75cb8c7d0d5cadefb827fd",
     "polymarket_trade.py": "71b5da67c456c2fb30f3578b84019b0152324bdf338c20c53941eba6b72adc94",
     "orderbook.py": "fe3decc44a8f1061c2788c1f2ae85739ade137910033031eac3138f11b22f090",
     "market_discovery.py": "23c605f678eaf1c6caf60259293b9bccf73413e7f632c0a6749c55acc571aa11",

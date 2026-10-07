@@ -745,7 +745,16 @@ class PaperBroker:
         self._rules_fetch = rules_fetch or (
             lambda cid: fetch_market_rules(cid, host=self.host, category=self.category))
         self._lock = threading.RLock()
-        self._execution_lock = threading.Lock()
+        # One paper ENTRY per token at a time: a second order on the same
+        # token while one is in flight is refused as a duplicate. Orders on
+        # different tokens (a market's UP and DOWN) may be in flight together;
+        # each books atomically under _lock (cash re-checked against its own
+        # actual cost there), so they cannot overspend between them.
+        self._execution_locks: dict[str, threading.Lock] = {}
+        # last_fill / last_error / last_timing per thread too: a caller
+        # matching two orders at once reads ITS order's outcome on the thread
+        # that placed it (other readers see the latest, as before).
+        self._results = threading.local()
         # Exits get their own lock. The execution lock exists to stop two
         # concurrent ENTRIES becoming a duplicate order; an exit is not a
         # duplicate entry, and sharing the lock meant a stop firing rejected
@@ -1135,8 +1144,11 @@ class PaperBroker:
         # measure where their milliseconds go: entered, delay started, met
         # the book. Published only once this order owns the broker.
         timing = {"enter_pc": time.perf_counter_ns()}
-        if not self._execution_lock.acquire(blocking=False):
-            return self._reject(side, amount, "another paper order is already in flight")
+        token = up_token_id if str(side).upper() == "UP" else down_token_id
+        with self._lock:
+            entry_lock = self._execution_locks.setdefault(str(token), threading.Lock())
+        if not entry_lock.acquire(blocking=False):
+            return self._reject(side, amount, "another paper order is already in flight on this token")
         try:
             self.last_timing = timing
             return self._place_trade(side, amount, up_token_id, down_token_id,
@@ -1147,7 +1159,27 @@ class PaperBroker:
                                      latency_from_pc=latency_from_pc, arrival_book=arrival_book,
                                      fak=fak, size_at_limit=size_at_limit)
         finally:
-            self._execution_lock.release()
+            entry_lock.release()
+
+    # -- per-order outcome: see _results in __init__
+    def _result(self, name):
+        local = self.__dict__.get("_results")
+        if local is not None and name in local.__dict__:
+            return local.__dict__[name]
+        return self.__dict__.get("_latest_" + name)
+
+    def _set_result(self, name, value) -> None:
+        local = self.__dict__.get("_results")
+        if local is not None:
+            local.__dict__[name] = value
+        self.__dict__["_latest_" + name] = value
+
+    last_fill = property(lambda self: self._result("last_fill"),
+                         lambda self, value: self._set_result("last_fill", value))
+    last_error = property(lambda self: self._result("last_error"),
+                          lambda self, value: self._set_result("last_error", value))
+    last_timing = property(lambda self: self._result("last_timing"),
+                           lambda self, value: self._set_result("last_timing", value))
 
     def _place_trade(self, side: str, amount: float,
                      up_token_id: str | None = None,

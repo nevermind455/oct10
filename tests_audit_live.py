@@ -13,9 +13,9 @@ chain end to end:
     response classification -> private trades (FillStore) -> fill parsing
     -> carry -> live ledger position.
 
-Requirements the code does NOT meet are expectedFailure tests named
-FINDING_*: they document the gap without changing the strategy. When one is
-fixed, unittest reports it as an unexpected success - drop the decorator.
+The six findings of the first audit (exact 0.50bp, the stake signed a cent
+short, no fill-confirmed latency, no trigger window, and the two global gates
+that held up the opposite side) are fixed; their tests are named FIXED_*.
 """
 from __future__ import annotations
 
@@ -122,9 +122,8 @@ class TriggerAudit(unittest.TestCase):
         d, _ = t.update(200.0, 60_010.0)
         self.assertIsNone(d)
 
-    @unittest.expectedFailure
-    def test_FINDING_an_exact_half_bp_move_always_triggers(self):
-        """FINDING (bug, minor): Trigger.update compares the float
+    def test_FIXED_an_exact_half_bp_move_always_triggers(self):
+        """FIXED (was a finding, bug, minor): Trigger.update compared the float
         (mid / ref - 1) * 1e4 with k_bp using >=. For mids where the move is
         exactly 0.50bp the float lands at 0.4999999999988 in ~43% of such cases,
         so the order is not sent. sniper_mode.py Trigger.update, line
@@ -398,7 +397,7 @@ class LivePathAudit(LivePathBase):
                     f"posted ${D(str(body['order']['makerAmount'])) / D(1_000_000)} (10 x 0.51)")
                 self.assertEqual((down["side"], down["target_shares"], down["carry_in"]), ("DOWN", 10.0, 0.0))
                 self.assertAlmostEqual(down["amount"], 5.10, places=6)          # 10 x 0.51, no UP carry in it
-                self.assertIn(D(str(body["order"]["makerAmount"])), (D("5100000"), D("5090000")))  # cent: FINDING
+                self.assertEqual(D(str(body["order"]["makerAmount"])), D("5100000"))    # the whole $5.10 is signed
                 self.assertEqual(self.sn.carry["UP"], 4.0)
             finally:
                 await self.teardown_live()
@@ -496,9 +495,8 @@ class LivePathAudit(LivePathBase):
                 await self.teardown_live()
         self.run_async(go())
 
-    @unittest.expectedFailure
-    def test_FINDING_journal_records_signal_to_fill_confirmed(self):
-        """FINDING (instrumentation gap): the private fill's arrival is stamped
+    def test_FIXED_journal_records_signal_to_fill_confirmed(self):
+        """FIXED (was an instrumentation gap): the private fill's arrival is stamped
         on the Fill (feeds/poly_user.py FillStore.record_trade, time.monotonic)
         but sniper_mode.Sniper._record_fak_fill never journals it, so
         signal -> fill_confirmed cannot be computed from the log."""
@@ -515,9 +513,8 @@ class LivePathAudit(LivePathBase):
                 await self.teardown_live()
         self.run_async(go())
 
-    @unittest.expectedFailure
-    def test_FINDING_journal_records_the_trigger_window(self):
-        """FINDING (log gap): the order row has the move (bp) but not the
+    def test_FIXED_journal_records_the_trigger_window(self):
+        """FIXED (was a log gap): the order row has the move (bp) but not the
         interval it was measured over (the reference tick's age); Sniper._signal
         does not pass the Trigger's reference time to the row."""
         async def go():
@@ -531,9 +528,8 @@ class LivePathAudit(LivePathBase):
                 await self.teardown_live()
         self.run_async(go())
 
-    @unittest.expectedFailure
-    def test_FINDING_down_signal_not_blocked_while_up_fak_quantity_pending(self):
-        """FINDING (requirement conflict): live, after an UP FAK is accepted
+    def test_FIXED_down_signal_not_blocked_while_up_fak_quantity_pending(self):
+        """FIXED (was a requirement conflict): live, after an UP FAK is accepted
         and before its traded quantity arrives on the private channel, every
         signal on BOTH sides is skipped ('awaiting FAK fill size':
         sniper_mode.Sniper._decide, and LiveExecution.prepare refuses too).
@@ -552,9 +548,8 @@ class LivePathAudit(LivePathBase):
 
 
 class SizingAudit(unittest.TestCase):
-    @unittest.expectedFailure
-    def test_FINDING_the_signed_stake_is_never_a_cent_below_the_computed_one(self):
-        """FINDING (bug, minor, pre-existing): py_clob_client_v2 signs a BUY's
+    def test_FIXED_the_signed_stake_is_never_a_cent_below_the_computed_one(self):
+        """FIXED (was a finding, bug, minor, pre-existing): py_clob_client_v2 signs a BUY's
         dollar amount with round_down(x, 2) = floor(x * 100) / 100 on a float.
         Amounts whose float sits just below the cent (5.10 -> 5.0999999...)
         are signed a cent lower: the live order buys up to ~1% fewer shares
@@ -568,8 +563,9 @@ class SizingAudit(unittest.TestCase):
             ask = cents / 100
             for target in range(10, 21):
                 amount = S.Sniper.ioc_spend([(ask, 1000)], target, ask, ask + 0.05)
-                if round_down(amount, 2) < round(amount, 2):
-                    short.append((target, ask, amount, round_down(amount, 2)))
+                signed = round_down(S.signing_amount(amount), 2)            # what the SDK signs now
+                if abs(signed - round(amount, 2)) > 1e-9:
+                    short.append((target, ask, amount, signed))
         say(f"signed a cent short: {len(short)} of 1001 (ask, target) cases, e.g. {short[:3]}")
         self.assertEqual(short, [])
 
@@ -619,9 +615,8 @@ class CooldownAudit(unittest.TestCase):
         self.assertEqual([(a, l, ok) for a, l, ok, _ in expect], [(a, l, g) for a, l, _, g in expect])
         self.assertEqual(sn.s.cooldown_ms, 300)
 
-    @unittest.expectedFailure
-    def test_FINDING_down_signal_not_blocked_while_an_up_order_is_in_flight(self):
-        """FINDING (requirement conflict): the one-order-in-flight guard
+    def test_FIXED_down_signal_not_blocked_while_an_up_order_is_in_flight(self):
+        """FIXED (was a requirement conflict): the one-order-in-flight guard
         (sniper_mode.Sniper._signal, `if self.busy`) is global: while an UP
         order awaits its venue reply (paper: its modelled match), a valid DOWN
         signal is skipped as 'previous order in flight'. Kept as a safety

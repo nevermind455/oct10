@@ -118,14 +118,18 @@ class CooldownTests(unittest.TestCase):
         self.assertEqual(orders, [("UP", 0.0), ("DOWN", 20.0)])
         self.assertEqual(sn.n["skip: cooldown"], 1)
 
-    def test_one_order_in_flight_is_still_the_rule(self):
-        # The per-side cooldown does not lift the existing in-flight guard: while
-        # an order awaits its outcome, a signal on either side waits.
+    def test_one_order_in_flight_per_side(self):
+        # While an order awaits its outcome its SIDE waits; the other side does not.
         sn, clock, orders = make()
-        sn._fire_now = lambda side, *a, **k: orders.append((side, None)) or object()   # leaves busy set
-        self.run_signals(sn, clock, [(UP_MOVE, 0), (DOWN_MOVE, 50)])
-        self.assertEqual(orders, [("UP", None)])
-        self.assertEqual(sn.n["skip: previous order in flight"], 1)
+
+        def fire(side, *a, **k):
+            orders.append((side, None))
+            sn.inflight[side] = {"end": None}           # stays in flight, like a real order
+            return object()
+        sn._fire_now = fire
+        self.run_signals(sn, clock, [(UP_MOVE, 0), (DOWN_MOVE, 50), (UP_MOVE, 400), (DOWN_MOVE, 450)])
+        self.assertEqual(orders, [("UP", None), ("DOWN", None)])
+        self.assertEqual(sn.n["skip: previous order in flight"], 2)     # UP@400 and DOWN@450, each its own side
         self.assertEqual(sn.n["skip: cooldown"], 0)
 
     def test_last_fire_compatibility(self):

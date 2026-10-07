@@ -79,7 +79,7 @@ import math
 import os
 import time
 from datetime import datetime
-from decimal import ROUND_FLOOR, Decimal
+from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from pathlib import Path
 
 import websockets
@@ -367,6 +367,22 @@ def signing_price(cap: float, tick: str) -> float:
     t = Decimal(str(tick))
     on_tick = (Decimal(str(cap)) / t).to_integral_value(rounding=ROUND_FLOOR) * t
     return float(on_tick) + 1e-9
+
+
+def signing_amount(amount: float) -> float:
+    """The BUY stake to sign: whole cents, plus a nudge far below a cent.
+
+    The order library floors the dollar amount with floats as well
+    (round_down: floor(x*100)/100), and 5.10*100 is 509.999... in binary, so
+    a $5.10 stake was signed as $5.09: a live order buying fewer shares than
+    its target and a cent less than the paper broker, which rounds the same
+    stake in Decimal. Same remedy as signing_price: the stake is first set to
+    whole cents exactly (half-up, as the paper broker rounds it), and the
+    nudge only makes the library land on that cent - it cannot reach the
+    next one. The stake never moves the price limit: that is signed apart.
+    """
+    cents = Decimal(str(amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return float(cents) + 1e-9
 
 
 def fast_signer(private_key: str, chain_id: int):
@@ -840,6 +856,13 @@ class StallWatch:
 
 
 MAX_GAP_MS = 2000.0
+# The move is (mid / ref - 1) * 1e4 in floats, and a move of exactly K bp can
+# come out a hair under K: 60000 -> 59997 is -0.4999999999999bp, 48740 ->
+# 48742.437 is +0.4999999999988bp - a threshold move that was not sent. The
+# comparison allows this much, far below the smallest step a BTC mid can make
+# (0.005 on 150,000 is 3.3e-4 bp), so it admits exact-threshold moves and
+# nothing genuinely smaller. The threshold itself is unchanged.
+K_BP_TOLERANCE = 1e-9
 
 
 class Trigger:
@@ -858,6 +881,9 @@ class Trigger:
         self.k_bp, self.window_ms = k_bp, window_ms
         self.max_gap_ms = max(float(max_gap_ms), float(window_ms))
         self.q: collections.deque = collections.deque()
+        # (time ms, mid) of the reference the last measured move was taken
+        # against: the price standing window_ms before that tick.
+        self.ref: tuple[float, float] | None = None
 
     def hold(self, t_ms: float) -> None:
         """No change as of t_ms. A feed that only speaks when its top of book
@@ -888,10 +914,11 @@ class Trigger:
             q.popleft()
         if q[0][0] > cut or t_ms - q[0][0] > self.max_gap_ms:
             return None, 0.0
+        self.ref = q[0]
         r = (mid / q[0][1] - 1.0) * 1e4
-        if r >= self.k_bp:
+        if r >= self.k_bp - K_BP_TOLERANCE:
             return 1, r
-        if r <= -self.k_bp:
+        if r <= -self.k_bp + K_BP_TOLERANCE:
             return -1, r
         return None, r
 
@@ -930,7 +957,10 @@ class Sniper:
         # When each side's last order was submitted (monotonic ms, the ticks'
         # clock). An UP order cools down UP only; DOWN stays free, and back.
         self.last_fire_by_side = {"UP": -1e18, "DOWN": -1e18}
-        self.busy = False
+        # The order each side has in flight (None: that side is free). An UP
+        # order waiting for its venue answer holds UP only; DOWN may trade -
+        # its fills are told apart by order id (live) / per-order result (paper).
+        self.inflight = {"UP": None, "DOWN": None}
         self.rounds = collections.defaultdict(lambda: {"fills": 0, "UP": 0.0, "DOWN": 0.0})
         self._fak_pending: dict = {}        # accepted orders awaiting actual trade quantities
         # FAK (IOC): shares an order did not fill, per side, for the next
@@ -1206,6 +1236,20 @@ class Sniper:
         return "tick"
 
     @property
+    def busy(self) -> bool:
+        """An order in flight on either side (the dashboard's 'busy')."""
+        return any(v is not None for v in self.inflight.values())
+
+    @busy.setter
+    def busy(self, value: bool) -> None:
+        """False frees both sides; True marks both in flight."""
+        self.inflight = {side: ({"end": None} if value else None) for side in ("UP", "DOWN")}
+
+    def _release(self, side: str) -> None:
+        """This side's order is resolved (or was never sent): the side is free."""
+        self.inflight[side] = None
+
+    @property
     def last_fire(self) -> float:
         """The most recent submission on either side (monotonic ms)."""
         return max(self.last_fire_by_side.values())
@@ -1233,10 +1277,11 @@ class Sniper:
                 # The move was measured on ticks that cannot be shown current
                 # (a backlog compresses seconds of movement into milliseconds):
                 # drop the reference too, so the rule restarts on fresh ticks only.
+                window = self._window_fields(feed, t)
                 trigger.q.clear()
                 side = "UP" if direction > 0 else "DOWN"
                 self._skip(why, {"wall": time.time(), "id": f"{time.time():.3f}-{side}", "side": side,
-                                 "bp": round(r, 3), "feed": feed, "binance_backlog": self.fresh.backlog,
+                                 "bp": round(r, 3), "feed": feed, **window, "binance_backlog": self.fresh.backlog,
                                  "binance_excess_ms": (round(self.fresh.last_excess, 1)
                                                        if self.fresh.last_excess is not None else None)})
                 return
@@ -1244,10 +1289,10 @@ class Sniper:
         if t - self.last_fire_by_side[side] < self.s.cooldown_ms:
             self.n["skip: cooldown" + tag] += 1         # this side only: the other side is not blocked
             return
-        if self.busy:
-            self.n["skip: previous order in flight" + tag] += 1
+        if self.inflight[side] is not None:
+            self.n["skip: previous order in flight" + tag] += 1     # this side's own order only
             return
-        self.busy = True
+        self.inflight[side] = {"end": None}
         task = self._fire_now(side, r, t, t_pc, feed=feed)
         if task is not None:
             # A closed window, stale book or failed live preflight is not an
@@ -1334,6 +1379,11 @@ class Sniper:
             kw["arrival_book"] = lambda token: self._arrival_book(token, arrival_ms, arrival_mono)
         ok = self.broker.place_trade(side, amount, up, down, cond, end, cap, None,
                                      latency_ms=latency_ms, tag="sniper", **kw)
+        # This order's own outcome, read on the thread that placed it: with
+        # UP and DOWN in flight together the broker's other order may finish
+        # in between, so the event loop must not read the broker afterwards.
+        plan["result"] = {"fill": getattr(self.broker, "last_fill", None),
+                          "error": getattr(self.broker, "last_error", None)}
         st.update(getattr(self.broker, "last_timing", None) or {})
         return ok, sign_ms, None, st
 
@@ -1469,7 +1519,7 @@ class Sniper:
             if not t <= price <= 1 - t + 1e-9:
                 return f"invalid price ({cap}), min: {t} - max: {1 - t}", None
             signed = self._builder.build_market_order(
-                self._clob["MarketOrderArgsV2"](token_id=str(token), amount=float(amount),
+                self._clob["MarketOrderArgsV2"](token_id=str(token), amount=signing_amount(amount),
                                                 side=self._clob["BUY"], price=price,
                                                 order_type=self._clob[self.s.order_type]),
                 self._clob["CreateOrderOptions"](tick_size=tick, neg_risk=False), version=2)
@@ -1678,6 +1728,35 @@ class Sniper:
         if task is not None:
             await task
 
+    def _window_fields(self, feed: str, t_ms: float) -> dict:
+        """The interval the move was measured over: from the reference price
+        (the one standing SNIPER_WINDOW_MS before the tick, so >= that) to the
+        tick that signalled, and that reference mid."""
+        trig = self.trigger if feed == self.s.primary_feed else self.triggers.get(feed)
+        ref = getattr(trig, "ref", None)
+        if not ref or ref[0] > t_ms:
+            return {}
+        return {"window_ms": round(t_ms - ref[0], 1), "ref_mid": ref[1]}
+
+    def _stamp_fill_confirmed(self, row: dict, plan: dict, seen_mono=None) -> None:
+        """Signal -> the order's full quantity known, and send -> it, on the
+        ticks' monotonic clock. seen_mono: when the private channel delivered
+        the last of its trades (or the venue's final status); None: the reply
+        itself told (a no-match). The bot needs the reply's order id as well,
+        so a trade seen before the reply counts from the reply.
+        t_signal_to_fill_known_ms: when this process actually booked it."""
+        t0_ms = float(plan["t0"]) * 1000.0
+        response = row.get("t_signal_to_response_ms")
+        ms = (float(seen_mono) * 1000.0 - t0_ms) if seen_mono is not None else response
+        if ms is None:
+            return
+        if response is not None:
+            ms = max(ms, response)
+        row["fill_confirmed_ms"] = round(ms, 2)
+        if row.get("t_signal_to_send_ms") is not None:
+            row["t_send_to_fill_confirmed_ms"] = round(ms - row["t_signal_to_send_ms"], 2)
+        row["t_signal_to_fill_known_ms"] = round(time.monotonic() * 1000.0 - t0_ms, 2)
+
     def _fire_now(self, side: str, r_bp: float, t_ms: float, t_pc: int | None = None, feed: str = "binance"):
         """Decide on the spot and hand the order to the sender at once.
 
@@ -1694,10 +1773,11 @@ class Sniper:
                "feed": feed,
                # BTC tick received -> decision started: our own event loop's delay.
                "loop_lag_ms": round(time.monotonic() * 1000.0 - t_ms, 1)}
+        row.update(self._window_fields(feed, t_ms))
         try:
             plan = self._decide(side, row, t_ms)
             if plan is None:
-                self.busy = False
+                self._release(side)
                 return None
             if self.live is not None:
                 return self._fire_live(side, r_bp, row, plan, t_pc, start_pc)
@@ -1742,7 +1822,7 @@ class Sniper:
             self.n["errors"] += 1
             row.update(result="error", reason=f"{type(exc).__name__}: {exc}")
             self._write(row)
-            self.busy = False
+            self._release(side)
             return None
 
     # ---------------------------------------------------------------- live canary
@@ -1759,7 +1839,7 @@ class Sniper:
             self.n["orders"] -= 1                       # decided, but not sent
             row["detail"] = str(exc)[:200]
             self._skip("live halted" if isinstance(exc, Halted) else "live refused", row)
-            self.busy = False
+            self._release(side)
             return None
         # The bytes go out here, still inside the BTC tick's own step: no
         # event-loop turn between the decision and the wire (None: no warm
@@ -1793,8 +1873,13 @@ class Sniper:
                        live_ts_us=ts, t_tick_to_decided_ms=round((plan["decided_pc"] - t_pc) / 1e6, 2))
             if "net_send_start" in ts:
                 row["t_decided_to_wire_ms"] = round(ts["net_send_start"] / 1000.0, 2)
+                row["t_signal_to_send_ms"] = round(row["t_tick_to_decided_ms"] + ts["net_send_start"] / 1000.0, 2)
                 if "response" in ts:
                     row["t_wire_to_reply_ms"] = round((ts["response"] - ts["net_send_start"]) / 1000.0, 2)
+                    row["t_send_to_response_ms"] = row["t_wire_to_reply_ms"]
+                    row["t_signal_to_response_ms"] = round(row["t_tick_to_decided_ms"] + ts["response"] / 1000.0, 2)
+            if kind == NO_MATCH:
+                self._stamp_fill_confirmed(row, plan)            # the reply says nothing filled
             if p.order_type == "FAK" and kind in (MATCHED, PENDING):
                 rd["fills"] += 1           # reserve one slot, even before the quantity is known
                 fill = res.get("fill")
@@ -1851,7 +1936,7 @@ class Sniper:
             row.update(result="error", reason=f"{type(exc).__name__}: {exc}")
             self._write(row)
         finally:
-            self.busy = False
+            self._release(side)
 
     def _record_fak_fill(self, row, plan, fill, *, update=False):
         """Report actual executed quantity, never the request or book estimate."""
@@ -1863,6 +1948,7 @@ class Sniper:
         self._settle_carry(plan, side, shares)
         if plan.get("target") is not None:
             row["carry_out"] = self.carry[side]
+        self._stamp_fill_confirmed(row, plan, fill.get("seen_mono"))
         if shares > 0:
             rd[side] += shares
             self.n["filled"] += 1
@@ -1923,7 +2009,9 @@ class Sniper:
     def _decide(self, side: str, row: dict, t_ms: float):
         """Every check and every field of the order; None (skip journalled) if it must not trade."""
         self._sync_live_fak()
-        if self._fak_pending:
+        if any(r.get("side") == side for r, _plan in self._fak_pending.values()):
+            # this side's accepted FAK has no traded quantity yet: its carry
+            # is unknown. The other side's pending FAK does not hold this one.
             return self._skip("awaiting FAK fill size", row)
         hub = self.hub
         up, down, cond, end = hub.up_token, hub.down_token, hub.condition_id, hub.window_end
@@ -1977,9 +2065,16 @@ class Sniper:
             # 10-share clip becomes $1 - the smallest order live could place.
             amount = max(self.s.shares * ask, MIN_ORDER_USD)
         rd = self.rounds[end]
-        if rd["fills"] >= self.s.max_fills_round or rd[side] + amount / ask > self.s.max_side_shares:
+        # The other side may have an order in flight in this round: it holds a
+        # fill slot until its outcome is known, so two sides together never
+        # pass the round's fill cap.
+        other = self.inflight.get("DOWN" if side == "UP" else "UP")
+        in_flight = 1 if isinstance(other, dict) and other.get("end") == end else 0
+        if (rd["fills"] + in_flight >= self.s.max_fills_round
+                or rd[side] + amount / ask > self.s.max_side_shares):
             return self._skip("round cap", row)
         decided_pc = time.perf_counter_ns()     # every check passed: this signal trades
+        self.inflight[side] = {"end": end}
         row.update(ask_seen=ask, cap=cap, shares=round(amount / ask, 4), amount=round(amount, 4))
         if target is not None:
             row.update(target_shares=round(target, 4), carry_in=round(carry, 4))
@@ -2003,9 +2098,17 @@ class Sniper:
             if sign_ms is not None:
                 row["sign_ms"] = round(sign_ms, 2)
             row.update(self._stages(t_pc, start_pc, call_pc, st))
-            fill = getattr(self.broker, "last_fill", None) or {}
+            if st.get("sent_pc") and t_pc is not None:
+                row["t_signal_to_send_ms"] = round((st["sent_pc"] - t_pc) / 1e6, 2)
+                if st.get("matched_pc"):
+                    # paper knows the quantity at its modelled match (no private channel)
+                    row["fill_confirmed_ms"] = round((st["matched_pc"] - t_pc) / 1e6, 2)
+                    row["t_send_to_fill_confirmed_ms"] = round((st["matched_pc"] - st["sent_pc"]) / 1e6, 2)
+            result = plan.get("result") or {"fill": getattr(self.broker, "last_fill", None),
+                                            "error": getattr(self.broker, "last_error", None)}
+            fill = result["fill"] or {}
             filled = bool(ok and fill.get("tag") == "sniper")
-            row["outcome"] = self._outcome(filled, None if filled else (sign_err or getattr(self.broker, "last_error", None)),
+            row["outcome"] = self._outcome(filled, None if filled else (sign_err or result["error"]),
                                            row, history=self._history_book() is not None)
             arrival = row.get("arrival")
             if arrival:
@@ -2041,7 +2144,7 @@ class Sniper:
                 self._spawn(self._markout(row, token))
             else:
                 self.n["refused"] += 1
-                reason = sign_err or getattr(self.broker, "last_error", None)
+                reason = sign_err or result["error"]
                 row.update(result="refused", reason=reason)
                 if "fak no-fill" in str(reason).lower():
                     self._settle_carry(plan, side, 0.0)
@@ -2059,7 +2162,7 @@ class Sniper:
             row.update(result="error", reason=f"{type(exc).__name__}: {exc}")
             self._write(row)
         finally:
-            self.busy = False
+            self._release(side)
 
     async def _markout(self, row: dict, token: str) -> None:
         """Bought-side mid 1s and 5s after the fill, minus price and fee (c/share)."""

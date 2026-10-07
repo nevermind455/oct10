@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
 
-from sniper_mode import FastOrderBuilder, fast_signer, signing_price  # noqa: F401 - fast_signer: build the live signer with it
+from sniper_mode import FastOrderBuilder, fast_signer, signing_amount, signing_price  # noqa: F401 - fast_signer: build the live signer with it
 
 # Result kinds of one send. Only MATCHED and PENDING mean the venue took the
 # order; AMBIGUOUS means nobody can know without reconciling.
@@ -473,7 +473,7 @@ class LeanSender:
         lib = self._lib
         st["build_pc"] = time.perf_counter_ns()
         signed = self.builder.build_market_order(
-            lib["MarketOrderArgsV2"](token_id=str(token), amount=float(amount), side=lib["BUY"],
+            lib["MarketOrderArgsV2"](token_id=str(token), amount=signing_amount(amount), side=lib["BUY"],
                                      price=signing_price(cap, tick), order_type=lib[order_type]),
             lib["CreateOrderOptions"](tick_size=tick, neg_risk=bool(rules["neg_risk"])), version=self.version)
         st["signed_pc"] = time.perf_counter_ns()
@@ -1153,6 +1153,7 @@ class LiveExecution:
                             raise ValueError("matched is not evidence of zero execution")
                         a["trade_ids"] = set(tids)
                         a["final_size"] = float(size)
+                        a.setdefault("final_mono", time.monotonic())   # when the final size became known
                     except (KeyError, ArithmeticError, TypeError, ValueError):
                         pass                          # incomplete evidence keeps the full reservation
         fill = self.fill_for(oid)
@@ -1213,7 +1214,8 @@ class LiveExecution:
                 return None
             a["quantity_resolved"] = True
             return {"shares": 0.0, "cost": 0.0, "fee": 0.0, "price": None,
-                    "source": "terminal order status", "statuses": [], "trade_ids": []}
+                    "source": "terminal order status", "statuses": [], "trade_ids": [],
+                    "seen_mono": a.get("final_mono")}
         actual_ids = {str(f.trade_id) for f in rows}
         if expected and actual_ids - expected:
             self._trip(f"FAK order {oid} has unexpected trades: reconcile")
@@ -1250,10 +1252,18 @@ class LiveExecution:
         if a.get("final_size") is not None and abs(float(shares) - a["final_size"]) > 1e-6:
             return None                            # not all final fills have arrived yet
         a["quantity_resolved"] = True
+        # When the full quantity became knowable (time.monotonic, the ticks'
+        # clock): the last of the order's trades arriving on the private
+        # channel - or, when the reply named no trade ids, the order status
+        # that fixed the final size, if that came later.
+        seen = max(float(getattr(f, "first_seen", 0.0) or 0.0) for f in rows)
+        if not expected and a.get("final_mono") is not None:
+            seen = max(seen, float(a["final_mono"]))
         return {"shares": float(shares), "price": float(cost / shares), "cost": float(cost), "fee": float(fee),
                 "partial": cost < Decimal(str(a["amount"])) - Decimal("0.01"),
                 "trades": len(rows), "trade_ids": sorted(actual_ids),
-                "statuses": sorted({str(f.status).upper() for f in rows}), "source": "user channel"}
+                "statuses": sorted({str(f.status).upper() for f in rows}), "source": "user channel",
+                "seen_mono": seen or None}
 
     # ------------------------------------------------------------ one order (event loop)
     def prepare(self, plan: dict, decided_pc: int | None = None) -> Prepared:
@@ -1267,12 +1277,17 @@ class LiveExecution:
         order_type = str(plan.get("order_type", "FOK")).upper()
         if order_type not in ("FOK", "FAK"):
             raise Refused(f"unknown order type {order_type!r}")
+        token, cond, end = plan["token"], plan["cond"], float(plan["end"])
         for oid, a in list(self.fak_orders.items()):
+            # Only this token's (this side's) unresolved FAK holds the order: the
+            # other side's fills are told apart by order id, and collateral is
+            # reserved per order (self.reserved), so the two may overlap.
+            if a.get("token") != token:
+                continue
             if not a.get("quantity_resolved") and self.fill_for(oid) is None:
                 self.kill.check()
-                raise Refused("accepted FAK order is still awaiting complete fill quantities")
+                raise Refused("accepted FAK order on this side is still awaiting complete fill quantities")
         self.sender.guard.check()                       # Refused (journalled) while the venue guard has orders paused
-        token, cond, end = plan["token"], plan["cond"], float(plan["end"])
         side, amount, up, down = plan["send"][:4]
         if self.balance_at is None or time.monotonic() - self.balance_at > self.balance_max_age_s:
             raise Refused("collateral balance is stale")

@@ -463,6 +463,12 @@ class JournalTailTests(unittest.TestCase):
                 fh.write(', "price": 0.5}\n')
             got = tail.read()
             self.assertEqual(len(got), 3, "a fill update must merge into its order, not add a row")
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"wall": 7.0, "side": "DOWN", "bp": -0.9, "result": "filled", "shares": 10,
+                                     "price": 0.5, "window_ms": 251.2, "fill_confirmed_ms": 186.4}) + "\n")
+            last = tail.read()[-1]
+            self.assertEqual((last["window_ms"], last["fill_confirmed_ms"]), (251.2, 186.4))
+            self.assertEqual(last["detail"], "confirmed 186ms")
             self.assertEqual((got[2]["result"], got[2]["shares"], got[2]["price"]), ("filled", 4.2, 0.5))
 
     def test_a_big_journal_is_read_from_its_tail_only(self):

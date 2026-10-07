@@ -1144,10 +1144,14 @@ class JournalTail:
             stamp = time.strftime("%H:%M:%S", time.localtime(float(row.get("wall") or 0.0)))
         except (TypeError, ValueError, OverflowError, OSError):
             stamp = "--"
+        confirmed = row.get("fill_confirmed_ms")
+        detail = ("partial" if row.get("partial") else "" if result == "filled" else reason[:120])
+        if confirmed is not None and result == "filled":
+            detail = (detail + " " if detail else "") + f"confirmed {float(confirmed):.0f}ms"
         return {"time": stamp, "side": row.get("side"), "bp": row.get("bp"), "ask": row.get("ask_seen"),
                 "cap": row.get("cap"), "result": result, "shares": row.get("shares"), "price": row.get("price"),
-                "order_id": row.get("order_id"),
-                "detail": "partial" if row.get("partial") else ("" if result == "filled" else reason[:120])}
+                "order_id": row.get("order_id"), "detail": detail,
+                "window_ms": row.get("window_ms"), "fill_confirmed_ms": confirmed}
 
 
 class DashView:
@@ -1252,7 +1256,8 @@ class DashView:
                     "orders": sn.n["orders"], "filled": sn.n["filled"], "refused": sn.n["refused"],
                     "fill_rate": summary.get("fill_rate"), "markout_1s_c": summary.get("markout_1s_c"),
                     "markout_5s_c": summary.get("markout_5s_c"), "order_type": s.order_type, "slip": s.slip,
-                    "latency_ms": summary.get("latency_ms"), "errors": sn.n["errors"], "in_flight": sn.busy,
+                    "latency_ms": summary.get("latency_ms"), "errors": sn.n["errors"],
+                    "in_flight": "+".join(s for s, v in getattr(sn, "inflight", {}).items() if v) or None,
                     "last_signal_bp": last[1] if last else None,
                     "last_signal_age_s": now_wall - last[0] if last else None}
             skips = sorted(((k[6:], v) for k, v in sn.n.items() if k.startswith("skip: ") and v),

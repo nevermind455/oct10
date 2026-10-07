@@ -136,7 +136,9 @@ def _trigger_body(t: dict, w: int) -> list[Row]:
     window = _num(t.get("window_ms"))
     rows = [
         _runs([(fit("feed", 9), DIM), (" ", PAPER), (f"{feed} ", Style("ink", bold=True)),
-               (status, state_fg(status)), ("  busy" if t.get("in_flight") else "", Style("blue"))], w),
+               (status, state_fg(status)),
+               (f"  busy {t['in_flight']}" if isinstance(t.get("in_flight"), str) else "  busy" if t.get("in_flight")
+                else "", Style("blue"))], w),
         _line("BTC mid", f"{_num(t['mid']):,.2f}" if _num(t.get("mid")) is not None else MISSING, w,
               Style("ink", bold=True)),
         _runs([(fit("move", 9), DIM), (" ", PAPER), (bp(move), Style("red", bold=True) if hot else Style("ink")),
