@@ -52,10 +52,13 @@ fi
 say "1. code: branch $BRANCH in $APP"
 if [ -d "$APP/.git" ]; then
     remote="$(git -C "$APP" remote | head -n 1)"
-    git -C "$APP" fetch --quiet "$remote" "$BRANCH"
     current="$(git -C "$APP" rev-parse --abbrev-ref HEAD)"
     [ "$current" = "$BRANCH" ] || die "$APP is on branch $current, not $BRANCH"
-    if git -C "$APP" diff --quiet && git -C "$APP" diff --cached --quiet; then
+    if [ -z "$remote" ]; then
+        warn "$APP has no git remote: code not updated"
+    elif ! git -C "$APP" fetch --quiet "$remote" "$BRANCH"; then
+        warn "could not fetch $BRANCH from $remote: code not updated"
+    elif git -C "$APP" diff --quiet && git -C "$APP" diff --cached --quiet; then
         git -C "$APP" merge --ff-only --quiet "$remote/$BRANCH" || die "cannot fast-forward $APP to $remote/$BRANCH"
         ok "at $(git -C "$APP" rev-parse --short HEAD)"
     else
