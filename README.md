@@ -72,8 +72,8 @@ is left of trigger -> ACK is outside the process:
 **The frozen spec.** `--live` refuses to start unless the resolved settings are
 exactly the frozen spec (`exec_latency.FROZEN_SPEC`: Binance, 1.00bp in 250ms, FAK,
 ask+$0.04, 300ms per side, 10 shares, carry to 20) and `SNIPER_CANARY_MAX_SHARES`
-admits the 20-share carried target. A missing `.env` value used to fall back
-silently to a code default (`SNIPER_SLIP=0.02`, `SNIPER_K_BP=1.0`). Every
+admits the 20-share carried target. A missing `.env` value falls back to a code
+default; for the trigger and the limit those are the spec (1.0bp, ask+$0.04). Every
 start prints the resolved configuration and which ECDSA backend signs (install
 `coincurve`: ~0.1ms per order against ~1.4ms in pure Python).
 

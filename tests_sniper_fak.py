@@ -309,7 +309,7 @@ class FAKConfigurationTests(unittest.TestCase):
             self.assertEqual(settings.order_type, "FAK")
             # the cooldown default is 300ms per side (was one shared 1000ms)
             self.assertEqual((settings.k_bp, settings.window_ms, settings.slip, settings.cooldown_ms),
-                             (1, 250, 0.02, 300))
+                             (1, 250, 0.04, 300))
             os.environ["SNIPER_ORDER_TYPE"] = "FOK"
             self.assertEqual(S.Settings().order_type, "FOK")
         with patch.dict(os.environ, {}, clear=True):

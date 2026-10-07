@@ -1469,7 +1469,9 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved (latency audit, decisions unchanged - tests_latency replays old vs new): T1 stamped
     # when the rule fires; FastOrderBuilder stamps T3/T4 around the ECDSA step; order rows carry
     # lat (T0..T7, exec_latency), signal_mid and the outcome counts, all after the send.
-    "sniper_mode.py": "4246e74008d339a9fe3028476cc900a3e737b165438145022f3eb43318004a5b",
+    # Re-approved: the SNIPER_SLIP code default is the frozen spec's $0.04 (was $0.02), so a
+    # missing .env line no longer runs paper at ask + 2c; a set value still wins.
+    "sniper_mode.py": "93f3fa0c39914f7bbda2c3edca1c515a7f94b0f44fac2651c9d914993bde0000",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.

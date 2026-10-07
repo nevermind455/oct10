@@ -139,12 +139,17 @@ class FrozenSpec(unittest.TestCase):
             self.assertIn(word, str(ctx.exception))
             self.assertIn(var, str(ctx.exception))
 
-    def test_a_missing_value_falling_back_to_an_old_default_refuses_live(self):
-        with self.assertRaises(RuntimeError) as ctx:
-            self.gate(SNIPER_K_BP=None, SNIPER_SLIP=None)            # code defaults: 1.0bp (the spec), $0.02 (not)
-        msg = str(ctx.exception)
-        self.assertNotIn("SNIPER_K_BP", msg)
-        self.assertIn("SNIPER_SLIP unset (code default)", msg)
+    def test_a_missing_trigger_or_slip_falls_back_to_the_spec(self):
+        # the code defaults ARE the spec: 1.0bp, ask + $0.04 (the slip default was $0.02)
+        self.assertTrue(self.gate(SNIPER_K_BP=None, SNIPER_SLIP=None))
+        with patch.dict(os.environ, {"SNIPER_ONLY": "1"}, clear=True):
+            s = S.Settings()
+        self.assertEqual((s.k_bp, s.slip), (1.0, 0.04))
+
+    def test_a_missing_value_falling_back_to_a_non_spec_default_is_named(self):
+        with patch.dict(os.environ, {}, clear=True):                  # without SNIPER_ONLY the default is FOK
+            bad = X.spec_violations(S.Settings(), 25)
+        self.assertTrue(any("SNIPER_ORDER_TYPE unset (code default)" in b for b in bad), bad)
 
     def test_a_canary_cap_below_the_carried_target_refuses_live(self):
         with self.assertRaises(RuntimeError) as ctx:

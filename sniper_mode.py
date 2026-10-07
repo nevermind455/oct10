@@ -563,7 +563,8 @@ class Settings:
         self.k_bp = _env_float("SNIPER_K_BP", 1.0)
         self.window_ms = _env_float("SNIPER_WINDOW_MS", 250)
         self.shares = _env_float("SNIPER_SHARES", 10)
-        self.slip = _env_float("SNIPER_SLIP", 0.02)
+        # the frozen spec's limit (exec_latency.FROZEN_SPEC): the ask seen + $0.04 at most
+        self.slip = _env_float("SNIPER_SLIP", 0.04)
         # Set -> the old fixed delay, no signing. Unset -> live-like.
         self.fixed_latency = bool(str(os.environ.get("SNIPER_LATENCY_MS", "")).strip())
         self.latency_ms = _env_float("SNIPER_LATENCY_MS", 200)

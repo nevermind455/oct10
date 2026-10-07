@@ -1869,8 +1869,10 @@ def t_sniper_coinbase_second_trigger_shares_one_cooldown():
 
 def _fixed_sniper_settings(**env):
     """Old fixed-delay mode: these tests use fake token ids ("up") that the
-    real order signer would rightly refuse to build."""
+    real order signer would rightly refuse to build. Their caps are priced at
+    ask + 2c, set here (the code default is the spec's 4c)."""
     import sniper_mode
+    env = {"SNIPER_SLIP": "0.02", **env}
     keys = ("SNIPER_LATENCY_MS", *env)
     saved = {k: os.environ.get(k) for k in keys}
     os.environ["SNIPER_LATENCY_MS"] = "200"
