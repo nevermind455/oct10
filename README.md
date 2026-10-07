@@ -98,6 +98,12 @@ own pending orders. It buys only when a purchase measurably improves the positio
   allows. Off by default (`POSITION_MANAGER_EXPOSURE_MAX_PAIR_COST=0`): hedging is
   not free.
 
+Whatever a buy is for, the UP+DOWN pairs it creates must pay: if it adds pairs
+(paired after > paired before, even a fraction of one), their cost at the expected
+VWAP + fees + the other side's average must be within the pair threshold (or the
+operator's hedge allowance), else `PAIR_ECONOMICS_BAD`. A lower average never
+excuses pairs above it.
+
 Manager orders are **FOK** (fill-or-kill): the whole order at or under its limit,
 or nothing. The manager only proposes a size the book can fill in full within its
 price boundary.
@@ -113,13 +119,31 @@ Every non-trade has a reason (`IMPROVEMENT_TOO_SMALL`, `PAIR_ECONOMICS_BAD`,
 `SNIPER_PRIORITY`, ...), shown on the dashboard and in
 `<sniper journal>_manager.jsonl`.
 
-**The sniper comes first.**
-- The manager runs as its own task, never in the tick handler.
-- It sends nothing while a sniper order is in flight or within 300ms of one.
+**The sniper comes first.** Every rule is on the manager's side; the sniper's own
+path is unchanged.
+- **Its liquidity.** A manager buy must leave, within the sniper's own cap (best ask
+  + `SNIPER_SLIP`), at least the sniper's largest target (`SNIPER_MAX_TARGET_SHARES`),
+  else `SNIPER_LIQUIDITY_RESERVE`. So a manager fill that lands first cannot leave
+  the sniper's next order short - in a book that holds still. Not preventable: an
+  order already at the venue cannot be recalled, and the venue reserves no
+  liquidity (other traders can take what was left).
+- **Its instant.** Nothing is sent while a sniper order is in flight or within
+  300ms of one. The send is one synchronous step that re-checks this and that the
+  state the decision used has not changed (`SNIPER_PRIORITY`, `STATE_CHANGED`), and
+  the worker checks once more right before the order leaves (`CANCELLED`, nothing sent).
+- **Its event loop.** An evaluation captures its inputs in one short step, then
+  computes one candidate at a time and lets the sniper's ticks run in between.
 - In paper it has its own execution slot in the broker, so it can neither refuse
   nor delay a sniper order.
-- Measured with the sniper's own benchmark: trigger -> send is unchanged
-  (~0.53ms p50) while the manager evaluates 160 times a second.
+
+**Orders.** Each order carries its market, token, side, reservation id and order id
+for good, and settles into its own market's history (a late result from an old
+market never touches the new one). Settlement is idempotent. An order without an
+outcome after `POSITION_MANAGER_ORDER_TIMEOUT_S` (5) is `UNKNOWN`: it may have
+reached the venue, so its reservation stays counted and its side stays blocked -
+no retry - until the outcome arrives. A fill is never counted as filled and
+pending at once. The dashboard's manager averages include fees (`Avg+fees`); the
+positions table's `AVG` is the price paid without fees.
 
 **Live.** `POSITION_MANAGER_LIVE_ENABLED=1` refuses to start: real manager orders
 wait for the replay results to be reviewed. With `--live` and the engine on, it is

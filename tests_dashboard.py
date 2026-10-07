@@ -409,13 +409,22 @@ def test_execution_latency_and_quality_are_visible() -> None:
 def test_position_manager_panel() -> None:
     text = _text(build(populated(), 120, 60, UNICODE))
     check("the manager panel is drawn when its engine is on and there is room", "POSITION MANAGER" in text, text)
-    for label in ("Shares", "Average", "Cost", "Best Bid", "Best Ask", "Pending", "New Avg/Buy", "Opportunity",
-                  "Combined Avg", "Paired", "Unpaired UP", "Unpaired DOWN", "Total Cost", "Pending Exp", "Fees"):
+    for label in ("Shares", "Avg+fees", "Cost", "Best Bid", "Best Ask", "Pending", "New Avg+fees", "Opportunity",
+                  "Comb Avg+fees", "Paired", "Unpaired UP", "Unpaired DOWN", "Total Cost", "Pending Exp", "Fees"):
         check(f"manager shows {label}", label in text, label)
     check("each side's state and full reason are readable",
           "IMPROVEMENT_TOO_SMALL" in text and "PAIR_COST_IMPROVEMENT" in text and "BLOCKED" in text
           and "IMPROVE" in text, text)
     check("values are shown", "$0.4512" in text and "$0.9403" in text and "10.32" in text, text)
+    # a missing value says why, never a bare "--"
+    blanks = populated()
+    blanks["pm"]["sides"]["UP"].update(best_bid=None, best_ask=None, blank="STALE", state="BLOCKED", reason="STALE_BOOK")
+    blanks["pm"]["sides"]["DOWN"].update(best_bid=None, best_ask=None, blank="WAITING")
+    blanks["pm"]["unknown_orders"] = 1
+    bt = _text(build(blanks, 160, 60, UNICODE))
+    seg = bt[bt.find("POSITION MANAGER"):]
+    check("missing manager values say STALE / WAITING, not '--'", "STALE" in seg and "WAITING" in seg, seg[:400])
+    check("an UNKNOWN manager order is shown", "1 UNKNOWN" in bt, bt)
     live = _text(build(populated("LIVE"), 120, 60, UNICODE))
     check("live says the manager is shadow-only", "SHADOW (no orders)" in live, live)
     off = populated()

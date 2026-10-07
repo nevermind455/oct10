@@ -529,6 +529,12 @@ def collect(label, ledger, broker, sn, pm, m, curve, asset_side, rounds, results
             "by_status": dict(collections.Counter(o.status for o in pm.orders.values())),
             "skips": {k[5:]: v for k, v in pm.n.items() if k.startswith("skip ")},
             "slippage_c_avg": (lambda xs: sum(xs) / len(xs) if xs else None)([x for x, t in slip if t == "manager"]),
+            # orders whose NEW pairs cost more than the pair threshold at their decision (must be 0)
+            "bad_pairs": sum(1 for o in pm.orders.values()
+                             if (o.reason_row.get("new_pairs") or 0) > 1e-9
+                             and o.reason_row.get("incremental_pair_cost") is not None
+                             and o.reason_row["incremental_pair_cost"]
+                             > 1.0 - float(o.reason_row.get("threshold_pair") or 0.0) + 1e-9),
             "eval_us": pm.summary()["eval_us"]},
     }
     return out
@@ -551,7 +557,8 @@ def report(a: dict, b: dict, cmp: dict) -> str:
     f = lambda v, n=2: "--" if v is None else f"{v:,.{n}f}"  # noqa: E731
     rows = [("total P/L $", "total_pnl", 2), ("realized P/L $", "realized_pnl", 2), ("fees $", "fees", 2),
             ("avg slippage c/share", "slippage_c_avg", 2), ("capital deployed $", "capital_deployed", 2),
-            ("max exposure (open cost) $", "max_exposure", 2), ("max worst-case loss $", "max_worst_case_loss", 2),
+            ("max exposure (open cost) $", "max_exposure", 2), ("max one-side exposure $", "max_one_sided_exposure", 2),
+            ("max worst-case loss $", "max_worst_case_loss", 2),
             ("max drawdown $", "max_drawdown", 2), ("avg UP cost", "avg_up_cost", 4),
             ("avg DOWN cost", "avg_down_cost", 4), ("paired cost (UP+DOWN)", "paired_cost", 4),
             ("paired shares", "paired_shares", 2), ("unpaired shares", "unpaired_shares", 2),
@@ -568,6 +575,7 @@ def report(a: dict, b: dict, cmp: dict) -> str:
     dpl = b["total_pnl"] - a["total_pnl"]
     out += ["", f"rounds with a venue result: {a['rounds_with_result']}",
             f"manager orders {mg.get('orders')} by class {mg.get('by_class')} by status {mg.get('by_status')}",
+            f"manager orders creating pairs above the pair threshold: {mg.get('bad_pairs')}",
             f"manager capital ${f(src.get('cost', 0.0))}  manager fees ${f(src.get('fees', 0.0))}  "
             f"manager-attributable P/L ${f(src.get('pnl', 0.0))}  manager slippage c {f(mg.get('slippage_c_avg'))}",
             f"additional capital deployed ${f(extra_cap)}  P/L change ${f(dpl)}  "

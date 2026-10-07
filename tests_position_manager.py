@@ -29,7 +29,7 @@ import testing_env  # noqa: E402,F401 - first: tests never read the bot's .env
 import position_manager as PM  # noqa: E402
 import tests_paper as TP  # noqa: E402
 from accounting.ledger import Ledger  # noqa: E402
-from paper_trade import MarketRules  # noqa: E402
+from paper_trade import BookSnapshot, MarketRules  # noqa: E402
 
 FEE = PM.fee_curve(0.07, 1)                      # shares * 0.07 * p(1-p)
 CFG = PM.PMConfig(enabled=True)
@@ -524,6 +524,572 @@ class Startup(unittest.TestCase):
             PM.PMConfig.from_env({"POSITION_MANAGER_MAX_ORDER_USD": "x", "POSITION_MANAGER_EXPIRY_TIERS": "a:b"})
         self.assertIn("POSITION_MANAGER_MAX_ORDER_USD", str(ctx.exception))
         self.assertIn("POSITION_MANAGER_EXPIRY_TIERS", str(ctx.exception))
+
+
+# =========================================================================== audit fixes
+class FakeBook:
+    """hub.book for runtime cases: views built from levels set per token."""
+
+    def __init__(self, mono=time.monotonic):
+        self.v, self.mono, self.ver = {}, mono, 0
+
+    def set(self, token, asks, bid=None, status="LIVE"):
+        self.ver += 1
+        self.v[str(token)] = (tuple(asks), bid, status, self.mono() + self.ver * 1e-9)   # when it was updated
+
+    def view(self, token):
+        asks, bid, status, upd = self.v.get(str(token), ((), None, "UNSYNCED", None))
+        return types.SimpleNamespace(asks=asks, best_ask=asks[0][0] if asks else None,
+                                     best_bid=bid if bid is not None else (round(asks[0][0] - 0.01, 2) if asks else None),
+                                     status=status, updated_mono=upd)
+
+
+class World:
+    """A PositionManager over a real Ledger, fake books and any broker."""
+    RULES = MarketRules(COND, D("0.07"), 1, D("5"), D("0.01"))
+
+    def __init__(self, cfg=CFG, broker=None, sniper=None, left=250.0, live_mode=False):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.led = Ledger(path=os.path.join(self.tmp.name, "l.json"))
+        self.book = FakeBook()
+        self.hub = types.SimpleNamespace(up_token=UP_T, down_token=DN_T, condition_id=COND,
+                                         window_end=time.time() + left, book=self.book)
+        rules_b = MarketRules(COND_B, D("0.07"), 1, D("5"), D("0.01"))
+        self.broker = broker or types.SimpleNamespace()
+        self.broker._rules_cache = {COND: (self.RULES, time.time()), COND_B: (rules_b, time.time())}
+        if not hasattr(self.broker, "cash_balance"):
+            self.broker.cash_balance = lambda: 1000.0
+        self.pm = PM.PositionManager(cfg, hub=self.hub, ledger=self.led, broker=self.broker, sniper=sniper,
+                                     live_mode=live_mode)
+
+    def fill(self, tid, token, shares, price, cond=COND, fee=0.0):
+        assert self.led.record_fill(tid, token, shares=shares, price=price, condition_id=cond, fee=fee)
+
+    def close(self):
+        self.pm.journal.close()
+        self.tmp.cleanup()
+
+
+COND_B, UP_B, DN_B = "0x" + "cd" * 32, "333", "444"
+
+
+def fake_sniper(target=20.0, slip=0.05):
+    """The sniper's state as the manager reads it (settings + in-flight + last send)."""
+    return types.SimpleNamespace(s=types.SimpleNamespace(max_target_shares=target, shares=10.0, slip=slip,
+                                                         order_type="FAK", stale_ms=2000.0),
+                                 inflight={"UP": None, "DOWN": None},
+                                 last_fire_by_side={"UP": -1e18, "DOWN": -1e18})
+
+
+class BadPairsThroughSideAvg(unittest.TestCase):
+    """FIX 1: no classification bypasses the economics of the pairs a buy creates."""
+
+    def test_the_audit_reproduction_is_rejected(self):
+        # UP 20 @0.59, DOWN 10 @0.85, DOWN ask 0.73: a lower DOWN average, new pairs at ~1.33
+        p = port(up=side(20, 0.59), down=side(10, 0.85, asks=((0.73, 100),)))
+        d = evaluate("DOWN", p)
+        self.assertNotEqual(d.action, "BUY")
+        self.assertEqual(d.reason, "PAIR_ECONOMICS_BAD")
+        for q in (5.0, 10.0):
+            c = PM.Engine(CFG)._candidate("DOWN", p, p.down, p.up, q, 0.75, FEE, 0.03, 0.02, PM.MarketHistory(), 1e3)
+            self.assertGreater(c.metrics["avg_improvement"], 0.03)          # the average does improve ...
+            self.assertGreater(c.metrics["incremental_pair_cost"], 1.3)       # ... at ~1.33 a pair
+            self.assertEqual((c.action, c.reason), ("BLOCKED", "PAIR_ECONOMICS_BAD"))
+
+    def test_fractional_new_pairs_are_checked_too(self):
+        # paired 20 -> 20.5: half a new pair, still at ~1.33 - previously below min_new_pairs, unchecked
+        p = port(up=side(20.5, 0.59), down=side(20, 0.85, asks=((0.73, 100),)))
+        c = PM.Engine(PERMISSIVE)._candidate("DOWN", p, p.down, p.up, 5.0, 0.75, FEE, 0.03, 0.02, PM.MarketHistory(), 1e3)
+        self.assertAlmostEqual(c.metrics["new_pairs"], 0.5)
+        self.assertEqual(c.reason, "PAIR_ECONOMICS_BAD")
+
+    def test_the_threshold_is_the_configured_one_with_vwap_and_fees(self):
+        # new pairs at 0.40 VWAP + fees (0.0168) + UP 0.57 = 0.9868: over 1 - 0.02, under $1
+        p = port(up=side(20, 0.57), down=side(10, 0.50, asks=((0.40, 100),)))
+        c = PM.Engine(CFG)._candidate("DOWN", p, p.down, p.up, 10.0, 0.42, FEE, 0.03, 0.02, PM.MarketHistory(), 1e3)
+        self.assertGreater(c.metrics["incremental_pair_cost"], 0.98)
+        self.assertLess(c.metrics["incremental_pair_cost"], 1.0)
+        self.assertEqual(c.reason, "PAIR_ECONOMICS_BAD")                    # not the hard-coded $1
+        loose = PM.Engine(replace(CFG, min_pair_improvement=0.0))._candidate(
+            "DOWN", p, p.down, p.up, 10.0, 0.42, FEE, 0.03, 0.0, PM.MarketHistory(), 1e3)
+        self.assertNotEqual(loose.reason, "PAIR_ECONOMICS_BAD")             # a looser configured threshold admits it
+
+    def test_good_pairs_and_the_opt_in_hedge_still_pass(self):
+        good = evaluate("DOWN", port(up=side(20, 0.45), down=side(0, None, asks=((0.49, 100),))))
+        self.assertEqual((good.action, good.classification), ("BUY", "PAIR_COST_IMPROVEMENT"))
+        hedge_cfg = replace(PERMISSIVE, exposure_max_pair_cost=1.40, exposure_min_loss_cut_usd=0.5)
+        p = port(up=side(20, 0.59), down=side(10, 0.85, asks=((0.73, 100),)))
+        d = evaluate("DOWN", p, hedge_cfg)
+        self.assertEqual(d.action, "BUY")                                   # the operator allowed that hedge cost
+
+    def test_a_buy_that_creates_no_pairs_is_unaffected(self):
+        p = port(down=side(20, 0.60, asks=((0.20, 100),)))                  # audit #7: only DOWN held
+        self.assertEqual(evaluate("DOWN", p).reason, "AVG_IMPROVES_BUT_RISK_REJECTED")
+
+
+class SniperLiquidity(unittest.TestCase):
+    """FIX 2: the manager yields the sniper's liquidity and its instant."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def paper(self, levels):
+        """The real PaperBroker over a fixed UP book (production own-fill memory: 2s)."""
+        snap = BookSnapshot("up", tuple((D(str(p)), D(str(q))) for p, q in levels), tick_size=D("0.01"),
+                            timestamp=str(int(time.time() * 1000)), book_hash="h", received_wall=time.time(),
+                            best_bid=D("0.49"))
+        b = TP._broker(self.tmp.name, balance=1000, selected_book=snap,
+                       context={"condition_id": "cond", "up_token_id": "up", "down_token_id": "down"})
+        b.own_fill_ttl_s = 2.0
+        return b
+
+    def manager_decides(self, levels, sniper):
+        """The manager's decision for UP on that book: 10 DOWN @0.40 to pair."""
+        w = World(cfg=CFG, sniper=sniper)
+        w.fill("d", DN_T, 10, 0.40)
+        w.book.set(UP_T, levels)
+        w.book.set(DN_T, [(0.61, 100)])
+        dec = w.pm.evaluate()
+        return w, dec["UP"]
+
+    def sniper_order(self, b, target=10.0):
+        ask = float(b._net_of_own_fills(b._book_fetch("up")).asks[0][0])
+        import sniper_mode
+        cap = round(ask + 0.05, 4)
+        levels = [(float(p), float(q)) for p, q in b._net_of_own_fills(b._book_fetch("up")).asks]
+        amount = max(sniper_mode.Sniper.ioc_spend(levels, target, ask, cap), 1.0)
+        ok = b.place_trade("UP", amount, "up", "down", "cond", TP.round_end(), cap, None, tag="sniper", fak=True)
+        return ok, (b.last_fill or {}).get("shares", 0.0)
+
+    def test_reserve_rule(self):
+        sn = fake_sniper()
+        thin = evaluate("UP", port(down=side(10, 0.40), up=side(0, None, asks=((0.50, 10), (0.60, 100)))), CFG)
+        self.assertEqual(thin.action, "BUY")                                # without the sniper attached ...
+        w, d = self.manager_decides([(0.50, 10), (0.60, 100)], sn)
+        self.assertEqual(d.reason, "SNIPER_LIQUIDITY_RESERVE")              # ... with it: yields the 10 shares
+        w.close()
+        w, d = self.manager_decides([(0.50, 40), (0.60, 100)], sn)
+        self.assertEqual(d.action, "BUY")                                   # 40 - 10 leaves the sniper's 20
+        self.assertGreaterEqual(d.metrics["sniper_depth"] - d.fill.qty, 20.0)
+        w.close()
+
+    def test_manager_qualifies_first_then_the_sniper_fires(self):
+        # thin book: the manager no longer takes the 10 shares; the sniper gets all of them
+        w, d = self.manager_decides([(0.50, 10), (0.60, 100)], fake_sniper())
+        self.assertNotEqual(d.action, "BUY")
+        b = self.paper([(0.50, 10), (0.60, 100)])
+        ok, got = self.sniper_order(b)
+        self.assertTrue(ok)
+        self.assertAlmostEqual(got, 10.0)
+        w.close()
+        # deep book: the manager buys first, the sniper still fills its whole target
+        w, d = self.manager_decides([(0.50, 40), (0.60, 100)], fake_sniper())
+        self.assertEqual(d.action, "BUY")
+        b = self.paper([(0.50, 40), (0.60, 100)])
+        self.assertTrue(b.place_trade("UP", d.stake, "up", "down", "cond", TP.round_end(), d.limit, None,
+                                      tag="manager", fak=False))
+        ok, got = self.sniper_order(b, target=20.0)
+        self.assertTrue(ok)
+        self.assertAlmostEqual(got, 20.0)
+        w.close()
+
+    def test_sniper_qualifies_first_then_the_manager(self):
+        sn = fake_sniper()
+        sn.inflight["UP"] = {"end": 1}
+        w, d = self.manager_decides([(0.50, 40), (0.60, 100)], sn)
+        self.assertEqual(d.reason, "SNIPER_PRIORITY")
+        w.close()
+
+    def test_simultaneous_eligibility_the_send_rechecks(self):
+        sn = fake_sniper()
+        w, d = self.manager_decides([(0.50, 40), (0.60, 100)], sn)
+        self.assertEqual(d.action, "BUY")                                   # decided ...
+        sn.last_fire_by_side["UP"] = time.monotonic() * 1000.0              # ... the sniper fires before the send
+
+        async def go():
+            return w.pm._dispatch(d, asyncio.get_running_loop())
+        self.assertIsNone(asyncio.run(go()))
+        self.assertEqual(d.reason, "SNIPER_PRIORITY")
+        self.assertEqual(w.pm.orders, {})                                   # nothing reserved, nothing leaked
+        self.assertFalse(w.pm.hist.sides["UP"].in_flight)
+        w.close()
+
+    def test_manager_order_preparing_then_the_sniper_fires(self):
+        sn = fake_sniper()
+        calls = []
+        broker = types.SimpleNamespace(place_trade=lambda *a, **k: calls.append(k) or True, last_fill=None,
+                                       last_error=None)
+        w = World(cfg=CFG, sniper=sn, broker=broker)
+        w.fill("d", DN_T, 10, 0.40)
+        w.book.set(UP_T, [(0.50, 40), (0.60, 100)])
+        w.book.set(DN_T, [(0.61, 100)])
+        d = w.pm.choose(w.pm.evaluate())
+        o = w.pm.reserve(d)                                                 # reserved, handed to the worker ...
+        sn.inflight["UP"] = {"end": 1}                                      # ... the sniper fires
+        ok, fill, err = w.pm._execute_paper(d, COND, UP_T, DN_T, w.hub.window_end, o=o)
+        w.pm._finish(o)
+        self.assertEqual(calls, [])                                         # nothing was sent
+        self.assertEqual((o.status, o.filled_qty), ("CANCELLED", 0.0))
+        self.assertFalse(w.pm.hist.sides["UP"].in_flight)
+        self.assertAlmostEqual(w.pm.hist.spend, 0.0)
+        sn.inflight["UP"] = None
+        sn.last_fire_by_side["UP"] = -1e18
+        self.assertEqual(w.pm.portfolio(COND, UP_T, DN_T).up.pending_shares, 0.0)
+        w.close()
+
+    def test_manager_order_already_dispatched_then_the_sniper_fires(self):
+        # Once sent it cannot be recalled (a FOK executes or dies on arrival); the
+        # reserve is what keeps the sniper whole in a book that holds still.
+        w, d = self.manager_decides([(0.50, 30), (0.60, 100)], fake_sniper())
+        self.assertEqual(d.action, "BUY")
+        b = self.paper([(0.50, 30), (0.60, 100)])
+        self.assertTrue(b.place_trade("UP", d.stake, "up", "down", "cond", TP.round_end(), d.limit, None,
+                                      tag="manager", fak=False))            # lands first
+        ok, got = self.sniper_order(b, target=20.0)
+        self.assertEqual((ok, got), (True, 20.0))
+        w.close()
+        # NOT preventable: another trader takes the reserve after the decision - the
+        # venue reserves nothing. The sniper then gets what is left, no more.
+        b = self.paper([(0.50, 15), (0.60, 100)])
+        self.assertTrue(b.place_trade("UP", d.stake, "up", "down", "cond", TP.round_end(), d.limit, None,
+                                      tag="manager", fak=False))
+        ok, got = self.sniper_order(b, target=20.0)
+        self.assertTrue(ok)
+        self.assertLess(got, 20.0)
+
+
+class MarketTransition(unittest.TestCase):
+    """FIX 3: an order settles into ITS market's history."""
+
+    def test_a_late_market_a_result_leaves_market_b_alone(self):
+        w = World()
+        w.fill("a1", UP_T, 20, 0.40)
+        w.book.set(UP_T, [(0.45, 100)])
+        w.book.set(DN_T, [(0.50, 100)])
+        dA = w.pm.choose(w.pm.evaluate())
+        oA = w.pm.reserve(dA)
+        self.assertEqual((oA.condition_id, oA.token_id, oA.side, oA.reservation_id, oA.source),
+                         (COND, DN_T, "DOWN", 1, "POSITION_MANAGER"))
+        self.assertTrue(oA.market_id.startswith(COND + "@"))
+        # A expires, B begins, B creates a DOWN pending order
+        w.hub.up_token, w.hub.down_token, w.hub.condition_id = UP_B, DN_B, COND_B
+        w.hub.window_end = time.time() + 280
+        w.book.set(UP_B, [(0.45, 100)])
+        w.book.set(DN_B, [(0.50, 100)])
+        w.fill("b1", UP_B, 40, 0.40, cond=COND_B)
+        dB = w.pm.choose(w.pm.evaluate())
+        oB = w.pm.reserve(dB)
+        hB = w.pm.hist
+        before = (hB.spend, hB.orders, hB.sides["DOWN"].in_flight, hB.sides["DOWN"].orders,
+                  hB.sides["DOWN"].last_buy_price, w.pm.portfolio(COND_B, UP_B, DN_B).down.pending_shares,
+                  w.pm.portfolio(COND_B, UP_B, DN_B).down.shares)
+        # the old A response arrives (it filled)
+        w.fill("manager-a", DN_T, dA.fill.qty, dA.fill.vwap, fee=dA.fill.fees)
+        w.pm.settle_order(oA, ok=True, fill={"order_id": "manager-a", "shares": dA.fill.qty,
+                                             "average_price": dA.fill.vwap, "fee": dA.fill.fees,
+                                             "total_cost": dA.fill.cost}, error=None)
+        after = (hB.spend, hB.orders, hB.sides["DOWN"].in_flight, hB.sides["DOWN"].orders,
+                 hB.sides["DOWN"].last_buy_price, w.pm.portfolio(COND_B, UP_B, DN_B).down.pending_shares,
+                 w.pm.portfolio(COND_B, UP_B, DN_B).down.shares)
+        self.assertEqual(before, after)                                     # B's spend, pending, inventory, counts
+        hA = w.pm.histories[COND]
+        self.assertFalse(hA.sides["DOWN"].in_flight)                        # A's own history took it
+        self.assertAlmostEqual(hA.spend, dA.fill.cost)
+        self.assertEqual(w.pm.evaluate()["DOWN"].reason, "ORDER_PENDING")   # no duplicate B order
+        self.assertEqual(oB.status, "PENDING")
+        w.close()
+
+
+class SlowBroker:
+    """A paper-like broker whose call returns when the test says: books the
+    fill into the ledger right after the pre-submit guard, as PaperBroker does."""
+
+    def __init__(self, ledger, *, shares, price, partial=False, delay=None, guard=True):
+        self.ledger, self.shares, self.price, self.partial = ledger, shares, price, partial
+        self.release, self.delay, self.use_guard = threading.Event(), delay, guard
+        self.calls, self._t = 0, threading.local()
+
+    last_fill = property(lambda self: getattr(self._t, "fill", None))
+    last_error = property(lambda self: getattr(self._t, "err", None))
+
+    def cash_balance(self):
+        return 1000.0
+
+    def place_trade(self, side, amount, up, down, cond, end, limit, _min, *, latency_ms=None, tag=None, fak=False,
+                    pre_submit_guard=None):
+        self.calls += 1
+        if self.delay is not None:
+            time.sleep(self.delay)
+        else:
+            self.release.wait(10)
+        self._t.fill, self._t.err = None, None
+        if self.use_guard and pre_submit_guard is not None and not pre_submit_guard():
+            self._t.err = "pre-submit guard rejected order"
+            return False
+        if not self.shares:
+            self._t.err = "FOK no-fill: nothing"
+            return False
+        oid = f"slow-{self.calls}"
+        token = up if side == "UP" else down
+        self.ledger.record_fill(oid, token, shares=self.shares, price=self.price, condition_id=cond, fee=0.0)
+        self._t.fill = {"order_id": oid, "shares": self.shares, "average_price": self.price, "fee": 0.0,
+                        "total_cost": self.shares * self.price, "partial": self.partial, "tag": tag}
+        return True
+
+
+class Timeouts(unittest.TestCase):
+    """FIX 4: no outcome by order_timeout_s -> UNKNOWN, reservation kept, no retry."""
+    # a long cooldown: after the outcome lands, no follow-up order inside the test's window
+    CFG_T = replace(CFG, poll_ms=5.0, order_timeout_s=0.15, cooldown_ms=60_000.0)
+
+    def run_case(self, broker_kw, *, wait_s, release_at=None, switch_market_at=None):
+        w = World(cfg=self.CFG_T)
+        broker = SlowBroker(w.led, **broker_kw)
+        broker._rules_cache = w.broker._rules_cache
+        w.pm.broker = broker
+        w.fill("s", UP_T, 20, 0.40)
+        w.book.set(UP_T, [(0.45, 100)])
+        w.book.set(DN_T, [(0.50, 100)])
+        seen = {}
+
+        async def go():
+            w.pm.start()
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < wait_s:
+                await asyncio.sleep(0.01)
+                el = time.monotonic() - t0
+                o = next(iter(w.pm.orders.values()), None)
+                if o is not None and o.status == "UNKNOWN" and "unknown" not in seen:
+                    p = w.pm.portfolio(COND, UP_T, DN_T)
+                    seen["unknown"] = (p.down.pending_shares if p else None, w.pm.hist.sides["DOWN"].in_flight)
+                if switch_market_at is not None and el >= switch_market_at and "switched" not in seen:
+                    seen["switched"] = True
+                    w.hub.up_token, w.hub.down_token, w.hub.condition_id = UP_B, DN_B, COND_B
+                    w.book.set(UP_B, [(0.45, 100)])
+                    w.book.set(DN_B, [(0.50, 100)])
+                if release_at is not None and el >= release_at:
+                    broker.release.set()
+            await asyncio.sleep(0.05)
+            await w.pm.stop()
+            broker.release.set()                                            # never-returning calls end here
+        asyncio.run(go())
+        return w, broker, seen
+
+    def test_a_request_that_never_returns_is_unknown_and_keeps_its_reservation(self):
+        w, broker, seen = self.run_case(dict(shares=10, price=0.50), wait_s=0.6)
+        o = w.pm.orders[1]
+        self.assertIn("unknown", seen)
+        self.assertEqual(seen["unknown"], (o.requested_qty, True))           # still counted, side still in flight
+        self.assertEqual(broker.calls, 1)                                   # never retried
+        self.assertEqual(len(w.pm.orders), 1)
+        w.close()
+
+    def test_an_ack_before_the_timeout_is_ordinary(self):
+        w, broker, seen = self.run_case(dict(shares=10, price=0.50, delay=0.02), wait_s=0.4)
+        o = w.pm.orders[1]
+        self.assertNotIn("unknown", seen)
+        self.assertEqual(o.status, "FILLED")
+        w.close()
+
+    def test_an_ack_after_the_timeout_settles_the_unknown_order_once(self):
+        w, broker, seen = self.run_case(dict(shares=10, price=0.50), wait_s=0.6, release_at=0.35)
+        o = w.pm.orders[1]
+        self.assertIn("unknown", seen)
+        self.assertEqual(o.status, "FILLED")
+        p = w.pm.portfolio(COND, UP_T, DN_T)
+        self.assertEqual((p.down.shares, p.down.pending_shares), (10.0, 0.0))   # once: filled, nothing pending
+        self.assertAlmostEqual(w.pm.histories[COND].spend, 5.0)
+        w.close()
+
+    def test_partial_fill_before_and_after_the_timeout(self):
+        for kw in (dict(delay=0.02), dict(release_at=0.35)):
+            release_at = kw.pop("release_at", None)
+            w, broker, seen = self.run_case(dict(shares=4.25, price=0.50, partial=True, **kw), wait_s=0.6,
+                                            release_at=release_at)
+            o = w.pm.orders[1]
+            self.assertEqual((o.status, o.filled_qty), ("PARTIAL", 4.25))
+            p = w.pm.portfolio(COND, UP_T, DN_T)
+            self.assertEqual((p.down.shares, p.down.pending_shares), (4.25, 0.0))
+            self.assertEqual("unknown" in seen, release_at is not None)
+            w.close()
+
+    def test_the_market_changes_while_an_order_is_unknown(self):
+        # the order already reached the venue (no broker-side guard): it fills late, in A
+        w, broker, seen = self.run_case(dict(shares=10, price=0.50, guard=False), wait_s=0.7,
+                                        switch_market_at=0.25, release_at=0.45)
+        o = w.pm.orders[1]
+        self.assertIn("unknown", seen)
+        self.assertEqual(o.status, "FILLED")
+        self.assertEqual(o.condition_id, COND)
+        self.assertFalse(w.pm.histories[COND].sides["DOWN"].in_flight)       # A's history settled
+        self.assertAlmostEqual(w.pm.histories[COND_B].spend, 0.0)             # B untouched
+        pB = w.pm.portfolio(COND_B, UP_B, DN_B)
+        self.assertEqual((pB.down.shares, pB.down.pending_shares), (0.0, 0.0))
+        w.close()
+
+
+class BookingWindow(unittest.TestCase):
+    """FIX 5: filled + still-pending is never counted twice."""
+
+    def run_booking(self, shares, partial):
+        w = World()
+        w.fill("s", UP_T, 20, 0.40)
+        w.book.set(UP_T, [(0.45, 100)])
+        w.book.set(DN_T, [(0.50, 100)])
+        d = w.pm.choose(w.pm.evaluate())
+        o = w.pm.reserve(d)
+        seen = {}
+
+        def place_trade(side, amount, up, down, cond, end, limit, _m, *, pre_submit_guard=None, **_k):
+            self.assertTrue(pre_submit_guard())
+            seen["guard"] = w.pm.portfolio(COND, UP_T, DN_T)             # booking under way: not readable
+            w.led.record_fill("p1", DN_T, shares=shares, price=0.50, condition_id=COND, fee=0.0)
+            seen["booked"] = w.pm.portfolio(COND, UP_T, DN_T)            # in the ledger, outcome not on the order yet
+            broker.last_fill = {"order_id": "p1", "shares": shares, "average_price": 0.5, "fee": 0.0,
+                                "total_cost": shares * 0.5, "partial": partial}
+            return True
+        broker = w.pm.broker
+        broker.place_trade, broker.last_error = place_trade, None
+        w.pm._execute_paper(d, COND, UP_T, DN_T, w.hub.window_end, o=o)
+        after = w.pm.portfolio(COND, UP_T, DN_T)                          # the loop's _finish has NOT run yet
+        w.close()
+        return d, seen, after
+
+    def test_full_and_partial_fills_under_a_delayed_callback(self):
+        for shares, partial in ((None, False), (4.25, True)):
+            with self.subTest(partial=partial):
+                d, seen, after = self.run_booking(shares or 10.0, partial)
+                got = shares or 10.0
+                self.assertIsNone(seen["guard"])
+                self.assertIsNone(seen["booked"])
+                self.assertEqual((after.down.shares, after.down.pending_shares), (got, 0.0))
+
+    def test_a_booking_that_starts_while_the_ledger_is_read_voids_the_read(self):
+        w = World()
+        w.fill("s", UP_T, 20, 0.40)
+        w.book.set(UP_T, [(0.45, 100)])
+        w.book.set(DN_T, [(0.50, 100)])
+        o = w.pm.reserve(w.pm.choose(w.pm.evaluate()))
+
+        class Trap(dict):
+            def values(inner):
+                with w.pm._olock:                       # what the pre-submit guard does, mid-read
+                    o.booking = True
+                    w.pm._epoch += 1
+                return dict.values(inner)
+        w.led.positions = Trap(w.led.positions)
+        self.assertIsNone(w.pm.portfolio(COND, UP_T, DN_T))
+        self.assertEqual(w.pm.busy_reason, "BOOKING_IN_PROGRESS")
+        w.close()
+
+
+class EventLoopSlices(unittest.TestCase):
+    """FIX 6: an evaluation holds the loop for one candidate at a time, never acts on stale state."""
+
+    def test_steps_yield_between_candidates_and_match_the_whole_evaluation(self):
+        w = World()
+        w.fill("s", UP_T, 20, 0.40)
+        w.book.set(UP_T, [(0.45, 100)])
+        w.book.set(DN_T, [(0.50, 100)])
+        steps, n = w.pm.evaluate_steps(), 0
+        while True:
+            try:
+                next(steps)
+                n += 1
+            except StopIteration as stop:
+                sliced = stop.value
+                break
+        whole = w.pm.evaluate()
+        self.assertGreater(n, 4)                                            # the loop gets control back n times
+        self.assertEqual({s: (d.action, d.reason, d.size) for s, d in sliced.items()},
+                         {s: (d.action, d.reason, d.size) for s, d in whole.items()})
+        w.close()
+
+    def test_a_state_change_between_snapshot_and_send_blocks_the_send(self):
+        w = World()
+        w.fill("s", UP_T, 20, 0.40)
+        w.book.set(UP_T, [(0.45, 100)])
+        w.book.set(DN_T, [(0.50, 100)])
+        d = w.pm.choose(w.pm.evaluate())
+        w.book.set(DN_T, [(0.50, 3), (0.70, 100)])                          # the book moved after the snapshot
+
+        async def go():
+            return w.pm._dispatch(d, asyncio.get_running_loop())
+        self.assertIsNone(asyncio.run(go()))
+        self.assertEqual(d.reason, "STATE_CHANGED")
+        self.assertEqual(w.pm.orders, {})
+        w.close()
+
+
+    def test_a_fill_booked_while_the_state_is_read_blocks_the_send(self):
+        # the sniper's worker books a fill DURING the manager's ledger read: the version
+        # was taken before the read, so the send sees the change and drops the decision
+        w = World()
+        w.fill("s", UP_T, 20, 0.40)
+        w.book.set(UP_T, [(0.45, 100)])
+        w.book.set(DN_T, [(0.50, 100)])
+        booked = []
+
+        class Trap(dict):
+            def values(inner):
+                if not booked:
+                    booked.append(1)
+                    w.led.record_fill("sniper-x", UP_T, shares=5, price=0.45, condition_id=COND, fee=0.0)
+                return dict.values(inner)
+        w.led.positions = Trap(w.led.positions)
+        d = w.pm.choose(w.pm.evaluate())
+        self.assertIsNotNone(d)
+
+        async def go():
+            return w.pm._dispatch(d, asyncio.get_running_loop())
+        self.assertIsNone(asyncio.run(go()))
+        self.assertEqual(d.reason, "STATE_CHANGED")
+        self.assertEqual(w.pm.orders, {})
+        w.close()
+
+
+class Hardening(unittest.TestCase):
+    def test_settlement_is_idempotent(self):
+        w = World()
+        w.fill("s", UP_T, 20, 0.40)
+        w.book.set(UP_T, [(0.45, 100)])
+        w.book.set(DN_T, [(0.50, 100)])
+        o = w.pm.reserve(w.pm.choose(w.pm.evaluate()))
+        f = {"order_id": "m1", "shares": o.requested_qty, "average_price": 0.5, "fee": 0.1,
+             "total_cost": o.requested_qty * 0.5 + 0.1}
+        w.pm.settle_order(o, ok=True, fill=f, error=None)
+        state = (w.pm.hist.spend, dict(w.pm.n), w.pm.hist.sides["DOWN"].last_done_mono, o.status, o.cost)
+        w.pm.settle_order(o, ok=True, fill=f, error=None)
+        w.pm.settle_order(o, ok=False, fill=None, error="late duplicate")
+        self.assertEqual((w.pm.hist.spend, dict(w.pm.n), w.pm.hist.sides["DOWN"].last_done_mono, o.status, o.cost),
+                         state)
+        w.close()
+
+    def test_a_busy_ledger_is_its_own_reason_not_insufficient_balance(self):
+        w = World()
+        w.fill("s", UP_T, 20, 0.40)
+        w.book.set(UP_T, [(0.45, 100)])
+        w.book.set(DN_T, [(0.50, 100)])
+        held, go = threading.Event(), threading.Event()
+
+        def hold():
+            with w.led._lock:
+                held.set()
+                go.wait(5)
+        t = threading.Thread(target=hold)
+        t.start()
+        held.wait(5)
+        try:
+            dec = w.pm.evaluate()
+        finally:
+            go.set()
+            t.join()
+        self.assertEqual({d.reason for d in dec.values()}, {"LEDGER_BUSY"})
+        self.assertIs(w.pm._cash_free() is PM._BUSY, False)                # free again now
+        w.close()
 
 
 if __name__ == "__main__":

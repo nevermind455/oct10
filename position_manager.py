@@ -23,7 +23,27 @@ possible loss is AVG_IMPROVES_BUT_RISK_REJECTED.
 Never in the sniper's path. It runs as its own task, reads state without
 waiting for a lock, yields to the sniper (no order while a sniper order is in
 flight or right after one), keeps a cash reserve for the sniper, and in paper
-uses its own execution slot in the broker (tag "manager"). Off by default:
+uses its own execution slot in the broker (tag "manager").
+
+The sniper comes first, in three places, all on the manager's side (the
+sniper's own path is untouched):
+    - liquidity: a manager buy must leave, within the sniper's own price cap
+      (best ask + SNIPER_SLIP), at least the sniper's largest target
+      (SNIPER_MAX_TARGET_SHARES) - else SNIPER_LIQUIDITY_RESERVE;
+    - the send: decided orders are sent in one synchronous step that re-checks
+      the sniper is idle and the state unchanged (SNIPER_PRIORITY,
+      STATE_CHANGED), and once more on the worker before the order leaves
+      (CANCELLED, nothing sent);
+    - the event loop: an evaluation captures its inputs once, then computes
+      one candidate at a time, letting the sniper's ticks run in between.
+What cannot be prevented: an order that has reached the venue cannot be
+recalled, and the venue reserves no liquidity - other traders can still take
+what the reserve left for the sniper.
+
+An order without an outcome after order_timeout_s is UNKNOWN (reconciliation
+required) - never assumed unfilled: its reservation stays counted and its side
+in flight, with no retry, until the outcome arrives. Every order carries its
+market for good and settles into that market's history. Off by default:
 
     POSITION_MANAGER_ENABLED=1        calculations, dashboard, paper orders
     POSITION_MANAGER_LIVE_ENABLED=1   real manager orders - NOT implemented until
@@ -48,6 +68,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import functools
 import json
 import math
 import os
@@ -64,7 +85,9 @@ REASONS = ("PRICE_NOT_BETTER", "IMPROVEMENT_TOO_SMALL", "PAIR_ECONOMICS_BAD", "A
            "MAX_EXPOSURE", "MAX_MANAGER_SPEND", "MAX_ORDERS", "MAX_SIDE_INVENTORY", "INSUFFICIENT_LIQUIDITY",
            "SLIPPAGE_TOO_HIGH", "TOO_CLOSE_TO_EXPIRY", "ORDER_PENDING", "COOLDOWN", "REARM_REQUIRED", "STALE_BOOK",
            "MARKET_INACTIVE", "SNIPER_PRIORITY", "INSUFFICIENT_BALANCE", "NOTHING_TO_MANAGE", "RULES_NOT_LOADED",
-           "DISABLED")
+           "DISABLED", "SNIPER_LIQUIDITY_RESERVE", "LEDGER_BUSY", "BOOKING_IN_PROGRESS", "STATE_CHANGED")
+OPEN_STATUSES = ("PENDING", "UNKNOWN")       # a reservation still counted as exposure
+_BUSY = object()                             # the ledger is held right now: no decision
 SIDES = ("UP", "DOWN")
 EPS = 1e-9
 
@@ -111,6 +134,7 @@ class PMConfig:
     score_capital_weight: float = 0.01
     poll_ms: float = 100.0
     skip_log_s: float = 5.0
+    order_timeout_s: float = 5.0              # no outcome by then: UNKNOWN (never assumed unfilled)
 
     @classmethod
     def from_env(cls, env=None, *, global_max_buy_price: float | None = None,
@@ -132,7 +156,7 @@ class PMConfig:
             "side_avg_min_gain_per_usd": "SIDE_AVG_MIN_GAIN_PER_USD",
             "pair_max_added_loss_usd": "PAIR_MAX_ADDED_LOSS_USD", "exposure_max_pair_cost": "EXPOSURE_MAX_PAIR_COST",
             "exposure_min_loss_cut_usd": "EXPOSURE_MIN_LOSS_CUT_USD", "sniper_quiet_ms": "SNIPER_QUIET_MS",
-            "sniper_cash_reserve_usd": "SNIPER_CASH_RESERVE_USD",
+            "sniper_cash_reserve_usd": "SNIPER_CASH_RESERVE_USD", "order_timeout_s": "ORDER_TIMEOUT_S",
         }
         values, bad = {}, []
         for attr, suffix in names.items():
@@ -183,7 +207,9 @@ class PMConfig:
                        f"{self.max_up_shares:g}/{self.max_down_shares:g} sh, exposure ${self.max_total_exposure_usd:g}, "
                        f"{self.max_orders} orders ({self.max_orders_per_side}/side); improvement >= "
                        f"{self.min_avg_improvement:g} avg / {self.min_pair_improvement:g} pair; slippage <= "
-                       f"{self.max_slippage:g}; cooldown {self.cooldown_ms:g}ms; >= {self.min_left_s:g}s left")
+                       f"{self.max_slippage:g}; cooldown {self.cooldown_ms:g}ms; >= {self.min_left_s:g}s left; "
+                       f"order timeout {self.order_timeout_s:g}s (then UNKNOWN); leaves the sniper's max target "
+                       f"inside its cap")
         return out
 
 
@@ -368,6 +394,9 @@ class MarketHistory:
     spend: float = 0.0
     sides: dict = field(default_factory=lambda: {s: SideHistory() for s in SIDES})
 
+    def copy(self) -> "MarketHistory":
+        return MarketHistory(self.condition, self.orders, self.spend, {k: replace(v) for k, v in self.sides.items()})
+
 
 class Engine:
     """The decision: pure, no I/O, no clock of its own - every input passed in."""
@@ -383,8 +412,21 @@ class Engine:
                 return float(mult)
         return float(max(m for _s, m in self.cfg.expiry_tiers)) if self.cfg.expiry_tiers else 1.0
 
-    def evaluate(self, side: str, port: Portfolio, *, fee, left_s: float, book_ok: bool, active: bool,
-                 hist: MarketHistory, now_mono: float, sniper_busy: bool, cash_free: float | None) -> Decision:
+    def evaluate(self, side: str, port: Portfolio, **kw) -> Decision:
+        """The whole decision at once (the replay, the tests): evaluate_steps to its end."""
+        steps = self.evaluate_steps(side, port, **kw)
+        while True:
+            try:
+                next(steps)
+            except StopIteration as stop:
+                return stop.value
+
+    def evaluate_steps(self, side: str, port: Portfolio, *, fee, left_s: float, book_ok: bool, active: bool,
+                       hist: MarketHistory, now_mono: float, sniper_busy: bool, cash_free: float | None,
+                       sniper_reserve: tuple | None = None):
+        """The decision as a generator that yields between candidates (the
+        runtime lets the event loop serve the sniper's ticks there). Every
+        input is passed in - a snapshot; nothing is read mid-way."""
         cfg = self.cfg
         d = Decision(side)
         s, o = port.side(side), port.side("DOWN" if side == "UP" else "UP")
@@ -412,8 +454,11 @@ class Engine:
         room = min(side_cap - s.total_shares,
                    (min(cfg.max_order_usd, cfg.max_market_usd - hist.spend)) / max(s.best_ask, 0.01))
         sizes = self._sizes(unpaired_other, room)
-        candidates = [self._candidate(side, port, s, o, q, boundary, fee, need_avg, need_pair, hist, cash_free)
-                      for q in sizes]
+        candidates = []
+        for q in sizes:
+            candidates.append(self._candidate(side, port, s, o, q, boundary, fee, need_avg, need_pair, hist,
+                                              cash_free, sniper_reserve))
+            yield
         for c in candidates:                         # every logged decision says which thresholds applied
             c.metrics.update(threshold_multiplier=mult, left_s=round(left_s, 1))
         if not candidates:
@@ -449,7 +494,8 @@ class Engine:
             d.classification = reason
         return d
 
-    def _candidate(self, side, port, s, o, q, boundary, fee, need_avg, need_pair, hist, cash_free) -> Decision:
+    def _candidate(self, side, port, s, o, q, boundary, fee, need_avg, need_pair, hist, cash_free,
+                   sniper_reserve=None) -> Decision:
         cfg = self.cfg
         d = Decision(side, size=q, limit=round(boundary, 4))
         f = expected_fill(s.asks, q, boundary, fee)
@@ -491,19 +537,30 @@ class Engine:
             return self._block(d, "INSUFFICIENT_LIQUIDITY")
         if f.slippage is not None and f.slippage > cfg.max_slippage + EPS:
             return self._block(d, "SLIPPAGE_TOO_HIGH")
-        # ---- STAGE 1: is there an economic benefit at all?
+        # ---- the pairs this purchase creates must pay, WHATEVER it is for: no
+        # classification bypasses pair economics (a lower average is no excuse for
+        # new UP+DOWN pairs above the threshold). Quantity-aware - only the pairs it
+        # adds (paired_after > paired_before) - at the expected VWAP + fees, against
+        # the configured threshold (1 - min_pair_improvement, stricter near expiry)
+        # or the operator's opt-in hedge allowance (EXPOSURE_MAX_PAIR_COST, 0 = off).
         cls, why = None, None
         avg_gain = d.metrics["avg_improvement"]
-        if inc_pair is not None and new_pairs >= cfg.min_new_pairs - EPS:
+        pairs_rule = None
+        if inc_pair is not None and new_pairs > EPS:
             if inc_pair <= 1.0 - need_pair + EPS:
-                cls = "PAIR_COST_IMPROVEMENT"
+                pairs_rule = "PAIR_COST_IMPROVEMENT"
             elif (cfg.exposure_max_pair_cost > 0
                   # stricter near expiry, like every other threshold
                   and inc_pair <= cfg.exposure_max_pair_cost - (need_pair - cfg.min_pair_improvement) + EPS
                   and loss_before - loss_after >= cfg.exposure_min_loss_cut_usd * (need_pair / max(cfg.min_pair_improvement, EPS)) - EPS):
-                cls = "EXPOSURE_IMPROVEMENT"
+                pairs_rule = "EXPOSURE_IMPROVEMENT"
             else:
-                why = "PAIR_ECONOMICS_BAD"
+                d.metrics["new_pairs_rejected"] = True
+                d.classification = "NO_IMPROVEMENT"
+                return self._block(d, "PAIR_ECONOMICS_BAD")
+        # ---- STAGE 1: is there an economic benefit at all?
+        if pairs_rule is not None and new_pairs >= cfg.min_new_pairs - EPS:
+            cls = pairs_rule
         if cls is None and avg_gain is not None and s.total_shares > EPS:
             if s.best_ask >= (avg_before or 0) - EPS:
                 why = why or "PRICE_NOT_BETTER"
@@ -538,6 +595,16 @@ class Engine:
         elif cls == "PAIR_COST_IMPROVEMENT":
             if added > cfg.pair_max_added_loss_usd + EPS:
                 return self._block(d, "AVG_IMPROVES_BUT_RISK_REJECTED")
+        # ---- the sniper's liquidity: after this fill the book must still hold the
+        # sniper's largest target within its own cap (best ask + its slip), so a
+        # manager fill that lands first cannot leave the sniper's next order short
+        if sniper_reserve:
+            want, over = sniper_reserve
+            sn_cap = min(s.best_ask + over, cfg.max_buy_price, 0.99)
+            depth = sum(sz for px, sz in s.asks if px <= sn_cap + EPS)
+            d.metrics.update(sniper_reserve_shares=want, sniper_depth=depth)
+            if depth - f.qty < want - EPS:
+                return self._block(d, "SNIPER_LIQUIDITY_RESERVE")
         # ---- an explainable score: what each part contributes, in dollars
         locked = max(0.0, new_pairs) * (1.0 - inc_pair) if inc_pair is not None else 0.0
         parts = {"locked_pair_profit": locked if cls != "EXPOSURE_IMPROVEMENT" else 0.0,
@@ -604,6 +671,8 @@ class ManagerOrder:
     reserved_usd: float
     expected_price: float | None
     limit: float | None
+    # PENDING -> FILLED / PARTIAL / ZERO_FILL / REJECTED / CANCELLED (never sent);
+    # UNKNOWN after order_timeout_s without an outcome (reconciliation required)
     status: str = "PENDING"
     filled_qty: float = 0.0
     actual_price: float | None = None
@@ -614,6 +683,18 @@ class ManagerOrder:
     t_done: float | None = None
     condition: str | None = None
     reason_row: dict = field(default_factory=dict)
+    # the order's identity, for good: its outcome settles into ITS market
+    token_id: str | None = None
+    market_id: str | None = None             # condition@window end
+    reservation_id: int | None = None
+    booking: bool = False                    # the broker is booking it now (its pre-submit guard passed)
+    booked: bool = False                     # the outcome is on the order (applied once)
+    finished: bool = False                   # ... and on its market's history (applied once)
+    timer: object = None
+
+    @property
+    def condition_id(self) -> str | None:
+        return self.condition
 
     @property
     def remaining_qty(self) -> float:
@@ -635,7 +716,8 @@ class PositionManager:
         self.live_mode = bool(live_mode)
         self.shadow = self.live_mode                 # live: decisions only, never orders (see the module doc)
         self.wall, self.mono = wall, mono
-        self.hist = MarketHistory()
+        self.hist = MarketHistory()                  # the active market's history
+        self.histories: dict = {None: self.hist}     # every market's, by condition id
         self.orders: dict[int, ManagerOrder] = {}
         self._seq = 0
         self.manager_order_ids: set[str] = set()
@@ -644,10 +726,33 @@ class PositionManager:
         self.n = collections.Counter()
         self._skip_logged: dict = {}
         self._version = None
+        self._snap_version = None
+        self._inconclusive = False
+        self.busy_reason: str | None = None
+        self.last_error: str | None = None
         self._task = None
-        self.eval_us: collections.deque = collections.deque(maxlen=2000)
+        # Order fields the executor thread writes (its outcome, the booking flag):
+        # held for microseconds only, never across I/O.
+        self._olock = threading.Lock()
+        self._epoch = 0                              # bumped when a booking starts or an outcome lands (seqlock)
+        self._gen = 0                                # bumped when a market history changes
+        self.eval_us: collections.deque = collections.deque(maxlen=2000)      # CPU time of a whole evaluation
+        self.slice_us: collections.deque = collections.deque(maxlen=4000)     # longest the event loop is held
 
     # ---------------------------------------------------------------- state
+    def _hist_for(self, cond) -> MarketHistory:
+        """ONE market's history (limits, flags, spend). An order settles into its
+        own market's, whichever market is active when its outcome arrives."""
+        if self.hist.condition == cond:                  # the active market's own object
+            h = self.histories[cond] = self.hist
+            return h
+        h = self.histories.get(cond)
+        if h is None:
+            h = self.histories[cond] = MarketHistory(condition=cond)
+            while len(self.histories) > 32:
+                self.histories.pop(next(iter(self.histories)))
+        return h
+
     def _rules_fee(self, cond: str):
         """The market's fee curve from the broker's cache - never a fetch here."""
         cached = getattr(self.broker, "cached_rules", None)              # the live shim
@@ -660,13 +765,31 @@ class PositionManager:
             return None, None
         return fee_curve(float(rules.fee_rate), int(rules.fee_exponent)), rules
 
+    def _open_orders(self, cond=None) -> list:
+        """(side, qty, usd, booking) of the reservations still open - under the order lock."""
+        with self._olock:
+            return [(o.side, o.requested_qty, o.reserved_usd, o.booking) for o in self.orders.values()
+                    if o.status in OPEN_STATUSES and not o.booked and (cond is None or o.condition == cond)]
+
     def portfolio(self, cond: str, up: str, down: str) -> Portfolio | None:
         """Confirmed fills of this market from the ledger (never requested
-        quantities) + this manager's pending reservations + the books. None
-        while a fill or settlement holds the ledger lock - never waits."""
+        quantities) + this manager's still-open reservations + the books.
+
+        Each share counted exactly once: an order whose fill the broker is
+        booking right now is neither 'pending' nor safely 'filled', so the
+        snapshot is skipped (BOOKING_IN_PROGRESS); a booking that starts or
+        lands while the ledger is read invalidates the read (a seqlock on
+        _epoch). None (busy_reason says why) - this never waits."""
+        with self._olock:
+            e0 = self._epoch
+        mine = self._open_orders(cond)
+        if any(b for _s, _q, _u, b in mine):
+            self.busy_reason = "BOOKING_IN_PROGRESS"
+            return None
         led = self.ledger
         lock = getattr(led, "_lock", None)
         if lock is not None and not lock.acquire(blocking=False):
+            self.busy_reason = "LEDGER_BUSY"
             return None
         try:
             rows = {}
@@ -677,14 +800,18 @@ class PositionManager:
         finally:
             if lock is not None:
                 lock.release()
+        with self._olock:
+            if self._epoch != e0:
+                self.busy_reason = "BOOKING_IN_PROGRESS"
+                return None
         port = Portfolio(SideState(), SideState(), realized=realized)
         for side, token in (("UP", up), ("DOWN", down)):
             st = port.side(side)
             st.shares, st.cost, st.fees = rows.get(str(token), (0.0, 0.0, 0.0))
-            for o in self.orders.values():
-                if o.side == side and o.status == "PENDING" and o.condition == cond:
-                    st.pending_shares += o.requested_qty
-                    st.pending_usd += o.reserved_usd
+            for s_, q_, u_, _b in mine:
+                if s_ == side:
+                    st.pending_shares += q_
+                    st.pending_usd += u_
             view = self.hub.book.view(str(token))
             st.best_bid, st.best_ask = view.best_bid, view.best_ask
             st.asks = self._visible_asks(str(token), view)
@@ -708,57 +835,121 @@ class PositionManager:
         return upd is None or (self.mono() - float(upd)) * 1000.0 <= stale_ms
 
     def _sniper_busy(self) -> bool:
+        """The sniper owns this instant: an order of its in flight, or one sent
+        within sniper_quiet_ms. Reads only (safe from the executor thread)."""
         sn = self.sniper
         if sn is None:
             return False
-        if any(v is not None for v in getattr(sn, "inflight", {}).values()):
+        if any(v is not None for v in list(getattr(sn, "inflight", {}).values())):
             return True
-        last = max(getattr(sn, "last_fire_by_side", {"_": -1e18}).values())
+        last = max(list(getattr(sn, "last_fire_by_side", {"_": -1e18}).values()))
         return self.mono() * 1000.0 - last < self.cfg.sniper_quiet_ms
 
-    def _cash_free(self) -> float | None:
+    def _sniper_reserve(self):
+        """(shares, how far over the best ask) the sniper's next order on a side
+        could take: its largest target (base + carry) up to its own price cap.
+        Read from the sniper's settings, never changed. None without a sniper."""
+        s = getattr(self.sniper, "s", None)
+        if s is None:
+            return None
+        try:
+            want = float(s.max_target_shares if str(s.order_type).upper() == "FAK" else s.shares)
+            return want, float(s.slip)
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    def _cash_free(self):
+        """Cash the manager may use; None when the broker has no balance to
+        check; _BUSY when a fill or settlement holds the ledger right now (no
+        decision then - never a false INSUFFICIENT_BALANCE)."""
         b = self.broker
         if not hasattr(b, "cash_balance"):
             return None
         led_lock = getattr(self.ledger, "_lock", None)
         if led_lock is not None and not led_lock.acquire(blocking=False):
-            return 0.0                                 # cannot tell right now: assume none (no order)
+            return _BUSY
         try:
-            return float(b.cash_balance()) - sum(o.reserved_usd for o in self.orders.values() if o.status == "PENDING")
+            cash = float(b.cash_balance())
         finally:
             if led_lock is not None:
                 led_lock.release()
+        return cash - sum(u for _s, _q, u, _b in self._open_orders())
 
     # ---------------------------------------------------------------- one evaluation
     def evaluate(self) -> dict | None:
-        """Both sides, independently, on the current state. No I/O."""
+        """Both sides on the current state, all at once (the replay, the tests)."""
+        steps = self.evaluate_steps()
+        while True:
+            try:
+                next(steps)
+            except StopIteration as stop:
+                return stop.value
+
+    def evaluate_steps(self):
+        """One evaluation, as a generator. The state is captured once, in one
+        short synchronous step (books, ledger, own orders, a copy of the
+        history); the candidates are then computed from that snapshot and the
+        generator yields between them, so the run loop lets the sniper's ticks
+        through. Nothing is re-read mid-way, and the send re-checks that
+        nothing changed since the snapshot (_dispatch). No I/O."""
         t0 = time.perf_counter_ns()
+        self._inconclusive = False
         hub = self.hub
         up, down, cond, end = hub.up_token, hub.down_token, hub.condition_id, hub.window_end
         if not (up and down and cond and end):
             self.last = {s: Decision(s, reason="MARKET_INACTIVE", action="BLOCKED") for s in SIDES}
             return None
-        if self.hist.condition != cond:                                  # a new market: fresh limits
-            self.hist = MarketHistory(condition=cond)
+        self.hist = self._hist_for(cond)                                 # a new market: fresh limits
         fee, _rules = self._rules_fee(cond)
+        # The version is taken BEFORE anything is read: a change made while the state
+        # is being read (a sniper fill booked on its worker thread, a book update)
+        # then shows at the send, and the decision is dropped (STATE_CHANGED).
+        snap_version = self._state_version()
         port = self.portfolio(cond, up, down)
-        if port is None:
-            return None                                                  # ledger busy: next poll
+        cash = self._cash_free() if port is not None else None
+        if port is None or cash is _BUSY:
+            reason = self.busy_reason if port is None else "LEDGER_BUSY"
+            self._inconclusive = True                                    # looked at again on the next poll
+            self.n[f"busy {reason}"] += 1
+            self.last = {s: Decision(s, action="BLOCKED", reason=reason,
+                                     metrics={"detail": "state not readable without waiting; retried next poll"})
+                         for s in SIDES}
+            return self.last
+        self._snap_version = snap_version
         self.last_port = port
         left = float(end) - self.wall()
         sniper_busy = self._sniper_busy()
-        cash = self._cash_free()
+        reserve = self._sniper_reserve()
+        hist = self.hist.copy()
+        books = {"UP": self._book_ok(up), "DOWN": self._book_ok(down)}
+        now = self.mono()
+        spent = time.perf_counter_ns() - t0
+        self.slice_us.append(spent / 1000.0)
         out = {}
-        for side, token in (("UP", up), ("DOWN", down)):
+        for side in SIDES:
             if fee is None:
                 out[side] = Decision(side, action="BLOCKED", reason="RULES_NOT_LOADED",
                                      metrics={"detail": "market fee rules not loaded yet"})
                 continue
-            out[side] = self.engine.evaluate(side, port, fee=fee, left_s=left, book_ok=self._book_ok(token),
-                                             active=left > 0, hist=self.hist, now_mono=self.mono(),
-                                             sniper_busy=sniper_busy, cash_free=cash)
+            steps = self.engine.evaluate_steps(side, port, fee=fee, left_s=left, book_ok=books[side], active=left > 0,
+                                               hist=hist, now_mono=now, sniper_busy=sniper_busy, cash_free=cash,
+                                               sniper_reserve=reserve)
+            while True:
+                t1 = time.perf_counter_ns()
+                try:
+                    next(steps)
+                    done = None
+                except StopIteration as stop:
+                    done = stop
+                dt = time.perf_counter_ns() - t1
+                spent += dt
+                self.slice_us.append(dt / 1000.0)
+                if done is not None:
+                    out[side] = done.value
+                    break
+                yield
         self.last = out
-        self.eval_us.append((time.perf_counter_ns() - t0) / 1000.0)
+        self.eval_us.append(spent / 1000.0)
         return out
 
     def _log_skip(self, d: Decision) -> None:
@@ -779,74 +970,135 @@ class PositionManager:
         return max(buys, key=lambda d: d.score) if buys else None
 
     def reserve(self, d: Decision) -> ManagerOrder:
-        """Reserve the order's exposure before it is sent (FILLED + PENDING)."""
+        """Reserve the order's exposure before it is sent (FILLED + PENDING). The
+        order carries its market, token and reservation id for good."""
         self._seq += 1
         reserve = float(d.metrics.get("capital_max") or d.fill.cost)
+        hub = self.hub
+        token = getattr(hub, "up_token", None) if d.side == "UP" else getattr(hub, "down_token", None)
+        cond = self.hist.condition
         o = ManagerOrder(None, "POSITION_MANAGER", d.side, d.classification, d.fill.qty, reserve,
-                         d.fill.vwap, d.limit, t_submit=self.wall(), condition=self.hist.condition,
-                         reason_row=d.row())
-        self.orders[self._seq] = o
+                         d.fill.vwap, d.limit, t_submit=self.wall(), condition=cond, reason_row=d.row(),
+                         token_id=None if token is None else str(token),
+                         market_id=f"{cond}@{int(float(getattr(hub, 'window_end', 0) or 0))}",
+                         reservation_id=self._seq)
+        with self._olock:
+            self.orders[self._seq] = o
         h = self.hist.sides[d.side]
         h.in_flight = True
         self.hist.orders += 1
         h.orders += 1
         self.hist.spend += reserve
+        self._gen += 1
         self.n["orders"] += 1
         self.n[f"orders {d.classification}"] += 1
         self.journal.write({"wall": self.wall(), "event": f"POSITION_MANAGER BUY {d.side}",
-                            "condition": self.hist.condition, "seq": self._seq, **d.row()})
+                            "condition": cond, "seq": self._seq, "market_id": o.market_id,
+                            "token_id": o.token_id, "reservation_id": o.reservation_id, **d.row()})
         self.on_event("manager", f"BUY {d.side} {d.fill.qty:.2f} @<= {d.limit:.2f} ({d.classification})", "info")
         return o
 
-    def settle_order(self, o: ManagerOrder, *, ok: bool, fill: dict | None, error: str | None) -> None:
-        """The order's actual outcome (never its request) releases the reservation."""
-        h = self.hist.sides[o.side]
+    def _book(self, o: ManagerOrder, *, ok: bool, fill: dict | None, error: str | None) -> bool:
+        """The order's actual outcome (never its request), applied to the order
+        once. Runs on the executor thread right after the broker returns, so a
+        booked fill is never also counted as pending (see portfolio)."""
+        with self._olock:
+            if o.booked:
+                return False
+            if ok and fill:
+                o.order_id = fill.get("order_id")
+                o.filled_qty = float(fill.get("shares") or 0.0)
+                o.actual_price = fill.get("average_price")
+                o.fees = float(fill.get("fee") or 0.0)
+                o.cost = float(fill.get("total_cost") or 0.0)
+                # FOK: the whole order executed. Fewer shares than planned means the book
+                # moved up (still inside the limit) before it arrived - a worse price, not a
+                # partial fill; requested_qty/filled_qty in the journal show it.
+                o.status = "PARTIAL" if fill.get("partial") else "FILLED"
+            else:
+                o.error = str(error or "no fill")[:200]
+                low = o.error.lower()
+                o.status = ("ZERO_FILL" if "no-fill" in low                 # FOK: killed, nothing bought
+                            else "CANCELLED" if low.startswith("cancelled before send")
+                            else "REJECTED")
+            o.booking, o.booked = False, True
+            self._epoch += 1
+        return True
+
+    def _finish(self, o: ManagerOrder) -> None:
+        """Release the reservation in the order's OWN market's history, once."""
+        if o.finished or not o.booked:
+            return
+        o.finished = True
+        if o.timer is not None:
+            try:
+                o.timer.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+        hist = self._hist_for(o.condition)
+        h = hist.sides[o.side]
         h.in_flight = False
         h.last_done_mono = self.mono()
         o.t_done = self.wall()
-        if ok and fill:
-            o.order_id = fill.get("order_id")
-            o.filled_qty = float(fill.get("shares") or 0.0)
-            o.actual_price = fill.get("average_price")
-            o.fees = float(fill.get("fee") or 0.0)
-            o.cost = float(fill.get("total_cost") or 0.0)
-            # FOK: the whole order executed. Fewer shares than planned means the book
-            # moved up (still inside the limit) before it arrived - a worse price, not a
-            # partial fill; requested_qty/filled_qty in the journal show it.
-            o.status = "PARTIAL" if fill.get("partial") else "FILLED"
+        if o.status in ("FILLED", "PARTIAL"):
             if o.order_id:
                 self.manager_order_ids.add(str(o.order_id))
             if o.actual_price is not None:
                 h.last_buy_price = float(o.actual_price)
             self.n["filled" if o.status == "FILLED" else "partial"] += 1
         else:
-            o.error = str(error or "no fill")[:200]
-            o.status = "ZERO_FILL" if "no-fill" in o.error.lower() else "REJECTED"   # FOK: killed, nothing bought
-            self.n["zero_fill" if o.status == "ZERO_FILL" else "rejected"] += 1
+            self.n[{"ZERO_FILL": "zero_fill", "CANCELLED": "cancelled"}.get(o.status, "rejected")] += 1
         # spend counts what was actually spent, not the reservation
-        self.hist.spend += o.cost - o.reserved_usd
+        hist.spend += o.cost - o.reserved_usd
+        self._gen += 1
         self.journal.write({"wall": self.wall(), "event": f"POSITION_MANAGER RESULT {o.side}", "status": o.status,
                             "order_id": o.order_id, "classification": o.classification,
                             "requested_qty": round(o.requested_qty, 4), "filled_qty": round(o.filled_qty, 4),
                             "expected_price": o.expected_price, "actual_price": o.actual_price, "fees": o.fees,
-                            "cost": o.cost, "error": o.error, "condition": o.condition})
+                            "cost": o.cost, "error": o.error, "condition": o.condition, "market_id": o.market_id,
+                            "token_id": o.token_id, "reservation_id": o.reservation_id})
 
-    def _execute_paper(self, d: Decision, cond, up, down, end) -> tuple:
-        """Worker thread: one FAK in the PAPER broker's 'manager' slot (the
+    def settle_order(self, o: ManagerOrder, *, ok: bool, fill: dict | None, error: str | None) -> None:
+        """The order's outcome: on the order, then on its market's history.
+        Idempotent - a second call changes nothing."""
+        self._book(o, ok=ok, fill=fill, error=error)
+        self._finish(o)
+
+    def _execute_paper(self, d: Decision, cond, up, down, end, o: ManagerOrder | None = None) -> tuple:
+        """Worker thread: one FOK in the PAPER broker's 'manager' slot (the
         sniper's slot on the same token is untouched). Never in live mode."""
         if self.shadow or self.live_mode:
             raise RuntimeError("the Position Manager places no live orders (shadow-only)")
-        lat = None
-        if self.sniper is not None and hasattr(self.sniper, "latency_plan"):
+        if self._sniper_busy():
+            # The last moment before the order leaves: the sniper fired after the
+            # decision. Nothing is sent, so nothing can have executed.
+            ok, fill, err = False, None, "cancelled before send: SNIPER_PRIORITY"
+        else:
+            lat = None
+            if self.sniper is not None and hasattr(self.sniper, "latency_plan"):
+                try:
+                    lat = float(self.sniper.latency_plan()[0])
+                except Exception:  # noqa: BLE001
+                    lat = None
+
+            def guard() -> bool:
+                if not (self.hub.condition_id == cond and float(end) - self.wall() >= self.cfg.min_left_s):
+                    return False
+                if o is not None:
+                    with self._olock:                 # the broker books right after this, under its own lock
+                        o.booking = True
+                        self._epoch += 1
+                return True
             try:
-                lat = float(self.sniper.latency_plan()[0])
-            except Exception:  # noqa: BLE001
-                lat = None
-        guard = lambda: (self.hub.condition_id == cond and float(end) - self.wall() >= self.cfg.min_left_s)  # noqa: E731
-        # FOK (fak=False): every share at or under the limit, or nothing at all
-        ok = self.broker.place_trade(d.side, d.stake, up, down, cond, end, d.limit, None,
-                                     latency_ms=lat, tag="manager", fak=False, pre_submit_guard=guard)
-        return ok, getattr(self.broker, "last_fill", None), getattr(self.broker, "last_error", None)
+                # FOK (fak=False): every share at or under the limit, or nothing at all
+                ok = self.broker.place_trade(d.side, d.stake, up, down, cond, end, d.limit, None,
+                                             latency_ms=lat, tag="manager", fak=False, pre_submit_guard=guard)
+                fill, err = getattr(self.broker, "last_fill", None), getattr(self.broker, "last_error", None)
+            except Exception as exc:  # noqa: BLE001 - an outcome all the same
+                ok, fill, err = False, None, f"{type(exc).__name__}: {exc}"
+        if o is not None:
+            self._book(o, ok=bool(ok), fill=fill, error=err)
+        return ok, fill, err
 
     # ---------------------------------------------------------------- the task
     def start(self):
@@ -870,7 +1122,7 @@ class PositionManager:
             if t:
                 v = hub.book.view(str(t))
                 vs.append((getattr(v, "updated_mono", None), v.best_ask))
-        return (hub.condition_id, tuple(vs), len(getattr(self.ledger, "seen", ())), self._seq)
+        return (hub.condition_id, tuple(vs), len(getattr(self.ledger, "seen", ())), self._seq, self._epoch, self._gen)
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -881,9 +1133,19 @@ class PositionManager:
                 if ver == self._version:
                     continue                                   # nothing new: nothing to evaluate
                 self._version = ver
-                decisions = self.evaluate()
+                steps = self.evaluate_steps()
+                while True:
+                    try:
+                        next(steps)
+                    except StopIteration as stop:
+                        decisions = stop.value
+                        break
+                    await asyncio.sleep(0)                     # the sniper's ticks run between candidates
                 if decisions is None:
                     continue
+                if self._inconclusive:
+                    self._version = None                       # the state was busy: look again next poll
+                self.last_error = None
                 for d in decisions.values():
                     self._log_skip(d)
                 d = self.choose(decisions)
@@ -894,44 +1156,90 @@ class PositionManager:
                     self.journal.write({"wall": self.wall(), "event": f"POSITION_MANAGER SHADOW BUY {d.side}",
                                         **d.row()})
                     continue
-                if self._sniper_busy():                        # re-checked at the send
-                    d.action, d.reason = "BLOCKED", "SNIPER_PRIORITY"
-                    self._log_skip(d)
-                    continue
-                hub = self.hub
-                cond, up, down, end = hub.condition_id, hub.up_token, hub.down_token, hub.window_end
-                o = self.reserve(d)
-                fut = loop.run_in_executor(None, self._execute_paper, d, cond, up, down, end)
-                fut.add_done_callback(lambda f, o=o: self._done(o, f))
+                self._dispatch(d, loop)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - the manager never stops the bot; it says why
                 self.n["errors"] += 1
-                self.on_event("manager", f"error: {type(exc).__name__}: {exc}", "bad")
+                self.last_error = f"{type(exc).__name__}: {exc}"[:200]
+                self.on_event("manager", f"error: {self.last_error}", "bad")
+
+    def _dispatch(self, d: Decision, loop) -> ManagerOrder | None:
+        """Send one decided order - synchronously, on the event loop: nothing (a
+        sniper tick, an order outcome) runs between these checks and the
+        reservation. The state the decision was made on must still be the state
+        now, and the sniper must not own this instant; then the exposure is
+        reserved (FILLED + PENDING) and the order handed to a worker."""
+        if self._state_version() != self._snap_version:
+            d.action, d.reason = "BLOCKED", "STATE_CHANGED"
+            self._version = None
+            self._log_skip(d)
+            return None
+        if self._sniper_busy():
+            d.action, d.reason = "BLOCKED", "SNIPER_PRIORITY"
+            self._log_skip(d)
+            return None
+        hub = self.hub
+        cond, up, down, end = hub.condition_id, hub.up_token, hub.down_token, hub.window_end
+        o = self.reserve(d)
+        o.timer = loop.call_later(max(0.05, self.cfg.order_timeout_s), self._timed_out, o)
+        fut = loop.run_in_executor(None, functools.partial(self._execute_paper, d, cond, up, down, end, o=o))
+        fut.add_done_callback(lambda f, o=o: self._done(o, f))
+        return o
+
+    def _timed_out(self, o: ManagerOrder) -> None:
+        """No outcome within order_timeout_s. That does NOT mean 'did not
+        execute': the order may have reached the venue. UNKNOWN - reconciliation
+        required: its reservation stays counted and its side stays in flight (no
+        new order there, no retry) until the authoritative outcome arrives."""
+        with self._olock:
+            if o.booked or o.status != "PENDING":
+                return
+            o.status = "UNKNOWN"
+            self._epoch += 1
+        self.n["unknown"] += 1
+        self.journal.write({"wall": self.wall(), "event": "POSITION_MANAGER ORDER UNKNOWN",
+                            "state": "RECONCILIATION_REQUIRED", "side": o.side, "market_id": o.market_id,
+                            "token_id": o.token_id, "reservation_id": o.reservation_id,
+                            "reserved_usd": o.reserved_usd, "requested_qty": o.requested_qty,
+                            "timeout_s": self.cfg.order_timeout_s})
+        self.on_event("manager", f"order {o.reservation_id} {o.side}: no outcome after {self.cfg.order_timeout_s:g}s "
+                                 f"- UNKNOWN, reservation kept until it is known", "warn")
 
     def _done(self, o: ManagerOrder, fut) -> None:
         try:
             ok, fill, err = fut.result()
         except Exception as exc:  # noqa: BLE001
             ok, fill, err = False, None, f"{type(exc).__name__}: {exc}"
-        self.settle_order(o, ok=bool(ok), fill=fill, error=err)
+        self._book(o, ok=bool(ok), fill=fill, error=err)          # once: a no-op when the worker booked it
+        self._finish(o)
 
     # ---------------------------------------------------------------- reading
     def snapshot(self) -> dict:
-        """What the dashboard shows - plain values, cheap (the last evaluation)."""
+        """What the dashboard shows - plain values, cheap (the last evaluation).
+        Each side says what a missing value means: STALE (its book), WAITING (no
+        market / state busy), ERROR (the last evaluation failed), else N/A."""
         port = self.last_port
+        unknown = sum(1 for o in list(self.orders.values()) if o.status == "UNKNOWN")
         out = {"engine": self.cfg.enabled, "live_orders": self.cfg.live_enabled and not self.shadow,
                "shadow": self.shadow, "orders": self.hist.orders, "spend": round(self.hist.spend, 4),
-               "max_orders": self.cfg.max_orders, "max_spend": self.cfg.max_market_usd, "sides": {}, "portfolio": {}}
+               "max_orders": self.cfg.max_orders, "max_spend": self.cfg.max_market_usd, "unknown_orders": unknown,
+               "avg_includes_fees": True, "sides": {}, "portfolio": {}}
         for side in SIDES:
             st = port.side(side) if port else SideState()
             d = self.last.get(side)
             state = "WAIT" if d is None or d.action == "WAIT" else "IMPROVE" if d.action == "BUY" else "BLOCKED"
+            reason = None if d is None else d.reason
+            blank = ("ERROR" if self.last_error else "STALE" if reason == "STALE_BOOK"
+                     else "WAITING" if port is None or reason in ("MARKET_INACTIVE", "LEDGER_BUSY",
+                                                                  "BOOKING_IN_PROGRESS", "RULES_NOT_LOADED")
+                     else "N/A")
             out["sides"][side] = {
                 "shares": st.shares, "avg": st.avg, "cost": st.cost, "best_bid": st.best_bid, "best_ask": st.best_ask,
                 "pending": st.pending_shares,
                 "new_avg_if_buy": (d.metrics.get("projected_avg") if d is not None else None),
-                "state": state, "reason": None if d is None else (d.classification if d.action == "BUY" else d.reason)}
+                "state": state, "reason": None if d is None else (d.classification if d.action == "BUY" else d.reason),
+                "blank": blank}
         if port is not None:
             out["portfolio"] = {"combined_avg": port.combined_avg, "paired": port.paired,
                                 "unpaired_up": port.unpaired_up, "unpaired_down": port.unpaired_down,
@@ -941,9 +1249,16 @@ class PositionManager:
 
     def summary(self) -> dict:
         xs = sorted(self.eval_us)
+        sl = sorted(self.slice_us)
         return {"enabled": self.cfg.enabled, "shadow": self.shadow, "counts": dict(self.n),
                 "eval_us": None if not xs else {"p50": xs[len(xs) // 2], "p99": xs[int(len(xs) * 0.99)],
                                                 "max": xs[-1], "n": len(xs)},
+                "slice_us": None if not sl else {"p50": sl[len(sl) // 2], "p99": sl[int(len(sl) * 0.99)],
+                                                 "max": sl[-1], "n": len(sl)},
+                "unknown_orders": [{"reservation_id": o.reservation_id, "market_id": o.market_id, "side": o.side,
+                                    "reserved_usd": o.reserved_usd} for o in list(self.orders.values())
+                                   if o.status == "UNKNOWN"],
                 "orders": [{"side": o.side, "classification": o.classification, "status": o.status,
                             "requested": o.requested_qty, "filled": o.filled_qty, "price": o.actual_price,
-                            "cost": o.cost, "order_id": o.order_id} for o in list(self.orders.values())[-20:]]}
+                            "cost": o.cost, "order_id": o.order_id, "market_id": o.market_id}
+                           for o in list(self.orders.values())[-20:]]}

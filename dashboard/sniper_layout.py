@@ -449,18 +449,23 @@ def _pm_side_body(sd: dict, w: int) -> list[Row]:
     sd = sd if isinstance(sd, dict) else {}
     sh = _num(sd.get("shares"))
     avg = _num(sd.get("avg"))
+    # a missing value says why: STALE (its book), WAITING (no market / state busy),
+    # ERROR (the last evaluation failed), else N/A - never a bare "--"
+    blank = _text(sd.get("blank"), "N/A") if sd.get("blank") in ("N/A", "WAITING", "STALE", "ERROR") else "N/A"
 
     def money4(v):
         f = _num(v)
-        return MISSING if f is None else f"${f:.4f}"
+        return blank if f is None else f"${f:.4f}"
+    # The manager's averages include fees ((notional + fees) / shares); the
+    # positions table's AVG is the price paid without fees (the ledger's avg_price).
     rows = [
         _line("Shares", "0.00" if sh is None else f"{sh:.2f}", w, Style("ink", bold=True), lw=12),
-        _line("Average", money4(avg) if sh else "N/A", w, Style("ink"), lw=12),
+        _line("Avg+fees", money4(avg) if sh else "N/A", w, Style("ink"), lw=12),
         _line("Cost", money(sd.get("cost")) if sh else "$0.00", w, Style("ink"), lw=12),
         _line("Best Bid", money4(sd.get("best_bid")), w, Style("ink"), lw=12),
         _line("Best Ask", money4(sd.get("best_ask")), w, Style("ink"), lw=12),
         _line("Pending", f"{_num(sd.get('pending')) or 0:.2f}", w, Style("ink"), lw=12),
-        _line("New Avg/Buy", money4(sd.get("new_avg_if_buy")) if sd.get("new_avg_if_buy") is not None else "N/A",
+        _line("New Avg+fees", money4(sd.get("new_avg_if_buy")) if sd.get("new_avg_if_buy") is not None else "N/A",
               w, Style("ink"), lw=12),
     ]
     state = _text(sd.get("state"), "WAIT")
@@ -478,8 +483,9 @@ def _pm_portfolio_body(pm: dict, w: int) -> list[Row]:
         return "0.00" if f is None else f"{f:.2f}"
     comb = _num(pf.get("combined_avg"))
     mode = "SHADOW (no orders)" if pm.get("shadow") else ("LIVE ORDERS" if pm.get("live_orders") else "paper orders")
+    unknown = int(_num(pm.get("unknown_orders")) or 0)
     return [
-        _line("Combined Avg", "N/A" if comb is None else f"${comb:.4f}", w,
+        _line("Comb Avg+fees", ("WAITING" if not pf else "N/A") if comb is None else f"${comb:.4f}", w,
               (Style("green", bold=True) if comb is not None and comb < 1 else Style("red", bold=True))
               if comb is not None else FAINT, lw=13),
         _line("Paired", n2(pf.get("paired")), w, Style("ink"), lw=13),
@@ -490,7 +496,8 @@ def _pm_portfolio_body(pm: dict, w: int) -> list[Row]:
         _line("Fees", money(pf.get("fees") or 0.0), w, Style("ink"), lw=13),
         _line("Orders", f"{count(pm.get('orders'))}/{count(pm.get('max_orders'))}  spend "
               f"{money(pm.get('spend'))}/{money(pm.get('max_spend'))}", w, Style("ink"), lw=13),
-        _runs([(mode, Style("amber") if pm.get("shadow") else DIM)], w),
+        _runs([(mode, Style("amber") if pm.get("shadow") else DIM),
+               (f"  {unknown} UNKNOWN (reconciliation required)" if unknown else "", Style("red", bold=True))], w),
     ]
 
 
