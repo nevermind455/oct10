@@ -84,6 +84,7 @@ from pathlib import Path
 
 import websockets
 
+import exec_latency
 from timer import now_et
 
 try:
@@ -424,6 +425,7 @@ class FastOrderBuilder:
         self.signer, self.signature_type, self.funder = builder.signer, builder.signature_type, builder.funder
         self._exchange: dict = {}
         self._key = None
+        self.last_sign_ns = None          # (T3, T4) of the newest order built here
 
     def _pk(self):
         if self._key is None:
@@ -455,7 +457,12 @@ class FastOrderBuilder:
             takerAmount=str(taker_amount), side=side, signer=b._v2_order_signer(), signatureType=b.signature_type,
             timestamp=str(time.time_ns() // 1_000_000), metadata=getattr(order_args, "metadata", bm.BYTES32_ZERO),
             builder=order_args.builder_code))
-        return bm.SignedOrderV2(**{**dataclasses.asdict(order), "signature": self.sign(eb, order)})
+        fields = dataclasses.asdict(order)
+        # T3 (order constructed) and T4 (signed) for the latency report.
+        t3 = time.perf_counter_ns()
+        signature = self.sign(eb, order)
+        self.last_sign_ns = (t3, time.perf_counter_ns())
+        return bm.SignedOrderV2(**{**fields, "signature": signature})
 
     def sign(self, eb, order) -> str:
         """The order's EIP-712 signature: '0x' + r || s || v (v = 27/28), as
@@ -562,7 +569,10 @@ class Settings:
         self.latency_ms = _env_float("SNIPER_LATENCY_MS", 200)
         # Polymarket's documented taker delay on up/down markets flagged itode:
         # "The order is held for 250 ms, then validation runs again" (docs,
-        # concepts/order-lifecycle). 150 was an older assumption.
+        # concepts/order-lifecycle). NOTE: the docs changelog says crypto is
+        # 150ms since 2026-09-04 14:00 UTC (50ms from 2026-08-17). The default
+        # stays 250: it also sets the end-of-round cutoff (_window), a strategy
+        # decision. SNIPER_HOLD_MS=150 models the venue as the changelog has it.
         self.hold_ms = _env_float("SNIPER_HOLD_MS", 250)
         self.server_ms = _env_float("SNIPER_SERVER_MS", 25)
         self.net_default_ms = _env_float("SNIPER_NET_MS", 14)
@@ -969,6 +979,10 @@ class Sniper:
         self.carry = {"UP": 0.0, "DOWN": 0.0}
         self.carry_market = None            # (condition id, round end) the carry belongs to
         self.n = collections.Counter()
+        # T0..T7 per order (exec_latency) and the outcome counts: filled after
+        # the send, read by the dashboard and the summary.
+        self.latency = exec_latency.LatencyStats()
+        self.quality = exec_latency.ExecQuality()
         self._skip_logged: dict = {}
         self.marks = {"1s": [], "5s": []}
         self.net_rtt: collections.deque = collections.deque(maxlen=5)
@@ -1268,6 +1282,7 @@ class Sniper:
         direction, r = trigger.update(t, mid)
         if direction is None:
             return
+        trig_pc = time.perf_counter_ns()                # T1: the rule fired
         primary = feed == self.s.primary_feed          # its counters keep the names the reports read
         tag = "" if primary else f" ({feed})"
         self.n["signals" + ("" if primary else f" {feed}")] += 1
@@ -1293,7 +1308,9 @@ class Sniper:
             self.n["skip: previous order in flight" + tag] += 1     # this side's own order only
             return
         self.inflight[side] = {"end": None}
+        self._t1 = (trig_pc, mid)                       # read by _fire_now in this same call
         task = self._fire_now(side, r, t, t_pc, feed=feed)
+        self._t1 = None
         if task is not None:
             # A closed window, stale book or failed live preflight is not an
             # order. Only a submitted order starts its side's cooldown, from the
@@ -1769,16 +1786,22 @@ class Sniper:
         """
         start_pc = time.perf_counter_ns()
         t_pc = start_pc if t_pc is None else t_pc
+        trig_pc, mid = getattr(self, "_t1", None) or (None, None)      # T1 and the mid, from _signal
         row = {"wall": time.time(), "id": f"{time.time():.3f}-{side}", "side": side, "bp": round(r_bp, 3),
                "feed": feed,
                # BTC tick received -> decision started: our own event loop's delay.
                "loop_lag_ms": round(time.monotonic() * 1000.0 - t_ms, 1)}
         row.update(self._window_fields(feed, t_ms))
+        if mid is not None:
+            row["signal_mid"] = mid
+        if feed == "binance" and self.fresh.last_excess is not None:
+            row["binance_excess_ms"] = round(self.fresh.last_excess, 1)    # feed age past its usual (exchange stamps)
         try:
             plan = self._decide(side, row, t_ms)
             if plan is None:
                 self._release(side)
                 return None
+            plan.update(t_pc=t_pc, trig_pc=trig_pc if trig_pc is not None else start_pc, t_ms=t_ms)
             if self.live is not None:
                 return self._fire_live(side, r_bp, row, plan, t_pc, start_pc)
             # Sign here, in the tick handler, and only then hand the order to a
@@ -1789,8 +1812,12 @@ class Sniper:
             st = {"tick_pc": t_pc, "decide_pc": start_pc, "decided_pc": plan["decided_pc"],
                   "built_pc": plan["built_pc"], "sign_pc": time.perf_counter_ns()}
             cpu0, gc0 = time.thread_time(), [g["collections"] for g in gc.get_stats()]
+            if self._builder is not None:
+                self._builder.last_sign_ns = None
             sign_ms, sign_err, signed = self._sign_now(plan)
             st["signed_pc"] = time.perf_counter_ns()
+            if getattr(self._builder, "last_sign_ns", None):
+                st["sign_start_pc"], st["sign_end_pc"] = self._builder.last_sign_ns
             # Signing's own CPU time and any garbage collections inside it:
             # wall time far above CPU time means it waited (GIL or OS).
             st["sign_cpu_ms"] = round((time.thread_time() - cpu0) * 1000.0, 3)
@@ -1871,6 +1898,7 @@ class Sniper:
                        # the market's taker-delay flag (itode) in the rules this order was signed under
                        taker_delay=(getattr(p, "rules", None) or {}).get("taker_delay"),
                        live_ts_us=ts, t_tick_to_decided_ms=round((plan["decided_pc"] - t_pc) / 1e6, 2))
+            self._latency_live(row, plan, res)
             if "net_send_start" in ts:
                 row["t_decided_to_wire_ms"] = round(ts["net_send_start"] / 1000.0, 2)
                 row["t_signal_to_send_ms"] = round(row["t_tick_to_decided_ms"] + ts["net_send_start"] / 1000.0, 2)
@@ -1880,6 +1908,7 @@ class Sniper:
                     row["t_signal_to_response_ms"] = round(row["t_tick_to_decided_ms"] + ts["response"] / 1000.0, 2)
             if kind == NO_MATCH:
                 self._stamp_fill_confirmed(row, plan)            # the reply says nothing filled
+                self._latency_fill(row, plan, None, "ACK")
             if p.order_type == "FAK" and kind in (MATCHED, PENDING):
                 rd["fills"] += 1           # reserve one slot, even before the quantity is known
                 fill = res.get("fill")
@@ -1889,6 +1918,7 @@ class Sniper:
                     self.n["pending"] += 1
                     row.update(result="pending", shares=None, price=None, fee=None, cost=None,
                                reason="accepted; waiting for complete private trade quantities")
+                    self._observe_live(row)
                     self._fak_pending[res["order_id"]] = (dict(row), plan)
                     self._write(row)
                     self._table_row(side, p.amount, "pending", end, order_id=res["order_id"])
@@ -1907,6 +1937,10 @@ class Sniper:
                 row.update(result="filled", shares=round(shares, 4), price=price, fee=est.get("fee"),
                            cost=round(p.amount, 4),
                            price_source=(fill or {}).get("source") or "decision-book estimate")
+                if fill:
+                    self._latency_fill(row, plan, fill.get("seen_mono"),
+                                       "ACK" if fill.get("source") == "order reply" else "PRIVATE_WS")
+                self._observe_live(row)
                 self._write(row)
                 self._table_row(side, p.amount, "filled", end)
                 self.on_event("sniper", f"LIVE FILL {side} {shares:.1f} @ {float(price or 0):.3f} "
@@ -1916,6 +1950,7 @@ class Sniper:
                 self.n["pending"] += 1
                 row.update(result="pending", reason=res.get("error"), fee=est.get("fee"),
                            shares=round(shares, 4), price=est.get("price"))
+                self._observe_live(row)
                 self._write(row)
                 self._table_row(side, p.amount, "pending", end)
                 self.on_event("sniper", f"LIVE order accepted, outcome pending ({res.get('venue_status')})", "info")
@@ -1927,6 +1962,7 @@ class Sniper:
                     self._settle_carry(plan, side, 0.0)       # an IOC that matched nothing: all of it carried
                     if plan.get("target") is not None:
                         row["carry_out"] = self.carry[side]
+                self._observe_live(row)
                 self._write(row)
                 self._table_row(side, p.amount, "missed" if kind == NO_MATCH else "rejected", end)
                 if kind != NO_MATCH:
@@ -1934,9 +1970,16 @@ class Sniper:
         except Exception as exc:  # noqa: BLE001 - a sniper fault must never stop the bot
             self.n["errors"] += 1
             row.update(result="error", reason=f"{type(exc).__name__}: {exc}")
+            self._observe_live(row)
             self._write(row)
         finally:
             self._release(side)
+
+    def _observe_live(self, row: dict) -> None:
+        """A live order's first outcome: its latency and its quality counts."""
+        self.quality.observe(row)
+        if row.get("lat"):
+            self.latency.add(row["lat"])
 
     def _record_fak_fill(self, row, plan, fill, *, update=False):
         """Report actual executed quantity, never the request or book estimate."""
@@ -1949,6 +1992,8 @@ class Sniper:
         if plan.get("target") is not None:
             row["carry_out"] = self.carry[side]
         self._stamp_fill_confirmed(row, plan, fill.get("seen_mono"))
+        lat = self._latency_fill(row, plan, fill.get("seen_mono"),
+                                 "ORDER_STATUS" if fill.get("source") == "terminal order status" else "PRIVATE_WS")
         if shares > 0:
             rd[side] += shares
             self.n["filled"] += 1
@@ -1962,6 +2007,10 @@ class Sniper:
         if update:
             # Keep the initial acknowledgement distinct from the quantity update.
             row.update(result="live_fill_update", wall=time.time(), resolved_result="filled" if shares else "refused")
+            self.quality.resolve(row)
+            self.latency.add({k: lat[k] for k in ("trigger_to_fill", "ack_to_fill") if k in lat})
+        else:
+            self._observe_live(row)
         self._write(row)
         self._table_row(side, fill["cost"] + fill.get("fee", 0), "filled" if shares else "missed", plan["end"],
                         order_id=row.get("order_id"))
@@ -2108,6 +2157,7 @@ class Sniper:
                                             "error": getattr(self.broker, "last_error", None)}
             fill = result["fill"] or {}
             filled = bool(ok and fill.get("tag") == "sniper")
+            self._latency_paper(row, plan, st)
             row["outcome"] = self._outcome(filled, None if filled else (sign_err or result["error"]),
                                            row, history=self._history_book() is not None)
             arrival = row.get("arrival")
@@ -2137,6 +2187,7 @@ class Sniper:
                     # BTC tick -> the order met the book, all of our own delays included.
                     row["match_ms"] = round((float(fill["matched_wall"]) - row["wall"]) * 1000.0
                                             + row["loop_lag_ms"], 1)
+                self.quality.observe(row)
                 self._write(row)
                 self._table_row(side, fill.get("total_cost"), "filled", end)
                 self.on_event("sniper", f"FILL {side} {float(fill.get('shares') or 0):.1f} @ "
@@ -2150,6 +2201,7 @@ class Sniper:
                     self._settle_carry(plan, side, 0.0)
                     if plan.get("target") is not None:
                         row["carry_out"] = self.carry[side]
+                self.quality.observe(row)
                 self._write(row)
                 # "FOK no-fill": the price ran past the cap while the order was
                 # in flight - a miss, not a rejection. Never retried: chasing a
@@ -2160,9 +2212,48 @@ class Sniper:
         except Exception as exc:  # noqa: BLE001 - a sniper fault must never stop the bot
             self.n["errors"] += 1
             row.update(result="error", reason=f"{type(exc).__name__}: {exc}")
+            self.quality.observe(row)
             self._write(row)
         finally:
             self._release(side)
+
+    # ---------------------------------------------------------------- T0..T7 (after the send)
+    SIMULATED = ("send_to_ack", "trigger_to_ack", "ack_to_fill", "trigger_to_fill")
+
+    def _latency_paper(self, row: dict, plan: dict, st: dict) -> None:
+        """Paper: T0..T5 are measured here; the venue's ACK and the fill are
+        the modelled match (row lat_*_source SIMULATED)."""
+        if st.get("sent_pc") is None:
+            return
+        lat = exec_latency.stages(t0=plan.get("t_pc"), t1=plan.get("trig_pc"), t2=plan.get("decided_pc"),
+                                  t3=st.get("sign_start_pc"), t4=st.get("sign_end_pc") or st.get("signed_pc"),
+                                  t5=st.get("sent_pc"), t6=st.get("matched_pc"))
+        if st.get("matched_pc") is not None:
+            lat = exec_latency.with_fill(lat, t_ms=plan["t_ms"], t0=plan.get("t_pc"), t1=plan.get("trig_pc"),
+                                         seen_mono=None)
+            row["lat_fill_source"] = "SIMULATED"
+        row.update(lat=lat, lat_ack_source="SIMULATED")
+        self.latency.add(lat, simulated=self.SIMULATED)
+
+    def _latency_live(self, row: dict, plan: dict, res: dict) -> None:
+        """Live: T0..T6 from this process and the transport's own stamps."""
+        decided = plan.get("decided_pc")
+        if decided is None:
+            return
+        lat = exec_latency.stages(t0=plan.get("t_pc"), t1=plan.get("trig_pc"), t2=decided,
+                                  **exec_latency.live_stamps(decided, res.get("ts_us") or {}))
+        row["lat"] = lat
+        if lat.get("trigger_to_ack") is not None:
+            row["lat_ack_source"] = "CLOB"
+
+    def _latency_fill(self, row: dict, plan: dict, seen_mono, source: str) -> dict:
+        """T7: the first authoritative observation of the fill quantity."""
+        lat = exec_latency.with_fill(dict(row.get("lat") or {}), t_ms=plan["t_ms"] if "t_ms" in plan else plan["t0"] * 1000.0,
+                                     t0=plan.get("t_pc"), t1=plan.get("trig_pc"), seen_mono=seen_mono)
+        row["lat"] = lat
+        if lat.get("trigger_to_fill") is not None:
+            row["lat_fill_source"] = source
+        return lat
 
     async def _markout(self, row: dict, token: str) -> None:
         """Bought-side mid 1s and 5s after the fill, minus price and fee (c/share)."""
@@ -2324,7 +2415,8 @@ class Sniper:
                    if self.s.primary_feed == "kraken" else {}),
                 **({"carry": self.carry_view()} if self.s.order_type == "FAK" else {}),
                 "errors": self.n["errors"], "shadow_errors": self.n["shadow errors"],
-                "latency_ms": round(self.latency_plan()[0], 1),
+                "latency_ms": round(self.latency_plan()[0], 1),       # paper's MODELLED flight, not a measurement
+                "exec_latency": self.latency.summary(), "exec_quality": self.quality.summary(),
                 "clob_rtt_ms": round(sorted(self.net_rtt)[len(self.net_rtt) // 2], 1) if self.net_rtt else None,
                 "loop_lag_ms": self._lag_summary(),
                 "binance": {**self.fresh.summary(), "reconnects": self.n["reconnects"],

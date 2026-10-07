@@ -7,6 +7,10 @@ tzdata>=2024.1
 # The venue client: signing, L2 credentials, market rules (pulls in httpx,
 # eth-account, eth-utils and eth-keys, which the sniper's fast signer uses).
 py-clob-client-v2>=1.1.0,<2
+# Fast ECDSA for order signing: eth_keys uses it automatically when installed.
+# Measured (bench_execution.py): ~0.1ms per order with it, ~1.4ms with the
+# pure-Python fallback. The bot prints which one it signs with at start.
+coincurve>=17.0.0,<22
 # The live sender's HTTP/2 connection (fast_h2) and httpx(http2=True).
 h2>=4.1.0,<5
 # py-clob-client-v2 imports httpx's proxy transport at import time; SOCKS

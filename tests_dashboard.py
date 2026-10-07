@@ -116,6 +116,11 @@ def populated(mode: str = "PAPER") -> dict:
                                 "value": 0.0, "pnl": 0.0}],
                       "pending": {"markets": 1, "shares": 10.0, "cost": 4.6}},
         "settlement": settlement_panel(),
+        "exec": {"paper": mode != "LIVE", "latency": exec_latency_fixture(), "quality": {
+            "attempted": 120, "sent": 118, "acked": 118, "filled": 70, "partial": 12, "zero_fill": 30,
+            "rejected": 2, "failed": 0, "pending": 1, "fill_rate": 0.695, "reject_rate": 0.017,
+            "last": {"signal_mid": 64012.5, "ask_seen": 0.55, "cap": 0.6, "price": 0.556, "slip_c": 0.6},
+            "avg_slip_c": 0.41, "slip_n": 82}},
         "events": [(now - i, "sniper", f"line {i}", ("info", "good", "warn", "bad")[i % 4])
                    for i in reversed(range(40))],                        # newest last, as run.py keeps them
     }
@@ -128,6 +133,16 @@ def populated(mode: str = "PAPER") -> dict:
                           "rules_ready": True}
         snap["health"][2] = ("USER WS", "LIVE", "fills 7")
     return snap
+
+
+def exec_latency_fixture() -> dict:
+    st = lambda **kw: dict(dict(n=841, last=0.4, avg=0.42, p50=0.40, p95=0.56, p99=0.67, max=0.82,  # noqa: E731
+                                simulated=False), **kw)
+    return {"feed_to_trigger": st(p50=0.01), "trigger_to_decision": st(p50=0.04), "build": st(p50=0.12),
+            "sign": st(p50=0.11), "dispatch": st(p50=0.19), "send_to_ack": st(p50=187.3), "ack_to_fill": st(p50=41.2),
+            "trigger_to_send": st(), "trigger_to_ack": st(last=190.1, avg=192.4, p50=188.0, p95=231.0, p99=402.0,
+                                                          max=611.0),
+            "trigger_to_fill": st(last=230.0, avg=236.1, p50=229.5, p95=300.2, p99=510.0, max=1210.0, n=168)}
 
 
 def market_view(label, state, end, **kw) -> dict:
@@ -169,6 +184,8 @@ def ui_states() -> list[tuple[str, dict]]:
     hostile["settlement"]["subject"].update(label="\x1b[2J" + "z" * 300, age_s=float("nan"), detail="\x07" * 50)
     hostile["settlement"]["pending"].append({"state": None, "label": None, "age_s": "x"})
     hostile["positions"]["rows"].append({"side": "\x1b", "shares": float("inf"), "pnl": "nope"})
+    hostile["exec"]["latency"]["trigger_to_send"] = {"p50": float("nan"), "last": "x", "max": float("inf")}
+    hostile["exec"]["quality"]["last"] = {"signal_mid": "\x1b[2J", "price": None}
     settled = populated()
     settled["settlement"] = settlement_panel("settled")
     idle = populated()
@@ -179,6 +196,7 @@ def ui_states() -> list[tuple[str, dict]]:
                    "health": [("A", "B", "C")], "skips": [("cooldown", None)]}
     wrong_types["settlement"] = {"subject": "x", "pending": [None, 3], "active": 7}
     wrong_types["positions"] = {"rows": "x", "pending": [1]}
+    wrong_types["exec"] = {"latency": [1, 2], "quality": "x"}
     return [("empty", {}), ("paper", populated()), ("live", populated("LIVE")), ("halted", halted),
             ("kraken", kraken), ("no round", no_round), ("hostile", hostile), ("wrong types", wrong_types),
             ("settled", settled), ("idle", idle)]
@@ -351,6 +369,24 @@ def test_settlement_states_are_spelled_out() -> None:
     check("LIVE shows REDEEMABLE apart from collateral", "REDEEMABLE" in text and "$4.37" in text, text)
     check("LIVE shows REDEEM PENDING with its amount",
           any("REDEEM" in ln and "PENDING $4.37" in ln for ln in text.splitlines()), text)
+
+
+def test_execution_latency_and_quality_are_visible() -> None:
+    text = _text(build(populated("LIVE"), 140, 52, UNICODE))
+    check("the latency band is drawn when there is room", "SNIPER EXECUTION LATENCY" in text, text)
+    for label in ("feed>trig", "decide", "build", "sign", "dispatch", "net>ACK", "ACK>fill", "TRIG>SEND",
+                  "TRIG>ACK", "TRIG>FILL", "LAST", "AVG", "P50", "P95", "P99", "MAX"):
+        check(f"latency shows {label}", label in text, text)
+    row = next((ln for ln in text.splitlines() if "TRIG>ACK" in ln), "")
+    check("trigger -> ACK row has its numbers", all(v in row for v in ("190", "192", "188", "231", "402", "611")), row)
+    for label in ("EXECUTION QUALITY", "attempted 120", "fill rate 70%", "ref ask .550", "limit .600", "avg fill .556"):
+        check(f"quality shows {label}", label in text, text)
+    paper = _text(build(populated(), 140, 52, UNICODE))
+    check("paper says its ACK and fill are simulated", "simulated" in paper, paper)
+    empty = populated("LIVE")
+    empty["exec"] = {"latency": {}, "quality": {}, "paper": False}
+    text = _text(build(empty, 140, 52, UNICODE))
+    check("no samples reads N/A, never a number", "N/A" in next((ln for ln in text.splitlines() if "TRIG>SEND" in ln), ""))
 
 
 def test_live_canary_halt_is_visible() -> None:

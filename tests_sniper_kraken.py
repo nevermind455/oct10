@@ -583,9 +583,13 @@ class RunGateTests(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, "PAPER only"):
             self.rf._live_sniper_gate(paper=False)
 
-    def test_kraken_live_with_the_explicit_switch_passes(self):
-        with env(SNIPER_PRIMARY_FEED="kraken", SNIPER_KRAKEN_LIVE="1", SNIPER_ONLY="1", SNIPER_LIVE_CANARY="1"):
-            self.assertTrue(self.rf._live_sniper_gate(paper=False))
+    def test_kraken_live_with_the_explicit_switch_is_refused_by_the_frozen_spec(self):
+        # The opt-in still clears the Kraken check; the frozen spec (exec_latency.FROZEN_SPEC)
+        # then refuses LIVE on any trigger feed but Binance.
+        with env(SNIPER_PRIMARY_FEED="kraken", SNIPER_KRAKEN_LIVE="1", SNIPER_ONLY="1", SNIPER_LIVE_CANARY="1",
+                 SNIPER_K_BP="0.5", SNIPER_SLIP="0.05"), \
+                self.assertRaisesRegex(RuntimeError, "(?s)frozen spec.*trigger feed: resolved kraken"):
+            self.rf._live_sniper_gate(paper=False)
 
     def test_kraken_paper_passes(self):
         with env(SNIPER_PRIMARY_FEED="kraken", SNIPER_ONLY="1"):

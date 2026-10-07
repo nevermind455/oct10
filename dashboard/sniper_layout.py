@@ -13,7 +13,10 @@ is optional: a missing value is drawn as "--", never invented.
     trigger     feed, status, mid, move_bp, k_bp, window_ms, last_signal_bp,
                 last_signal_age_s, signals, signals_per_min, orders, filled,
                 refused, fill_rate, markout_1s_c, markout_5s_c, order_type,
-                slip, latency_ms, clob_rtt_ms, errors, in_flight
+                slip, send_p50_ms, ack_p50_ms, ack_simulated, errors, in_flight
+    exec        latency {metric: {n, last, avg, p50, p95, p99, max, simulated}}
+                (exec_latency.STAGES + TOTALS), quality (exec_latency.ExecQuality
+                summary), paper
     market      slug, seconds_left, trade_until_s, book_status, up / down
                 ({bid, ask, status, age_ms}), round_fills, max_fills,
                 round_up_sh, round_down_sh, max_side_shares
@@ -180,8 +183,10 @@ def _trigger_body(t: dict, w: int) -> list[Row]:
                (cents(t.get("markout_1s_c")), pnl_style(_num(t.get("markout_1s_c")))), ("  5s ", DIM),
                (cents(t.get("markout_5s_c")), pnl_style(_num(t.get("markout_5s_c"))))], w),
         _runs([(fit("order", 9), DIM), (" ", PAPER), (_text(t.get("order_type")), Style("ink")),
-               (f" ask+{_num(t['slip']):.2f}" if _num(t.get("slip")) is not None else "", DIM),
-               (f"  lat {_num(t['latency_ms']):.0f}ms" if _num(t.get("latency_ms")) is not None else "", DIM),
+               (f" +{_num(t['slip']):.2f}" if _num(t.get("slip")) is not None else "", DIM),
+               # measured trigger -> send and -> ACK (p50); paper's ACK is the model's
+               (f" snd {_lat(t.get('send_p50_ms'))}", Style("ink")),
+               (f" ack {_lat(t.get('ack_p50_ms'))}{' sim' if t.get('ack_simulated') else ''}", DIM),
                (f"  err {count(t.get('errors'))}" if _num(t.get("errors")) else "", Style("red", bold=True))], w),
     ]
     return rows
@@ -358,6 +363,89 @@ def _px(v) -> str:
     if f is None:
         return MISSING
     return f"{f:.3f}"[1:] if 0 <= f < 1 else f"{f:.3f}"
+
+
+def _lat(v) -> str:
+    """A latency in ms: 0.41ms, 12.3ms, 190ms; N/A without a sample."""
+    f = _num(v)
+    if f is None:
+        return "N/A"
+    return f"{f:.2f}ms" if f < 10 else f"{f:.1f}ms" if f < 100 else f"{f:.0f}ms"
+
+
+LAT_STAGES = (("feed_to_trigger", "feed>trig"), ("trigger_to_decision", "decide"), ("build", "build"),
+              ("sign", "sign"), ("dispatch", "dispatch"), ("send_to_ack", "net>ACK"), ("ack_to_fill", "ACK>fill"))
+LAT_TOTALS = (("trigger_to_send", "TRIG>SEND"), ("trigger_to_ack", "TRIG>ACK"), ("trigger_to_fill", "TRIG>FILL"))
+
+
+def _latency_body(lat: dict, w: int) -> list[Row]:
+    """SNIPER EXECUTION LATENCY: every stage (p50), then LAST / AVG / P50 /
+    P95 / P99 / MAX for trigger -> send, -> ACK, -> fill known. 'sim': the
+    paper model's venue answer, not a measurement."""
+    lat = lat if isinstance(lat, dict) else {}
+
+    def p50(key):
+        d = lat.get(key) if isinstance(lat.get(key), dict) else {}
+        return _lat(d.get("p50")) + (" sim" if d.get("simulated") else "")
+    parts = ["p50"] + [f"{label} {p50(key)}" for key, label in LAT_STAGES]
+    rows, line = [], ""
+    for part in parts:                                  # wrap the stage list to the panel
+        if line and len(line) + 2 + len(part) > w:
+            rows.append(_runs([(line, Style("ink"))], w))
+            line = part
+        else:
+            line = f"{line}  {part}" if line else part
+    if line:
+        rows.append(_runs([(line, Style("ink"))], w))
+    rows = rows[:2]
+    cw = max(6, min(9, (w - 11) // 7))
+    rows.append(_runs([(fit("ms", 10), FAINT)] + [(fit(h, cw, ">"), Style("dim", bold=True))
+                                                        for h in ("LAST", "AVG", "P50", "P95", "P99", "MAX", "n")], w))
+    for key, label in LAT_TOTALS:
+        d = lat.get(key) if isinstance(lat.get(key), dict) else {}
+        vals = [_lat(d.get(k)).replace("ms", "") for k in ("last", "avg", "p50", "p95", "p99", "max")]
+        vals.append(count(d.get("n")) if d else "N/A")
+        rows.append(_runs([(fit(label + (" sim" if d.get("simulated") else ""), 10), Style("ink", bold=True))]
+                          + [(fit(v, cw, ">"), Style("ink")) for v in vals], w))
+    return rows
+
+
+def _quality_body(q: dict, w: int) -> list[Row]:
+    q = q if isinstance(q, dict) else {}
+    last = q.get("last") if isinstance(q.get("last"), dict) else {}
+    pct = lambda v: "N/A" if _num(v) is None else f"{_num(v) * 100:.0f}%"  # noqa: E731
+    mid = _num(last.get("signal_mid"))
+    slip = _num(last.get("slip_c"))
+    avg = _num(q.get("avg_slip_c"))
+    return [
+        _runs([(f"attempted {count(q.get('attempted'))}  sent {count(q.get('sent'))}  "
+                f"acked {count(q.get('acked'))}  pending {count(q.get('pending'))}", Style("ink"))], w),
+        _runs([("filled ", DIM), (count(q.get("filled")), Style("green", bold=True)),
+               (" partial ", DIM), (count(q.get("partial")), Style("green")),
+               (" zero ", DIM), (count(q.get("zero_fill")), Style("amber")),
+               (" rej ", DIM), (count(q.get("rejected")), Style("red")),
+               (" fail ", DIM), (count(q.get("failed")), Style("red", bold=True))], w),
+        _runs([("fill rate ", DIM), (pct(q.get("fill_rate")), Style("ink", bold=True)),
+               ("  reject rate ", DIM), (pct(q.get("reject_rate")), Style("ink"))], w),
+        _runs([("last  signal ", DIM), (f"{mid:,.2f}" if mid is not None else "N/A", Style("ink")),
+               ("  ref ask ", DIM), (_px(last.get("ask_seen")), Style("ink")),
+               ("  limit ", DIM), (_px(last.get("cap")), Style("ink"))], w),
+        _runs([("      avg fill ", DIM), (_px(last.get("price")), Style("ink")),
+               ("  slip ", DIM), ("N/A" if slip is None else f"{slip:+.1f}c", pnl_style(None if slip is None else -slip))], w),
+        _runs([("avg slippage ", DIM), ("N/A" if avg is None else f"{avg:+.2f}c", Style("ink")),
+               (f"  over {count(q.get('slip_n'))} fills" if q.get("slip_n") else "", FAINT)], w),
+    ]
+
+
+def _latency_band(snap: dict, cols: int, h: int, g: Glyphs) -> list[Row]:
+    ex = snap.get("exec") if isinstance(snap.get("exec"), dict) else {}
+    title = "SNIPER EXECUTION LATENCY" + (" (paper: ACK/fill simulated)" if ex.get("paper") else "")
+    body_h = max(0, h - 2)
+    if cols < 100:
+        return panel(title, _latency_body(ex.get("latency"), cols - 2)[:body_h], cols, h, g)
+    w = hsplit(cols, (1.6, 1.0), (66, 34))
+    return join([panel(title, _latency_body(ex.get("latency"), w[0] - 2)[:body_h], w[0], h, g),
+                 panel("EXECUTION QUALITY", _quality_body(ex.get("quality"), w[1] - 2)[:body_h], w[1], h, g)], w, h)
 
 
 def _secs(v) -> str:
@@ -564,6 +652,10 @@ def _build(snap: dict, cols: int, rows: int, g: Glyphs) -> list[Row]:
     settle_h = 9 if remaining >= 15 else 5 if remaining >= 11 else 0
     side_rows = _side_body(snap, 1, 99)          # how many rows the side panel wants
     room = remaining - settle_h
+    # SNIPER EXECUTION LATENCY | EXECUTION QUALITY when it still leaves the
+    # middle band its 8 rows and EVENTS 5 (the trigger row shows send/ACK p50 always)
+    lat_h = 8 if room >= 8 + 8 + 5 else 0
+    room -= lat_h
     mid_h = min(room, max(8, len(side_rows) + 2))
     if room - mid_h < 5:                          # not enough for events below: take it all
         mid_h = room
@@ -577,6 +669,9 @@ def _build(snap: dict, cols: int, rows: int, g: Glyphs) -> list[Row]:
     if settle_h:
         out += _settlement_band(snap, cols, settle_h, g)
         remaining -= settle_h
+    if lat_h:
+        out += _latency_band(snap, cols, lat_h, g)
+        remaining -= lat_h
     if remaining >= 3:
         out += panel("EVENTS", _events_body(snap.get("events") or [], cols - 2, remaining - 2), cols, remaining, g)
     return out

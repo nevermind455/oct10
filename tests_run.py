@@ -63,8 +63,10 @@ def patched(obj, **attrs):
             setattr(obj, k, v)
 
 
+# --live also requires the resolved settings to be the frozen spec (exec_latency.FROZEN_SPEC)
+FROZEN_ENV = {"SNIPER_K_BP": "0.5", "SNIPER_WINDOW_MS": "250", "SNIPER_ORDER_TYPE": "FAK", "SNIPER_SLIP": "0.05", "SNIPER_COOLDOWN_MS": "300", "SNIPER_SHARES": "10", "SNIPER_MAX_TARGET_SHARES": "20", "SNIPER_CANARY_MAX_SHARES": "25"}
 SNIPER_ENV = {"SNIPER_ONLY": "1", "SNIPER_LIVE_CANARY": None, "SNIPER_PRIMARY_FEED": None,
-              "SNIPER_KRAKEN_LIVE": None}
+              "SNIPER_KRAKEN_LIVE": None, **FROZEN_ENV}
 
 
 # ---------------------------------------------------------------- live gate
@@ -97,7 +99,9 @@ class LiveGateTests(unittest.TestCase):
                 self.assertFalse(run._live_sniper_gate(True))       # paper on Kraken is fine
         with env(**{**SNIPER_ENV, "SNIPER_LIVE_CANARY": "1", "SNIPER_PRIMARY_FEED": "kraken",
                     "SNIPER_KRAKEN_LIVE": "1"}):
-            self.assertTrue(run._live_sniper_gate(False))
+            # the opt-in passes the Kraken check, but the frozen spec's trigger is Binance
+            with self.assertRaisesRegex(RuntimeError, "(?s)frozen spec.*trigger feed"):
+                run._live_sniper_gate(False)
         with env(**{**SNIPER_ENV, "SNIPER_PRIMARY_FEED": "kraken", "SNIPER_KRAKEN_LIVE": "1"}):
             with self.assertRaisesRegex(RuntimeError, "SNIPER_LIVE_CANARY"):
                 run._live_sniper_gate(False)                      # the opt-in is not the canary flag
@@ -601,7 +605,7 @@ class SettingsErrorTests(unittest.TestCase):
             self.assertIn(expected, str(caught.exception), key)
 
     def test_several_bad_values_are_all_named(self):
-        with env(**SNIPER_ENV, SNIPER_SLIP="0.9", SNIPER_K_BP="-1"), self.assertRaises(ValueError) as caught:
+        with env(**{**SNIPER_ENV, "SNIPER_SLIP": "0.9", "SNIPER_K_BP": "-1"}), self.assertRaises(ValueError) as caught:
             sniper_mode.Settings()
         self.assertIn("SNIPER_SLIP=0.9", str(caught.exception))
         self.assertIn("SNIPER_K_BP=-1", str(caught.exception))

@@ -1466,10 +1466,14 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved: exact-threshold moves trigger (K_BP_TOLERANCE); the stake is signed in whole
     # cents (signing_amount); one order in flight PER SIDE (inflight), per-order paper outcomes;
     # rows carry window_ms and fill_confirmed_ms / t_signal_to_send_ms / t_send_to_response_ms.
-    "sniper_mode.py": "d5964977e15ca4393caf12809585ff47fdab710715585a935a74409a4d40dc06",
+    # Re-approved (latency audit, decisions unchanged - tests_latency replays old vs new): T1 stamped
+    # when the rule fires; FastOrderBuilder stamps T3/T4 around the ECDSA step; order rows carry
+    # lat (T0..T7, exec_latency), signal_mid and the outcome counts, all after the send.
+    "sniper_mode.py": "4246e74008d339a9fe3028476cc900a3e737b165438145022f3eb43318004a5b",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
-    "sniper_live.py": "f7776ac28957d9ef76d89727b3f8fc2e93e200d07ae1ce39753f86d64e3046fd",
+    # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
+    "sniper_live.py": "333adf56eed0f9eebc8bd77e0b671169ac60e489e890a91e2a2d2061a948f359",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads

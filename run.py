@@ -567,6 +567,16 @@ def _live_sniper_gate(paper: bool) -> bool:
     if not sniper_mode.live_canary():
         raise RuntimeError("SNIPER_ONLY with --live trades real money with the sniper: refusing to start LIVE "
                            "unless SNIPER_LIVE_CANARY=1 is set too")
+    # The resolved settings must be the frozen spec: an old .env value (or a
+    # missing one, falling back to a code default such as SNIPER_K_BP=1.0)
+    # used to change the strategy silently.
+    import exec_latency
+    import sniper_live
+    bad = exec_latency.spec_violations(sniper_mode.Settings(), sniper_live.limits_from_env().max_order_shares)
+    if bad:
+        raise RuntimeError("refusing LIVE: the resolved sniper configuration is not the frozen spec\n  - "
+                           + "\n  - ".join(bad) + "\nFix .env (see .env.example). A deliberate strategy change "
+                           "goes in exec_latency.FROZEN_SPEC, reviewed - not in an environment variable.")
     return True
 
 
@@ -696,6 +706,16 @@ def start_lines(rt: Runtime) -> list[str]:
     lines.append(f"account band {config.MIN_BUY_PRICE:g}-{config.MAX_BUY_PRICE:g}, trades from "
                  f"{config.TRADE_LAST_SECONDS}s to {config.MIN_SECONDS_TO_EXPIRY:g}s left")
     lines.append(f"state: ledger {getattr(rt.ledger, 'path', '--')}; journal {rt.journal_path}")
+    if rt.sniper is not None:
+        import exec_latency
+        limits = getattr(getattr(rt.live_exec, "sender", None), "limits", None)
+        cap = getattr(limits, "max_order_shares", None)
+        lines += exec_latency.effective_config_lines(rt.sniper.s, live=not rt.paper, canary_max_shares=cap)
+        if rt.paper:
+            lines += [f"WARNING paper differs from the frozen spec (LIVE would refuse): {v}"
+                      for v in exec_latency.spec_violations(rt.sniper.s, cap)]
+        if "pure-Python" in exec_latency.signing_backend():
+            lines.append("WARNING orders are signed with the pure-Python ECDSA (~1.4ms vs ~0.1ms): pip install coincurve")
     lines += ignored_settings()
     return lines
 
@@ -1395,7 +1415,11 @@ class DashView:
                     "orders": sn.n["orders"], "filled": sn.n["filled"], "refused": sn.n["refused"],
                     "fill_rate": summary.get("fill_rate"), "markout_1s_c": summary.get("markout_1s_c"),
                     "markout_5s_c": summary.get("markout_5s_c"), "order_type": s.order_type, "slip": s.slip,
-                    "latency_ms": summary.get("latency_ms"), "errors": sn.n["errors"],
+                    "model_latency_ms": summary.get("latency_ms") if rt.paper else None,
+                    "send_p50_ms": ((summary.get("exec_latency") or {}).get("trigger_to_send") or {}).get("p50"),
+                    "ack_p50_ms": ((summary.get("exec_latency") or {}).get("trigger_to_ack") or {}).get("p50"),
+                    "ack_simulated": ((summary.get("exec_latency") or {}).get("trigger_to_ack") or {}).get("simulated"),
+                    "errors": sn.n["errors"],
                     "in_flight": "+".join(s for s, v in getattr(sn, "inflight", {}).items() if v) or None,
                     "last_signal_bp": last[1] if last else None,
                     "last_signal_age_s": now_wall - last[0] if last else None}
@@ -1403,6 +1427,8 @@ class DashView:
                            key=lambda kv: -kv[1])
             snap["skips"] = skips[:6]
         snap["trigger"] = trig
+        snap["exec"] = {"latency": summary.get("exec_latency") or {}, "quality": summary.get("exec_quality") or {},
+                        "paper": rt.paper}
         end = hub.window_end
         market = {"slug": f"btc-updown-5m-{hub.window_start}" if hub.window_start and hub.up_token else None,
                   "seconds_left": (float(end) - now_wall) if end else None,

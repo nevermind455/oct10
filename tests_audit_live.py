@@ -658,8 +658,10 @@ class OldPathAudit(unittest.TestCase):
         builds = self.calls({"build_market_order", "create_market_order", "create_order", "post_order"})
         say("order-building / posting call sites: " + "; ".join(f"{f}:{n} {c}" for f, n, c in builds))
         live_files = {f for f, _, _ in builds}
-        self.assertTrue(live_files <= {"sniper_live.py", "sniper_mode.py", "polymarket_trade.py", "live_preflight.py"},
-                        live_files)
+        # bench_execution.py builds orders with a throwaway key made in memory and sends
+        # them only to a fake CLOB on 127.0.0.1 (a latency benchmark, not an order path)
+        self.assertTrue(live_files <= {"sniper_live.py", "sniper_mode.py", "polymarket_trade.py", "live_preflight.py",
+                                       "bench_execution.py"}, live_files)
 
     def test_every_lean_sender_prepare_passes_the_order_type(self):
         src = (ROOT / "sniper_live.py").read_text(encoding="utf-8")

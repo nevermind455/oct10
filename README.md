@@ -45,6 +45,37 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
   live orders.
 - **Exit.** Every position is held to settlement.
 
+## Execution latency
+
+Every order records T0..T7 (`exec_latency.py`): feed event received, trigger fired,
+decision done, order built, signed, request dispatched (bytes to the kernel),
+Polymarket's ACK, and the first authoritative fill observation with its source
+(`ACK`, `PRIVATE_WS`, `ORDER_STATUS`). The dashboard's SNIPER EXECUTION LATENCY
+panel shows every stage and LAST/AVG/P50/P95/P99/MAX for trigger -> send, -> ACK
+and -> fill known. Paper has no venue, so its ACK and fill are the model's,
+labelled `sim`.
+
+Measured on the live code path (`python bench_execution.py`: real signing, a warm
+HTTP/2 connection, a fake CLOB on 127.0.0.1), trigger -> send is about 0.4ms. What
+is left of trigger -> ACK is outside the process:
+
+- **The network.** Run `python bench_network.py` on the VPS: warm round trip to the
+  CLOB, TCP/TLS setup, and the Binance and Polymarket sockets.
+- **Polymarket's taker delay.** Crypto markets hold every taker order: 150ms since
+  2026-09-04 14:00 UTC (docs changelog; 250ms until 2026-08-17). The reply waits for
+  it, so trigger -> ACK cannot go below about 150ms plus one round trip.
+- **The paper model.** It still assumes the old 250ms hold (`SNIPER_HOLD_MS`).
+  `SNIPER_HOLD_MS=150` models the venue as documented now. It also moves the
+  end-of-round cutoff 0.1s later, which is why it is your choice, not a default.
+
+**The frozen spec.** `--live` refuses to start unless the resolved settings are
+exactly the frozen spec (`exec_latency.FROZEN_SPEC`: Binance, 0.50bp in 250ms, FAK,
+ask+$0.05, 300ms per side, 10 shares, carry to 20) and `SNIPER_CANARY_MAX_SHARES`
+admits the 20-share carried target. A missing `.env` value used to fall back
+silently to an old code default (`SNIPER_K_BP=1.0`, `SNIPER_SLIP=0.02`). Every
+start prints the resolved configuration and which ECDSA backend signs (install
+`coincurve`: ~0.1ms per order against ~1.4ms in pure Python).
+
 ## Settlement
 
 Every market the bot sees is tracked by its condition id, from discovery to its result:
@@ -155,6 +186,8 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | `SNIPER_KRAKEN_LIVE` | 0 | 1 = explicit opt-in to trade live on the Kraken trigger |
 | `LEDGER_PATH` / `LIVE_SNIPER_JOURNAL` | live_ledger.json / live_sniper.jsonl | live state files |
 | `PAPER_LEDGER_PATH` / `PAPER_ACCOUNT_PATH` / `PAPER_AUDIT_PATH` | paper_*.json(l) | paper state files; the sniper journal is `<audit>_sniper.jsonl` |
+| `SNIPER_HOLD_MS` | 250 | paper's modelled taker hold; the venue's crypto delay is 150ms since 2026-09-04 |
+| `SNIPER_SWITCH_MS` | unset (5ms) | Python's GIL switch interval: how long another thread (a dashboard frame) can hold up a tick |
 | `SETTLE_ONCHAIN` | on (unset) | read results from the chain first; `0` = the CLOB + Gamma mirrors only (5-13 min later) |
 | `POLYGON_RPC` | publicnode | the Polygon RPC for those reads (may embed an API key) |
 | `SETTLE_RPC_TIMEOUT` / `SETTLE_API_EVERY_S` / `SETTLE_TIMEOUT_S` | 8 / 5 / 900 | one RPC read's limit; how often a market asks the mirrors when the chain cannot answer; when a pending market raises SETTLEMENT_TIMEOUT (it keeps being checked) |
@@ -284,6 +317,8 @@ Then update the changed digests in `BASELINE_SHA` (`tests_feeds.py`), run `pytho
 | `run.py` | the runner: gates, locks, feeds, paper broker or live canary, rotation, settlement, dashboard snapshot, shutdown |
 | `sniper_mode.py` | the sniper: trigger, gates, sizing, paper execution, journal |
 | `sniper_live.py`, `fast_h2.py` | live canary: lean signed sender on HTTP/2, limits, kill switch, reconciliation |
+| `exec_latency.py` | T0..T7 latency, execution quality, the frozen spec and the effective-config check |
+| `bench_execution.py`, `bench_network.py` | latency benchmarks: the live code path in-process, and this box's network to the venue |
 | `paper_trade.py` | paper broker: fills against Polymarket's book at the modelled match instant |
 | `polymarket_trade.py`, `orderbook.py`, `market_discovery.py` | venue client, book parsing, round discovery |
 | `feeds/` | Polymarket market and user channels, book state, REST reconcile, supervision |

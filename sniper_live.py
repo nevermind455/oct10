@@ -472,11 +472,15 @@ class LeanSender:
                           self.realized_loss() if self.realized_loss else None)
         lib = self._lib
         st["build_pc"] = time.perf_counter_ns()
+        if hasattr(self.builder, "last_sign_ns"):
+            self.builder.last_sign_ns = None
         signed = self.builder.build_market_order(
             lib["MarketOrderArgsV2"](token_id=str(token), amount=signing_amount(amount), side=lib["BUY"],
                                      price=signing_price(cap, tick), order_type=lib[order_type]),
             lib["CreateOrderOptions"](tick_size=tick, neg_risk=bool(rules["neg_risk"])), version=self.version)
         st["signed_pc"] = time.perf_counter_ns()
+        if getattr(self.builder, "last_sign_ns", None):
+            st["sign_start_pc"], st["sign_end_pc"] = self.builder.last_sign_ns     # T3, T4
         payload = lib["to_json"](signed, self.creds.api_key, lib[order_type])
         body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
         # No Connection header: HTTP/2 forbids connection-specific headers
