@@ -26,6 +26,8 @@ WRAP_ON = "\x1b[?7h"
 CLEAR = "\x1b[2J\x1b[H"
 HOME = "\x1b[H"
 ERASE_LINE = "\x1b[K"
+SYNC_ON = "\x1b[?2026h"      # synchronized output: begin (ignored where unsupported)
+SYNC_OFF = "\x1b[?2026l"     # ... end: the terminal shows the whole frame at once
 
 
 def render_row(row: Row) -> str:
@@ -203,48 +205,62 @@ class Renderer:
         self.last_ms = (time.perf_counter() - t0) * 1000.0
         return self.last_ms
 
+    # Well under what a Windows console takes in one write (~16k characters).
+    CHUNK_CHARS = 8000
+
     def _emit(self, parts: list[str]) -> None:
-        """Put the whole frame on screen in as few writes as possible.
+        """Put the whole frame on screen, every byte of it.
 
         Each part is a complete row paint - a cursor move followed by content
-        that covers the line edge to edge - so nothing here can leave a row
-        half-drawn.
+        that covers the line edge to edge - and chunks break only between rows,
+        never inside one.
 
-        The frame goes out as one write. Handing the text layer a chunk at a
-        time let its 8 KiB buffer flush mid-frame, and the console drew
-        whatever had arrived: at 209x51 a normal frame is ~12 KiB over three
-        or four writes, six times a second. Writing the encoded bytes in a
-        single call keeps the whole frame in one console write, so a partial
-        frame is never displayed.
+        A Windows console takes at most ~16k characters per write and reports
+        how many it took; the rest of a bigger write is simply not drawn (seen
+        with python -u, where the frame goes straight to the console's raw
+        writer). As this renderer only redraws rows that change, the lost rows
+        then stay stale. So the frame goes out in row-aligned chunks and each
+        chunk is written until all of it has been taken.
 
-        Windows consoles accept 32767 characters per write, so oversized
-        frames still have to be split. They break between rows, never inside
-        one.
+        The frame is wrapped in synchronized-output markers (DEC mode 2026):
+        terminals that support them show it all at once; the rest ignore them.
         """
-        payload = "".join(parts)
-        raw = getattr(self.stream, "buffer", None)
-        limit = 32000
-        if raw is not None and len(payload) <= limit:
-            enc = getattr(self.stream, "encoding", None) or "utf-8"
-            self.stream.flush()          # keep start()/stop() ordering intact
-            raw.write(payload.encode(enc, "replace"))
-            raw.flush()
-            return
-        if len(payload) <= limit:
-            self.stream.write(payload)
-            self.stream.flush()
-            return
+        chunks: list[str] = []
         buf: list[str] = []
         size = 0
-        for part in parts:
-            if buf and size + len(part) > limit:
-                self.stream.write("".join(buf))
+        for part in (SYNC_ON, *parts, SYNC_OFF):
+            if buf and size + len(part) > self.CHUNK_CHARS:
+                chunks.append("".join(buf))
                 buf, size = [], 0
             buf.append(part)
             size += len(part)
         if buf:
-            self.stream.write("".join(buf))
-        self.stream.flush()
+            chunks.append("".join(buf))
+        raw = getattr(self.stream, "buffer", None)
+        if raw is None:
+            for chunk in chunks:
+                self.stream.write(chunk)
+            self.stream.flush()
+            return
+        enc = getattr(self.stream, "encoding", None) or "utf-8"
+        self.stream.flush()          # keep start()/stop() ordering intact
+        for chunk in chunks:
+            write_all(raw, chunk.encode(enc, "replace"))
+        raw.flush()
+
+
+def write_all(raw, data: bytes) -> None:
+    """Write every byte: a raw (unbuffered) writer may take only part of a
+    write and say so; a buffered one takes it all. Raises if a writer stops
+    taking anything, rather than spinning."""
+    view = memoryview(data)
+    while view:
+        n = raw.write(view)
+        if n is None:                # a buffered writer took it all
+            return
+        if n <= 0:
+            raise OSError("terminal accepted no bytes")
+        view = view[n:]
 
 
 class PlainRenderer:

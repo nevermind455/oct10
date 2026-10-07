@@ -140,6 +140,19 @@ Research (read-only, heavy; run it beside the bot at low priority). It scores dy
 LAB_DATA=/opt/lab_data nice -n 19 .venv/bin/python sniper_dynexec.py
 ```
 
+## Run on a Windows PC (paper)
+
+Paper runs fine on a PC; live belongs on the VPS (a home link is slow to the CLOB, and some ISPs hijack polymarket.com's DNS).
+
+1. Make `.env` from `.env.example`, with three changes:
+   - `SNIPER_DELAY_SOURCE=model`, unless you copied `live_sniper.jsonl` from the VPS.
+   - `SNIPER_LIVE_CANARY=0`.
+   - `PAPER_LEDGER_PATH`, `PAPER_ACCOUNT_PATH`, `PAPER_AUDIT_PATH` and `BOT_LOCK_PATH` pointing to a folder outside OneDrive. Its sync can lock a file at the moment the ledger replaces it.
+2. Double-click `run_paper.cmd`, or run `python run.py --paper --dash` in Windows Terminal. Ctrl+C stops it.
+3. Check it with the same daily tools: `python sniper_why.py`, `python sniper_check.py`.
+
+If the start prints `[DNS] Polymarket name resolution is redirected`, set Windows' DNS to 1.1.1.1 or 8.8.8.8, or enable DNS-over-HTTPS. Otherwise discovery and every venue call fail.
+
 ## Install on the VPS (beside the old bot)
 
 Run these as the user that `git pull`s `/opt/btcbot`; the deploy key belongs to that user.

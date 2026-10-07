@@ -491,6 +491,58 @@ def test_frame_diff() -> None:
     check("alt screen exited", ALT_OFF in tail)
 
 
+def test_a_console_that_takes_part_of_a_write_still_gets_the_whole_frame() -> None:
+    """A Windows console takes ~16k characters per write and says how many it
+    took; the rest was lost, and the renderer never redrew those rows."""
+    class Chunky(io.RawIOBase):
+        def __init__(self, limit):
+            self.limit, self.data, self.calls = limit, bytearray(), []
+
+        def writable(self):
+            return True
+
+        def write(self, b):
+            n = min(len(b), self.limit)
+            self.data += bytes(b[:n])
+            self.calls.append(n)
+            return n
+
+    class Console(io.TextIOWrapper):
+        def isatty(self):
+            return True
+
+    raw = Chunky(1000)
+    tty = Console(raw, encoding="utf-8", write_through=True)
+    r = Renderer(tty)
+    r.cols, r.rows = 160, 48
+    r.size = lambda: (160, 48)
+    r.start()
+    frame = build(populated("LIVE"), 160, 48, r.g)
+    r.draw(frame)
+    r.stop()
+    out = raw.data.decode("utf-8")
+    check("a frame bigger than one console write was split", len(raw.calls) > 3, str(len(raw.calls)))
+    check("no part write took more than the console allows", max(raw.calls) <= 1000, str(max(raw.calls)))
+    check("every row of the frame reached the console",
+          all(f"\x1b[{i};1H" in out for i in range(1, 49)), out[-200:])
+    check("the frame is wrapped in synchronized output", "\x1b[?2026h" in out and "\x1b[?2026l" in out)
+    last_row = render_row(frame[-1])
+    check("the last row arrived intact", last_row in out, last_row[:60])
+
+
+def test_write_all_refuses_a_writer_that_takes_nothing() -> None:
+    from dashboard.renderer import write_all
+
+    class Dead:
+        def write(self, b):
+            return 0
+    try:
+        write_all(Dead(), b"frame")
+        check("a dead writer raises instead of spinning", False, "returned")
+    except OSError:
+        check("a dead writer raises instead of spinning", True)
+
+
 def test_no_hash_in_rendered_bytes() -> None:
     """Through the real renderer, escape codes and all."""
     for cols, rows in ((120, 40), (84, 24)):
