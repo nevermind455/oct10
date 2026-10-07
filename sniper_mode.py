@@ -16,7 +16,7 @@ settlement so its fills land in the same account:
     memory (no wallet, nothing sent), so it costs the same CPU and fails
     wherever the live library would refuse it. It is then matched after the
     measured one-way time to the CLOB (a round trip is probed every 5s) +
-    Polymarket's taker hold (SNIPER_HOLD_MS=150) + SNIPER_SERVER_MS=25 for the
+    Polymarket's taker hold (SNIPER_HOLD_MS=250) + SNIPER_SERVER_MS=25 for the
     venue's own processing - the one part only a real order could measure.
     The broker fills against the book as it is THEN, net of our own recent
     fills, refusing if the price ran past the cap.
@@ -544,7 +544,10 @@ class Settings:
         # Set -> the old fixed delay, no signing. Unset -> live-like.
         self.fixed_latency = bool(str(os.environ.get("SNIPER_LATENCY_MS", "")).strip())
         self.latency_ms = _env_float("SNIPER_LATENCY_MS", 200)
-        self.hold_ms = _env_float("SNIPER_HOLD_MS", 150)
+        # Polymarket's documented taker delay on up/down markets flagged itode:
+        # "The order is held for 250 ms, then validation runs again" (docs,
+        # concepts/order-lifecycle). 150 was an older assumption.
+        self.hold_ms = _env_float("SNIPER_HOLD_MS", 250)
         self.server_ms = _env_float("SNIPER_SERVER_MS", 25)
         self.net_default_ms = _env_float("SNIPER_NET_MS", 14)
         # Paper only - where each paper order's flight time (order out ->

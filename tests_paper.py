@@ -2181,18 +2181,18 @@ def t_sniper_live_like_mode_signs_and_uses_measured_latency():
     hub, broker = Hub(), Broker()
     sn = sniper_mode.Sniper(hub, broker, settings=s)
     check("before any probe the lab's 14ms one-way is used",
-          abs(sn.latency_plan()[0] - (14 + 150 + 25)) < 1e-9, str(sn.latency_plan()))
+          abs(sn.latency_plan()[0] - (14 + 250 + 25)) < 1e-9, str(sn.latency_plan()))
     sn.net_rtt.extend([30.0, 90.0, 40.0])
     lat, parts = sn.latency_plan()
-    check("latency = half the median round trip + 150ms hold + 25ms server",
-          abs(lat - (20 + 150 + 25)) < 1e-9 and parts["net_measured"], str((lat, parts)))
+    check("latency = half the median round trip + 250ms hold (documented) + 25ms server",
+          abs(lat - (20 + 250 + 25)) < 1e-9 and parts["net_measured"], str((lat, parts)))
     if sn._builder is None:
         check("py_clob_client_v2 is importable in the test environment", False)
         return
     rows = []
     sn._write = rows.append
     asyncio.run(sn._fire("UP", 1.2, time.monotonic() * 1000))
-    check("the broker is told the live-like latency", broker.calls == [195.0], str(broker.calls))
+    check("the broker is told the live-like latency", broker.calls == [295.0], str(broker.calls))
     check("...and when the order left (after signing), so its delay runs from there",
           isinstance(getattr(broker, "sent_pc", None), int), str(getattr(broker, "sent_pc", None)))
     check("the order was really signed and its time recorded",

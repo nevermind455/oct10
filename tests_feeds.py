@@ -1443,8 +1443,8 @@ def t_paper_state_paths_are_isolated_and_configurable():
 
 
 # The files that decide, size, price, send and book an order. Carved out of
-# spe8 at b314d70 byte-for-byte, so these are spe8 HEAD's digests: the guard
-# also proves the carve-out changed nothing. polymarket_trade.py, orderbook.py,
+# spe24 byte-for-byte (b314d70, then ace4d41's sniper_mode.py), so these are
+# spe24's own digests: the guard also proves the carve-out changed nothing. polymarket_trade.py, orderbook.py,
 # market_discovery.py, timer.py and config.py carry the same digests spe8's own
 # baseline approved. An intentional change to any of them needs review and a
 # new digest here (and in tests_dashboard, which reads this table).
@@ -1453,7 +1453,9 @@ TRADING_FILES = ["sniper_mode.py", "sniper_live.py", "paper_trade.py", "polymark
                  "accounting/ledger.py", "accounting/fees.py", "accounting/settlement.py",
                  "accounting/resolution.py", "feeds/book.py", "feeds/poly_user.py", "feeds/reconcile.py"]
 BASELINE_SHA = {  # approved trading-file baseline; intentional changes require review
-    "sniper_mode.py": "195b19993b80daf3f115e145cd1630e503f4d8c715741745e2e2cc6f18679a5d",
+    # sniper_mode.py re-approved at spe24 ace4d41: the paper model's taker hold
+    # is Polymarket's documented 250ms (was 150). SNIPER_DELAY_SOURCE=live is unchanged.
+    "sniper_mode.py": "1209100bffa39da8730bd0bab623c72119e592fab4d6c72f2cbc58f1ac8df6ce",
     "sniper_live.py": "d17b9858113703267949e5358fdee65e83d33a5129cbf70d0154fb2167cddfd6",
     "paper_trade.py": "b75fa9828687069e48258f53aec2250107327d16531bd6dbbd50438ed55c1b78",
     "polymarket_trade.py": "71b5da67c456c2fb30f3578b84019b0152324bdf338c20c53941eba6b72adc94",
