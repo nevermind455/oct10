@@ -1696,6 +1696,8 @@ class Sniper:
                        new_connection=res.get("new_connection"), amount=round(p.amount, 4), cap=p.cap,
                        price_signed=p.price, order_type=p.order_type,
                        client_order_id=p.client_order_id, estimate=est or None,
+                       # the market's taker-delay flag (itode) in the rules this order was signed under
+                       taker_delay=(getattr(p, "rules", None) or {}).get("taker_delay"),
                        live_ts_us=ts, t_tick_to_decided_ms=round((plan["decided_pc"] - t_pc) / 1e6, 2))
             if "net_send_start" in ts:
                 row["t_decided_to_wire_ms"] = round(ts["net_send_start"] / 1000.0, 2)
@@ -1829,7 +1831,7 @@ class Sniper:
         if not (up and down and cond and end):
             return self._skip("no current round", row)
         left = float(end) - time.time()
-        row.update(round_end=end, left_s=round(left, 1))
+        row.update(round_end=end, left_s=round(left, 1), condition_id=str(cond))
         first, last = self._window()
         if left > first:
             return self._skip("before trade window", row)

@@ -3,8 +3,9 @@
 A Polymarket bot that trades one thing: Polymarket's 5-minute **btc-updown-5m**
 markets, the instant BTC moves. It runs in **paper** (simulated fills on the real book, the default) or as a capped **live canary** (real orders under hard limits).
 
-This repo is carved out of `spe24` at **ace4d41** (b314d70 plus ace4d41's
-250ms taker hold for the paper model). The trading engine was copied byte for
+This repo is carved out of `spe24` at **aaff811**: b314d70's engine, plus
+ace4d41 (the paper model's documented 250ms taker hold) and aaff811 (order rows
+journal their market and taker-delay flag). The trading engine was copied byte for
 byte, with no rewrite. What is new: `run.py` (the runner, which
 replaces `run_feeds.py`'s `SNIPER_ONLY` path), the sniper dashboard, `setup.sh`
 and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
@@ -182,7 +183,7 @@ python run_tests.py run feeds    # just tests_run.py and tests_feeds.py
 ```
 
 - **No network, no wallet.** The suites never read `.env`: `testing_env.py` turns the load off for the test process and removes the bot's settings from the inherited environment.
-- **Hash-locked trading files.** `tests_feeds.py` locks the trading files to their approved SHA-256. The engine is byte-identical to spe24 ace4d41. Any change to a trading file needs review and a new digest.
+- **Hash-locked trading files.** `tests_feeds.py` locks the trading files to their approved SHA-256. The engine is byte-identical to spe24 aaff811. Any change to a trading file needs review and a new digest.
 - **Regression tests carried over.**
   - b50cb59: a 400 FOK miss is NO_MATCH (`tests_sniper_recovery`).
   - 8abe70f: fill cost comes from the maker legs (`tests_fill_cost`).
@@ -194,6 +195,17 @@ python run_tests.py run feeds    # just tests_run.py and tests_feeds.py
 - **Regression tests written here.** spe24 had none for these two; they are in `tests_run.py`:
   - aa3adc7: a present STOP_LIVE makes preflight FAIL.
   - 7eedf06: a settings error names the bad value.
+
+## Keeping up with spe24
+
+spe24 keeps moving. To take a later spe24 commit into this tree, run this on the dev PC from `sniperBTC`, with `spe8` beside it:
+
+```bash
+git -C ../spe8 diff --stat aaff811 HEAD -- $(git ls-files)         # what changed in the files carried here
+git -C ../spe8 diff aaff811 HEAD -- $(git ls-files) | git apply -3  # take it; adapted tests may need a hand-merge
+```
+
+Then update the changed digests in `BASELINE_SHA` (`tests_feeds.py`), run `python run_tests.py`, commit with the spe24 hash in the message, and push.
 
 ## Layout
 

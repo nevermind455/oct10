@@ -1072,7 +1072,8 @@ def t_sniper_live_end_to_end_and_halted_skips():
             rows = [json.loads(x) for x in open(journal, encoding="utf-8")]
             filled = [r for r in rows if r.get("result") == "filled"]
             out["filled"] = filled and {k: filled[0].get(k) for k in ("live", "kind", "outcome", "order_id",
-                                                                        "price", "shares", "price_source")}
+                                                                        "price", "shares", "price_source",
+                                                                        "condition_id", "taker_delay")}
             out["send_rows"] = sum(1 for r in rows if r.get("result") == "live_send")
             out["posts"] = fake.hits[("POST", "/order")]
             out["round"] = dict(sn.rounds[hub.window_end])
@@ -1096,6 +1097,8 @@ def t_sniper_live_end_to_end_and_halted_skips():
           o["posts"] == 1 and o["filled"] and o["filled"]["live"] is True and o["filled"]["kind"] == "MATCHED"
           and o["filled"]["outcome"] == "FILLED" and o["filled"]["order_id"] == "0xorder1"
           and abs(o["filled"]["price"] - 0.5) < 1e-9 and o["filled"]["price_source"] == "order reply", str(o))
+    check("sniper live: the order row names its market and the taker-delay flag it was signed under",
+          o["filled"] and o["filled"]["condition_id"] == COND and o["filled"]["taker_delay"] is True, str(o))
     check("sniper live: the send row is journalled, the round cap counted, busy cleared, table row added",
           o["send_rows"] == 1 and o["round"]["fills"] == 1 and abs(o["round"]["UP"] - 10) < 1e-9
           and o["busy"] is False and o["table"] == ["filled"], str(o))
