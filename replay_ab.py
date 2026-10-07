@@ -109,10 +109,14 @@ def events(paths):
 
 
 def scan_rounds(paths) -> dict:
-    """window_start -> round info, and how many book updates each round has."""
+    """window_start -> round info, and how many book updates each round has.
+    Also fixes the replay's end ("__until__"): a recording still being written
+    grows between the two runs, and A and B must see identical events."""
     rounds, counts = {}, collections.Counter()
     asset_round = {}
+    last = 0.0
     for ev in events(paths):
+        last = max(last, ev[1])
         if ev[0] == "round":
             info = ev[2]
             rounds[int(info["window_start"])] = info
@@ -123,7 +127,9 @@ def scan_rounds(paths) -> dict:
                 w = asset_round.get(str(a))
                 if w is not None:
                     counts[w] += 1
-    return {w: dict(info, book_updates=counts[w]) for w, info in rounds.items()}
+    out = {w: dict(info, book_updates=counts[w]) for w, info in rounds.items()}
+    out["__until__"] = last
+    return out
 
 
 def outcomes(rounds: dict, cache_path: pathlib.Path) -> dict:
@@ -314,6 +320,8 @@ for _attr, _var, _val, _l, _f in exec_latency.FROZEN_SPEC:
 
 async def run_variant(paths, rounds, results, *, with_pm: bool, pm_cfg: PMM.PMConfig, latency_ms: float,
                       start_cash: float, label: str) -> dict:
+    until = rounds.get("__until__", math.inf)
+    rounds = {w: i for w, i in rounds.items() if w != "__until__"}
     clock = Clock()
     tmp = pathlib.Path(tempfile.mkdtemp(prefix=f"replay_{label}_"))
     ledger = Ledger(path=str(tmp / "ledger.json"))
@@ -404,6 +412,8 @@ async def run_variant(paths, rounds, results, *, with_pm: bool, pm_cfg: PMM.PMCo
 
         for ev in events(paths):
             kind, now = ev[0], ev[1]
+            if now > until:
+                break                                       # identical input for A and B
             clock.now = now
             if broker.pending:
                 due = broker.resolve_due()
@@ -581,7 +591,9 @@ def main(argv=None) -> int:
         print("no recordings found in", dirs)
         return 1
     rounds = scan_rounds(paths)
+    until = rounds.pop("__until__")
     res = outcomes(rounds, pathlib.Path(dirs[-1]) / "replay_outcomes.json")
+    rounds["__until__"] = until
     pm_cfg = PMM.PMConfig.from_env({}, global_max_buy_price=0.95, global_max_side_shares=200)
     t0 = time.time()
     a = asyncio.run(run_variant(paths, rounds, res, with_pm=False, pm_cfg=pm_cfg, latency_ms=args.latency_ms,
@@ -589,6 +601,7 @@ def main(argv=None) -> int:
     b = asyncio.run(run_variant(paths, rounds, res, with_pm=True, pm_cfg=pm_cfg, latency_ms=args.latency_ms,
                                 start_cash=args.cash, label="B"))
     cmp = compare_sniper(a, b)
+    rounds.pop("__until__", None)
     print(f"{len(paths)} recordings, {len(rounds)} rounds ({sum(1 for i in rounds.values() if i['condition_id'] in res)}"
           f" with a venue result), replayed twice in {time.time() - t0:.0f}s\n")
     print(report(a, b, cmp))
