@@ -1,0 +1,36 @@
+# Credentials and local overrides
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.keystore
+*.seed
+STOP_LIVE
+
+# Every runtime state file: ledgers, paper account, journals, telemetry.
+# Balances, positions, order ids and P&L - never in git.
+*.json
+*.jsonl
+*.csv
+*.lock
+*.log
+*.txt
+!requirements*.txt
+archive/
+
+# Local runtimes and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.test-tmp/
+*.tmp
+*.bak
+
+# Editor/OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

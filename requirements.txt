@@ -1,0 +1,18 @@
+requests>=2.31.0,<3
+websockets>=12.0,<16
+python-dotenv>=1.0.0,<2
+# Windows Python has no built-in IANA tz database; ZoneInfo("America/New_York")
+# needs this package. Harmless on Linux.
+tzdata>=2024.1
+# The venue client: signing, L2 credentials, market rules (pulls in httpx,
+# eth-account, eth-utils and eth-keys, which the sniper's fast signer uses).
+py-clob-client-v2>=1.1.0,<2
+# The live sender's HTTP/2 connection (fast_h2) and httpx(http2=True).
+h2>=4.1.0,<5
+# py-clob-client-v2 imports httpx's proxy transport at import time; SOCKS
+# support keeps an ALL_PROXY environment from crashing it.
+socksio>=1.0.0,<2
+# On-chain settlement (payoutNumerators on Polygon, ~85s after a round instead
+# of ~10min from the CLOB/Gamma mirrors). Optional at runtime: without it
+# SETTLE_ONCHAIN fails closed and settlement falls back to those APIs.
+web3>=7.0.0,<8
