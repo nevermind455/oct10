@@ -91,9 +91,10 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | --- | --- | --- |
 | `SNIPER_ONLY` | 1 | required: this build is the sniper only |
 | `SNIPER_PRIMARY_FEED` | binance | trigger feed: `binance` or `kraken` |
-| `SNIPER_K_BP` / `SNIPER_WINDOW_MS` | 0.8 / 250 | trigger: a move of >= 0.8bp within 250ms |
-| `SNIPER_ORDER_TYPE` | FAK | FAK keeps partial fills; FOK is all-or-nothing |
-| `SNIPER_SLIP` | 0.45 | limit = ask + 0.45, clipped at `MAX_BUY_PRICE` |
+| `SNIPER_K_BP` / `SNIPER_WINDOW_MS` | 0.5 / 250 | trigger: a move of >= 0.5bp within 250ms |
+| `SNIPER_SHARES` | 10 | target shares per order (sized as 10 x the ask seen, at least $1) |
+| `SNIPER_ORDER_TYPE` | FAK | IOC limit: partial fills kept, the rest cancelled; FOK is all-or-nothing |
+| `SNIPER_SLIP` | 0.05 | limit = the ask seen + 0.05, clipped at `MAX_BUY_PRICE`: never pays more |
 | `SNIPER_COOLDOWN_MS` | 1000 | the pause after each sent order |
 | `SNIPER_MIN_LEFT_S` | 10 | no order with fewer seconds left in the round |
 | `SNIPER_MAX_FILLS_ROUND` / `SNIPER_MAX_SIDE_SHARES` | 20 / 200 | per-round caps |
