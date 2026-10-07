@@ -115,10 +115,12 @@ fi
 chmod 600 .env
 # A setting that points into the old install would make this bot write the
 # old bot's ledger or journal. Re-point it here (same file name).
-old_re="$(printf '%s' "$OLD" | sed 's/[][\.*^$]/\\&/g')"
+old_re="$(printf '%s' "$OLD" | sed 's/[][\.*^$#]/\\&/g')"          # a regex for the old path
+app_sub="$(printf '%s' "$APP" | sed 's/[\&#]/\\&/g')"             # a sed replacement for the new one
 pointing="$(grep -E "^[A-Za-z_][A-Za-z0-9_]*=.*${old_re}" .env | cut -d= -f1 | tr '\n' ' ' || true)"
 if [ -n "$pointing" ]; then
-    sed -i -E "/^[A-Za-z_][A-Za-z0-9_]*=.*${old_re}/ s#${old_re}#${APP}#g" .env
+    # '#' delimits both the address and the substitution: the paths are full of '/'.
+    sed -i -E "\\#^[A-Za-z_][A-Za-z0-9_]*=.*${old_re}# s#${old_re}#${app_sub}#g" .env
     ok "re-pointed from $OLD to $APP: $pointing"
 fi
 grep -qE '^SNIPER_ONLY=1[[:space:]]*$' .env || warn "SNIPER_ONLY=1 is not set: run.py refuses to start without it"
