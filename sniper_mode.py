@@ -568,6 +568,9 @@ class Settings:
         self.min_left_s = _env_float("SNIPER_MIN_LEFT_S", 10)
         self.max_fills_round = int(_env_float("SNIPER_MAX_FILLS_ROUND", 20))
         self.max_side_shares = _env_float("SNIPER_MAX_SIDE_SHARES", 200)
+        # FAK (IOC) only: what an order did not fill is added to the next
+        # same-side order in the same market, the target never above this.
+        self.max_target_shares = _env_float("SNIPER_MAX_TARGET_SHARES", 20)
         self.stale_ms = _env_float("SNIPER_STALE_MS", 2000)
         # Which book a paper order fills against. "exchange": the book as it
         # stood at the modelled match instant on the venue's own clock (the
@@ -627,6 +630,8 @@ class Settings:
                                    f"asks from 0.50)"),
             (0 <= self.latency_ms < 60_000, f"SNIPER_LATENCY_MS={self.latency_ms:g} (0 to 60000)"),
             (self.max_fills_round > 0, f"SNIPER_MAX_FILLS_ROUND={self.max_fills_round} (must be > 0)"),
+            (self.max_target_shares >= self.shares,
+             f"SNIPER_MAX_TARGET_SHARES={self.max_target_shares:g} (must be >= SNIPER_SHARES={self.shares:g})"),
             (min(self.hold_ms, self.server_ms, self.net_default_ms) >= 0,
              "SNIPER_HOLD_MS / SNIPER_SERVER_MS / SNIPER_NET_MS must be >= 0"),
             (self.binance_stale_ms > 0 and self.binance_unknown_ms > 0 and self.binance_backlog_max >= 0
@@ -647,16 +652,20 @@ class Settings:
         journal says which feed decided its orders."""
         return f" [triggered by Kraken {KRAKEN_SYMBOL} ticker (bbo), not Binance]" if self.primary_feed == "kraken" else ""
 
+    def carry_text(self) -> str:
+        return (f" (+ same-side unfilled carry, <= {self.max_target_shares:g} sh)"
+                if self.order_type == "FAK" else "")
+
     def lines(self, live: bool = False) -> list[str]:
         if live:
             return [f"SNIPER LIVE CANARY{self.lead_text()}: spot mid >= {self.k_bp}bp within {self.window_ms:.0f}ms -> real {self.order_type} "
-                    f"{self.shares:.0f} sh at ask+{self.slip:.2f}, cooldown {self.cooldown_ms:.0f}ms, "
+                    f"{self.shares:.0f} sh{self.carry_text()} at ask+{self.slip:.2f}, cooldown {self.cooldown_ms:.0f}ms, "
                     f">= {self.min_left_s:.0f}s left, <= {self.max_fills_round} fills and "
                     f"{self.max_side_shares:.0f} sh/side per round"
                     + (f"; shadow fills at {','.join(map(str, self.shadow_ms))}ms (arithmetic only)"
                        if self.shadow_ms else "") + self.feeds_text()]
         return [f"SNIPER paper-only{self.lead_text()}: spot mid >= {self.k_bp}bp within {self.window_ms:.0f}ms -> {self.order_type} "
-                f"{self.shares:.0f} sh at ask+{self.slip:.2f}, "
+                f"{self.shares:.0f} sh{self.carry_text()} at ask+{self.slip:.2f}, "
                 + (f"matched {self.latency_ms:.0f}ms after deciding (fixed); " if self.fixed_latency else
                    f"real order signing + {self.delay_note}; " if self.delay_note else
                    f"live-like: real order signing + measured one-way to the CLOB + {self.hold_ms:.0f}ms hold "
@@ -921,6 +930,11 @@ class Sniper:
         self.busy = False
         self.rounds = collections.defaultdict(lambda: {"fills": 0, "UP": 0.0, "DOWN": 0.0})
         self._fak_pending: dict = {}        # accepted orders awaiting actual trade quantities
+        # FAK (IOC): shares an order did not fill, per side, for the next
+        # same-side order in the same market. Never moved across sides;
+        # cleared when the market changes (carry_market).
+        self.carry = {"UP": 0.0, "DOWN": 0.0}
+        self.carry_market = None            # (condition id, round end) the carry belongs to
         self.n = collections.Counter()
         self._skip_logged: dict = {}
         self.marks = {"1s": [], "5s": []}
@@ -1536,6 +1550,67 @@ class Sniper:
                        f"set MIN_BUY_PRICE=0.05 and MAX_BUY_PRICE=0.95")
         return out
 
+    # ---------------------------------------------------------------- IOC target and carry
+    def _carry_for(self, cond, end) -> dict:
+        """The carry of this market. A different market (or round) clears both
+        sides first: a remainder never outlives the market it was owed in."""
+        key = (str(cond), end)
+        if self.carry_market != key:
+            self.carry = {"UP": 0.0, "DOWN": 0.0}
+            self.carry_market = key
+        return self.carry
+
+    def carry_view(self) -> dict:
+        """The carry as it applies to the hub's current market: zero on both
+        sides once the market changed, even before the next order clears it."""
+        key = (str(getattr(self.hub, "condition_id", None)), getattr(self.hub, "window_end", None))
+        current = self.carry_market == key
+        return {side: (self.carry[side] if current else 0.0) for side in ("UP", "DOWN")}
+
+    def _settle_carry(self, plan, side: str, filled) -> None:
+        """An IOC's outcome is known: the shares it did not fill wait for the
+        next order on the SAME side in the SAME market (replacing that side's
+        carry - the target already included it). A FOK, an order whose market
+        has changed since, and an outcome nobody knows (rejected, ambiguous,
+        unknown book) leave the carry as it is."""
+        key = plan.get("carry_market")
+        if key is None or key != self.carry_market:
+            return
+        left = max(0.0, float(plan["target"]) - float(filled or 0.0))
+        self.carry[side] = round(left, 4) if left >= 0.01 else 0.0
+
+    def _visible_levels(self, token: str, view) -> list:
+        """Ask levels (price, size), best first, as a live account would see
+        them: net of our own recent paper fills, exactly as _visible_ask."""
+        net = getattr(self.broker, "_net_of_own_fills", None)
+        ttl = getattr(self.broker, "own_fill_ttl_s", 0)
+        recent = getattr(self.broker, "has_recent_own_fill", None)
+        if net is not None and ttl and (recent is None or recent(token)):
+            from paper_trade import PaperRejected, snapshot_from_book_view
+            try:
+                return [(float(p), float(q)) for p, q in net(snapshot_from_book_view(view, expected_token=token)).asks]
+            except PaperRejected:
+                pass
+        return [(float(p), float(q)) for p, q in (view.asks or ())]
+
+    @staticmethod
+    def ioc_spend(levels, target: float, ask: float, cap: float) -> float:
+        """Dollars that buy `target` shares on the book the decision saw: the
+        levels from the best ask up to the cap, consumed in order. Shares the
+        book does not show within the cap are priced at the reference ask - by
+        the match more depth may be there; whatever is not bought is carried,
+        never chased above the cap. Rounded up to the cent (orders are signed
+        in whole cents), so a full book gives the whole target."""
+        need, cost = float(target), 0.0
+        for price, size in levels:
+            if price > cap + 1e-9 or need <= 1e-9:
+                break
+            take = min(need, float(size))
+            cost += take * float(price)
+            need -= take
+        cost += max(0.0, need) * float(ask)
+        return math.ceil(cost * 100.0 - 1e-6) / 100.0
+
     def _visible_ask(self, token: str, view):
         """Best ask as a live account would see it.
 
@@ -1746,6 +1821,10 @@ class Sniper:
             else:
                 self.n["refused"] += 1
                 row.update(result="refused", reason=res.get("error") or kind)
+                if kind == NO_MATCH:
+                    self._settle_carry(plan, side, 0.0)       # an IOC that matched nothing: all of it carried
+                    if plan.get("target") is not None:
+                        row["carry_out"] = self.carry[side]
                 self._write(row)
                 self._table_row(side, p.amount, "missed" if kind == NO_MATCH else "rejected", end)
                 if kind != NO_MATCH:
@@ -1764,6 +1843,9 @@ class Sniper:
         row.update(shares=shares, price=fill.get("price"), cost=fill["cost"], fee=fill.get("fee", 0),
                    partial=fill.get("partial", False), price_source=fill["source"],
                    fill_statuses=fill.get("statuses", []), reason=None)
+        self._settle_carry(plan, side, shares)
+        if plan.get("target") is not None:
+            row["carry_out"] = self.carry[side]
         if shares > 0:
             rd[side] += shares
             self.n["filled"] += 1
@@ -1861,20 +1943,35 @@ class Sniper:
         if not lo <= ask <= hi:
             row.update(ask_seen=ask)
             return self._skip("ask outside price band", row)
-        # The venue refuses a marketable BUY under $1, so under 10c the
-        # 10-share clip becomes $1 - the smallest order live could place.
-        amount = max(self.s.shares * ask, MIN_ORDER_USD)
+        # The price ceiling is fixed here, once, from the ask this decision saw:
+        # never recomputed from a later ask, so it cannot chase the book.
+        cap = min(0.99, round(ask + self.s.slip, 4))
+        target = carry = None
+        if self.s.order_type == "FAK":
+            # IOC: a share target - the base clip plus what this side's last
+            # order in this market did not fill - sized on the visible levels
+            # up to the ceiling (and never past the account's MAX_BUY_PRICE).
+            carry = self._carry_for(cond, end)[side]
+            target = min(self.s.shares + carry, self.s.max_target_shares)
+            amount = max(self.ioc_spend(self._visible_levels(str(token), view), target, ask, min(cap, hi)),
+                         MIN_ORDER_USD)
+        else:
+            # The venue refuses a marketable BUY under $1, so under 10c the
+            # 10-share clip becomes $1 - the smallest order live could place.
+            amount = max(self.s.shares * ask, MIN_ORDER_USD)
         rd = self.rounds[end]
         if rd["fills"] >= self.s.max_fills_round or rd[side] + amount / ask > self.s.max_side_shares:
             return self._skip("round cap", row)
         decided_pc = time.perf_counter_ns()     # every check passed: this signal trades
-        cap = min(0.99, round(ask + self.s.slip, 4))
         row.update(ask_seen=ask, cap=cap, shares=round(amount / ask, 4), amount=round(amount, 4))
+        if target is not None:
+            row.update(target_shares=round(target, 4), carry_in=round(carry, 4))
         self.n["orders"] += 1
         lat, parts = self.latency_plan()
         row.update(latency_ms=round(lat, 1), **parts)
         tick = getattr(view, "tick_size", None)
         return {"end": end, "token": str(token), "amount": amount, "rd": rd, "cap": cap, "lat": lat, "view": view,
+                "target": target, "carry_market": self.carry_market if target is not None else None,
                 "order_type": self.s.order_type, "tick": f"{float(tick):g}" if tick else "0.01",
                 "other": str(down if side == "UP" else up), "cond": str(cond), "t0": t_ms / 1000.0,
                 "decided_pc": decided_pc, "built_pc": time.perf_counter_ns(),
@@ -1909,6 +2006,9 @@ class Sniper:
                 self.n["filled"] += 1
                 rd["fills"] += 1
                 rd[side] += float(fill.get("shares") or 0)
+                self._settle_carry(plan, side, fill.get("shares"))
+                if plan.get("target") is not None:
+                    row["carry_out"] = self.carry[side]
                 row.update(result="filled", order_id=fill.get("order_id"), shares=fill.get("shares"),
                            price=fill.get("average_price"), fee=fill.get("fee"), cost=fill.get("total_cost"))
                 if fill.get("partial"):
@@ -1926,6 +2026,10 @@ class Sniper:
                 self.n["refused"] += 1
                 reason = sign_err or getattr(self.broker, "last_error", None)
                 row.update(result="refused", reason=reason)
+                if "fak no-fill" in str(reason).lower():
+                    self._settle_carry(plan, side, 0.0)
+                    if plan.get("target") is not None:
+                        row["carry_out"] = self.carry[side]
                 self._write(row)
                 # "FOK no-fill": the price ran past the cap while the order was
                 # in flight - a miss, not a rejection. Never retried: chasing a
@@ -2098,6 +2202,7 @@ class Sniper:
                                "gap_ms_max": round(self.kraken_gap_max, 1),
                                "lag_ms": BinanceFreshness._q(self.kraken_lag), "system": self.kraken_system}}
                    if self.s.primary_feed == "kraken" else {}),
+                **({"carry": self.carry_view()} if self.s.order_type == "FAK" else {}),
                 "errors": self.n["errors"], "shadow_errors": self.n["shadow errors"],
                 "latency_ms": round(self.latency_plan()[0], 1),
                 "clob_rtt_ms": round(sorted(self.net_rtt)[len(self.net_rtt) // 2], 1) if self.net_rtt else None,

@@ -242,6 +242,21 @@ def test_mode_market_and_account_are_visible() -> None:
     check("live collateral is shown", "$123.45" in live)
 
 
+def test_ioc_carry_is_visible() -> None:
+    snap = populated()
+    snap["market"]["carry"] = {"UP": {"carry": 4.0, "next": 14.0}, "DOWN": {"carry": 0.0, "next": 10.0}}
+    text = _text(build(snap, 120, 40, UNICODE))
+    row = next((ln for ln in text.splitlines() if "carry" in ln and "->" in ln), "")
+    check("the carry row shows each side's carried shares and its next target",
+          "4 -> 14" in row and "0 -> 10" in row, row)
+    no_carry = _text(build(populated(), 120, 40, UNICODE))
+    check("no carry row without IOC carry data (FOK)", not any("carry" in ln and "->" in ln
+                                                               for ln in no_carry.splitlines()))
+    for cols, rows in SIZES:
+        ok, detail = _geometry_ok(build(snap, cols, rows, UNICODE), cols, rows)
+        check(f"geometry with carry {cols}x{rows}", ok, detail)
+
+
 def test_live_canary_halt_is_visible() -> None:
     snap = dict(ui_states())["halted"]
     text = _text(build(snap, 120, 40, UNICODE))

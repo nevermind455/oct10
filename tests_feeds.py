@@ -1457,7 +1457,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # is Polymarket's documented 250ms (was 150). SNIPER_DELAY_SOURCE=live is unchanged.
     # Re-approved at spe24 aaff811: order rows also journal condition_id and the
     # market's taker_delay flag (diagnostics; no decision reads them).
-    "sniper_mode.py": "24352ce92c7287f8841649dab267f94b4864cd11f1a4850b132a3b26f6574fa4",
+    # Re-approved here (sniperBTC, not spe24): IOC (FAK) orders size a SHARE target
+    # (SNIPER_SHARES + this side's unfilled carry, <= SNIPER_MAX_TARGET_SHARES) on
+    # the visible levels up to ask + SNIPER_SLIP; actual fills settle the carry,
+    # which never crosses sides and dies with its market. FOK is unchanged.
+    "sniper_mode.py": "94faaf5b5acdeea62ea61852cd7d152f90f03b91934aa0ce7505ba3fadee0fd3",
     "sniper_live.py": "d17b9858113703267949e5358fdee65e83d33a5129cbf70d0154fb2167cddfd6",
     "paper_trade.py": "b75fa9828687069e48258f53aec2250107327d16531bd6dbbd50438ed55c1b78",
     "polymarket_trade.py": "71b5da67c456c2fb30f3578b84019b0152324bdf338c20c53941eba6b72adc94",

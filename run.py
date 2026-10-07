@@ -1276,6 +1276,11 @@ class DashView:
             market.update(round_fills=(rd or {}).get("fills", 0), round_up_sh=(rd or {}).get("UP", 0.0),
                           round_down_sh=(rd or {}).get("DOWN", 0.0), max_fills=sn.s.max_fills_round,
                           max_side_shares=sn.s.max_side_shares)
+            if sn.s.order_type == "FAK" and hasattr(sn, "carry_view"):
+                carry = sn.carry_view()
+                market["carry"] = {side: {"carry": carry[side],
+                                          "next": min(sn.s.shares + carry[side], sn.s.max_target_shares)}
+                                   for side in ("UP", "DOWN")}
         snap["market"] = market
         snap["canary"] = self._canary()
         snap["health"] = self._health_rows(summary, health)
@@ -1363,7 +1368,8 @@ def status_text(snap: dict) -> str:
             f"book={(health.get('POLY BOOK') or ('--',))[0]} user={(health.get('USER WS') or ('--',))[0]} | "
             f"signals={t.get('signals')} orders={t.get('orders')} filled={t.get('filled')} "
             f"missed={t.get('refused')} errors={t.get('errors')} | "
-            f"pnl={'--' if pnl is None else f'{pnl:+.2f}'} open={a.get('open')} fees={a.get('fees')}"
+            + (f"carry UP {m['carry']['UP']['carry']:g} DN {m['carry']['DOWN']['carry']:g} | " if m.get("carry") else "")
+            + f"pnl={'--' if pnl is None else f'{pnl:+.2f}'} open={a.get('open')} fees={a.get('fees')}"
             + (f" | canary {'HALTED: ' + '; '.join(canary['halted']) if canary.get('halted') else 'armed'}"
                f" orders {canary.get('orders')}/{canary.get('max_orders')}" if canary else "")
             + (f" | skips: {skips}" if skips else ""))

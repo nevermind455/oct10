@@ -519,6 +519,10 @@ class DashViewTests(unittest.TestCase):
         self.assertIsNone(snap["canary"])
         self.assertEqual(dict((n, s) for n, s, _ in snap["health"])["USER WS"], "ABSENT")
         self.assertEqual(len(sn.rounds), 0, "the dashboard created a round entry by reading it")
+        self.assertEqual(market["carry"], {"UP": {"carry": 0.0, "next": 10.0}, "DOWN": {"carry": 0.0, "next": 10.0}})
+        sn.carry_market, sn.carry["UP"] = (str(hub.condition_id), hub.window_end), 4.0
+        self.assertEqual(run.DashView(rt).snapshot()["market"]["carry"]["UP"], {"carry": 4.0, "next": 14.0})
+        self.assertIn("carry UP 4 DN 0", run.status_text(run.DashView(rt).snapshot()))
         line = run.status_text(snap)
         for part in ("PAPER", "binance=", "signals=7", "orders=2", "filled=1", "skips: cooldown 5"):
             self.assertIn(part, line)

@@ -27,9 +27,19 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
   - The per-round caps (`SNIPER_MAX_FILLS_ROUND`, `SNIPER_MAX_SIDE_SHARES`) are not reached.
   - The Binance freshness gate passes: the feed is not behind, has no backlog,
     and its age is known.
-- **Order.** FOK or FAK for 10 shares at the ask. The stake is at least $1, and
-  at least the venue minimum shares x the limit price. The limit is ask +
-  `SNIPER_SLIP`, clipped at `MAX_BUY_PRICE`.
+- **Order.** An IOC limit order (Polymarket's FAK) with a share target:
+  - **Target.** 10 shares, plus whatever this side's last order in this market
+    did not fill, capped at 20 shares.
+  - **Limit.** The freshest best ask + `SNIPER_SLIP`. It is fixed at the decision,
+    never recomputed from a later ask, and clipped at `MAX_BUY_PRICE`.
+  - **Sizing.** The stake buys the target on the book the decision saw, walking
+    the levels from the ask up to the limit. It is at least $1, and at least the
+    venue minimum shares x the limit.
+  - **Fills.** A partial fill is kept, and its remainder waits for the next
+    same-side signal. It is never retried. A zero fill is not a fill.
+  - **Carry.** UP and DOWN carries are kept apart, and both are cleared when the
+    market changes.
+  - **FOK.** `SNIPER_ORDER_TYPE=FOK` keeps the old all-or-nothing order with no carry.
 - **Paper fills.** Paper fills against Polymarket's book at the modelled match
   instant. With `SNIPER_DELAY_SOURCE=live`, each order's delay is drawn from real
   live orders.
@@ -92,7 +102,8 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | `SNIPER_ONLY` | 1 | required: this build is the sniper only |
 | `SNIPER_PRIMARY_FEED` | binance | trigger feed: `binance` or `kraken` |
 | `SNIPER_K_BP` / `SNIPER_WINDOW_MS` | 0.5 / 250 | trigger: a move of >= 0.5bp within 250ms |
-| `SNIPER_SHARES` | 10 | target shares per order (sized as 10 x the ask seen, at least $1) |
+| `SNIPER_SHARES` | 10 | base target shares per order (at least $1) |
+| `SNIPER_MAX_TARGET_SHARES` | 20 | cap on base + same-side unfilled carry |
 | `SNIPER_ORDER_TYPE` | FAK | IOC limit: partial fills kept, the rest cancelled; FOK is all-or-nothing |
 | `SNIPER_SLIP` | 0.05 | limit = the ask seen + 0.05, clipped at `MAX_BUY_PRICE`: never pays more |
 | `SNIPER_COOLDOWN_MS` | 1000 | the pause after each sent order |

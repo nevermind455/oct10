@@ -186,7 +186,14 @@ def _market_body(m: dict, w: int, g: Glyphs) -> list[Row]:
         return _runs([(fit(label, 9), DIM), (" ", PAPER), (fit(a, cw), sa), (fit(b, cw), sb)], w)
 
     up_sh, dn_sh = _num(m.get("round_up_sh")), _num(m.get("round_down_sh"))
-    return [
+    carry = m.get("carry") if isinstance(m.get("carry"), dict) else {}
+
+    def carried(side):
+        c = carry.get(side) if isinstance(carry.get(side), dict) else {}
+        n, nxt = _num(c.get("carry")), _num(c.get("next"))
+        return MISSING if n is None else f"{n:g} -> {nxt:g}" if nxt is not None else f"{n:g}"
+
+    rows = [
         _line("round", _text(m.get("slug"), "waiting for discovery"), w, Style("ink", bold=True)),
         left_row,
         head,
@@ -200,6 +207,11 @@ def _market_body(m: dict, w: int, g: Glyphs) -> list[Row]:
                (f" /{_num(m['max_side_shares']):.0f}sh" if _num(m.get("max_side_shares")) is not None else "", FAINT)],
               w),
     ]
+    if carry:      # IOC: unfilled shares waiting for the next same-side signal -> that order's target
+        rows.append(pair("carry", carried("UP"), carried("DOWN"),
+                         Style("amber", bold=True) if (_num((carry.get("UP") or {}).get("carry")) or 0) else Style("ink"),
+                         Style("amber", bold=True) if (_num((carry.get("DOWN") or {}).get("carry")) or 0) else Style("ink")))
+    return rows
 
 
 def _account_body(a: dict, w: int) -> list[Row]:
