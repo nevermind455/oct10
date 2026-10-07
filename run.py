@@ -567,6 +567,10 @@ def _live_sniper_gate(paper: bool) -> bool:
     if not sniper_mode.live_canary():
         raise RuntimeError("SNIPER_ONLY with --live trades real money with the sniper: refusing to start LIVE "
                            "unless SNIPER_LIVE_CANARY=1 is set too")
+    if str(os.environ.get("POSITION_MANAGER_LIVE_ENABLED", "")).strip().lower() in ("1", "true", "yes", "on"):
+        raise RuntimeError("POSITION_MANAGER_LIVE_ENABLED=1: real Position Manager orders are not implemented "
+                           "until its paper/replay results are reviewed (replay_ab.py). Unset it; with "
+                           "POSITION_MANAGER_ENABLED=1 the manager runs shadow-only in LIVE (decisions, no orders).")
     # The resolved settings must be the frozen spec: an old .env value (or a
     # missing one, falling back to a code default such as SNIPER_K_BP=1.0)
     # used to change the strategy silently.
@@ -601,6 +605,7 @@ class Runtime:
     live_exec: object = None
     reconciler: object = None
     settler: object = None
+    pm: object = None                     # position_manager.PositionManager (off unless enabled)
     journal_path: Path | None = None
     trade_rows: list = dataclasses.field(default_factory=list)
     tasks: list = dataclasses.field(default_factory=list)
@@ -659,6 +664,7 @@ def build_paper(rt: Runtime, *, paper_balance: float | None = None) -> None:
     rt.journal_path = audit.with_name(f"{audit.stem}_sniper.jsonl")
     rt.sniper = sniper_mode.Sniper(hub, rt.broker, on_event=on_event, journal_path=rt.journal_path,
                                    trade_rows=rt.trade_rows, own_rounds=True)
+    rt.pm = build_manager(rt, broker=rt.broker)
 
 
 async def build_live(rt: Runtime) -> None:
@@ -693,6 +699,7 @@ async def build_live(rt: Runtime) -> None:
     rt.journal_path = _state_path("LIVE_SNIPER_JOURNAL", "live_sniper.jsonl")
     rt.sniper = sniper_mode.Sniper(hub, rt.live_exec.shim, on_event=on_event, journal_path=rt.journal_path,
                                    trade_rows=rt.trade_rows, own_rounds=True, live=rt.live_exec)
+    rt.pm = build_manager(rt, broker=rt.live_exec.shim)
 
 
 def start_lines(rt: Runtime) -> list[str]:
@@ -714,10 +721,27 @@ def start_lines(rt: Runtime) -> list[str]:
         if rt.paper:
             lines += [f"WARNING paper differs from the frozen spec (LIVE would refuse): {v}"
                       for v in exec_latency.spec_violations(rt.sniper.s, cap)]
+        if rt.pm is not None:
+            lines += rt.pm.cfg.lines(live_mode=not rt.paper)
         if "pure-Python" in exec_latency.signing_backend():
             lines.append("WARNING orders are signed with the pure-Python ECDSA (~1.4ms vs ~0.1ms): pip install coincurve")
     lines += ignored_settings()
     return lines
+
+
+def build_manager(rt: Runtime, *, broker):
+    """The Position Manager: a separate consumer of the books, the ledger and
+    the sniper's state. Off unless POSITION_MANAGER_ENABLED=1; paper orders in
+    paper, shadow-only (no orders) in LIVE. Its limits never exceed the global ones."""
+    import config
+    import position_manager
+    cfg = position_manager.PMConfig.from_env(global_max_buy_price=config.MAX_BUY_PRICE,
+                                             global_max_side_shares=rt.sniper.s.max_side_shares,
+                                             global_max_unsettled_usd=config.MAX_UNSETTLED_EXPOSURE)
+    journal = rt.journal_path.with_name(f"{rt.journal_path.stem}_manager.jsonl") if rt.journal_path else None
+    return position_manager.PositionManager(cfg, hub=rt.hub, ledger=rt.ledger, broker=broker, sniper=rt.sniper,
+                                            on_event=on_event, journal_path=journal if cfg.enabled else None,
+                                            live_mode=not rt.paper)
 
 
 def build_settler(rt: Runtime) -> SettlementWorker:
@@ -885,6 +909,8 @@ async def run_runtime(rt: Runtime, *, dash: bool = False, paper_balance: float |
         rt.tasks.append(asyncio.create_task(_rotation_loop(rt.hub, rt.stop, on_round=_tracker(rt.settler)),
                                             name="rotation"))
         rt.tasks.append(rt.settler.start())
+        if rt.pm is not None and rt.pm.cfg.enabled:
+            rt.tasks.append(rt.pm.start())
         if not rt.paper:
             rt.tasks.append(asyncio.create_task(_ledger_loop(rt.hub, rt.ledger, rt.stop), name="ledger"))
         if dash_task is not None:
@@ -948,7 +974,9 @@ async def shutdown(rt: Runtime) -> None:
         with contextlib.suppress(Exception):
             await rt.live_exec.stop()
         log.append("live_exec")
-    for name, service in (("reconciler", rt.reconciler), ("settler", rt.settler), ("hub", rt.hub)):
+    pm = rt.pm if rt.pm is not None and rt.pm.cfg.enabled else None     # stopped (journal flushed) when it ran
+    for name, service in (("reconciler", rt.reconciler), ("settler", rt.settler), ("manager", pm),
+                          ("hub", rt.hub)):
         if service is None:
             continue
         try:
@@ -1023,6 +1051,8 @@ def report(rt: Runtime) -> dict:
             out["balance_check"] = rt.ledger.reconcile_balance()
     if rt.settler is not None:
         out["settlement"] = rt.settler.summary()
+    if rt.pm is not None and rt.pm.cfg.enabled:
+        out["position_manager"] = rt.pm.summary()
     if rt.live_exec is not None:
         out["canary"] = rt.live_exec.status()
     return out
@@ -1455,6 +1485,9 @@ class DashView:
         settlement = self._settlement()
         snap["settlement"] = settlement
         snap["positions"] = dict(self._positions)
+        pm = getattr(rt, "pm", None)
+        if pm is not None and pm.cfg.enabled:
+            snap["pm"] = pm.snapshot()
         if settlement and not rt.paper and snap["account"]:
             # LIVE: winning shares not yet redeemed are worth their payout but are
             # not in the collateral balance - shown, and counted in equity.

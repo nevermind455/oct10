@@ -651,8 +651,11 @@ class OldPathAudit(unittest.TestCase):
     def test_no_live_order_path_other_than_the_lean_sender(self):
         place = self.calls({"place_trade"})
         say("place_trade call sites: " + "; ".join(f"{f}:{n} {c}" for f, n, c in place))
-        # sniper_mode calls its broker's place_trade: the PaperBroker (paper) - live uses LiveExecution
-        self.assertTrue(all(f in ("sniper_mode.py", "paper_trade.py", "polymarket_trade.py") for f, _, _ in place))
+        # sniper_mode calls its broker's place_trade: the PaperBroker (paper) - live uses LiveExecution.
+        # position_manager.py: the PAPER broker only (raises in live/shadow mode; --live refuses manager
+        # orders); replay_ab.py: its own replay broker, no venue at all.
+        self.assertTrue(all(f in ("sniper_mode.py", "paper_trade.py", "polymarket_trade.py", "position_manager.py",
+                                  "replay_ab.py") for f, _, _ in place), place)
         self.assertFalse(any(c.startswith(("polymarket_trade.", "pt.")) for _, _, c in place),
                          "something calls the old polymarket_trade.place_trade (FOK path)")
         builds = self.calls({"build_market_order", "create_market_order", "create_order", "post_order"})

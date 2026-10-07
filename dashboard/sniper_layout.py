@@ -14,6 +14,11 @@ is optional: a missing value is drawn as "--", never invented.
                 last_signal_age_s, signals, signals_per_min, orders, filled,
                 refused, fill_rate, markout_1s_c, markout_5s_c, order_type,
                 slip, send_p50_ms, ack_p50_ms, ack_simulated, errors, in_flight
+    pm          position_manager.PositionManager.snapshot(): engine, live_orders,
+                shadow, orders, spend, sides {UP/DOWN: shares, avg, cost, best_bid,
+                best_ask, pending, new_avg_if_buy, state WAIT/IMPROVE/BLOCKED,
+                reason}, portfolio {combined_avg, paired, unpaired_up/down,
+                total_cost, pending, fees, exposure}
     exec        latency {metric: {n, last, avg, p50, p95, p99, max, simulated}}
                 (exec_latency.STAGES + TOTALS), quality (exec_latency.ExecQuality
                 summary), paper
@@ -437,6 +442,78 @@ def _quality_body(q: dict, w: int) -> list[Row]:
     ]
 
 
+STATE_PM = {"IMPROVE": Style("green", bold=True), "BLOCKED": Style("amber", bold=True), "WAIT": Style("faint")}
+
+
+def _pm_side_body(sd: dict, w: int) -> list[Row]:
+    sd = sd if isinstance(sd, dict) else {}
+    sh = _num(sd.get("shares"))
+    avg = _num(sd.get("avg"))
+
+    def money4(v):
+        f = _num(v)
+        return MISSING if f is None else f"${f:.4f}"
+    rows = [
+        _line("Shares", "0.00" if sh is None else f"{sh:.2f}", w, Style("ink", bold=True), lw=12),
+        _line("Average", money4(avg) if sh else "N/A", w, Style("ink"), lw=12),
+        _line("Cost", money(sd.get("cost")) if sh else "$0.00", w, Style("ink"), lw=12),
+        _line("Best Bid", money4(sd.get("best_bid")), w, Style("ink"), lw=12),
+        _line("Best Ask", money4(sd.get("best_ask")), w, Style("ink"), lw=12),
+        _line("Pending", f"{_num(sd.get('pending')) or 0:.2f}", w, Style("ink"), lw=12),
+        _line("New Avg/Buy", money4(sd.get("new_avg_if_buy")) if sd.get("new_avg_if_buy") is not None else "N/A",
+              w, Style("ink"), lw=12),
+    ]
+    state = _text(sd.get("state"), "WAIT")
+    reason = _text(sd.get("reason"), "")
+    rows.append(_runs([(fit("Opportunity", 12), DIM), (" ", PAPER), (state, STATE_PM.get(state, Style("ink")))], w))
+    rows.append(_runs([(" " * 13, PAPER), (reason if reason and state != "WAIT" else "", FAINT)], w))
+    return rows
+
+
+def _pm_portfolio_body(pm: dict, w: int) -> list[Row]:
+    pf = pm.get("portfolio") if isinstance(pm.get("portfolio"), dict) else {}
+
+    def n2(v):
+        f = _num(v)
+        return "0.00" if f is None else f"{f:.2f}"
+    comb = _num(pf.get("combined_avg"))
+    mode = "SHADOW (no orders)" if pm.get("shadow") else ("LIVE ORDERS" if pm.get("live_orders") else "paper orders")
+    return [
+        _line("Combined Avg", "N/A" if comb is None else f"${comb:.4f}", w,
+              (Style("green", bold=True) if comb is not None and comb < 1 else Style("red", bold=True))
+              if comb is not None else FAINT, lw=13),
+        _line("Paired", n2(pf.get("paired")), w, Style("ink"), lw=13),
+        _line("Unpaired UP", n2(pf.get("unpaired_up")), w, Style("ink"), lw=13),
+        _line("Unpaired DOWN", n2(pf.get("unpaired_down")), w, Style("ink"), lw=13),
+        _line("Total Cost", money(pf.get("total_cost") or 0.0), w, Style("ink"), lw=13),
+        _line("Pending Exp", money(pf.get("pending") or 0.0), w, Style("ink"), lw=13),
+        _line("Fees", money(pf.get("fees") or 0.0), w, Style("ink"), lw=13),
+        _line("Orders", f"{count(pm.get('orders'))}/{count(pm.get('max_orders'))}  spend "
+              f"{money(pm.get('spend'))}/{money(pm.get('max_spend'))}", w, Style("ink"), lw=13),
+        _runs([(mode, Style("amber") if pm.get("shadow") else DIM)], w),
+    ]
+
+
+def _manager_band(snap: dict, cols: int, h: int, g: Glyphs) -> list[Row]:
+    pm = snap.get("pm") if isinstance(snap.get("pm"), dict) else {}
+    sides = pm.get("sides") if isinstance(pm.get("sides"), dict) else {}
+    body_h = max(0, h - 2)
+    if cols < 90:
+        up = (sides.get("UP") or {}) if isinstance(sides.get("UP"), dict) else {}
+        dn = (sides.get("DOWN") or {}) if isinstance(sides.get("DOWN"), dict) else {}
+        rows = [_runs([("UP   ", Style("green", bold=True)), (_text(up.get("state"), "WAIT"),
+                                                              STATE_PM.get(_text(up.get("state"), "WAIT"), Style("ink"))),
+                       (f" {_text(up.get('reason'), '')}", FAINT)], cols - 2),
+                _runs([("DOWN ", Style("red", bold=True)), (_text(dn.get("state"), "WAIT"),
+                                                            STATE_PM.get(_text(dn.get("state"), "WAIT"), Style("ink"))),
+                       (f" {_text(dn.get('reason'), '')}", FAINT)], cols - 2)]
+        return panel("POSITION MANAGER", (rows + _pm_portfolio_body(pm, cols - 2))[:body_h], cols, h, g)
+    w = hsplit(cols, (1.0, 1.0, 1.0), (30, 30, 30))
+    return join([panel("POSITION MANAGER  UP", _pm_side_body(sides.get("UP"), w[0] - 2)[:body_h], w[0], h, g),
+                 panel("DOWN", _pm_side_body(sides.get("DOWN"), w[1] - 2)[:body_h], w[1], h, g),
+                 panel("PORTFOLIO", _pm_portfolio_body(pm, w[2] - 2)[:body_h], w[2], h, g)], w, h)
+
+
 def _latency_band(snap: dict, cols: int, h: int, g: Glyphs) -> list[Row]:
     ex = snap.get("exec") if isinstance(snap.get("exec"), dict) else {}
     title = "SNIPER EXECUTION LATENCY" + (" (paper: ACK/fill simulated)" if ex.get("paper") else "")
@@ -654,6 +731,9 @@ def _build(snap: dict, cols: int, rows: int, g: Glyphs) -> list[Row]:
     room = remaining - settle_h
     # SNIPER EXECUTION LATENCY | EXECUTION QUALITY when it still leaves the
     # middle band its 8 rows and EVENTS 5 (the trigger row shows send/ACK p50 always)
+    # POSITION MANAGER (only when its engine is on), then the latency band
+    pm_h = 11 if isinstance(snap.get("pm"), dict) and snap["pm"].get("engine") and room >= 11 + 8 + 3 else 0
+    room -= pm_h
     lat_h = 8 if room >= 8 + 8 + 5 else 0
     room -= lat_h
     mid_h = min(room, max(8, len(side_rows) + 2))
@@ -669,6 +749,9 @@ def _build(snap: dict, cols: int, rows: int, g: Glyphs) -> list[Row]:
     if settle_h:
         out += _settlement_band(snap, cols, settle_h, g)
         remaining -= settle_h
+    if pm_h:
+        out += _manager_band(snap, cols, pm_h, g)
+        remaining -= pm_h
     if lat_h:
         out += _latency_band(snap, cols, lat_h, g)
         remaining -= lat_h

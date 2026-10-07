@@ -185,9 +185,13 @@ async def make_live(tmp: str):
     return fake, ex, store
 
 
-async def bench_live(m: int, matched_every: int = 5) -> dict:
+async def bench_live(m: int, matched_every: int = 5, with_pm: bool = False, pm_stress: bool = False) -> dict:
     tmp = tempfile.mkdtemp(prefix="bench_live_")
     fake, ex, store = await make_live(tmp)
+    if with_pm:
+        # inventory to manage, so the manager does full evaluations (both sides, every size)
+        ex.ledger.record_fill("seed-up", T.UP, shares=20, price=0.45, condition_id=T.COND, fee=0.16)
+        ex.ledger.record_fill("seed-dn", T.DN, shares=5, price=0.50, condition_id=T.COND, fee=0.04)
     book = T.live_book(asks=((0.55, 500), (0.56, 500), (0.57, 500)), bids=((0.54, 500),))
     book.apply_snapshot(T.DN, [(0.44, 500)], [(0.45, 500), (0.46, 500)], ts_ms=int(time.time() * 1000),
                         require_exchange_ts=False)
@@ -199,6 +203,15 @@ async def bench_live(m: int, matched_every: int = 5) -> dict:
     sn = S.Sniper(hub, ex.shim, journal_path=journal, settings=settings, trade_rows=[], own_rounds=True, live=ex)
     sn.fresh.enabled = False
     ex.attach(sn) if hasattr(ex, "attach") else None
+    pm = None
+    if with_pm:
+        import position_manager as PMM
+        from dataclasses import replace as _replace
+        pm = PMM.PositionManager(_replace(PMM.PMConfig(enabled=True), poll_ms=5.0), hub=hub, ledger=ex.ledger,
+                                 broker=ex.shim, sniper=sn, live_mode=True)       # live: shadow, never orders
+        if pm_stress:
+            pm._state_version = lambda: object()          # a full evaluation on every 5ms poll
+        pm.start()
     n_order = 0
     wall0 = time.perf_counter()
 
@@ -257,6 +270,8 @@ async def bench_live(m: int, matched_every: int = 5) -> dict:
         await settle_side(side, *r)
     await asyncio.sleep(0.05)
     elapsed = time.perf_counter() - wall0
+    if pm is not None:
+        await pm.stop()
     for task in list(sn._tasks):
         task.cancel()
     await asyncio.gather(*sn._tasks, return_exceptions=True)
@@ -290,6 +305,13 @@ async def bench_live(m: int, matched_every: int = 5) -> dict:
     out["new_connection_on_hot_path"] = sum(1 for r in orders if r.get("new_connection"))
     out["matched_unresolved"] = len(sn._fak_pending)
     out["posted"] = sum(1 for o in fake.orders)                     # POSTs the fake CLOB received
+    lat = [r.get("lat") or {} for r in orders]
+    out["lat_ms"] = {k: stats_last([x.get(k) for x in lat]) for k in ("feed_to_trigger", "trigger_to_decision",
+                                                                     "trigger_to_send", "trigger_to_ack")}
+    if pm is not None:
+        out["pm"] = pm.summary()["eval_us"]
+        out["pm_counts"] = dict(pm.n)
+        out["pm_last"] = {s: (d.action, d.reason, d.classification) for s, d in pm.last.items()}
     return out
 
 

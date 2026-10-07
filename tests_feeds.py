@@ -1479,7 +1479,9 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads
     # our recent fills without the broker lock (a booking holds it through the ledger's
     # fsync - and behind a settlement's) and prunes only when the lock is free. Same answer.
-    "paper_trade.py": "5fdea1e24a64aa719617dced6af4ef4aa853a842d5142162feb1816aa0fa6bf6",
+    # Re-approved (Position Manager): one order in flight per token PER SOURCE (tag), so another
+    # strategy's order can neither refuse nor delay the sniper's on the same token.
+    "paper_trade.py": "3a6ddbba88e10f0a29c632a3454a4412c609836287c28204047b483d2c7a44a4",
     "polymarket_trade.py": "71b5da67c456c2fb30f3578b84019b0152324bdf338c20c53941eba6b72adc94",
     "orderbook.py": "fe3decc44a8f1061c2788c1f2ae85739ade137910033031eac3138f11b22f090",
     "market_discovery.py": "23c605f678eaf1c6caf60259293b9bccf73413e7f632c0a6749c55acc571aa11",

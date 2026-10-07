@@ -77,6 +77,57 @@ silently to a code default (`SNIPER_SLIP=0.02`, `SNIPER_K_BP=1.0`). Every
 start prints the resolved configuration and which ECDSA backend signs (install
 `coincurve`: ~0.1ms per order against ~1.4ms in pure Python).
 
+## Position Manager
+
+An optional layer beside the sniper (`position_manager.py`), **off by default**
+(`POSITION_MANAGER_ENABLED=0`). It never changes what the sniper does. It watches
+both sides of the current market: the ledger's confirmed fills, both books, and its
+own pending orders. It buys only when a purchase measurably improves the position:
+
+- **PAIR_COST_IMPROVEMENT.** New matched UP+DOWN shares cost less than $1 after
+  fees and expected slippage, by `POSITION_MANAGER_MIN_PAIR_IMPROVEMENT`. One UP
+  plus one DOWN pays $1 whichever side wins (0.50 + 0.50 on a 50-50 result), and
+  fees are charged at the purchase. It buys only as much as pairs the other side's
+  unpaired shares.
+- **SIDE_AVG_IMPROVEMENT.** A lower average on a side already held, by
+  `POSITION_MANAGER_MIN_AVG_IMPROVEMENT`. A lower average is not lower risk: every
+  extra share of one side adds its whole cost to the loss if the other side wins.
+  So by default only a buy adding at most $1 of worst-case loss passes. Larger ones
+  are `AVG_IMPROVES_BUT_RISK_REJECTED`.
+- **EXPOSURE_IMPROVEMENT.** Cutting the worst-case loss at a pair cost the operator
+  allows. Off by default (`POSITION_MANAGER_EXPOSURE_MAX_PAIR_COST=0`): hedging is
+  not free.
+
+Every buy passes two checks: the benefit, then the added capital and risk.
+Its limits are spend, orders, side inventory and total exposure (filled + pending),
+plus a cash reserve kept for the sniper. Prices come from the book walked to the
+order's limit (expected VWAP, never the displayed best). A same-side
+average-down needs the ask a further `POSITION_MANAGER_MIN_PRICE_IMPROVEMENT_BETWEEN_ENTRIES`
+lower and waits out a cooldown, so a falling book is never laddered. Its thresholds
+tighten as the round ends, and it stops `POSITION_MANAGER_MIN_LEFT_S` before.
+Every non-trade has a reason (`IMPROVEMENT_TOO_SMALL`, `PAIR_ECONOMICS_BAD`,
+`SNIPER_PRIORITY`, ...), shown on the dashboard and in
+`<sniper journal>_manager.jsonl`.
+
+**The sniper comes first.**
+- The manager runs as its own task, never in the tick handler.
+- It sends nothing while a sniper order is in flight or within 300ms of one.
+- In paper it has its own execution slot in the broker, so it can neither refuse
+  nor delay a sniper order.
+- Measured with the sniper's own benchmark: trigger -> send is unchanged
+  (~0.53ms p50) while the manager evaluates 160 times a second.
+
+**Live.** `POSITION_MANAGER_LIVE_ENABLED=1` refuses to start: real manager orders
+wait for the replay results to be reviewed. With `--live` and the engine on, it is
+shadow-only (decisions logged, no orders).
+
+**A/B replay.** `python replay_ab.py --data <recordings>` replays every recorded
+round twice: the sniper alone, then the sniper + manager. Both get identical events,
+each round settles on its venue result, and the output includes the manager's
+capital, its attributable P/L, the P/L per extra dollar, the extra drawdown and
+exposure, and any sniper order that differs. Record with
+`python -m latency_lab.recorder` (public data only).
+
 ## Settlement
 
 Every market the bot sees is tracked by its condition id, from discovery to its result:
@@ -187,6 +238,7 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | `SNIPER_KRAKEN_LIVE` | 0 | 1 = explicit opt-in to trade live on the Kraken trigger |
 | `LEDGER_PATH` / `LIVE_SNIPER_JOURNAL` | live_ledger.json / live_sniper.jsonl | live state files |
 | `PAPER_LEDGER_PATH` / `PAPER_ACCOUNT_PATH` / `PAPER_AUDIT_PATH` | paper_*.json(l) | paper state files; the sniper journal is `<audit>_sniper.jsonl` |
+| `POSITION_MANAGER_ENABLED` / `_LIVE_ENABLED` | 0 / 0 | the Position Manager (paper orders; LIVE shadow-only) / real manager orders (refused for now) |
 | `SNIPER_HOLD_MS` | 250 | paper's modelled taker hold; the venue's crypto delay is 150ms since 2026-09-04 |
 | `SNIPER_SWITCH_MS` | unset (5ms) | Python's GIL switch interval: how long another thread (a dashboard frame) can hold up a tick |
 | `SETTLE_ONCHAIN` | on (unset) | read results from the chain first; `0` = the CLOB + Gamma mirrors only (5-13 min later) |
@@ -319,6 +371,7 @@ Then update the changed digests in `BASELINE_SHA` (`tests_feeds.py`), run `pytho
 | `sniper_mode.py` | the sniper: trigger, gates, sizing, paper execution, journal |
 | `sniper_live.py`, `fast_h2.py` | live canary: lean signed sender on HTTP/2, limits, kill switch, reconciliation |
 | `exec_latency.py` | T0..T7 latency, execution quality, the frozen spec and the effective-config check |
+| `position_manager.py`, `replay_ab.py` | the optional Position Manager, and its A/B replay on recorded markets |
 | `bench_execution.py`, `bench_network.py` | latency benchmarks: the live code path in-process, and this box's network to the venue |
 | `paper_trade.py` | paper broker: fills against Polymarket's book at the modelled match instant |
 | `polymarket_trade.py`, `orderbook.py`, `market_discovery.py` | venue client, book parsing, round discovery |

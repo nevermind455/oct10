@@ -116,6 +116,7 @@ def populated(mode: str = "PAPER") -> dict:
                                 "value": 0.0, "pnl": 0.0}],
                       "pending": {"markets": 1, "shares": 10.0, "cost": 4.6}},
         "settlement": settlement_panel(),
+        "pm": pm_fixture(shadow=mode == "LIVE"),
         "exec": {"paper": mode != "LIVE", "latency": exec_latency_fixture(), "quality": {
             "attempted": 120, "sent": 118, "acked": 118, "filled": 70, "partial": 12, "zero_fill": 30,
             "rejected": 2, "failed": 0, "pending": 1, "fill_rate": 0.695, "reject_rate": 0.017,
@@ -133,6 +134,19 @@ def populated(mode: str = "PAPER") -> dict:
                           "rules_ready": True}
         snap["health"][2] = ("USER WS", "LIVE", "fills 7")
     return snap
+
+
+def pm_fixture(shadow=False) -> dict:
+    return {"engine": True, "live_orders": False, "shadow": shadow, "orders": 2, "spend": 7.09, "max_orders": 6,
+            "max_spend": 25.0,
+            "sides": {"UP": {"shares": 20.0, "avg": 0.4512, "cost": 9.02, "best_bid": 0.44, "best_ask": 0.46,
+                             "pending": 0.0, "new_avg_if_buy": 0.4581, "state": "BLOCKED",
+                             "reason": "IMPROVEMENT_TOO_SMALL"},
+                      "DOWN": {"shares": 9.68, "avg": 0.4891, "cost": 4.73, "best_bid": 0.47, "best_ask": 0.49,
+                               "pending": 5.0, "new_avg_if_buy": 0.4921, "state": "IMPROVE",
+                               "reason": "PAIR_COST_IMPROVEMENT"}},
+            "portfolio": {"combined_avg": 0.9403, "paired": 9.68, "unpaired_up": 10.32, "unpaired_down": 0.0,
+                          "total_cost": 13.75, "pending": 2.6, "fees": 0.21, "exposure": 4.07}}
 
 
 def exec_latency_fixture() -> dict:
@@ -185,6 +199,8 @@ def ui_states() -> list[tuple[str, dict]]:
     hostile["settlement"]["pending"].append({"state": None, "label": None, "age_s": "x"})
     hostile["positions"]["rows"].append({"side": "\x1b", "shares": float("inf"), "pnl": "nope"})
     hostile["exec"]["latency"]["trigger_to_send"] = {"p50": float("nan"), "last": "x", "max": float("inf")}
+    hostile["pm"]["sides"]["UP"].update(reason="\x1b[31m" + "r" * 300, shares=float("nan"), state=None)
+    hostile["pm"]["portfolio"] = {"combined_avg": "x", "paired": float("inf")}
     hostile["exec"]["quality"]["last"] = {"signal_mid": "\x1b[2J", "price": None}
     settled = populated()
     settled["settlement"] = settlement_panel("settled")
@@ -197,6 +213,7 @@ def ui_states() -> list[tuple[str, dict]]:
     wrong_types["settlement"] = {"subject": "x", "pending": [None, 3], "active": 7}
     wrong_types["positions"] = {"rows": "x", "pending": [1]}
     wrong_types["exec"] = {"latency": [1, 2], "quality": "x"}
+    wrong_types["pm"] = {"engine": True, "sides": [1], "portfolio": "x"}
     return [("empty", {}), ("paper", populated()), ("live", populated("LIVE")), ("halted", halted),
             ("kraken", kraken), ("no round", no_round), ("hostile", hostile), ("wrong types", wrong_types),
             ("settled", settled), ("idle", idle)]
@@ -387,6 +404,26 @@ def test_execution_latency_and_quality_are_visible() -> None:
     empty["exec"] = {"latency": {}, "quality": {}, "paper": False}
     text = _text(build(empty, 140, 52, UNICODE))
     check("no samples reads N/A, never a number", "N/A" in next((ln for ln in text.splitlines() if "TRIG>SEND" in ln), ""))
+
+
+def test_position_manager_panel() -> None:
+    text = _text(build(populated(), 120, 60, UNICODE))
+    check("the manager panel is drawn when its engine is on and there is room", "POSITION MANAGER" in text, text)
+    for label in ("Shares", "Average", "Cost", "Best Bid", "Best Ask", "Pending", "New Avg/Buy", "Opportunity",
+                  "Combined Avg", "Paired", "Unpaired UP", "Unpaired DOWN", "Total Cost", "Pending Exp", "Fees"):
+        check(f"manager shows {label}", label in text, label)
+    check("each side's state and full reason are readable",
+          "IMPROVEMENT_TOO_SMALL" in text and "PAIR_COST_IMPROVEMENT" in text and "BLOCKED" in text
+          and "IMPROVE" in text, text)
+    check("values are shown", "$0.4512" in text and "$0.9403" in text and "10.32" in text, text)
+    live = _text(build(populated("LIVE"), 120, 60, UNICODE))
+    check("live says the manager is shadow-only", "SHADOW (no orders)" in live, live)
+    off = populated()
+    off["pm"] = {"engine": False}
+    check("no panel while the engine is off", "POSITION MANAGER" not in _text(build(off, 120, 60, UNICODE)))
+    for cols, rows in ((80, 60), (120, 60), (200, 60)):
+        ok, detail = _geometry_ok(build(populated(), cols, rows, UNICODE), cols, rows)
+        check(f"geometry with the manager {cols}x{rows}", ok, detail)
 
 
 def test_live_canary_halt_is_visible() -> None:

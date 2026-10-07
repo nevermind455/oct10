@@ -1145,8 +1145,12 @@ class PaperBroker:
         # the book. Published only once this order owns the broker.
         timing = {"enter_pc": time.perf_counter_ns()}
         token = up_token_id if str(side).upper() == "UP" else down_token_id
+        # One order in flight per token PER SOURCE (tag): the sniper's slot on a
+        # token is never taken by another strategy's order (the position
+        # manager's), so it can neither refuse nor delay the sniper. Booking
+        # stays atomic under self._lock either way.
         with self._lock:
-            entry_lock = self._execution_locks.setdefault(str(token), threading.Lock())
+            entry_lock = self._execution_locks.setdefault((str(token), str(tag or "")), threading.Lock())
         if not entry_lock.acquire(blocking=False):
             return self._reject(side, amount, "another paper order is already in flight on this token")
         try:
