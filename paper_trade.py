@@ -1547,13 +1547,23 @@ class PaperBroker:
         if not self.own_fill_ttl_s or not isinstance(book, BookSnapshot):
             return book
         now = time.monotonic()
-        with self._lock:
-            live = [f for f in self._own_fills.get(book.token_id, ())
-                    if now - f[0] < self.own_fill_ttl_s]
-            if live:
-                self._own_fills[book.token_id] = live
-            else:
-                self._own_fills.pop(book.token_id, None)
+        # Read without the broker lock: the sniper calls this on the event loop,
+        # and a booking holds that lock while the ledger fsyncs (or waits for a
+        # settlement's fsync), which froze the loop for the write. list() of a
+        # list is one atomic copy under the GIL; appends happen under the lock.
+        live = [f for f in list(self._own_fills.get(book.token_id, ()))
+                if now - f[0] < self.own_fill_ttl_s]
+        if self._lock.acquire(blocking=False):      # prune only when it costs no wait
+            try:
+                current = self._own_fills.get(book.token_id)
+                if current is not None:
+                    kept = [f for f in current if now - f[0] < self.own_fill_ttl_s]
+                    if kept:
+                        self._own_fills[book.token_id] = kept
+                    else:
+                        self._own_fills.pop(book.token_id, None)
+            finally:
+                self._lock.release()
         if not live:
             return book
         used: dict = {}

@@ -25,7 +25,8 @@ def _no_dotenv(*_args, **_kwargs) -> bool:
 
 dotenv.load_dotenv = _no_dotenv
 
-_PREFIXES = ("SNIPER_", "PAPER_", "POLY_", "LIVE_", "DASH_", "STOP_LOSS_", "FLIP_", "PHASE1_", "PHASE2_")
+_PREFIXES = ("SNIPER_", "PAPER_", "POLY_", "LIVE_", "DASH_", "STOP_LOSS_", "FLIP_", "PHASE1_", "PHASE2_",
+             "SETTLE_")
 _NAMES = {
     "PRIVATE_KEY", "POLYGON_RPC", "LEDGER_PATH", "USER_WS", "RECONCILE", "BOOK_SOURCE", "BTC_FEED",
     "BTC_STALE_AFTER", "BOOK_STALE_AFTER", "PRICE_STALE_POLICY", "BOOK_AUDIT", "TRADE_LAST_SECONDS",
@@ -38,3 +39,6 @@ for _key in list(os.environ):
         os.environ.pop(_key, None)
 # The other-install lock probe defaults to /opt/btcbot on Linux: tests name their own.
 os.environ["OTHER_BOT_LOCKS"] = ""
+# Settlement reads the chain by default; no test may reach Polygon or the CLOB
+# through it. The tests of that path turn it back on around fakes.
+os.environ["SETTLE_ONCHAIN"] = "0"

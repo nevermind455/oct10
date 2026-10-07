@@ -933,8 +933,10 @@ async def t_settlement_keeps_an_error_when_a_later_condition_succeeds():
 
         w = SettlementWorker(led, fetch=mixed_fetch, interval=0.05)
         await w.run_once()
+        # Both are asked in the same pass, concurrently (one slow market no
+        # longer holds up the next), so the order they are asked in is free.
         check("mixed cycle checks both open conditions",
-              calls == [COND, other_condition], str(calls))
+              sorted(calls) == sorted([COND, other_condition]), str(calls))
         check("later successful fetch does not erase an earlier cycle error",
               "first condition unavailable" in (w.last_error or ""),
               str(w.summary()))

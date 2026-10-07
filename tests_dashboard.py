@@ -110,6 +110,12 @@ def populated(mode: str = "PAPER") -> dict:
                    ("SETTLE", "OK", ""), ("LEDGER", "OK", ""), ("CLOCK", "OK", "clock synchronized"),
                    ("LOOP LAG", "OK", "p50 8ms p99 15ms")],
         "skips": [("cooldown", 309), ("ask outside price band", 106), ("binance feed behind", 1)],
+        "positions": {"rows": [{"side": "UP", "shares": 5.435, "avg": 0.46, "cost": 2.50, "bid": 0.47,
+                                "value": 2.55, "pnl": 0.05},
+                               {"side": "DOWN", "shares": 0.0, "avg": None, "cost": 0.0, "bid": 0.52,
+                                "value": 0.0, "pnl": 0.0}],
+                      "pending": {"markets": 1, "shares": 10.0, "cost": 4.6}},
+        "settlement": settlement_panel(),
         "events": [(now - i, "sniper", f"line {i}", ("info", "good", "warn", "bad")[i % 4])
                    for i in reversed(range(40))],                        # newest last, as run.py keeps them
     }
@@ -122,6 +128,28 @@ def populated(mode: str = "PAPER") -> dict:
                           "rules_ready": True}
         snap["health"][2] = ("USER WS", "LIVE", "fills 7")
     return snap
+
+
+def market_view(label, state, end, **kw) -> dict:
+    v = {"condition_id": "0x" + label.replace(":", "").replace("-", "")[:8].ljust(64, "0"), "label": label,
+         "state": state, "window_start": end - 300, "window_end": end, "age_s": None, "winner": None,
+         "settlement_price": None, "realized": None, "settlement_s": None, "redeem": None, "redeem_amount": None,
+         "detail": "", "error": None, "has_position": True, "source": "rotation"}
+    v.update(kw)
+    return v
+
+
+def settlement_panel(subject: str = "pending") -> dict:
+    """SettlementWorker.panel() as run.DashView labels it: one market trading,
+    two waiting for their result, one settled."""
+    active = market_view("14:05-14:10", "ACTIVE", 1754781000)
+    p1 = market_view("14:00-14:05", "PENDING SETTLEMENT", 1754780700, age_s=6.2, detail="not resolved on chain yet")
+    p2 = market_view("13:55-14:00", "PENDING SETTLEMENT", 1754780400, age_s=306.2, error="polygon rpc unavailable")
+    done = market_view("13:50-13:55", "SETTLED", 1754780100, winner="UP", settlement_price=1.0, realized=2.31,
+                       settlement_s=58.3, redeem="N/A (PAPER)")
+    subj = {"pending": p2, "settled": done, "active": active}[subject]
+    return {"active": active, "subject": subj, "pending": [p1, p2], "previous": [p1, p2, done],
+            "last_settled": done, "pending_count": 2, "redeem_pending": 0.0}
 
 
 def ui_states() -> list[tuple[str, dict]]:
@@ -138,12 +166,22 @@ def ui_states() -> list[tuple[str, dict]]:
     hostile["events"].append((time.time(), "\x1b[31m", "\x9b2J" + "y" * 3000, "nonsense-level"))
     hostile["health"].append(("\x1b", None, None))
     hostile["account"]["cash"] = 1e18
+    hostile["settlement"]["subject"].update(label="\x1b[2J" + "z" * 300, age_s=float("nan"), detail="\x07" * 50)
+    hostile["settlement"]["pending"].append({"state": None, "label": None, "age_s": "x"})
+    hostile["positions"]["rows"].append({"side": "\x1b", "shares": float("inf"), "pnl": "nope"})
+    settled = populated()
+    settled["settlement"] = settlement_panel("settled")
+    idle = populated()
+    idle["settlement"] = settlement_panel("active")
     wrong_types = {"mode": 7, "trigger": {"mid": "abc", "signals": "x", "markout_1s_c": "1"},
                    "market": {"up": {"bid": "0.4", "ask": None}, "seconds_left": "soon"},
                    "orders": [{"result": None, "shares": "ten"}], "events": [(None, None, None, None)],
                    "health": [("A", "B", "C")], "skips": [("cooldown", None)]}
+    wrong_types["settlement"] = {"subject": "x", "pending": [None, 3], "active": 7}
+    wrong_types["positions"] = {"rows": "x", "pending": [1]}
     return [("empty", {}), ("paper", populated()), ("live", populated("LIVE")), ("halted", halted),
-            ("kraken", kraken), ("no round", no_round), ("hostile", hostile), ("wrong types", wrong_types)]
+            ("kraken", kraken), ("no round", no_round), ("hostile", hostile), ("wrong types", wrong_types),
+            ("settled", settled), ("idle", idle)]
 
 
 def _text(frame) -> str:
@@ -255,6 +293,64 @@ def test_ioc_carry_is_visible() -> None:
     for cols, rows in SIZES:
         ok, detail = _geometry_ok(build(snap, cols, rows, UNICODE), cols, rows)
         check(f"geometry with carry {cols}x{rows}", ok, detail)
+
+
+def test_settlement_status_is_always_visible() -> None:
+    """MARKET STATUS is never blank: in the header at every size, and in the
+    SETTLEMENT block whenever the band fits."""
+    for tag, snap in ui_states():
+        for cols, rows in ((200, 60), (120, 40), (100, 30), (80, 24), (64, 20)):
+            text = _text(build(snap, cols, rows, UNICODE))
+            head = text.splitlines()[0] if text else ""
+            if cols >= 100:
+                check(f"header carries the market status ({tag} {cols}x{rows})",
+                      any(s in head for s in ("ACTIVE", "DISCOVERING")), head)
+            status = [ln for ln in text.splitlines() if "MARKET STATUS" in ln]
+            if rows >= 24 and cols >= 64 and tag not in ("empty", "wrong types"):
+                check(f"SETTLEMENT block shown ({tag} {cols}x{rows})", bool(status), text[:300])
+            for ln in status:
+                value = ln.split("MARKET STATUS", 1)[1].strip(" \u2502")
+                check(f"MARKET STATUS has a value ({tag} {cols}x{rows})", bool(value.strip()), ln)
+
+
+def test_settlement_states_are_spelled_out() -> None:
+    pending = _text(build(populated(), 120, 40, UNICODE))
+    check("the oldest pending market is the SETTLEMENT subject", "13:55-14:00" in pending, pending)
+    check("PENDING SETTLEMENT and WAITING are shown",
+          "PENDING SETTLEMENT" in pending and "WAITING" in pending, pending)
+    check("its age is shown", "306s" in pending, pending)
+    check("the failure it waits on is named", "polygon rpc" in pending, pending)
+    check("the header counts pending markets", "2 PENDING SETTLEMENT" in pending.splitlines()[0],
+          pending.splitlines()[0])
+    check("MARKETS lists the active market and each pending one",
+          "ACTIVE MARKET" in pending and "14:05-14:10" in pending and "14:00-14:05 WAITING RESULT" in pending,
+          pending)
+    check("the position table has its columns",
+          all(h in pending for h in ("SIDE", "SHARES", "AVG", "COST", "BID", "VALUE", "P/L")), pending)
+    check("a position row reads shares, avg, cost, bid, value, P/L",
+          any(all(x in ln for x in ("UP", "5.435", ".460", "$2.50", ".470", "$2.55", "+$0.05"))
+              for ln in pending.splitlines()), pending)
+    check("ended markets awaiting a result are carried at cost", "cost $4.60" in pending, pending)
+    snap = populated()
+    snap["settlement"] = settlement_panel("settled")
+    settled = _text(build(snap, 120, 40, UNICODE))
+    for label in ("WINNER", "SETTLE PRICE", "REALIZED P/L", "SETTLE TIME", "REDEEM"):
+        check(f"settled block shows {label}", label in settled, settled)
+    check("settled values", "$1.00" in settled and "+$2.31" in settled and "58.3s" in settled
+          and "N/A (PAPER)" in settled, settled)
+    snap["settlement"] = settlement_panel("active")
+    idle = _text(build(snap, 120, 40, UNICODE))
+    row = next(ln for ln in idle.splitlines() if "MARKET STATUS" in ln)
+    check("an idle block says ACTIVE", "ACTIVE" in row, row)
+    check("and names the last settled market", "13:50 UP +$2.31" in idle or "13:50-13:55 UP +$2.31" in idle, idle)
+    live = populated("LIVE")
+    live["account"].update(redeemable=4.37, position_value=2.55, equity=130.37, unrealized=0.05, total=-2.25)
+    live["settlement"] = settlement_panel("settled")
+    live["settlement"]["subject"].update(redeem="REDEEM PENDING", redeem_amount=4.37)
+    text = _text(build(live, 120, 40, UNICODE))
+    check("LIVE shows REDEEMABLE apart from collateral", "REDEEMABLE" in text and "$4.37" in text, text)
+    check("LIVE shows REDEEM PENDING with its amount",
+          any("REDEEM" in ln and "PENDING $4.37" in ln for ln in text.splitlines()), text)
 
 
 def test_live_canary_halt_is_visible() -> None:

@@ -31,6 +31,7 @@ import asyncio
 import collections
 import contextlib
 import dataclasses
+import functools
 import json
 import math
 import os
@@ -699,6 +700,60 @@ def start_lines(rt: Runtime) -> list[str]:
     return lines
 
 
+def build_settler(rt: Runtime) -> SettlementWorker:
+    """The settlement worker: one record per market (condition id), checked
+    from the moment it ends - the chain first (~1 minute after a round), the
+    CLOB + Gamma mirrors as fallback - on its own thread pool, never the
+    order path's. Its lifecycle events also go to <ledger>_settlements.jsonl."""
+    import timer
+    from accounting import resolution
+    ledger_path = Path(rt.ledger.path)
+    redeem_check = None
+    if not rt.paper:
+        holder = _wallet_holder()
+        if holder is None:
+            on_event("settle", "no wallet address to read: REDEEM PENDING is shown but not tracked", "warn")
+        else:
+            import onchain_resolution
+            redeem_check = functools.partial(onchain_resolution.balance_of, holder)
+    return SettlementWorker(
+        rt.ledger, interval=1.0,
+        fetch=resolution.Resolver(api_every_s=_env_seconds("SETTLE_API_EVERY_S", 5.0) or 5.0),
+        on_event=on_event, journal_path=ledger_path.with_name(f"{ledger_path.stem}_settlements.jsonl"),
+        paper=rt.paper, redeem_check=redeem_check, clock=timer.unix, poll_active=False,
+        timeout_s=_env_seconds("SETTLE_TIMEOUT_S", 900.0) or 900.0)
+
+
+def _wallet_holder() -> str | None:
+    """The address that holds the outcome tokens: POLY_FUNDER (proxy wallets),
+    else the signer's own address. Derived in memory; never logged."""
+    import config
+    if config.POLY_FUNDER:
+        return str(config.POLY_FUNDER)
+    try:
+        import polymarket_trade
+        from eth_account import Account
+        key = polymarket_trade._normalize_private_key(os.environ.get("POLY_PRIVATE_KEY")
+                                                      or os.environ.get("PRIVATE_KEY"))
+        return Account.from_key(key).address if key else None
+    except Exception:
+        return None
+
+
+def _tracker(settler):
+    """rotation -> settlement: every confirmed round is tracked by its condition id."""
+    def on_round(tokens: dict) -> None:
+        if settler is None or not tokens:
+            return
+        try:
+            settler.track(tokens.get("condition_id"), tokens.get("window_start"), tokens.get("window_end"),
+                          up_token=tokens.get("up_token_id"), down_token=tokens.get("down_token_id"),
+                          slug=tokens.get("slug"))
+        except Exception as exc:
+            on_event("settle", f"SETTLEMENT_ERROR | could not track the round: {type(exc).__name__}: {exc}", "bad")
+    return on_round
+
+
 async def run(dash: bool = False, *, paper: bool = True, paper_balance: float | None = None) -> None:
     configured = os.environ.get("BOT_LOCK_PATH")
     lock_path = Path(configured) if configured else ROOT / (".btc_bot_paper.lock" if paper else ".btc_bot_live.lock")
@@ -766,7 +821,7 @@ async def run_runtime(rt: Runtime, *, dash: bool = False, paper_balance: float |
         # Prove the accounting directory is writable before any order can happen.
         if not rt.ledger.save():
             raise RuntimeError("accounting ledger is not writable; refusing to start")
-        rt.settler = SettlementWorker(rt.ledger, interval=1.0, on_event=on_event)
+        rt.settler = build_settler(rt)
         if rt.cfg.reconcile == "auto":
             rt.reconciler = RestReconciler(rt.hub.fill_store,
                                            lambda: fetch_trades(_reconcile_markets(rt.ledger, rt.hub)),
@@ -807,7 +862,8 @@ async def run_runtime(rt: Runtime, *, dash: bool = False, paper_balance: float |
         rt.tasks.append(rt.sniper_task)
         if rt.reconciler is not None:
             rt.tasks.append(rt.reconciler.start())
-        rt.tasks.append(asyncio.create_task(_rotation_loop(rt.hub, rt.stop), name="rotation"))
+        rt.tasks.append(asyncio.create_task(_rotation_loop(rt.hub, rt.stop, on_round=_tracker(rt.settler)),
+                                            name="rotation"))
         rt.tasks.append(rt.settler.start())
         if not rt.paper:
             rt.tasks.append(asyncio.create_task(_ledger_loop(rt.hub, rt.ledger, rt.stop), name="ledger"))
@@ -965,9 +1021,10 @@ def _task_failure_event(task: asyncio.Task, name: str) -> None:
 
 
 # ---------------------------------------------------------------- background loops
-async def _rotation_loop(hub, stop) -> None:
+async def _rotation_loop(hub, stop, on_round=None) -> None:
     """Discover this round's tokens EARLY, so the book socket is warm long
-    before the sniper reads it, and pre-subscribe the next round's books."""
+    before the sniper reads it, and pre-subscribe the next round's books.
+    `on_round(tokens)` hears every confirmed round (the settlement tracker)."""
     import config
     import market_discovery
     import timer
@@ -998,6 +1055,8 @@ async def _rotation_loop(hub, stop) -> None:
                                             tokens.get("window_end"))
                     if changed:
                         on_event("rotation", f"round tokens subscribed with {timer.seconds_left()}s left", "info")
+                    if on_round is not None:
+                        on_round(tokens)
                     last_key = key
             # Re-read the clock: discovery above may have blocked for seconds.
             remain_now = timer.seconds_left()
@@ -1167,6 +1226,7 @@ class DashView:
         self._acct_at = -1e9
         self._slow: dict = {}
         self._slow_at = -1e9
+        self._positions: dict = {}
         self.every = accounting_every_s
 
     # ---- slow parts, refreshed once a second
@@ -1188,8 +1248,16 @@ class DashView:
             self._acct = acct
 
     def _accounting_nowait(self) -> dict | None:
-        """Account figures, or None while a fill or settlement holds the ledger
-        lock (waiting for it froze every feed and the sniper for the write)."""
+        """Account figures and the POSITION table, or None while a fill or
+        settlement holds the ledger lock (waiting for it froze every feed and
+        the sniper for the write).
+
+        Positions in the market trading now are marked to its live bid.
+        Positions in markets that have ended and await their result have no
+        book left to mark (their tokens are unsubscribed at rotation): they are
+        carried at cost - neither a gain nor a loss until the venue's result
+        settles them - so equity stays defined through settlement and
+        cash + position value = equity, realized + unrealized = total P/L."""
         rt = self.rt
         ledger = rt.ledger
         if ledger is None:
@@ -1198,14 +1266,60 @@ class DashView:
         if lock is not None and not lock.acquire(blocking=False):
             return None
         try:
-            mark = _mark(rt.hub)
+            hub = rt.hub
+            mark = _mark(hub)
+            s = ledger.summary()
+            cash = rt.broker.cash_balance() if rt.broker is not None else None
+            active = str(hub.condition_id or "")
+            sides = {str(t): side for side, t in (("UP", hub.up_token), ("DOWN", hub.down_token)) if t}
+            table = {side: {"side": side, "shares": 0.0, "avg": None, "cost": 0.0} for side in ("UP", "DOWN")}
+            pending = {"markets": set(), "shares": 0.0, "cost": 0.0}
+            active_value, unrealized, unmarkable = 0.0, 0.0, 0
+            for pos in ledger.positions.values():
+                if pos.settled or pos.shares <= 0:
+                    continue
+                if active and pos.condition_id == active and str(pos.token_id) in sides:
+                    row = table[sides[str(pos.token_id)]]
+                    row.update(shares=float(pos.shares), avg=pos.avg_price, cost=float(pos.cost))
+                    continue
+                pending["markets"].add(pos.condition_id)
+                pending["shares"] += float(pos.shares)
+                pending["cost"] += float(pos.cost)
+            for side, row in table.items():
+                token = next((t for t, sd in sides.items() if sd == side), None)
+                bid = None
+                if token is not None:
+                    try:
+                        bid = mark(token)
+                    except Exception:
+                        bid = None
+                row["bid"] = bid
+                if row["shares"] <= 0:
+                    row["value"], row["pnl"] = 0.0, 0.0
+                elif bid is None:
+                    row["value"] = row["pnl"] = None
+                    unmarkable += 1
+                else:
+                    row["value"] = row["shares"] * float(bid)
+                    row["pnl"] = row["value"] - row["cost"]
+                    active_value += row["value"]
+                    unrealized += row["pnl"]
+            position_value = None if unmarkable else active_value + pending["cost"]
+            realized = s.get("realized_pnl")
+            out = {"realized": realized, "unrealized": None if unmarkable else unrealized,
+                   "position_value": position_value, "awaiting_cost": pending["cost"],
+                   "open": s.get("open_positions"), "pending_cost": s.get("pending_cost"),
+                   "fees": s.get("fees_paid"), "wins": s.get("wins"), "losses": s.get("losses")}
+            self._positions = {"rows": [table["UP"], table["DOWN"]],
+                               "pending": {"markets": len(pending["markets"]), "shares": pending["shares"],
+                                           "cost": pending["cost"]}}
             if rt.broker is not None:
-                s = rt.broker.summary(mark=mark)
-                return {"kind": "PAPER", "cash": s.get("cash"), "equity": s.get("equity"), "pnl": s.get("total_pnl"),
-                        "realized": s.get("realized_pnl"), "open": s.get("open_positions"),
-                        "pending_cost": s.get("pending_cost"), "fees": s.get("fees_paid"), "wins": s.get("wins"),
-                        "losses": s.get("losses"), "start": s.get("starting_balance")}
-            s = ledger.summary(mark=mark)
+                start = rt.broker.start_balance
+                equity = None if position_value is None else cash + position_value
+                out.update(kind="PAPER", cash=cash, equity=equity, start=start,
+                           pnl=None if equity is None else equity - start,
+                           total=None if equity is None else equity - start)
+                return out
             bal = getattr(rt.live_exec, "balance", None)
             if bal is None and getattr(ledger, "balance_marks", None):
                 bal = ledger.balance_marks[-1][1]
@@ -1213,15 +1327,40 @@ class DashView:
                 check = ledger.reconcile_balance().get("status")
             except Exception:
                 check = None
-            return {"kind": "LIVE", "balance": bal, "balance_status": check, "realized": s.get("realized_pnl"),
-                    "open": s.get("open_positions"), "pending_cost": s.get("pending_cost"),
-                    "fees": s.get("fees_paid"), "wins": s.get("wins"), "losses": s.get("losses"),
-                    "start": time.strftime("%m-%d %H:%M", time.localtime(rt.started))}
+            total = None if out["unrealized"] is None or realized is None else realized + out["unrealized"]
+            out.update(kind="LIVE", balance=bal, balance_status=check, total=total,
+                       start=time.strftime("%m-%d %H:%M", time.localtime(rt.started)))
+            return out
         except Exception:
             return None
         finally:
             if lock is not None:
                 lock.release()
+
+    def _settlement(self) -> dict | None:
+        """The settlement worker's panel, with each market labelled by its
+        window in ET (the dashboard clock's zone)."""
+        settler = self.rt.settler
+        if settler is None or not hasattr(settler, "panel"):
+            return None
+        import timer
+        try:
+            p = settler.panel(timer.unix(), active_condition=self.rt.hub.condition_id)
+        except Exception as exc:
+            return {"error": f"{type(exc).__name__}: {exc}"}
+        seen = []
+        for v in [p.get("active"), p.get("subject"), p.get("last_settled")] + p["pending"] + p["previous"]:
+            if v is None or any(v is x for x in seen):
+                continue
+            seen.append(v)
+            v.pop("positions", None)
+            start, end = v.get("window_start"), v.get("window_end")
+            if start and end:
+                v["label"] = (f"{timer.now_et(start).strftime('%H:%M')}-"
+                              f"{timer.now_et(end).strftime('%H:%M')}")
+            else:
+                v["label"] = (v.get("slug") or str(v.get("condition_id") or "")[-8:]) or "--"
+        return p
 
     # ---- the snapshot
     def snapshot(self) -> dict:
@@ -1287,6 +1426,16 @@ class DashView:
                                           "next": min(sn.s.shares + carry[side], sn.s.max_target_shares)}
                                    for side in ("UP", "DOWN")}
         snap["market"] = market
+        settlement = self._settlement()
+        snap["settlement"] = settlement
+        snap["positions"] = dict(self._positions)
+        if settlement and not rt.paper and snap["account"]:
+            # LIVE: winning shares not yet redeemed are worth their payout but are
+            # not in the collateral balance - shown, and counted in equity.
+            acct = snap["account"]
+            acct["redeemable"] = settlement.get("redeem_pending") or 0.0
+            if acct.get("balance") is not None and acct.get("position_value") is not None:
+                acct["equity"] = float(acct["balance"]) + acct["position_value"] + acct["redeemable"]
         snap["canary"] = self._canary()
         snap["health"] = self._health_rows(summary, health)
         return snap
@@ -1337,7 +1486,8 @@ class DashView:
                          f"fills {rt.hub.fill_store.summary().get('fills')}"))
             rows.append(("RECONCILE", "ABSENT" if rt.reconciler is None else
                          ("OK" if not rt.reconciler.armed else "WAIT"), ""))
-        rows.append(("SETTLE", rt.settler.health_status() if rt.settler is not None else "ABSENT", ""))
+        rows.append(("SETTLE", rt.settler.health_status() if rt.settler is not None else "ABSENT",
+                     self._settle_detail()))
         rows.append(("LEDGER", "ABSENT" if rt.ledger is None else
                      ("ERROR" if rt.ledger.last_persistence_error else "OK"), ""))
         rows.append(("CLOCK", "OK" if rt.clock_ok else ("WAIT" if rt.clock_ok is None else "WARN"),
@@ -1347,6 +1497,17 @@ class DashView:
             rows.append(("LOOP LAG", "OK" if (lag.get("p99") or 0) < 50 else "WARN",
                          f"p50 {lag.get('p50')}ms p99 {lag.get('p99')}ms"))
         return rows
+
+    def _settle_detail(self) -> str:
+        settler = self.rt.settler
+        try:
+            lat = settler.latency()
+            pending = sum(1 for r in settler.records.values() if r.state in ("PENDING SETTLEMENT", "SETTLING"))
+        except Exception:
+            return ""
+        last = lat.get("settled_after_expiry_s") or {}
+        return (f"pending {pending}" + (f"  settled p50 {last['p50']:.1f}s n{last['n']}" if last else "")
+                + (f"  err {settler.last_error[:40]}" if settler.last_error else ""))
 
     def _trig_status(self) -> str | None:
         sn = self.rt.sniper
@@ -1367,6 +1528,16 @@ def status_text(snap: dict) -> str:
     pnl = a.get("pnl") if a.get("kind") == "PAPER" else a.get("realized")
     skips = ", ".join(f"{k} {v}" for k, v in (snap.get("skips") or [])[:3])
     canary = snap.get("canary")
+    st = (snap.get("settlement") or {}).get("subject") or {}
+    settle = ""
+    if st:
+        settle = f"settle {st.get('label') or '--'} {st.get('state')}"
+        if st.get("state") == "SETTLED":
+            settle += (f" {st.get('winner') or '?'} {float(st.get('realized') or 0):+.2f}"
+                       + (f" in {st['settlement_s']:.1f}s" if st.get("settlement_s") is not None else ""))
+        elif st.get("age_s") is not None:
+            settle += f" {st['age_s']:.0f}s"
+        settle += " | "
     return (f"{TAG} {snap.get('clock')} {snap.get('mode')} | {t.get('feed')}={t.get('status')} "
             f"mid={t.get('mid') if t.get('mid') is None else round(t['mid'], 2)} | "
             f"round={m.get('slug') or '--'} T-{'?' if left is None else round(left)}s "
@@ -1374,6 +1545,7 @@ def status_text(snap: dict) -> str:
             f"signals={t.get('signals')} orders={t.get('orders')} filled={t.get('filled')} "
             f"missed={t.get('refused')} errors={t.get('errors')} | "
             + (f"carry UP {m['carry']['UP']['carry']:g} DN {m['carry']['DOWN']['carry']:g} | " if m.get("carry") else "")
+            + settle
             + f"pnl={'--' if pnl is None else f'{pnl:+.2f}'} open={a.get('open')} fees={a.get('fees')}"
             + (f" | canary {'HALTED: ' + '; '.join(canary['halted']) if canary.get('halted') else 'armed'}"
                f" orders {canary.get('orders')}/{canary.get('max_orders')}" if canary else "")

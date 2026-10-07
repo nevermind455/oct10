@@ -1472,7 +1472,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     "sniper_live.py": "f7776ac28957d9ef76d89727b3f8fc2e93e200d07ae1ce39753f86d64e3046fd",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
-    "paper_trade.py": "803f98c9c739b75d94eb1954f1d5158b5112f5224c75cb8c7d0d5cadefb827fd",
+    # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads
+    # our recent fills without the broker lock (a booking holds it through the ledger's
+    # fsync - and behind a settlement's) and prunes only when the lock is free. Same answer.
+    "paper_trade.py": "5fdea1e24a64aa719617dced6af4ef4aa853a842d5142162feb1816aa0fa6bf6",
     "polymarket_trade.py": "71b5da67c456c2fb30f3578b84019b0152324bdf338c20c53941eba6b72adc94",
     "orderbook.py": "fe3decc44a8f1061c2788c1f2ae85739ade137910033031eac3138f11b22f090",
     "market_discovery.py": "23c605f678eaf1c6caf60259293b9bccf73413e7f632c0a6749c55acc571aa11",
@@ -1481,8 +1484,14 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     "fast_h2.py": "768b40391d3c526431997872192ceb62fe1c4371719d5753b2a588886b7a81fb",
     "accounting/ledger.py": "959aaaea83f8c4f0f1ef3f471a1d6c61d10b6749f76372338310dd70fcb5f7a5",
     "accounting/fees.py": "44e45be00c7c3b330ef0ff11950fa42944029ba83a61ec8066af3494c0956dc7",
-    "accounting/settlement.py": "54adb4fbbf366a8a9e6f72ddbb262d6c52f36b5306c9fdd75b5fefed154a1e63",
-    "accounting/resolution.py": "5cc1cc420811898d9e48dcfd4f1fc7e4a90035f5f63262b4e5e4931eb3c43d93",
+    # Re-approved (settlement audit): one record per market (condition id), checked from
+    # expiry, concurrently, on the worker's own pool; explicit lifecycle events and a journal;
+    # REDEEM PENDING / REDEEMED tracked apart from SETTLED. Ledger.settle is unchanged.
+    "accounting/settlement.py": "1aed2d0c223ee75bb8a90f43a521ba16ef207050dbb282a4ec84f44f54aac6ff",
+    # Re-approved: Resolver - the chain's payout vector first, the market's outcome order read
+    # once per market, the CLOB + Gamma mirrors only when the chain cannot answer. fetch() is
+    # unchanged but for its chain=False switch.
+    "accounting/resolution.py": "844a91591f9dba9f8e3cb078bcc788c1051c5ad9687d26aa46498dc3d296e7e9",
     "feeds/book.py": "d90704050d0e9537be5ed34fb2e60313d4ea92a2c8d0f73efcd00fd55d603246",
     "feeds/poly_user.py": "f0dbd62bd0ef708dc15391915aab39e83802106c26af7780c81712ca42ae6b55",
     "feeds/reconcile.py": "71dea5e832fb970e5cfac1880686cf5eff477a34c48c9b91ba961f77b3e9cb6f",

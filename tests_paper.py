@@ -1479,7 +1479,7 @@ def t_paper_dashboard_renders_exact_geometry():
         "".join(text for text, _style in row)
         for row in build(snap, 120, 40, glyphs()))
     check("paper dashboard visibly identifies mode", "PAPER" in full_text, full_text)
-    check("paper dashboard exposes P&L", "P&L" in full_text and "-$0.50" in full_text, full_text)
+    check("paper dashboard exposes P&L", "TOTAL P/L" in full_text and "-$0.50" in full_text, full_text)
     check("paper dashboard shows cash", "$987.65" in full_text, full_text)
 
 

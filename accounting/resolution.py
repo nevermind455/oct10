@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
+import time
 from dataclasses import dataclass
 from urllib.parse import quote, urlsplit
 
@@ -223,8 +225,11 @@ def parse_clob_market(m: dict, condition_id: str) -> Resolution:
     return Resolution(cid, RESOLVED, payouts, winning_label=winner_label)
 
 
-def fetch(condition_id: str, timeout: float = 10.0) -> Resolution:
-    """Require independent CLOB and Gamma resolution surfaces to agree."""
+def fetch(condition_id: str, timeout: float = 10.0, *, chain: bool = True) -> Resolution:
+    """Require independent CLOB and Gamma resolution surfaces to agree.
+
+    With ``chain`` (and SETTLE_ONCHAIN not off) the on-chain payout vector is
+    asked first. Resolver passes chain=False: it has just read the chain."""
     cid = str(condition_id)
     if not CONDITION_RE.fullmatch(cid):
         return Resolution(cid, UNKNOWN, {}, detail="invalid condition id")
@@ -256,7 +261,7 @@ def fetch(condition_id: str, timeout: float = 10.0) -> Resolution:
     # order this same CLOB response carries - verified across 9 rounds to match
     # the on-chain outcome-slot order. Any failure falls straight through to
     # the API path below, so an unreachable RPC costs nothing but the attempt.
-    if onchain_resolution.enabled():
+    if chain and onchain_resolution.enabled():
         slot_tokens = [str((row or {}).get("token_id") or "")
                        for row in (clob_data.get("tokens") or [])]
         chain_payouts, chain_detail = onchain_resolution.payouts_for(
@@ -327,3 +332,122 @@ def fetch(condition_id: str, timeout: float = 10.0) -> Resolution:
     return Resolution(cid, RESOLVED, dict(clob_resolution.payouts),
                       winning_label=clob_resolution.winning_label,
                       detail="CLOB and Gamma final payouts agree")
+
+
+def slot_rows(m: dict, condition_id: str) -> list[tuple[str, str]] | None:
+    """The CLOB market's ``tokens`` as [(token_id, outcome label)] in
+    outcome-slot order, or None unless it is a clean UP/DOWN binary for this
+    condition. Fixed for a market's life, so one read serves every poll."""
+    cid = str(condition_id)
+    if not isinstance(m, dict) or str(m.get("condition_id") or "") != cid:
+        return None
+    rows = m.get("tokens")
+    if not isinstance(rows, list) or len(rows) != 2:
+        return None
+    out: list[tuple[str, str]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            return None
+        token = str(row.get("token_id") or "")
+        label = str(row.get("outcome") or "").strip()
+        if not TOKEN_RE.fullmatch(token) or int(token) <= 0:
+            return None
+        out.append((token, label))
+    if (out[0][0] == out[1][0]
+            or {label.lower() for _, label in out} != {"up", "down"}):
+        return None
+    return out
+
+
+class Resolver:
+    """resolver(condition_id) -> Resolution: the chain first, the API mirrors
+    as a slower fallback. Thread-safe; one instance per settlement worker.
+
+    The old path GET the CLOB market on every poll before it could even ask
+    the chain (the CLOB response carries the outcome-slot order), and without
+    SETTLE_ONCHAIN it waited for the CLOB and Gamma mirrors to agree - 5 to
+    13 minutes after a round. Here the slot order is read once per market
+    (``prepare`` does it while the market is still trading), so a poll after
+    expiry is one batched chain read. The mirrors are asked at most every
+    ``api_every_s`` per market, and only when the chain cannot answer (RPC
+    unreachable, SETTLE_ONCHAIN=0): a chain that answers "not resolved yet"
+    is ahead of both mirrors, so asking them then only costs requests.
+    """
+
+    def __init__(self, *, timeout: float = 8.0, api_every_s: float = 5.0,
+                 clock=time.monotonic) -> None:
+        self.timeout = float(timeout)
+        self.api_every_s = float(api_every_s)
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._slots: dict[str, list[tuple[str, str]]] = {}
+        self._api_at: dict[str, float] = {}
+
+    def slots(self, condition_id: str) -> list[tuple[str, str]] | None:
+        with self._lock:
+            return self._slots.get(str(condition_id))
+
+    def prepare(self, condition_id: str) -> bool:
+        """Read and cache the market's outcome-slot order (one CLOB GET).
+        Only the chain read needs it: with SETTLE_ONCHAIN off it is a no-op."""
+        cid = str(condition_id)
+        if not CONDITION_RE.fullmatch(cid) or not onchain_resolution.enabled():
+            return False
+        if self.slots(cid):
+            return True
+        try:
+            response = http_pool.get(f"{CLOB}/markets/{cid}", timeout=self.timeout,
+                                     allow_redirects=False)
+            response.raise_for_status()
+            if response.status_code != 200:
+                return False
+            rows = slot_rows(response.json(), cid)
+        except Exception:
+            return False
+        if not rows:
+            return False
+        with self._lock:
+            self._slots[cid] = rows
+            if len(self._slots) > 256:                     # one per 5-minute round: ~21 hours
+                for old in list(self._slots)[:128]:
+                    self._slots.pop(old, None)
+        return True
+
+    def forget(self, condition_id: str) -> None:
+        with self._lock:
+            self._slots.pop(str(condition_id), None)
+            self._api_at.pop(str(condition_id), None)
+
+    def __call__(self, condition_id: str) -> Resolution:
+        cid = str(condition_id)
+        if not CONDITION_RE.fullmatch(cid):
+            return Resolution(cid, UNKNOWN, {}, detail="invalid condition id")
+        chain_detail = None
+        if onchain_resolution.enabled():
+            if not self.prepare(cid):
+                chain_detail = "market outcome order not read yet (CLOB unreachable)"
+            else:
+                slots = self.slots(cid) or []
+                payouts, chain_detail = onchain_resolution.payouts_for(cid, [t for t, _ in slots])
+                if payouts:
+                    winner = next((label for token, label in slots
+                                   if abs(payouts.get(token, 0.0) - 1.0) <= 1e-9), None)
+                    if winner is None and all(abs(v - 0.5) <= 1e-9 for v in payouts.values()):
+                        winner = "50/50"
+                    return Resolution(cid, RESOLVED, dict(payouts), winning_label=winner,
+                                      detail=chain_detail)
+                if chain_detail == "not resolved on chain yet":
+                    return Resolution(cid, PENDING, {}, detail=chain_detail)
+        now = self._clock()
+        with self._lock:
+            due = now - self._api_at.get(cid, -1e18) >= self.api_every_s
+            if due:
+                self._api_at[cid] = now
+        if not due:
+            return Resolution(cid, PENDING, {}, detail=(
+                f"{chain_detail}; API mirrors next in {self.api_every_s:g}s" if chain_detail
+                else "awaiting the API mirrors"))
+        mirrors = fetch(cid, self.timeout, chain=False)
+        if mirrors.resolved or not chain_detail:
+            return mirrors
+        return Resolution(cid, mirrors.status, {}, detail=f"{chain_detail}; mirrors: {mirrors.detail}"[:300])

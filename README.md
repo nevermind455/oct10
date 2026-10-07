@@ -45,6 +45,38 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
   live orders.
 - **Exit.** Every position is held to settlement.
 
+## Settlement
+
+Every market the bot sees is tracked by its condition id, from discovery to its result:
+
+```
+ACTIVE -> EXPIRED -> PENDING SETTLEMENT -> SETTLING -> SETTLED
+                         (LIVE, winning shares held) -> REDEEM PENDING -> REDEEMED
+```
+
+- **Only the venue's result settles.** A timer reaching zero moves a market to
+  PENDING SETTLEMENT, nothing more; a BTC price never picks a winner. The result is
+  the payout vector of the Conditional Tokens contract on Polygon (what a
+  redemption actually pays), read about a minute after a round ends. The CLOB and
+  Gamma APIs mirror it 5 to 13 minutes later; they are the fallback when the chain
+  cannot be read (`SETTLE_ONCHAIN=0`, or the RPC is unreachable).
+- **The next market is never held up.** Each market settles on its own; any number
+  can be pending at once. Checks run concurrently on the settlement worker's own
+  threads, never on the event loop or the order path's thread pool.
+- **P/L moves once.** Settlement books the payout in the ledger exactly once (a
+  repeated result, a second check, a restart: all no-ops). Until then, a position in
+  an ended market is carried at cost, so equity stays defined and
+  `cash + position value = equity`, `realized + unrealized = total P/L`.
+- **Settled is not redeemed.** Paper credits the payout to cash at settlement. Live,
+  winning shares are still outcome tokens in the wallet until they are redeemed for
+  collateral (claim on polymarket.com); the dashboard shows REDEEM PENDING and
+  REDEEMABLE until the wallet's on-chain balance proves REDEEMED.
+- **Events.** `MARKET_EXPIRED`, `SETTLEMENT_PENDING`, `RESULT_RECEIVED`,
+  `ACCOUNTING_SETTLED`, `REDEEM_PENDING`, `REDEEMED`, and on failure
+  `SETTLEMENT_TIMEOUT`, `RESULT_API_ERROR`, `RESULT_NOT_FINAL`, `ACCOUNTING_ERROR`,
+  `REDEEM_FAILED`. They show in the dashboard's events and are appended, with their
+  timestamps, to `<ledger>_settlements.jsonl` beside the ledger.
+
 ## Run
 
 ```bash
@@ -86,7 +118,11 @@ The dashboard shows:
 - **Market.** The current market, seconds left, and UP/DOWN best bid and ask with book status.
 - **This round.** Fills and shares per side, against the caps.
 - **Orders.** The latest orders: side, BTC move, ask seen, limit, result, and shares@price.
-- **Account.** Cash and P&L (the paper account), or collateral and realized P&L (the live ledger).
+- **Account.** Cash (live: collateral and REDEEMABLE), position value, equity, realized, unrealized and total P/L.
+- **Market status.** In the header: ACTIVE, and how many markets are PENDING SETTLEMENT.
+- **Position.** SIDE, SHARES, AVG, COST, BID, VALUE and P/L in the market trading now, and what ended markets still hold at cost.
+- **Settlement.** The oldest market still waiting (status, PENDING AGE, what it waits on), or one just settled (WINNER, SETTLE PRICE, REALIZED P/L, SETTLE TIME, REDEEM), and the last settled market.
+- **Markets.** The active market, every market pending settlement with its age, and the latest settled ones.
 - **Live canary.** Limits used, the latency guard, and every HALT reason.
 - **Feed health.** Binance freshness or Kraken lag, Polymarket book, user channel, settlement, ledger, clock and loop lag.
 - **Skips and events.** The skip reasons, and recent events.
@@ -119,6 +155,9 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | `SNIPER_KRAKEN_LIVE` | 0 | 1 = explicit opt-in to trade live on the Kraken trigger |
 | `LEDGER_PATH` / `LIVE_SNIPER_JOURNAL` | live_ledger.json / live_sniper.jsonl | live state files |
 | `PAPER_LEDGER_PATH` / `PAPER_ACCOUNT_PATH` / `PAPER_AUDIT_PATH` | paper_*.json(l) | paper state files; the sniper journal is `<audit>_sniper.jsonl` |
+| `SETTLE_ONCHAIN` | on (unset) | read results from the chain first; `0` = the CLOB + Gamma mirrors only (5-13 min later) |
+| `POLYGON_RPC` | publicnode | the Polygon RPC for those reads (may embed an API key) |
+| `SETTLE_RPC_TIMEOUT` / `SETTLE_API_EVERY_S` / `SETTLE_TIMEOUT_S` | 8 / 5 / 900 | one RPC read's limit; how often a market asks the mirrors when the chain cannot answer; when a pending market raises SETTLEMENT_TIMEOUT (it keeps being checked) |
 
 `run.py` names, at start, any old main-strategy setting it ignores (`STOP_LOSS_ENABLED`, `BOOK_SOURCE`, ...).
 
