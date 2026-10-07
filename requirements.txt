@@ -16,3 +16,5 @@ socksio>=1.0.0,<2
 # of ~10min from the CLOB/Gamma mirrors). Optional at runtime: without it
 # SETTLE_ONCHAIN fails closed and settlement falls back to those APIs.
 web3>=7.0.0,<8
+# sniper_rescore.py / sniper_dynexec.py (research, read-only) and their tests.
+numpy>=1.26,<3

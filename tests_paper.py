@@ -669,6 +669,32 @@ def t_sniper_gc_runs_only_in_the_rounds_no_trade_seconds():
           len(gcs) == 1 and 2.0 < gcs[0]["left_s"] < 8.0 and th[2] == 1000, f"{gcs} {th}")
 
 
+def t_rescore_walks_the_recorded_book_like_a_venue_fok():
+    import math
+    import numpy as np
+    import sniper_rescore as R
+    nan = float("nan")
+    cases = {
+        "fills at the best ask": R.fok([(0.50, 10), (0.51, 50)], 5.0, 0.52)[:3] == ("fill", 10.0, 0.5),
+        "walks levels up to the cap": (lambda x: x[0] == "fill" and abs(x[2] - (2.5 + 2.55) / (5 + 5)) < 1e-9)(
+            R.fok([(0.50, 5), (0.51, 5), (0.60, 50)], 5.05, 0.52)),
+        "best ask over the cap: miss (cap)": R.fok([(0.53, 100)], 5.0, 0.52) == ("miss", "cap"),
+        "not enough under the cap: miss (depth)": R.fok([(0.50, 2), (0.53, 100)], 5.0, 0.52)
+        == ("miss", "depth under cap"),
+        "recorded depth ends under the cap: unknown": R.fok([(0.50, 2), (nan, nan)], 5.0, 0.52)[0] == "unknown",
+        "under 5 shares: miss": R.fok([(0.50, 100)], 2.0, 0.52) == ("miss", "below venue minimum"),
+        "fee 0.07*p*(1-p) per share": abs(R.fok([(0.50, 10)], 5.0, 0.52)[3] - 0.175) < 1e-12,
+    }
+    v = {"asks": np.array([[[nan, nan]], [[nan, nan]]]), "ba": np.array([0.44, 1.0])}
+    cases["no ask levels on record but a best ask under $1: unknown, not a miss"] = \
+        R.walk(v, 0, 5.0, 0.46)[0] == "unknown" and R.walk(v, 1, 5.0, 1.0) == ("miss", "no asks")
+    m, se, n = R.clustered([1.0, 3.0, 2.0, 6.0], ["a", "a", "b", "b"])
+    cases["round-clustered error: two rounds (2, 4) around mean 3 -> se 1"] = \
+        abs(m - 3.0) < 1e-12 and abs(se - math.sqrt((4 + 4) / 16 * 2)) < 1e-12 and n == 4
+    bad = [k for k, ok in cases.items() if not ok]
+    check("sniper_rescore: FOK walk, missing data and clustered errors", not bad, str(bad))
+
+
 def t_sniper_visible_ask_fast_path_gives_the_same_answer():
     import sniper_mode
     from feeds.book import BookView

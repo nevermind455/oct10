@@ -122,6 +122,12 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 .venv/bin/python kraken_race.py          # Kraken vs Binance: which tells this machine first
 ```
 
+Research (read-only, heavy; run it beside the bot at low priority). It scores dynamic price limits and sizes against what the bot sends now, on the latency lab's recordings and the live canary's real orders:
+
+```bash
+LAB_DATA=/opt/lab_data nice -n 19 .venv/bin/python sniper_dynexec.py
+```
+
 ## Install on the VPS (beside the old bot)
 
 Run these as the user that `git pull`s `/opt/btcbot`; the deploy key belongs to that user.
@@ -221,4 +227,5 @@ Then update the changed digests in `BASELINE_SHA` (`tests_feeds.py`), run `pytho
 | `config.py`, `timer.py`, `http_pool.py`, `onchain_resolution.py` | settings, clock, HTTP, on-chain settlement |
 | `dashboard/` | renderer, widgets and theme (from spe24), plus `sniper_layout.py` and `console.py` |
 | `sniper_why.py` ... `kraken_race.py` | the daily read-only tools |
+| `sniper_dynexec.py`, `sniper_rescore.py`, `latency_lab/load.py` | research: dynamic execution scored on the lab recordings (`LAB_DATA`) and live orders; needs numpy |
 | `setup.sh`, `.env.example`, `requirements.txt` | VPS install |
