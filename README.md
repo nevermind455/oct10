@@ -19,7 +19,7 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
   that reference must be no more than 2s old. Kraken heartbeats carry the price
   forward. A move up buys **UP**; a move down buys **DOWN**, in the current round.
 - **Gates.** An order only goes out if all of these hold:
-  - Cooldown: only a sent order starts it.
+  - Cooldown: 300ms per side, started when an order is submitted. An UP order never blocks a DOWN signal, and vice versa.
   - At most one order in flight.
   - The round window allows it, with at least `SNIPER_MIN_LEFT_S` seconds left.
   - The book is LIVE and fresh, and has asks on the chosen side.
@@ -106,7 +106,7 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | `SNIPER_MAX_TARGET_SHARES` | 20 | cap on base + same-side unfilled carry |
 | `SNIPER_ORDER_TYPE` | FAK | IOC limit: partial fills kept, the rest cancelled; FOK is all-or-nothing |
 | `SNIPER_SLIP` | 0.05 | limit = the ask seen + 0.05, clipped at `MAX_BUY_PRICE`: never pays more |
-| `SNIPER_COOLDOWN_MS` | 1000 | the pause after each sent order |
+| `SNIPER_COOLDOWN_MS` | 300 | per side: an order starts a pause on ITS side only, from its submission |
 | `SNIPER_MIN_LEFT_S` | 10 | no order with fewer seconds left in the round |
 | `SNIPER_MAX_FILLS_ROUND` / `SNIPER_MAX_SIDE_SHARES` | 20 / 200 | per-round caps |
 | `MIN_BUY_PRICE` / `MAX_BUY_PRICE` | 0.05 / 0.95 | the asks the bot may buy |

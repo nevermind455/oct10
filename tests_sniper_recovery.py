@@ -265,17 +265,24 @@ class SignalTests(unittest.TestCase):
         with patch.dict("os.environ", {"SNIPER_LATENCY_MS": "200", "SNIPER_COOLDOWN_MS": "1000"}):
             sn = S.Sniper(None, None, settings=S.Settings())
         called = []
+        clock = {"ms": 1000.0}
         def fire(*args, **kwargs):
             called.append(args)
             sn.busy = False
+            clock["ms"] += 3.0                  # deciding and sending take a moment
             return None if len(called) == 1 else object()
         sn._fire_now = fire
         trigger = types.SimpleNamespace(update=lambda t, mid: (1, 2))
-        sn._signal("binance", trigger, 60000, 1000, 1)
-        sn._signal("binance", trigger, 60000, 1050, 2)
-        sn._signal("coinbase", trigger, 60000, 1100, 3)
+        with patch.object(S.time, "monotonic", lambda: clock["ms"] / 1000.0):
+            sn._signal("binance", trigger, 60000, 1000, 1)
+            clock["ms"] = 1050.0
+            sn._signal("binance", trigger, 60000, 1050, 2)
+            clock["ms"] = 1100.0
+            sn._signal("coinbase", trigger, 60000, 1100, 3)
         self.assertEqual(len(called), 2)
-        self.assertEqual(sn.last_fire, 1050)
+        # the cooldown started when the order was submitted (1053), on its side only
+        self.assertAlmostEqual(sn.last_fire_by_side["UP"], 1053.0)
+        self.assertEqual(sn.last_fire_by_side["DOWN"], -1e18)
         self.assertEqual(sn.n["fired binance"], 1)
         self.assertEqual(sn.n["skip: cooldown (coinbase)"], 1)
 

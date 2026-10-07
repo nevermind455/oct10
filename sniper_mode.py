@@ -38,7 +38,7 @@ untouched:
                                 SNIPER_CANARY_* limits (see sniper_live.limits_from_env)
     SNIPER_K_BP=1.0             SNIPER_WINDOW_MS=250
     SNIPER_SHARES=10            SNIPER_SLIP=0.02
-    SNIPER_LATENCY_MS=(unset)   SNIPER_COOLDOWN_MS=1000
+    SNIPER_LATENCY_MS=(unset)   SNIPER_COOLDOWN_MS=300 (per side, from the order's submission)
     SNIPER_MIN_LEFT_S=10        SNIPER_MAX_FILLS_ROUND=20
     SNIPER_MAX_SIDE_SHARES=200  SNIPER_STALE_MS=2000
     SNIPER_BINANCE_FRESHNESS=1  the Binance socket also carries btcusdt@trade (it has
@@ -564,7 +564,8 @@ class Settings:
         self.delay_journal = (os.environ.get("SNIPER_DELAY_JOURNAL") or os.environ.get("LIVE_SNIPER_JOURNAL")
                               or "live_sniper.jsonl")
         self.delay_note = ""                   # set by a paper Sniper once the live delays are loaded
-        self.cooldown_ms = _env_float("SNIPER_COOLDOWN_MS", 1000)
+        # Per side: an order on one side starts that side's cooldown only.
+        self.cooldown_ms = _env_float("SNIPER_COOLDOWN_MS", 300)
         self.min_left_s = _env_float("SNIPER_MIN_LEFT_S", 10)
         self.max_fills_round = int(_env_float("SNIPER_MAX_FILLS_ROUND", 20))
         self.max_side_shares = _env_float("SNIPER_MAX_SIDE_SHARES", 200)
@@ -645,7 +646,7 @@ class Settings:
         if self.primary_feed == "kraken" and self.kraken_url != KRAKEN_TICKER_URL:
             route += f"; Kraken via {self.kraken_url}"
         return route + (("; second trigger: " + ",".join(self.extra_feeds)
-                         + " (whichever feed signals first, shared cooldown)") if self.extra_feeds else "")
+                         + " (whichever feed signals first; each side's cooldown is shared)") if self.extra_feeds else "")
 
     def lead_text(self) -> str:
         """Names the trigger on every start line when it is not Binance, so a
@@ -659,7 +660,7 @@ class Settings:
     def lines(self, live: bool = False) -> list[str]:
         if live:
             return [f"SNIPER LIVE CANARY{self.lead_text()}: spot mid >= {self.k_bp}bp within {self.window_ms:.0f}ms -> real {self.order_type} "
-                    f"{self.shares:.0f} sh{self.carry_text()} at ask+{self.slip:.2f}, cooldown {self.cooldown_ms:.0f}ms, "
+                    f"{self.shares:.0f} sh{self.carry_text()} at ask+{self.slip:.2f}, cooldown {self.cooldown_ms:.0f}ms per side, "
                     f">= {self.min_left_s:.0f}s left, <= {self.max_fills_round} fills and "
                     f"{self.max_side_shares:.0f} sh/side per round"
                     + (f"; shadow fills at {','.join(map(str, self.shadow_ms))}ms (arithmetic only)"
@@ -670,7 +671,7 @@ class Settings:
                    f"real order signing + {self.delay_note}; " if self.delay_note else
                    f"live-like: real order signing + measured one-way to the CLOB + {self.hold_ms:.0f}ms hold "
                    f"+ {self.server_ms:.0f}ms server allowance; ")
-                + f"cooldown {self.cooldown_ms:.0f}ms, >= {self.min_left_s:.0f}s left, "
+                + f"cooldown {self.cooldown_ms:.0f}ms per side, >= {self.min_left_s:.0f}s left, "
                 f"<= {self.max_fills_round} fills and {self.max_side_shares:.0f} sh/side per round"
                 + (f"; shadow fills at {','.join(map(str, self.shadow_ms))}ms (arithmetic only)"
                    if self.shadow_ms else "")
@@ -926,7 +927,9 @@ class Sniper:
         self.triggers = {name: Trigger(self.s.k_bp, self.s.window_ms) for name in self.s.extra_feeds}
         self.fresh = BinanceFreshness(self.s.binance_stale_ms, self.s.binance_unknown_ms, self.s.binance_backlog_max)
         self.journal = Path(journal_path) if journal_path else None
-        self.last_fire = -1e18
+        # When each side's last order was submitted (monotonic ms, the ticks'
+        # clock). An UP order cools down UP only; DOWN stays free, and back.
+        self.last_fire_by_side = {"UP": -1e18, "DOWN": -1e18}
         self.busy = False
         self.rounds = collections.defaultdict(lambda: {"fills": 0, "UP": 0.0, "DOWN": 0.0})
         self._fak_pending: dict = {}        # accepted orders awaiting actual trade quantities
@@ -1202,11 +1205,22 @@ class Sniper:
             self.kraken_lag.append(time.time() * 1000.0 - ex)
         return "tick"
 
+    @property
+    def last_fire(self) -> float:
+        """The most recent submission on either side (monotonic ms)."""
+        return max(self.last_fire_by_side.values())
+
+    @last_fire.setter
+    def last_fire(self, t_ms: float) -> None:
+        """Set both sides' cooldown start (e.g. -1e18 clears them)."""
+        self.last_fire_by_side = {"UP": t_ms, "DOWN": t_ms}
+
     def _signal(self, feed: str, trigger, mid: float, t: float, t_pc: int) -> None:
-        """The rule on one feed's mid, then the gates every feed shares: one
-        cooldown and one order in flight, so a move seen by two feeds is one
-        order - fired by whichever saw it first. Binance's counters keep their
-        old names; a second feed's are suffixed with its name."""
+        """The rule on one feed's mid, then the gates every feed shares: the
+        signal's SIDE cooldown and one order in flight, so a move seen by two
+        feeds (the same side) is one order - fired by whichever saw it first.
+        Binance's counters keep their old names; a second feed's are suffixed
+        with its name."""
         direction, r = trigger.update(t, mid)
         if direction is None:
             return
@@ -1226,18 +1240,21 @@ class Sniper:
                                  "binance_excess_ms": (round(self.fresh.last_excess, 1)
                                                        if self.fresh.last_excess is not None else None)})
                 return
-        if t - self.last_fire < self.s.cooldown_ms:
-            self.n["skip: cooldown" + tag] += 1
+        side = "UP" if direction > 0 else "DOWN"
+        if t - self.last_fire_by_side[side] < self.s.cooldown_ms:
+            self.n["skip: cooldown" + tag] += 1         # this side only: the other side is not blocked
             return
         if self.busy:
             self.n["skip: previous order in flight" + tag] += 1
             return
         self.busy = True
-        task = self._fire_now("UP" if direction > 0 else "DOWN", r, t, t_pc, feed=feed)
+        task = self._fire_now(side, r, t, t_pc, feed=feed)
         if task is not None:
             # A closed window, stale book or failed live preflight is not an
-            # order. Only an eligible attempt consumes the shared cooldown.
-            self.last_fire = t
+            # order. Only a submitted order starts its side's cooldown, from the
+            # moment it was submitted (_fire_now has sent it / handed it to the
+            # matcher by now), on the same monotonic clock as the ticks.
+            self.last_fire_by_side[side] = time.monotonic() * 1000.0
             self.n[f"fired {feed}"] += 1
 
     # ---------------------------------------------------------------- limits

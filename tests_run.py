@@ -604,7 +604,7 @@ class SettingsErrorTests(unittest.TestCase):
             s = sniper_mode.Settings()
         self.assertEqual((s.k_bp, s.window_ms, s.order_type, s.slip, s.cooldown_ms, s.min_left_s,
                           s.max_fills_round, s.max_side_shares, s.primary_feed),
-                         (0.5, 250.0, "FAK", 0.05, 1000.0, 10.0, 20, 200.0, "binance"))
+                         (0.5, 250.0, "FAK", 0.05, 300.0, 10.0, 20, 200.0, "binance"))
         self.assertEqual(s.shares, 10.0)
 
 

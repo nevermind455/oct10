@@ -1461,7 +1461,9 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # (SNIPER_SHARES + this side's unfilled carry, <= SNIPER_MAX_TARGET_SHARES) on
     # the visible levels up to ask + SNIPER_SLIP; actual fills settle the carry,
     # which never crosses sides and dies with its market. FOK is unchanged.
-    "sniper_mode.py": "94faaf5b5acdeea62ea61852cd7d152f90f03b91934aa0ce7505ba3fadee0fd3",
+    # Re-approved here: the cooldown is per side (an UP order never blocks DOWN, nor
+    # back), 300ms by default, and starts when the order is submitted.
+    "sniper_mode.py": "49b80c77309c74c6f40228edb8a4878a380330b0d4df406233147caecb1997b3",
     "sniper_live.py": "d17b9858113703267949e5358fdee65e83d33a5129cbf70d0154fb2167cddfd6",
     "paper_trade.py": "b75fa9828687069e48258f53aec2250107327d16531bd6dbbd50438ed55c1b78",
     "polymarket_trade.py": "71b5da67c456c2fb30f3578b84019b0152324bdf338c20c53941eba6b72adc94",

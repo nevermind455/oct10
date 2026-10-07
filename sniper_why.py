@@ -27,7 +27,7 @@ EXPLAIN = {
     "ask outside price band": "the ask is outside MIN_BUY_PRICE..MAX_BUY_PRICE",
     "round cap": "SNIPER_MAX_FILLS_ROUND / SNIPER_MAX_SIDE_SHARES reached in this market",
     "no asks left after our own recent fills": "our own recent fills used up the visible asks",
-    "cooldown": "another signal fired within SNIPER_COOLDOWN_MS",
+    "cooldown": "an order on the same side was submitted within SNIPER_COOLDOWN_MS",
     "previous order in flight": "the previous order was still waiting for its match",
     "awaiting FAK fill size": "a live FAK order's fill size has not arrived yet",
     "live halted": "the live canary is HALTED (kill switch) - restart needed",
