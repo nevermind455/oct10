@@ -198,6 +198,16 @@ class Liquidity(unittest.TestCase):
         thin = port(up=side(20, 0.45), down=side(0, None, asks=((0.50, 3), (0.60, 100))))
         self.assertEqual(evaluate("DOWN", thin).reason, "INSUFFICIENT_LIQUIDITY")   # 3 within the boundary
 
+    def test_fok_only_sizes_the_book_fills_completely(self):
+        # 20 unpaired UP, but only 7 DOWN within the limit: a 20-share FOK would be killed,
+        # so the manager asks for a size the book holds in full (5), never more
+        p = port(up=side(20, 0.45), down=side(0, None, asks=((0.50, 7), (0.60, 100))))
+        d = evaluate("DOWN", p, replace(CFG, max_order_usd=20, max_market_usd=40))
+        self.assertEqual((d.action, d.size, d.metrics["order_type"]), ("BUY", 5.0, "FOK"))
+        self.assertAlmostEqual(d.fill.qty, 5.0)                          # every share of the order
+        self.assertLessEqual(d.stake, 0.50 * 7 + 1e-9)                  # the stake fits the depth in full
+        self.assertEqual(d.stake, round(d.stake, 2))                    # whole cents
+
     def test_excessive_slippage(self):
         p = port(up=side(20, 0.40), down=side(0, None, asks=((0.40, 1), (0.42, 30))))
         d = evaluate("DOWN", p, replace(CFG, max_slippage=0.005, max_order_usd=20, max_market_usd=40))
@@ -355,7 +365,7 @@ class Concurrency(unittest.TestCase):
             b = self.broker(tmp, slow_book)
             out = {}
             t = threading.Thread(target=lambda: out.setdefault("pm", b.place_trade(
-                "UP", 2, "up", "down", "cond", TP.round_end(), 0.99, None, tag="manager", fak=True)), name="manager")
+                "UP", 2, "up", "down", "cond", TP.round_end(), 0.99, None, tag="manager", fak=False)), name="manager")
             t.start()
             self.assertTrue(entered.wait(2))
             ok = b.place_trade("UP", 2, "up", "down", "cond", TP.round_end(), 0.99, None, tag="sniper", fak=True)
@@ -393,9 +403,7 @@ class Concurrency(unittest.TestCase):
             for fill, ok, err, status, spent in (
                     ({"order_id": "p1", "shares": 10, "average_price": 0.5, "fee": 0.09, "total_cost": 5.09}, True,
                      None, "FILLED", 5.09),
-                    ({"order_id": "p2", "shares": 4, "average_price": 0.5, "fee": 0.04, "total_cost": 2.04,
-                      "partial": True}, True, None, "PARTIAL", 2.04),
-                    (None, False, "FAK no-fill: nothing at or below 0.52", "ZERO_FILL", 0.0),
+                    (None, False, "FOK no-fill: only $3.10 available at or below 0.52", "ZERO_FILL", 0.0),
                     (None, False, "spread exceeds paper limit", "REJECTED", 0.0)):
                 pm.hist = PM.MarketHistory(condition="c")
                 o = pm.reserve(d)
@@ -406,7 +414,7 @@ class Concurrency(unittest.TestCase):
                 self.assertFalse(pm.hist.sides["DOWN"].in_flight)
                 self.assertAlmostEqual(pm.hist.spend, spent)                # only what was really spent
                 self.assertEqual(o.filled_qty, (fill or {}).get("shares", 0))
-            self.assertEqual(pm.manager_order_ids, {"p1", "p2"})            # attributable by order id
+            self.assertEqual(pm.manager_order_ids, {"p1"})                  # attributable by order id
         finally:
             pm.journal.close()
 
@@ -419,6 +427,7 @@ class Concurrency(unittest.TestCase):
                 ok = b.place_trade("DOWN", amount, "up", "down", "cond", TP.round_end(), 0.99, None, tag=tag, fak=True)
                 res[tag] = (ok, b.last_fill)
             threads = [threading.Thread(target=run, args=("sniper", 2)), threading.Thread(target=run, args=("manager", 3))]
+            # (run() sends both as FAK; the manager's real executor uses FOK - see test_the_manager_executes_fok)
             for t in threads:
                 t.start()
             for t in threads:
@@ -428,6 +437,57 @@ class Concurrency(unittest.TestCase):
             lots = {lot.trade_id for lot in b.ledger.positions["down"].lots}
             self.assertEqual(len(ids), 2)
             self.assertEqual(lots, ids)                                 # each fill under its own order id
+
+
+class FokExecution(unittest.TestCase):
+    def test_the_manager_executes_fok(self):
+        calls = []
+
+        def place_trade(*a, **k):
+            calls.append(k)
+            return False
+        broker = types.SimpleNamespace(place_trade=place_trade, last_fill=None, last_error="FOK no-fill: thin")
+        hub = types.SimpleNamespace(condition_id=COND)
+        pm = PM.PositionManager(CFG, hub=hub, ledger=Ledger(), broker=broker)
+        try:
+            d = PM.Decision("UP", action="BUY", fill=PM.Fill(qty=5, notional=2.0, vwap=0.4), stake=2.0, limit=0.42)
+            ok, fill, err = pm._execute_paper(d, COND, UP_T, DN_T, time.time() + 200)
+            self.assertEqual(calls[0]["fak"], False)                     # fill-or-kill
+            self.assertEqual(calls[0]["tag"], "manager")
+            o = pm.reserve(replace(d, classification="PAIR_COST_IMPROVEMENT",
+                                   fill=PM.Fill(qty=5, notional=2.0, fees=0.03, vwap=0.4)))
+            pm.settle_order(o, ok=ok, fill=fill, error=err)
+            self.assertEqual((o.status, o.filled_qty), ("ZERO_FILL", 0.0))  # killed: nothing bought
+            self.assertIn("Execution:    FOK", "\n".join(CFG.lines(live_mode=False)))
+        finally:
+            pm.journal.close()
+
+    def test_a_fok_that_filled_at_a_worse_price_is_filled_not_partial(self):
+        broker = types.SimpleNamespace(place_trade=lambda *a, **k: True, last_error=None,
+                                       last_fill=None)
+        hub = types.SimpleNamespace(condition_id=COND)
+        pm = PM.PositionManager(CFG, hub=hub, ledger=Ledger(), broker=broker)
+        try:
+            d = PM.Decision("UP", action="BUY", classification="PAIR_COST_IMPROVEMENT",
+                            fill=PM.Fill(qty=5, notional=2.0, fees=0.03, vwap=0.4), stake=2.0, limit=0.42)
+            o = pm.reserve(d)
+            # the whole $2.00 executed, but the book had moved to 0.41: 4.88 shares
+            pm.settle_order(o, ok=True, fill={"order_id": "f1", "shares": 4.878, "average_price": 0.41,
+                                              "fee": 0.03, "total_cost": 2.03}, error=None)
+            self.assertEqual(o.status, "FILLED")
+            self.assertAlmostEqual(o.filled_qty, 4.878)
+        finally:
+            pm.journal.close()
+
+    def test_the_real_paper_broker_kills_a_manager_fok_it_cannot_fill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b = TP._broker(tmp, balance=500,
+                           context={"condition_id": "cond", "up_token_id": "up", "down_token_id": "down"})
+            # the book holds $1.20 at 0.40 and $5.00 at 0.50: $3.00 capped at 0.45 cannot fill in full
+            ok = b.place_trade("UP", 3, "up", "down", "cond", TP.round_end(), 0.45, None, tag="manager", fak=False)
+            self.assertFalse(ok)
+            self.assertIn("FOK no-fill", b.last_error)
+            self.assertNotIn("up", b.ledger.positions)                    # nothing bought
 
 
 class LiveGuard(unittest.TestCase):

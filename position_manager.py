@@ -13,6 +13,10 @@ buys only when a purchase measurably improves the position:
                             allows (off by default: hedging is not free)
 
 and then only if the extra capital and risk pass a second, independent check.
+
+Manager orders are FOK (fill-or-kill): the whole order at or under its limit,
+or nothing - never a partial position. A candidate exists only for a size the
+book can fill completely within the order's price boundary.
 "The price went down" is never a reason to buy. A lower average with a larger
 possible loss is AVG_IMPROVES_BUT_RISK_REJECTED.
 
@@ -172,7 +176,8 @@ class PMConfig:
         engine = "ENABLED" if self.enabled else "DISABLED"
         orders = ("ENABLED (refused: not implemented until the replay results are reviewed)" if self.live_enabled
                   else "DISABLED") if live_mode else "paper only" if self.enabled else "DISABLED"
-        out = ["POSITION MANAGER", f"  Engine:       {engine}", f"  Live Orders:  {orders}"]
+        out = ["POSITION MANAGER", f"  Engine:       {engine}", f"  Live Orders:  {orders}",
+               "  Execution:    FOK (all of the order at or under its limit, or nothing)"]
         if self.enabled:
             out.append(f"  limits: order ${self.max_order_usd:g}, market ${self.max_market_usd:g}, side "
                        f"{self.max_up_shares:g}/{self.max_down_shares:g} sh, exposure ${self.max_total_exposure_usd:g}, "
@@ -463,12 +468,11 @@ class Engine:
         comb_after = None
         if avg_after is not None and other_avg is not None:
             comb_after = avg_after + other_avg if side == "UP" else other_avg + avg_after
-        # The stake signed: at least the venue minimum AT THE LIMIT (a FAK's size is
-        # stake / limit), so it can spend a little more than the expected walk. Every
-        # cap and the reservation use that maximum; the economics use the expected fill.
-        d.stake = round(max(f.notional, cfg.venue_min_shares * boundary, cfg.venue_min_usd), 4)
+        # FOK: the stake is the cost of exactly these shares, in whole cents (as the
+        # venue quantizes it), and the book must hold all of it within the limit.
+        d.stake = round(max(math.ceil(f.notional * 100 - 1e-9) / 100, cfg.venue_min_usd), 2)
         capital_max = d.stake + (f.fees * d.stake / f.notional if f.notional > EPS else 0.0)
-        d.metrics.update(capital_max=capital_max)
+        d.metrics.update(capital_max=capital_max, order_type="FOK")
         d.metrics.update(
             current_shares=s.total_shares, current_avg=avg_before, best_ask=s.best_ask, best_bid=s.best_bid,
             expected_qty=f.qty, projected_avg=avg_after,
@@ -478,8 +482,12 @@ class Engine:
             pair_cost_before=port.combined_avg, pair_cost_after=comb_after, incremental_pair_cost=inc_pair,
             exposure_before=loss_before, exposure_after=loss_after, added_loss=loss_after - loss_before,
             capital=f.cost, threshold_avg=need_avg, threshold_pair=need_pair)
-        # ---- liquidity first: a candidate the book cannot fill is not a candidate
-        if f.qty < max(cfg.min_liquidity_shares, cfg.venue_min_shares) - EPS or f.notional < cfg.venue_min_usd:
+        # ---- liquidity first: a candidate the book cannot fill is not a candidate.
+        # FOK: all of the size (and all of the stake, after rounding to the cent).
+        room_usd = sum(p * q for p, q in s.asks if p <= boundary + EPS)
+        if (f.qty < q - 1e-6 or d.stake > room_usd + 1e-9
+                or f.qty < max(cfg.min_liquidity_shares, cfg.venue_min_shares) - EPS
+                or f.notional < cfg.venue_min_usd):
             return self._block(d, "INSUFFICIENT_LIQUIDITY")
         if f.slippage is not None and f.slippage > cfg.max_slippage + EPS:
             return self._block(d, "SLIPPAGE_TOO_HIGH")
@@ -802,7 +810,10 @@ class PositionManager:
             o.actual_price = fill.get("average_price")
             o.fees = float(fill.get("fee") or 0.0)
             o.cost = float(fill.get("total_cost") or 0.0)
-            o.status = "PARTIAL" if fill.get("partial") or o.filled_qty < o.requested_qty - 1e-6 else "FILLED"
+            # FOK: the whole order executed. Fewer shares than planned means the book
+            # moved up (still inside the limit) before it arrived - a worse price, not a
+            # partial fill; requested_qty/filled_qty in the journal show it.
+            o.status = "PARTIAL" if fill.get("partial") else "FILLED"
             if o.order_id:
                 self.manager_order_ids.add(str(o.order_id))
             if o.actual_price is not None:
@@ -810,7 +821,7 @@ class PositionManager:
             self.n["filled" if o.status == "FILLED" else "partial"] += 1
         else:
             o.error = str(error or "no fill")[:200]
-            o.status = "ZERO_FILL" if "no-fill" in o.error.lower() else "REJECTED"
+            o.status = "ZERO_FILL" if "no-fill" in o.error.lower() else "REJECTED"   # FOK: killed, nothing bought
             self.n["zero_fill" if o.status == "ZERO_FILL" else "rejected"] += 1
         # spend counts what was actually spent, not the reservation
         self.hist.spend += o.cost - o.reserved_usd
@@ -832,8 +843,9 @@ class PositionManager:
             except Exception:  # noqa: BLE001
                 lat = None
         guard = lambda: (self.hub.condition_id == cond and float(end) - self.wall() >= self.cfg.min_left_s)  # noqa: E731
+        # FOK (fak=False): every share at or under the limit, or nothing at all
         ok = self.broker.place_trade(d.side, d.stake, up, down, cond, end, d.limit, None,
-                                     latency_ms=lat, tag="manager", fak=True, pre_submit_guard=guard)
+                                     latency_ms=lat, tag="manager", fak=False, pre_submit_guard=guard)
         return ok, getattr(self.broker, "last_fill", None), getattr(self.broker, "last_error", None)
 
     # ---------------------------------------------------------------- the task

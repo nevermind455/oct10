@@ -98,6 +98,10 @@ own pending orders. It buys only when a purchase measurably improves the positio
   allows. Off by default (`POSITION_MANAGER_EXPOSURE_MAX_PAIR_COST=0`): hedging is
   not free.
 
+Manager orders are **FOK** (fill-or-kill): the whole order at or under its limit,
+or nothing. The manager only proposes a size the book can fill in full within its
+price boundary.
+
 Every buy passes two checks: the benefit, then the added capital and risk.
 Its limits are spend, orders, side inventory and total exposure (filled + pending),
 plus a cash reserve kept for the sniper. Prices come from the book walked to the

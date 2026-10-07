@@ -13,9 +13,11 @@ books). Every round in the recordings is used - none picked or dropped - and
 settles on its authoritative venue result (accounting.resolution, cached).
 
 How an order fills: it reaches the venue latency_ms after the decision (the
-modelled taker hold + network) and is filled as a FAK against the recorded
-book at that instant, up to its limit, minus what our own orders took from
-that book in the last 2s (sniper and manager compete for the same depth).
+modelled taker hold + network) and is matched against the recorded book at
+that instant, up to its limit, minus what our own orders took from that book
+in the last 2s (sniper and manager compete for the same depth). The sniper's
+orders are FAK (whatever is there); the manager's are FOK (all of it, or
+nothing).
 Fees: the venue curve, shares * 0.07 * p(1-p) (the rate on every recorded
 paper fill). Decisions only see the past; fills see the book at arrival.
 
@@ -211,7 +213,7 @@ class ReplayBroker:
                                                          Decimal("0.01")), self.clock.now)
         return hit[0]
 
-    def _enqueue(self, side, amount, up, down, cond, end, cap, tag, ref_ask, callback=None):
+    def _enqueue(self, side, amount, up, down, cond, end, cap, tag, ref_ask, callback=None, fok=False):
         ev, slot = threading.Event(), {}
         token = up if side == "UP" else down
         with self.lock:
@@ -219,20 +221,21 @@ class ReplayBroker:
             self.pending.append({"arrival": self.clock.now + self.latency_s, "side": side, "amount": float(amount),
                                  "token": str(token), "cond": str(cond), "end": float(end), "cap": float(cap),
                                  "tag": tag, "ref_ask": ref_ask, "decided": self.clock.now, "ev": ev, "slot": slot,
-                                 "callback": callback})
+                                 "callback": callback, "fok": bool(fok)})
         return ev, slot
 
     def place_trade(self, side, amount, up, down, cond, end, max_price, min_price=None, *, latency_ms=None,
                     tag=None, fak=False, **_kw) -> bool:
         view = self.book.view(str(up if side == "UP" else down))
-        ev, slot = self._enqueue(side, amount, up, down, cond, end, max_price, tag or "sniper", view.best_ask)
+        ev, slot = self._enqueue(side, amount, up, down, cond, end, max_price, tag or "sniper", view.best_ask,
+                                 fok=not fak)
         ev.wait(120)
         self._local.fill, self._local.error = slot.get("fill"), slot.get("error")
         return bool(slot.get("ok"))
 
-    def submit(self, side, amount, up, down, cond, end, cap, *, tag, callback):
+    def submit(self, side, amount, up, down, cond, end, cap, *, tag, callback, fok=True):
         view = self.book.view(str(up if side == "UP" else down))
-        self._enqueue(side, amount, up, down, cond, end, cap, tag, view.best_ask, callback)
+        self._enqueue(side, amount, up, down, cond, end, cap, tag, view.best_ask, callback, fok=fok)
 
     def cash_balance(self) -> float:
         with self.ledger._lock:
@@ -289,6 +292,9 @@ class ReplayBroker:
                 used.append((p, take))
             if shares <= 1e-9:
                 err = f"FAK no-fill: nothing at or below {cap}"
+            elif o["fok"] and spend > 1e-6:
+                # FOK: all of it at or under the cap, or nothing
+                err = f"FOK no-fill: only ${o['amount'] - spend:.6f} available at or below {cap}"
         if err is not None:
             slot.update(ok=False, error=err, fill=None)
         else:
