@@ -562,6 +562,23 @@ class PreflightStopFileTests(unittest.TestCase):
         self.assertEqual([r[0] for r in rows], ["PASS"])
 
 
+class SniperCheckToolTests(unittest.TestCase):
+    """sniper_check.py reads FAK (IOC) outcomes and the real price limit."""
+
+    def test_fak_no_fill_is_the_price_moving_and_unknown_book_is_a_gap(self):
+        import sniper_check as sc
+        self.assertEqual(sc.refusal_kind("FAK no-fill: nothing at or below 0.64"), "price ran past the cap (normal)")
+        self.assertEqual(sc.refusal_kind("FOK no-fill: only $0.00 available"), "price ran past the cap (normal)")
+        self.assertIn("measurement gap",
+                      sc.refusal_kind("unknown book state at the modelled arrival: the feed has not yet passed"))
+
+    def test_the_cap_is_read_from_the_orders(self):
+        import sniper_check as sc
+        rows = [{"cap": 0.52, "ask_seen": 0.47}, {"cap": 0.60, "ask_seen": 0.55}, {"cap": 0.95, "ask_seen": 0.93}]
+        self.assertEqual(sc.order_slip_c(rows), 5.0)                  # the clipped 0.93 -> 0.95 is the outlier
+        self.assertEqual(sc.order_slip_c([]), 2.0)
+
+
 class SettingsErrorTests(unittest.TestCase):
     """7eedf06: a bad SNIPER_* value is named with its allowed range, not
     reported as 'invalid SNIPER_* settings'."""

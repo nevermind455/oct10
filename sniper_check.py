@@ -77,10 +77,20 @@ def _git_head() -> str | None:
         return None
 
 
+def order_slip_c(rows) -> float:
+    """The price limit the orders were sent with, in cents above the ask they
+    saw (SNIPER_SLIP; the median, as MAX_BUY_PRICE clips it for high asks)."""
+    xs = [round((float(r["cap"]) - float(r["ask_seen"])) * 100, 1) for r in rows
+          if r.get("cap") is not None and r.get("ask_seen") is not None]
+    return statistics.median(xs) if xs else 2.0
+
+
 def refusal_kind(reason) -> str:
     r = str(reason or "").lower()
-    if "fok no-fill" in r:
+    if "fok no-fill" in r or "fak no-fill" in r:          # FAK (IOC): nothing left at or below the cap
         return "price ran past the cap (normal)"
+    if "unknown book state" in r:
+        return "book at the modelled arrival not seen yet (paper measurement gap, not a price move)"
     if "execution interval" in r or "cutoff" in r or "time remaining" in r:
         return "outside trade window (skipped instead since f8bbb2e)"
     if "floor" in r or "min_buy_price" in r or "maximum buy price" in r:
@@ -240,14 +250,17 @@ def main() -> int:
     for why, n in collections.Counter(refusal_kind(r.get("reason")) for r in refused).most_common():
         print(f"         refuse{n:6d}  {why}")
     odd = [r for r in refused if "normal" not in refusal_kind(r.get("reason"))
-           and "since" not in refusal_kind(r.get("reason"))]
+           and "since" not in refusal_kind(r.get("reason"))
+           and "measurement gap" not in refusal_kind(r.get("reason"))]
     old = [r for r in refused if "since" in refusal_kind(r.get("reason"))]
     if old:
         rep.line("WARN", f"{len(old)} refusals the current code skips instead - pull + restart if they are recent "
                          f"(last {(time.time() - max(float(r['wall']) for r in old)) / 60:.0f} min ago)")
+    gaps = sum(1 for r in refused if "measurement gap" in refusal_kind(r.get("reason")))
     rep.line("PASS" if not odd else "WARN",
              f"{len(odd)} refusals for reasons other than price moving" if odd else
-             "every refusal is the price moving past the cap, as the lab expects")
+             "every refusal is the price moving past the cap, as the lab expects"
+             + (f" ({gaps} more: paper could not see the book at the modelled arrival)" if gaps else ""))
 
     # ------------------------------------------------------------ plumbing
     print("\n3. EVERY FILL IS WHAT IT SHOULD BE")
@@ -368,7 +381,8 @@ def main() -> int:
           f"and asks 0.05-0.95 - a narrower window or band means proportionally fewer)")
     slip = [(float(f.get("price") or 0) - float(f.get("ask_seen") or 0)) * 100 for f in fills]
     if slip:
-        print(f"         paid {statistics.fmean(slip):+.2f}c vs the ask seen at the decision (cap allows +2c)")
+        print(f"         paid {statistics.fmean(slip):+.2f}c vs the ask seen at the decision "
+              f"(cap allows +{order_slip_c(fills):g}c)")
     for k, lab in (("markout_1s_c", None), ("markout_5s_c", LAB_MARKOUT_5S_C)):
         items = [(f.get("round_end"), float(marks[f["order_id"]][k]) * float(f.get("shares") or 0),
                   float(f.get("shares") or 0))
@@ -512,7 +526,7 @@ def main() -> int:
                     pay_t = pay.get(r.get("token"), (1.0 - pay[o]) if o in pay else None)
                     if pay_t is not None:
                         st.append((g, (sh * pay_t - sh * float(q["px"]) - float(q["fee"])) * 100, sh))
-                label = "ask+2c" if slip == "base" else f"ask+{slip}c"
+                label = f"ask+{order_slip_c(fills + refused):g}c" if slip == "base" else f"ask+{slip}c"
                 print(f"         {label:>8}  {n_fill / len(shadows):>6.0%}  {fmt_ratio(mk):<24}  {fmt_ratio(st):<24}")
             print("         a wider limit is only worth it if its markout holds up while the fill rate rises")
 
