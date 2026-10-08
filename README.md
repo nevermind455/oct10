@@ -277,6 +277,38 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 
 A set `SNIPER_*` number that does not parse, or is NaN or infinite, stops the start and names the variable; so does a negative cooldown, minimum time left or book-wait, or a side cap or stale limit of 0. The `SNIPER_CANARY_MAX_*` caps must be finite numbers >= 0 (whole numbers for the counts). A bad value used to quietly become the default, and `nan` switched a canary cap off.
 
+## Real-time paper: the sniper and the Position Manager on live markets
+
+```bash
+python paper_realtime.py run --markets 25      # supervisor; stops after 25 settled markets
+python paper_realtime.py ctl restart           # clean restart (state restored from disk)
+python paper_realtime.py ctl hard-restart      # crash test: killed, then restarted
+python paper_realtime.py ctl stop
+python paper_realtime.py report                # per-market table, P/L by source, invariant checks
+```
+
+The supervisor starts two things in their own folder (`~/sniperbtc-realtime`; never your usual paper state):
+
+- `run.py --paper` with `POSITION_MANAGER_ENABLED=1`. Both the sniper and the manager trade the same paper account against the real Binance feed and real Polymarket books, rounds and results. Every fill is a **simulated paper fill**.
+- The market recorder, so the same stream can be replayed later as sniper-only vs sniper + manager (`replay_ab.py --data <dir>/lab`).
+
+Every 30 seconds it samples the bot's CPU, RAM, threads and handles, re-checks the paper invariants, and writes both to `monitor.jsonl`.
+
+At start, paper prints `TRADING MODE: REAL-TIME PAPER ... LIVE ORDER EXECUTION: DISABLED ... REAL MONEY RISK: $0`. Every order-capable live entry point (18 of them) is replaced by a refusal that is counted; the final report shows the count.
+
+Each paper fill's ledger source carries its strategy (`paper_live_book/sniper` or `/manager`). That gives exact per-source spend, fees and P/L, which the dashboard shows in `PAPER P/L BY SOURCE`.
+
+To stop any bot cleanly without a console (on Windows a background process cannot receive CTRL_BREAK), create the file `<BOT_LOCK_PATH>.stop`. The bot deletes it and shuts down as on SIGTERM.
+
+## Restart, ownership and durability
+
+- **Ledger.** A fill or settlement appends one fsynced line to `<ledger>.journal`. A full snapshot is written every 500 entries, every 2 minutes in paper (every 60 seconds live), and at shutdown. A restart replays the journal, and a damaged one refuses to start. Booking a fill costs the same at any ledger size (0.7 ms; it was 188 ms at 50,000 positions).
+- **One process per ledger and per wallet.** Two bots on one ledger file, or two live bots on one wallet on this machine, are refused. The wallet lock lives in `~/.sniperbtc/locks`. Locks cannot see another machine; there, live reconciliation is the safety net.
+- **The live canary's budget survives restarts.** Orders, fills, spend, rounds, the loss window and halts are kept in `live_canary_state.json`. At start they are reconciled with the ledger's order authorizations, and an unreadable or missing file refuses the live start. `--new-canary-session` starts a new budget deliberately and keeps the old file as `.bak`.
+- **Paper.** Round caps are rebuilt from the ledger. The manager's per-market limits are rebuilt from its journal. The carry restarts at 0, which is smaller, never larger.
+
+**Share caps are estimates.** The sniper's IOC is signed in dollars (makerAmount, USDC). If the ask falls before the match, the same stake buys more shares than the target, so the share target, the round side cap and the canary's shares-per-order cap are checked at the decision's prices only. Dollar limits (stake, spend cap, cash) are hard. A fill above target is journalled as `over_target`.
+
 ## Daily checks (read-only; safe beside a running bot)
 
 ```bash
