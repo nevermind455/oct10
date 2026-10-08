@@ -576,6 +576,7 @@ def t_ledger_save_reuses_unchanged_positions_never_stale_ones():
         led.record_fill_durable("t2", DN_TOK, shares=6.0, price=0.40, condition_id=COND)
         led.record_fill_durable("t3", "other-tok", shares=5.0, price=0.30, condition_id="cond-other")
         led.settle(parse_market(_market()))
+        led.save()        # fills and settlements go to the journal; the snapshot encoder is what is tested here
 
         def on_disk():
             return json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
@@ -602,6 +603,7 @@ def t_ledger_save_reuses_unchanged_positions_never_stale_ones():
         led.save()
         settled_text = led._pos_text[UP_TOK][1]
         led.record_fill_durable("t4", "other-tok", shares=1.0, price=0.31, condition_id="cond-other")
+        led.save()
         check("an unchanged settled position's text is reused, not re-encoded",
               led._pos_text[UP_TOK][1] is settled_text)
         check("the changed open position is saved fresh",
@@ -612,16 +614,18 @@ def t_ledger_save_reuses_unchanged_positions_never_stale_ones():
               == {k: _pos_dict(v) for k, v in led.positions.items()})
         # The cached `seen` list must follow a rolled-back fill: a failed save
         # discards its trade id, and a different fill then restores the size.
-        real_write = led._write_payload
-        led._write_payload = lambda payload: False
+        real_write, real_append = led._write_payload, led._append_journal
+        led._write_payload = lambda payload: False          # both durable paths fail
+        led._append_journal = lambda entry: False
         try:
             led.record_fill_durable("t-rolled-back", "other-tok", shares=1.0, price=0.32, condition_id="cond-other")
             check("a failed save raises", False)
         except RuntimeError:
             pass
-        led._write_payload = real_write
+        led._write_payload, led._append_journal = real_write, real_append
         led.record_fill_durable("t-after", "other-tok", shares=1.0, price=0.33, condition_id="cond-other")
-        seen_on_disk = on_disk()["seen"]
+        from accounting.ledger import current_payload
+        seen_on_disk = current_payload(path)["seen"]        # the snapshot plus its journal: what a restart sees
         check("after a rollback the saved trade ids hold the new fill, never the rolled-back one",
               "t-after" in seen_on_disk and "t-rolled-back" not in seen_on_disk
               and seen_on_disk == sorted(led.seen), str(seen_on_disk))

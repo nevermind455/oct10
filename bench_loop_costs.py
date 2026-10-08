@@ -25,6 +25,7 @@ import statistics
 import sys
 import tempfile
 import time
+import tracemalloc
 import types
 from decimal import Decimal as D
 
@@ -49,6 +50,7 @@ def build(n_positions: int, led: Ledger):
             led.positions[f"{i}1"].settled = led.positions[f"{i}2"].settled = True
             led.positions[f"{i}1"].payout_per_share, led.positions[f"{i}2"].payout_per_share = 1.0, 0.0
             led.positions[f"{i}1"].realized, led.positions[f"{i}2"].realized = 5.28, -4.72
+            led.positions[f"{i}1"].settled_wall = led.positions[f"{i}2"].settled_wall = time.time()
     led.save()
     last = n_positions // 2 - 1
     return "0x" + f"{last + 1:064x}", f"{last}1", f"{last}2"
@@ -129,6 +131,18 @@ def main(argv=None) -> int:
                 "worker: settlement scan": timed(lambda: w._ledger_scan(frozenset({cid})), n=20),
                 "ledger file KiB": round(os.path.getsize(led.path) / 1024, 1),
             }
+            t = time.perf_counter()
+            again = Ledger(path=led.path)
+            again.load()
+            row["restart: Ledger.load"] = {"p50": round((time.perf_counter() - t) * 1000.0, 3)}
+            tracemalloc.start()
+            snap0 = tracemalloc.take_snapshot()
+            probe = Ledger(path=led.path)
+            probe.load()
+            grown = sum(x.size_diff for x in tracemalloc.take_snapshot().compare_to(snap0, "filename"))
+            tracemalloc.stop()
+            row["ledger in memory MiB"] = round(grown / 2 ** 20, 1)
+            del probe, again
             pm.journal.close()
             out[n] = row
             print(f"{n:>6} positions  " + "  ".join(

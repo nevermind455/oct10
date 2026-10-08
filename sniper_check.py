@@ -15,6 +15,7 @@ numbers with the latency lab: ~1 in 3 orders filled, ~+1c/share net markout
 """
 from __future__ import annotations
 
+
 import argparse
 import collections
 import json
@@ -25,6 +26,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+from accounting.ledger import current_payload  # noqa: E402
 
 LAB_FILL_RATE = 1 / 3
 LAB_MARKOUT_5S_C = 1.06
@@ -197,8 +199,8 @@ def main() -> int:
     journal = [r for r in journal if float(r.get("wall") or 0) >= since]
     audit = [r for r in jsonl(audit_path) if float(r.get("wall") or 0) >= since]
     try:
-        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        ledger = current_payload(str(ledger_path))     # the snapshot plus its journal
+    except (OSError, ValueError, RuntimeError):
         ledger = {}
 
     decisions = [r for r in journal if r.get("result") in ("filled", "refused", "skipped", "error")]

@@ -497,11 +497,17 @@ class Bot:
                     realized += F(str(p.shares)) * pay - cost
                     if p.payout_per_share != float(pay):
                         counts["settlement_double_counts"] += 1
-        cash = self.broker.cash_balance()
+            # read under the SAME lock as the oracle: a settlement running on the
+            # worker pool must not land between the two reads (it did once in
+            # 10,000 scenarios when these two read the ledger after the lock)
+            cash = self.broker.cash_balance()
+            realized_led = led.summary()["realized_pnl"]
         if abs(float(F(str(self.start_cash)) - spent + paid) - cash) > 1e-6:
             counts["accounting_mismatches"] += 1
-        if abs(led.summary()["realized_pnl"] - float(realized)) > 1e-6:
+            self.why[f"mismatch cash: oracle {float(F(str(self.start_cash)) - spent + paid):.6f} vs {cash:.6f}"] += 1
+        if abs(realized_led - float(realized)) > 1e-6:
             counts["accounting_mismatches"] += 1
+            self.why[f"mismatch realized: oracle {float(realized):.6f} vs {realized_led:.6f}"] += 1
         for o in self.pm.orders.values():
             if o.requested_qty < 0 or o.reserved_usd < 0 or o.filled_qty < 0:
                 counts["negative_pending"] += 1
@@ -707,7 +713,8 @@ class Resources(unittest.TestCase):
         self.assertLessEqual(after["pm_orders"], PM.PositionManager.KEEP_FINISHED + 10)
         # book history of old tokens is kept history_s (30s) then dropped at a rotation: bounded by
         # time, not by count - this test rotates every ~0.1s, a live bot every 300s
-        self.assertLessEqual(after["book_history"], 2 + 2 * 30 * rotations / max(1.0, self.elapsed))
+        # (+ slack: the window's edges and the 5.5s waits around the measurement)
+        self.assertLessEqual(after["book_history"], 20 + 2 * 36 * rotations / max(1.0, self.elapsed))
         self.assertLess(grown, 40 * 1024 * 1024)
         self.results = (before, after, grown)
 

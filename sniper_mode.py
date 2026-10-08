@@ -988,6 +988,9 @@ class Sniper:
         # its fills are told apart by order id (live) / per-order result (paper).
         self.inflight = {"UP": None, "DOWN": None}
         self.rounds = collections.defaultdict(lambda: {"fills": 0, "UP": 0.0, "DOWN": 0.0})
+        # signals per round by side, and how many each gate stopped (journalled as
+        # a round_summary row once the round has ended; no decision reads it)
+        self.round_signals = collections.defaultdict(collections.Counter)
         # token id -> (shares, fills) the ledger already held when this process
         # started (seed_rounds). A round's caps count them from its first order
         # on: a restart must not reset a market's caps to zero.
@@ -1167,7 +1170,20 @@ class Sniper:
     async def _round_watch(self) -> None:
         while True:
             self.roll_rounds()
+            self._journal_round_signals()
             await asyncio.sleep(0.5)
+
+    def _journal_round_signals(self) -> None:
+        """One round_summary row per ended round: its signals by side and the
+        signals the cooldown / in-flight gates stopped (the journal's order and
+        skip rows cover the rest; skips are coalesced there)."""
+        now_end = getattr(self.hub, "window_end", None)
+        for end in [e for e in self.round_signals if e is not None and now_end is not None and e < now_end]:
+            c = self.round_signals.pop(end)
+            self._write({"wall": time.time(), "result": "round_summary", "round_end": end,
+                         "signals": c["UP"] + c["DOWN"], "signals_up": c["UP"], "signals_down": c["DOWN"],
+                         "cooldown_skips": c["cooldown"], "in_flight_skips": c["in_flight"]})
+        self.round_signals.pop(None, None)
 
     def _spawn(self, coro) -> None:
         # Keep a reference: the loop holds tasks weakly, so an unreferenced
@@ -1338,11 +1354,15 @@ class Sniper:
                                                        if self.fresh.last_excess is not None else None)})
                 return
         side = "UP" if direction > 0 else "DOWN"
+        per_round = self.round_signals[getattr(self.hub, "window_end", None)]   # diagnostics: never read here
+        per_round[side] += 1
         if t - self.last_fire_by_side[side] < self.s.cooldown_ms:
             self.n["skip: cooldown" + tag] += 1         # this side only: the other side is not blocked
+            per_round["cooldown"] += 1
             return
         if self.inflight[side] is not None:
             self.n["skip: previous order in flight" + tag] += 1     # this side's own order only
+            per_round["in_flight"] += 1
             return
         self.inflight[side] = {"end": None}
         self._t1 = (trig_pc, mid)                       # read by _fire_now in this same call
@@ -2018,6 +2038,19 @@ class Sniper:
         if row.get("lat"):
             self.latency.add(row["lat"])
 
+    def _note_over_target(self, row: dict, plan: dict, shares) -> None:
+        """F1 (audit): a dollar-sized IOC whose ask fell before the match buys
+        more shares than its target. Journalled and counted - never hidden.
+        Diagnostics only, after the fill: no decision reads it."""
+        target = plan.get("target")
+        try:
+            got = float(shares or 0)
+        except (TypeError, ValueError):
+            return
+        if target is not None and got > float(target) + 1e-6:
+            row["over_target"] = round(got - float(target), 4)
+            self.n["fills above target (ask fell)"] += 1
+
     def _record_fak_fill(self, row, plan, fill, *, update=False):
         """Report actual executed quantity, never the request or book estimate."""
         side, rd = row["side"], plan["rd"]
@@ -2033,6 +2066,7 @@ class Sniper:
                                  "ORDER_STATUS" if fill.get("source") == "terminal order status" else "PRIVATE_WS")
         if shares > 0:
             rd[side] += shares
+            self._note_over_target(row, plan, shares)
             self.n["filled"] += 1
             row.update(result="filled", outcome="FILLED")
             self.on_event("sniper", f"LIVE FAK {'PARTIAL ' if row['partial'] else ''}FILL {side} "
@@ -2171,7 +2205,7 @@ class Sniper:
                 or rd[side] + amount / ask > self.s.max_side_shares):
             return self._skip("round cap", row)
         decided_pc = time.perf_counter_ns()     # every check passed: this signal trades
-        self.inflight[side] = {"end": end}
+        self.inflight[side] = {"end": end, "amount": amount}
         row.update(ask_seen=ask, cap=cap, shares=round(amount / ask, 4), amount=round(amount, 4))
         if target is not None:
             row.update(target_shares=round(target, 4), carry_in=round(carry, 4))
@@ -2224,6 +2258,7 @@ class Sniper:
                 self.n["filled"] += 1
                 rd["fills"] += 1
                 rd[side] += float(fill.get("shares") or 0)
+                self._note_over_target(row, plan, fill.get("shares"))
                 self._settle_carry(plan, side, fill.get("shares"))
                 if plan.get("target") is not None:
                     row["carry_out"] = self.carry[side]

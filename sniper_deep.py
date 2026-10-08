@@ -25,12 +25,14 @@ round-clustered t values.
 """
 from __future__ import annotations
 
+
 import argparse
 import collections
 import json
 from pathlib import Path
 
 import sniper_check as sc
+from accounting.ledger import current_payload  # noqa: E402
 
 
 def load(env_path: str, whole: bool, hours: float | None = None):
@@ -48,8 +50,8 @@ def load(env_path: str, whole: bool, hours: float | None = None):
         since, scope = float(starts[-1]["wall"]) - 1, "since the bot's last restart (--all for everything)"
     journal = [r for r in journal if float(r.get("wall") or 0) >= since]
     try:
-        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        ledger = current_payload(str(ledger_path))     # the snapshot plus its journal
+    except (OSError, ValueError, RuntimeError):
         ledger = {}
     pay = {}
     for pos in (ledger.get("positions") or {}).values():
@@ -102,8 +104,8 @@ def daily(env_path: str) -> int:
     ledger_path = sc.state_path(env, "PAPER_LEDGER_PATH", "paper_ledger.json")
     journal = sc.jsonl(audit_path.with_name(f"{audit_path.stem}_sniper.jsonl"))
     try:
-        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        ledger = current_payload(str(ledger_path))     # the snapshot plus its journal
+    except (OSError, ValueError, RuntimeError):
         ledger = {}
     pay = {}
     for pos in (ledger.get("positions") or {}).values():

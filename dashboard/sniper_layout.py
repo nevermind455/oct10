@@ -139,6 +139,8 @@ def _header(snap: dict, cols: int) -> Row:
         halted = canary.get("halted") or []
         parts += [(" ", PAPER), (" HALTED " if halted else " CANARY ARMED ",
                                  state_style("FAIL" if halted else "WARN"))]
+    elif mode == "PAPER" and cols >= 140:
+        parts += [(" ", PAPER), (" NO REAL ORDERS · $0 AT RISK ", Style("ink", "paper2", bold=True))]
     parts += [("  ", PAPER), (_text(market.get("slug"), "no round yet")[:40], Style("ink", bold=True)),
               ("  ", PAPER), (f"T-{left:.0f}s" if left is not None else "T-?", Style("blue", bold=True))]
     st = snap.get("settlement") if isinstance(snap.get("settlement"), dict) else {}
@@ -171,8 +173,12 @@ def _trigger_body(t: dict, w: int) -> list[Row]:
                (status, state_fg(status)),
                (f"  busy {t['in_flight']}" if isinstance(t.get("in_flight"), str) else "  busy" if t.get("in_flight")
                 else "", Style("blue"))], w),
-        _line("BTC mid", f"{_num(t['mid']):,.2f}" if _num(t.get("mid")) is not None else MISSING, w,
-              Style("ink", bold=True)),
+        _runs([(fit("BTC mid", 9), DIM), (" ", PAPER),
+               (f"{_num(t['mid']):,.2f}" if _num(t.get("mid")) is not None else MISSING, Style("ink", bold=True)),
+               # Binance at the round's start, when this process saw it begin (approximate:
+               # the market's strike is Chainlink's price); N/A after joining mid-round
+               ((f"  start ~{_num(t['btc_start']):,.0f}" if _num(t.get("btc_start")) is not None
+                 else "  start N/A") if "btc_start" in t else "", FAINT)], w),
         _runs([(fit("move", 9), DIM), (" ", PAPER), (bp(move), Style("red", bold=True) if hot else Style("ink")),
                (f" /{window:.0f}ms" if window is not None else "", DIM),
                (f" k{k:g}" if k is not None else "", FAINT)], w),
@@ -482,8 +488,15 @@ def _pm_portfolio_body(pm: dict, w: int) -> list[Row]:
         f = _num(v)
         return "0.00" if f is None else f"{f:.2f}"
     comb = _num(pf.get("combined_avg"))
-    mode = "SHADOW (no orders)" if pm.get("shadow") else ("LIVE ORDERS" if pm.get("live_orders") else "paper orders")
+    mode = ("SHADOW (no orders)" if pm.get("shadow") else
+            "LIVE ORDERS" if pm.get("live_orders") else "REAL-TIME PAPER")
     unknown = int(_num(pm.get("unknown_orders")) or 0)
+    trade, block = pm.get("last_trade"), pm.get("last_block")
+    activity = [
+        _line("Activity", f"eval {count(pm.get('evaluations'))}  opp {count(pm.get('opportunities'))}  "
+              f"ord {count(pm.get('orders_total'))}  fill {count(pm.get('fills_total'))}", w, Style("ink"), lw=13),
+        _line("Last trade", f"{trade[1]} {trade[2]}" if trade else "N/A", w, Style("green"), lw=13),
+        _line("Last block", f"{block[1]} {block[2]}" if block else "N/A", w, FAINT, lw=13)]
     return [
         _line("Comb Avg+fees", ("WAITING" if not pf else "N/A") if comb is None else f"${comb:.4f}", w,
               (Style("green", bold=True) if comb is not None and comb < 1 else Style("red", bold=True))
@@ -498,7 +511,7 @@ def _pm_portfolio_body(pm: dict, w: int) -> list[Row]:
               f"{money(pm.get('spend'))}/{money(pm.get('max_spend'))}", w, Style("ink"), lw=13),
         _runs([(mode, Style("amber") if pm.get("shadow") else DIM),
                (f"  {unknown} UNKNOWN (reconciliation required)" if unknown else "", Style("red", bold=True))], w),
-    ]
+    ] + activity
 
 
 def _manager_band(snap: dict, cols: int, h: int, g: Glyphs) -> list[Row]:
@@ -519,6 +532,42 @@ def _manager_band(snap: dict, cols: int, h: int, g: Glyphs) -> list[Row]:
     return join([panel("POSITION MANAGER  UP", _pm_side_body(sides.get("UP"), w[0] - 2)[:body_h], w[0], h, g),
                  panel("DOWN", _pm_side_body(sides.get("DOWN"), w[1] - 2)[:body_h], w[1], h, g),
                  panel("PORTFOLIO", _pm_portfolio_body(pm, w[2] - 2)[:body_h], w[2], h, g)], w, h)
+
+
+def _pnl_body(acct: dict, w: int) -> list[Row]:
+    """PAPER P/L by source: every figure from simulated fills on the real books."""
+    attr = acct.get("attribution") if isinstance(acct.get("attribution"), dict) else {}
+    cols = (("SOURCE", 9), ("FILLS", 6), ("SPEND", 10), ("FEES", 8), ("REALIZED", 10), ("UNREAL", 9),
+            ("TOTAL", 10), ("W/L", 7), ("WIN%", 5))
+    head = _runs([(fit(n, k), DIM) for n, k in cols], w)
+    rows = [head]
+    tot = {"fills": 0, "spend": 0.0, "fees": 0.0, "realized": 0.0, "unrealized": 0.0, "total": 0.0, "wins": 0,
+           "losses": 0}
+    names = [n for n in ("sniper", "manager") if n in attr] + [n for n in attr if n not in ("sniper", "manager")]
+    for name in names or ["sniper"]:
+        a = attr.get(name) or {}
+        for k in tot:
+            tot[k] += a.get(k) or 0
+        rows.append(_pnl_row(name.upper(), a, cols, w))
+    rows.append(_pnl_row("COMBINED", tot, cols, w, bold=True))
+    rows.append(_runs([("capital ", DIM), (money(tot["spend"]), Style("ink")),
+                       ("  reserved ", DIM), (money(acct.get("reserved") or 0.0), Style("ink")),
+                       ("  max exposure ", DIM), (money(acct.get("max_exposure")), Style("ink")),
+                       ("  max drawdown ", DIM), (money(acct.get("max_drawdown")), Style("ink")),
+                       ("  (this run)", FAINT)], w))
+    return rows
+
+
+def _pnl_row(label, a, cols, w, bold=False):
+    total = _num(a.get("total"))
+    won, lost = int(a.get("wins") or 0), int(a.get("losses") or 0)
+    vals = [label, f"{int(a.get('fills') or 0)}", money(a.get("spend") or 0.0), money(a.get("fees") or 0.0),
+            money(a.get("realized") or 0.0, sign=True), money(a.get("unrealized") or 0.0, sign=True),
+            money(total or 0.0, sign=True), f"{won}/{lost}",
+            f"{100.0 * won / (won + lost):.0f}%" if won + lost else "N/A"]
+    st = Style("green", bold=bold) if (total or 0) > 0 else Style("red", bold=bold) if (total or 0) < 0 else Style("ink", bold=bold)
+    return _runs([(fit(v, k), st if i in (4, 6) else Style("ink", bold=bold)) for i, (v, (_n, k)) in
+                  enumerate(zip(vals, cols))], w)
 
 
 def _latency_band(snap: dict, cols: int, h: int, g: Glyphs) -> list[Row]:
@@ -739,8 +788,13 @@ def _build(snap: dict, cols: int, rows: int, g: Glyphs) -> list[Row]:
     # SNIPER EXECUTION LATENCY | EXECUTION QUALITY when it still leaves the
     # middle band its 8 rows and EVENTS 5 (the trigger row shows send/ACK p50 always)
     # POSITION MANAGER (only when its engine is on), then the latency band
-    pm_h = 11 if isinstance(snap.get("pm"), dict) and snap["pm"].get("engine") and room >= 11 + 8 + 3 else 0
+    pm_on = isinstance(snap.get("pm"), dict) and snap["pm"].get("engine")
+    pm_h = (14 if pm_on and room >= 14 + 8 + 8 + 3 else 11 if pm_on and room >= 11 + 8 + 3 else 0)
     room -= pm_h
+    acct_now = snap.get("account") if isinstance(snap.get("account"), dict) else {}
+    pnl_h = (8 if str(acct_now.get("kind") or "").upper() == "PAPER" and isinstance(acct_now.get("attribution"), dict)
+             and room >= 8 + 8 + 3 else 0)
+    room -= pnl_h
     lat_h = 8 if room >= 8 + 8 + 5 else 0
     room -= lat_h
     mid_h = min(room, max(8, len(side_rows) + 2))
@@ -759,6 +813,10 @@ def _build(snap: dict, cols: int, rows: int, g: Glyphs) -> list[Row]:
     if pm_h:
         out += _manager_band(snap, cols, pm_h, g)
         remaining -= pm_h
+    if pnl_h:
+        out += panel("PAPER P/L BY SOURCE (simulated fills on real books)",
+                     _pnl_body(acct_now, cols - 2)[:pnl_h - 2], cols, pnl_h, g)
+        remaining -= pnl_h
     if lat_h:
         out += _latency_band(snap, cols, lat_h, g)
         remaining -= lat_h

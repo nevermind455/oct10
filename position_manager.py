@@ -393,6 +393,10 @@ class MarketHistory:
     orders: int = 0
     spend: float = 0.0
     sides: dict = field(default_factory=lambda: {s: SideHistory() for s in SIDES})
+    # diagnostics for the per-market report (journalled when the market changes)
+    evaluations: int = 0
+    opportunities: int = 0
+    blocked: collections.Counter = field(default_factory=collections.Counter)
 
     def copy(self) -> "MarketHistory":
         return MarketHistory(self.condition, self.orders, self.spend, {k: replace(v) for k, v in self.sides.items()})
@@ -730,6 +734,11 @@ class PositionManager:
         self._inconclusive = False
         self.busy_reason: str | None = None
         self._cash_cache = None                      # (ledger fill count, mono, cash) - see _cash_free
+        self.last_trade: tuple | None = None         # (wall, side, classification) of the last order sent
+        self.last_block: tuple | None = None         # (wall, side, reason) of the last refused opportunity
+        self.restored: dict = {}
+        import uuid
+        self.run_id = uuid.uuid4().hex[:12]           # this process: reservation ids restart at 1 in each
         self.last_error: str | None = None
         self._task = None
         # Order fields the executor thread writes (its outcome, the booking flag):
@@ -915,6 +924,12 @@ class PositionManager:
         if not (up and down and cond and end):
             self.last = {s: Decision(s, reason="MARKET_INACTIVE", action="BLOCKED") for s in SIDES}
             return None
+        if self.hist.condition not in (None, cond):
+            old = self.hist
+            self.journal.write({"wall": self.wall(), "event": "POSITION_MANAGER MARKET SUMMARY",
+                                "condition": old.condition, "evaluations": old.evaluations,
+                                "opportunities": old.opportunities, "orders": old.orders,
+                                "spend": round(old.spend, 6), "blocked": dict(old.blocked)})
         self.hist = self._hist_for(cond)                                 # a new market: fresh limits
         fee, _rules = self._rules_fee(cond)
         # The version is taken BEFORE anything is read: a change made while the state
@@ -1009,7 +1024,7 @@ class PositionManager:
         self.n["orders"] += 1
         self.n[f"orders {d.classification}"] += 1
         self.journal.write({"wall": self.wall(), "event": f"POSITION_MANAGER BUY {d.side}",
-                            "condition": cond, "seq": self._seq, "market_id": o.market_id,
+                            "condition": cond, "seq": self._seq, "market_id": o.market_id, "run_id": self.run_id,
                             "token_id": o.token_id, "reservation_id": o.reservation_id, **d.row()})
         self.on_event("manager", f"BUY {d.side} {d.fill.qty:.2f} @<= {d.limit:.2f} ({d.classification})", "info")
         return o
@@ -1073,6 +1088,7 @@ class PositionManager:
                             "requested_qty": round(o.requested_qty, 4), "filled_qty": round(o.filled_qty, 4),
                             "expected_price": o.expected_price, "actual_price": o.actual_price, "fees": o.fees,
                             "cost": o.cost, "error": o.error, "condition": o.condition, "market_id": o.market_id,
+                            "run_id": self.run_id,
                             "token_id": o.token_id, "reservation_id": o.reservation_id})
 
     KEEP_FINISHED = 200
@@ -1176,11 +1192,18 @@ class PositionManager:
                 if self._inconclusive:
                     self._version = None                       # the state was busy: look again next poll
                 self.last_error = None
+                self.n["evaluations"] += 1
+                self.hist.evaluations += 1
                 for d in decisions.values():
                     self._log_skip(d)
+                    if d.action == "BLOCKED" and d.reason not in (None, "NOTHING_TO_MANAGE"):
+                        self.last_block = (self.wall(), d.side, d.reason)
+                        self.hist.blocked[d.reason] += 1
                 d = self.choose(decisions)
                 if d is None:
                     continue
+                self.n["opportunities"] += 1
+                self.hist.opportunities += 1
                 if self.shadow:
                     self.n["shadow buys"] += 1
                     self.journal.write({"wall": self.wall(), "event": f"POSITION_MANAGER SHADOW BUY {d.side}",
@@ -1212,6 +1235,7 @@ class PositionManager:
         hub = self.hub
         cond, up, down, end = hub.condition_id, hub.up_token, hub.down_token, hub.window_end
         o = self.reserve(d)
+        self.last_trade = (self.wall(), d.side, d.classification)
         o.timer = loop.call_later(max(0.05, self.cfg.order_timeout_s), self._timed_out, o)
         fut = loop.run_in_executor(None, functools.partial(self._execute_paper, d, cond, up, down, end, o=o))
         fut.add_done_callback(lambda f, o=o: self._done(o, f))
@@ -1245,6 +1269,47 @@ class PositionManager:
         self._finish(o)
 
     # ---------------------------------------------------------------- reading
+    def restore_from_journal(self, path, *, now: float | None = None, horizon_s: float = 3600.0) -> dict:
+        """After a restart, rebuild each recent market's history (orders,
+        per-side orders, spend, last buy price) from this manager's own
+        journal, so its per-market limits do not start from zero again.
+        Conservative: an order whose result never reached the journal (the
+        process stopped first) counts its full reservation as spent."""
+        now = self.wall() if now is None else float(now)
+        p = Path(path) if path else None
+        if p is None or not p.exists():
+            return {}
+        buys, results = {}, {}
+        with p.open(encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(r, dict) or now - float(r.get("wall") or 0) > horizon_s:
+                    continue
+                ev, rid = str(r.get("event") or ""), r.get("reservation_id")
+                key = (r.get("condition"), r.get("run_id"), rid if rid is not None else r.get("seq"))
+                if ev.startswith("POSITION_MANAGER BUY") and r.get("condition"):
+                    buys[key] = r
+                elif ev.startswith("POSITION_MANAGER RESULT") and r.get("condition"):
+                    results[key] = r
+        out = {}
+        for (cond, run, _rid), b in buys.items():
+            h = self._hist_for(cond)
+            side = str(b.get("side") or "")
+            if side not in SIDES:
+                continue
+            res = results.get((cond, run, _rid))
+            h.orders += 1
+            h.sides[side].orders += 1
+            h.spend += float(res.get("cost") or 0.0) if res else float(b.get("capital_max") or 0.0)
+            if res and res.get("status") in ("FILLED", "PARTIAL") and res.get("actual_price") is not None:
+                h.sides[side].last_buy_price = float(res["actual_price"])
+            out[cond] = {"orders": h.orders, "spend": round(h.spend, 4)}
+        self.restored = out
+        return out
+
     def snapshot(self) -> dict:
         """What the dashboard shows - plain values, cheap (the last evaluation).
         Each side says what a missing value means: STALE (its book), WAITING (no
@@ -1253,6 +1318,9 @@ class PositionManager:
         unknown = sum(1 for o in list(self.orders.values()) if o.status == "UNKNOWN")
         out = {"engine": self.cfg.enabled, "live_orders": self.cfg.live_enabled and not self.shadow,
                "shadow": self.shadow, "orders": self.hist.orders, "spend": round(self.hist.spend, 4),
+               "evaluations": self.n["evaluations"], "opportunities": self.n["opportunities"],
+               "orders_total": self.n["orders"], "fills_total": self.n["filled"] + self.n["partial"],
+               "last_trade": self.last_trade, "last_block": self.last_block,
                "max_orders": self.cfg.max_orders, "max_spend": self.cfg.max_market_usd, "unknown_orders": unknown,
                "avg_includes_fees": True, "sides": {}, "portfolio": {}}
         for side in SIDES:

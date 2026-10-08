@@ -606,6 +606,8 @@ class Runtime:
     reconciler: object = None
     settler: object = None
     pm: object = None                     # position_manager.PositionManager (off unless enabled)
+    new_canary_session: bool = False      # LIVE: start a new canary budget deliberately (audit F3)
+    stop_request: Path | None = None      # a file here asks for a clean shutdown (see _wait_until_stopped)
     journal_path: Path | None = None
     trade_rows: list = dataclasses.field(default_factory=list)
     tasks: list = dataclasses.field(default_factory=list)
@@ -695,7 +697,7 @@ async def build_live(rt: Runtime) -> None:
     polymarket_trade._telemetry_dir = ROOT
     rt.live_exec = await asyncio.to_thread(
         sniper_live.build_live_execution, ledger=ledger, on_event=on_event,
-        user_ready=hub.user.ready_for_market, fills=hub.fill_store)
+        user_ready=hub.user.ready_for_market, fills=hub.fill_store, new_session=rt.new_canary_session)
     rt.journal_path = _state_path("LIVE_SNIPER_JOURNAL", "live_sniper.jsonl")
     rt.sniper = sniper_mode.Sniper(hub, rt.live_exec.shim, on_event=on_event, journal_path=rt.journal_path,
                                    trade_rows=rt.trade_rows, own_rounds=True, live=rt.live_exec)
@@ -708,6 +710,17 @@ def start_lines(rt: Runtime) -> list[str]:
     mode = ("PAPER (NO WALLET / NO SIGNATURE / NO LIVE ORDERS)" if rt.paper
             else "LIVE CANARY (REAL ORDERS UNDER THE CANARY LIMITS)")
     lines = [f"MODE={mode} | {rt.cfg.describe()}"]
+    if rt.paper:
+        pm_on = rt.pm is not None and rt.pm.cfg.enabled
+        lines = ["TRADING MODE: REAL-TIME PAPER",
+                 "MARKET DATA: LIVE (Binance BTCUSDT, Polymarket books, real round timing and results)",
+                 "SNIPER: PAPER ACTIVE",
+                 f"POSITION MANAGER: {'PAPER ACTIVE (orders on the paper broker)' if pm_on else 'DISABLED'}",
+                 "LIVE ORDER EXECUTION: DISABLED"
+                 + (f" ({len(PAPER_FIREWALL)} live order paths blocked; calls so far: "
+                    f"{sum(LIVE_ORDER_CALLS.values())})" if PAPER_FIREWALL else ""),
+                 "REAL MONEY RISK: $0",
+                 "FILLS: SIMULATED PAPER FILLS on the real books (never real exchange fills)"] + lines
     if rt.sniper is not None:
         lines += list(rt.sniper.lines()) + list(rt.sniper.plan_gaps())
     lines.append(f"account band {config.MIN_BUY_PRICE:g}-{config.MAX_BUY_PRICE:g}, trades from "
@@ -739,9 +752,15 @@ def build_manager(rt: Runtime, *, broker):
                                              global_max_side_shares=rt.sniper.s.max_side_shares,
                                              global_max_unsettled_usd=config.MAX_UNSETTLED_EXPOSURE)
     journal = rt.journal_path.with_name(f"{rt.journal_path.stem}_manager.jsonl") if rt.journal_path else None
-    return position_manager.PositionManager(cfg, hub=rt.hub, ledger=rt.ledger, broker=broker, sniper=rt.sniper,
-                                            on_event=on_event, journal_path=journal if cfg.enabled else None,
-                                            live_mode=not rt.paper)
+    pm = position_manager.PositionManager(cfg, hub=rt.hub, ledger=rt.ledger, broker=broker, sniper=rt.sniper,
+                                          on_event=on_event, journal_path=journal if cfg.enabled else None,
+                                          live_mode=not rt.paper)
+    if cfg.enabled and rt.paper and journal is not None:
+        # a restart must not reset the manager's per-market limits (orders, spend)
+        restored = pm.restore_from_journal(journal)
+        if restored:
+            on_event("manager", f"restored per-market limits from its journal: {restored}", "info")
+    return pm
 
 
 def build_settler(rt: Runtime) -> SettlementWorker:
@@ -798,7 +817,83 @@ def _tracker(settler):
     return on_round
 
 
-async def run(dash: bool = False, *, paper: bool = True, paper_balance: float | None = None) -> None:
+# PAPER: every attempt on a blocked live order path, by path (must stay empty).
+LIVE_ORDER_CALLS: collections.Counter = collections.Counter()
+PAPER_FIREWALL: list = []
+
+
+def install_paper_firewall() -> list[str]:
+    """PAPER: every way a real order could leave this process refuses - and
+    is counted, so "no real order was sent" is a number, not a belief. Paper
+    already never builds the live client (polymarket_trade.disable_live_execution)
+    or the live sender; this also replaces each order-capable entry point (the
+    SDK client's create/post/cancel calls, the legacy place_trade/sell_shares,
+    the live sender and LiveExecution, the HTTP/2 order write) with a refusal.
+    Only run() installs it, for --paper: it is process-wide and irreversible."""
+    import fast_h2
+    import polymarket_trade
+    import sniper_live
+    from py_clob_client_v2.client import ClobClient
+    polymarket_trade.disable_live_execution()
+    targets = [(ClobClient, n) for n in ("create_order", "create_market_order", "post_order", "post_orders",
+                                         "create_and_post_order", "create_and_post_market_order",
+                                         "cancel_order", "cancel_orders", "cancel_all", "cancel_market_orders")]
+    targets += [(polymarket_trade, "place_trade"), (polymarket_trade, "sell_shares"),
+                (sniper_live.LeanSender, "start"), (sniper_live.LeanSender, "send"),
+                (sniper_live.LiveExecution, "send"), (sniper_live.LiveExecution, "start_send"),
+                (fast_h2.FastH2, "post_now"), (fast_h2.FastH2, "post")]
+    for owner, name in targets:
+        label = f"{getattr(owner, '__name__', str(owner)).split('.')[-1]}.{name}"
+
+        def blocked(*_a, _label=label, **_k):
+            LIVE_ORDER_CALLS[_label] += 1
+            raise RuntimeError(f"PAPER: {_label} is blocked - no real order can be sent")
+        setattr(owner, name, blocked)
+        PAPER_FIREWALL.append(label)
+    return list(PAPER_FIREWALL)
+
+
+def ownership_locks(paper: bool) -> list:
+    """The locks that make this process the only one trading its state (audit
+    F4), beyond the install's own BOT_LOCK_PATH:
+
+    - the LEDGER's: one process per ledger file, in both modes - two bots on
+      one paper or live ledger would each book fills the other never sees;
+    - LIVE, the WALLET's: one process per wallet on this machine, whatever
+      folder or ledger it runs from (a hash of the address names the file
+      under SNIPER_WALLET_LOCK_DIR, default ~/.sniperbtc/locks). Two machines
+      cannot see each other's locks: there, live reconciliation is the net
+      (a confirmed fill no order of ours explains halts the canary).
+    Returns the acquired locks (release them); raises RuntimeError if held."""
+    ledger_path = _paper_state_paths()["ledger"] if paper else _state_path("LEDGER_PATH", "ledger.json")
+    wanted = [(_ProcessLock(Path(str(ledger_path) + ".lock")), f"the ledger {ledger_path}")]
+    if not paper:
+        holder = _wallet_holder()
+        if holder is None:
+            raise RuntimeError("LIVE needs the wallet address (POLY_FUNDER or the private key) to take its "
+                               "one-bot-per-wallet lock")
+        import sniper_live
+        key = sniper_live.CanarySession.wallet_key_for(holder)
+        lock_dir = Path(os.environ.get("SNIPER_WALLET_LOCK_DIR") or (Path.home() / ".sniperbtc" / "locks"))
+        wanted.append((_ProcessLock(lock_dir / f"wallet-{key}.lock"), "this wallet"))
+    held = []
+    try:
+        for lock, what in wanted:
+            try:
+                lock.acquire()
+            except RuntimeError:
+                raise RuntimeError(f"another bot process is already trading {what}: refusing to start "
+                                   f"a second one") from None
+            held.append(lock)
+    except BaseException:
+        for lock in reversed(held):
+            lock.release()
+        raise
+    return held
+
+
+async def run(dash: bool = False, *, paper: bool = True, paper_balance: float | None = None,
+              new_canary_session: bool = False) -> None:
     configured = os.environ.get("BOT_LOCK_PATH")
     lock_path = Path(configured) if configured else ROOT / (".btc_bot_paper.lock" if paper else ".btc_bot_live.lock")
     if not lock_path.is_absolute():
@@ -808,12 +903,22 @@ async def run(dash: bool = False, *, paper: bool = True, paper_balance: float | 
     check_other_bots(paper=paper, own_lock=lock_path)
     process_lock = _ProcessLock(lock_path)
     process_lock.acquire()
+    if paper:
+        install_paper_firewall()
+    try:
+        owned = ownership_locks(paper)
+    except BaseException:
+        process_lock.release()
+        raise
     executor = _install_io_executor()
     try:
         hub, cfg = build_hub(paper=paper)
-        rt = Runtime(paper=paper, hub=hub, cfg=cfg)
+        rt = Runtime(paper=paper, hub=hub, cfg=cfg, new_canary_session=new_canary_session,
+                     stop_request=Path(str(lock_path) + ".stop"))
         await run_runtime(rt, dash=dash, paper_balance=paper_balance)
     finally:
+        for lock in reversed(owned):
+            lock.release()
         process_lock.release()
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
@@ -918,6 +1023,8 @@ async def run_runtime(rt: Runtime, *, dash: bool = False, paper_balance: float |
             rt.tasks.append(rt.pm.start())
         if not rt.paper:
             rt.tasks.append(asyncio.create_task(_ledger_loop(rt.hub, rt.ledger, rt.stop), name="ledger"))
+        elif hasattr(rt.ledger, "journal_pending"):
+            rt.tasks.append(asyncio.create_task(_snapshot_loop(rt.ledger, rt.stop), name="ledger-snapshot"))
         if dash_task is not None:
             rt.tasks.append(dash_task)
         else:
@@ -950,13 +1057,26 @@ async def run_runtime(rt: Runtime, *, dash: bool = False, paper_balance: float |
 
 async def _wait_until_stopped(rt: Runtime) -> BaseException | None:
     """Until stop is set or the sniper task ends. A sniper that died leaves a
-    bot that only looks alive, so that is a failed run, not a quiet idle."""
+    bot that only looks alive, so that is a failed run, not a quiet idle.
+
+    A file at rt.stop_request (``<BOT_LOCK_PATH>.stop``) asks for the same clean
+    shutdown as SIGTERM: on Windows a bot started in the background has no
+    console that CTRL_BREAK could reach. The file is removed when honoured."""
     while not rt.stop.is_set():
         task = rt.sniper_task
         if task is not None and task.done():
             exc = None if task.cancelled() else task.exception()
             on_event("sniper", f"sniper task ended: {exc!r}", "bad")
             return exc or RuntimeError("the sniper task returned")
+        req = getattr(rt, "stop_request", None)
+        if req is not None and req.exists():
+            try:
+                req.unlink()
+            except OSError:
+                pass
+            on_event("shutdown", f"clean stop requested ({req.name})", "warn")
+            print(f"{TAG} clean stop requested by {req}", flush=True)
+            return None
         await asyncio.sleep(0.5)
     return None
 
@@ -1012,6 +1132,10 @@ async def shutdown(rt: Runtime) -> None:
             drained = _persist_fill_drain(rt.ledger, rt.hub.fill_store)
             if drained:
                 on_event("shutdown", f"durably booked {drained} late fill(s)", "warn")
+            # Leave one compact snapshot (the journal's entries folded in); the
+            # journal alone would also restore everything on the next start.
+            if getattr(rt.ledger, "journal_pending", lambda: 0)() and not rt.ledger.save():
+                on_event("shutdown", "final ledger snapshot failed (the journal still holds every fill)", "warn")
         except Exception as exc:
             detail = f"final fill drain failed: {type(exc).__name__}: {exc}"
             on_event("shutdown", detail, "bad")
@@ -1058,6 +1182,8 @@ def report(rt: Runtime) -> dict:
         out["settlement"] = rt.settler.summary()
     if rt.pm is not None and rt.pm.cfg.enabled:
         out["position_manager"] = rt.pm.summary()
+    if rt.paper:
+        out["paper_firewall"] = {"blocked_paths": len(PAPER_FIREWALL), "live_order_calls": dict(LIVE_ORDER_CALLS)}
     if rt.live_exec is not None:
         out["canary"] = rt.live_exec.status()
     return out
@@ -1164,6 +1290,20 @@ async def _ledger_loop(hub, ledger, stop) -> None:
             on_event("ledger", f"{type(exc).__name__}: {exc}", "warn")
 
 
+async def _snapshot_loop(ledger, stop, every_s: float = 120.0) -> None:
+    """PAPER: fold the ledger's journal into a full snapshot every couple of
+    minutes, on a worker (LIVE's _ledger_loop saves every 60s). Fills are
+    durable in the journal the moment they are booked; this keeps the journal
+    short so a restart replays little (audit F2)."""
+    while not stop.is_set():
+        await asyncio.sleep(every_s)
+        try:
+            if ledger.journal_pending() and not await asyncio.to_thread(ledger.save):
+                on_event("ledger", f"periodic snapshot failed: {ledger.last_persistence_error}", "warn")
+        except Exception as exc:
+            on_event("ledger", f"periodic snapshot failed: {type(exc).__name__}: {exc}", "warn")
+
+
 async def _status_loop(rt: Runtime) -> None:
     """Without --dash: one compact line a minute, safe for a log file."""
     view = DashView(rt, accounting_off_loop=True)
@@ -1268,6 +1408,73 @@ class JournalTail:
                 "window_ms": row.get("window_ms"), "fill_confirmed_ms": confirmed}
 
 
+def _num_or(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _lot_source(source: str) -> str:
+    """Which strategy a ledger lot came from (paper lots carry their tag)."""
+    s = str(source or "")
+    if s.startswith("paper_live_book/"):
+        return s.split("/", 1)[1] or "untagged"
+    return "untagged" if s == "paper_live_book" else "live"
+
+
+def _attribution(ledger, active: str, bids: dict) -> dict:
+    """P/L by source (sniper / manager), from every BUY lot - actual fills,
+    never requests. Settled lots: shares x payout - cost (fees in). Lots in the
+    market trading now: marked to its bid. Lots waiting for a result: at cost.
+    Caller holds the ledger lock (worker thread)."""
+    out: dict = {}
+    for pos in ledger.positions.values():
+        for lot in pos.lots:
+            if str(lot.side or "").upper() != "BUY":
+                continue
+            a = out.setdefault(_lot_source(lot.source), {"fills": 0, "spend": 0.0, "fees": 0.0, "shares": 0.0,
+                                                        "realized": 0.0, "unrealized": 0.0, "pending_cost": 0.0,
+                                                        "_markets": {}})
+            cost = lot.shares * lot.price + lot.fee
+            a["fills"] += 1
+            a["spend"] += cost
+            a["fees"] += lot.fee
+            a["shares"] += lot.shares
+            if pos.settled:
+                pnl = lot.shares * float(pos.payout_per_share or 0.0) - cost
+                a["realized"] += pnl
+                a["_markets"][pos.condition_id] = a["_markets"].get(pos.condition_id, 0.0) + pnl
+            elif pos.condition_id == active and bids.get(str(pos.token_id)) is not None:
+                a["unrealized"] += lot.shares * float(bids[str(pos.token_id)]) - cost
+            else:
+                a["pending_cost"] += cost
+    for a in out.values():
+        markets = a.pop("_markets")
+        a["wins"] = sum(1 for v in markets.values() if v > 0)
+        a["losses"] = sum(1 for v in markets.values() if v <= 0)
+        a["total"] = a["realized"] + a["unrealized"]
+    return out
+
+
+def _reserved_cash(rt) -> float:
+    """Cash committed to orders not yet booked: the sniper's in-flight stakes
+    and the manager's open reservations (PENDING / UNKNOWN)."""
+    total = 0.0
+    sn = getattr(rt, "sniper", None)
+    for v in list((getattr(sn, "inflight", None) or {}).values()):
+        if isinstance(v, dict):
+            total += float(v.get("amount") or 0.0)
+    pm = getattr(rt, "pm", None)
+    if pm is not None and getattr(pm.cfg, "enabled", False):
+        try:
+            total += sum(u for _s, _q, u, _b in pm._open_orders())
+        except Exception:  # noqa: BLE001 - a display figure; the broker re-checks cash itself
+            pass
+    return total
+
+
 class DashView:
     """Builds the dashboard snapshot: plain values copied out of the hub, the
     Sniper, the broker/ledger and the canary. Call snapshot() on the event
@@ -1317,6 +1524,7 @@ class DashView:
         acct = self._accounting_nowait()
         if acct is not None:
             self._acct = acct
+            self._peaks(acct)
 
     def _collect_accounting(self) -> None:
         """Take a finished off-loop accounting result, if there is one."""
@@ -1331,6 +1539,19 @@ class DashView:
             return
         if acct is not None:
             self._acct = acct
+            self._peaks(acct)
+
+    def _peaks(self, acct: dict) -> None:
+        """This run's max exposure (open cost + reserved) and max drawdown of
+        equity, from each accounting refresh (on the loop: two comparisons)."""
+        exposure = (_num_or(acct.get("pending_cost")) or 0.0) + (_num_or(acct.get("reserved")) or 0.0)
+        self._max_exposure = max(getattr(self, "_max_exposure", 0.0), exposure)
+        equity = _num_or(acct.get("equity"))
+        if equity is not None:
+            self._peak_equity = max(getattr(self, "_peak_equity", equity), equity)
+            self._max_drawdown = max(getattr(self, "_max_drawdown", 0.0), self._peak_equity - equity)
+        acct["max_exposure"] = self._max_exposure
+        acct["max_drawdown"] = getattr(self, "_max_drawdown", None)
 
     def _accounting_nowait(self) -> dict | None:
         """Account figures and the POSITION table, or None while a fill or
@@ -1391,7 +1612,11 @@ class DashView:
                     unrealized += row["pnl"]
             position_value = None if unmarkable else active_value + pending["cost"]
             realized = s.get("realized_pnl")
+            bids = {str(t): row.get("bid") for t, sd in sides.items() for row in (table[sd],)}
+            attribution = _attribution(ledger, active, bids)
+            reserved = _reserved_cash(rt)
             out = {"realized": realized, "unrealized": None if unmarkable else unrealized,
+                   "attribution": attribution, "reserved": reserved,
                    "position_value": position_value, "awaiting_cost": pending["cost"],
                    "open": s.get("open_positions"), "pending_cost": s.get("pending_cost"),
                    "fees": s.get("fees_paid"), "wins": s.get("wins"), "losses": s.get("losses")}
@@ -1496,8 +1721,17 @@ class DashView:
         snap["trigger"] = trig
         snap["exec"] = {"latency": summary.get("exec_latency") or {}, "quality": summary.get("exec_quality") or {},
                         "paper": rt.paper}
+        start = getattr(hub, "window_start", None)
+        if start and trig.get("mid") and start != getattr(self, "_btc_start_round", None):
+            # Binance mid when this process first saw the round, if that was at its
+            # start: an approximation (the market's strike is Chainlink's price)
+            self._btc_start_round = start
+            self._btc_start = trig["mid"] if now_wall - float(start) <= 5.0 else None
+        if trig:
+            trig["btc_start"] = getattr(self, "_btc_start", None)
         end = hub.window_end
         market = {"slug": f"btc-updown-5m-{hub.window_start}" if hub.window_start and hub.up_token else None,
+                  "btc_now": trig.get("mid"), "btc_start": getattr(self, "_btc_start", None),
                   "seconds_left": (float(end) - now_wall) if end else None,
                   "book_status": (health.get("book") or {}).get("status")}
         for side, token in (("up", hub.up_token), ("down", hub.down_token)):
@@ -1734,15 +1968,21 @@ def main(argv=None) -> int:
     mode.add_argument("--live", action="store_true", help="the sniper's LIVE CANARY: real orders under hard limits")
     ap.add_argument("--paper-balance", type=float,
                     help="starting paper cash (first launch only; default PAPER_START_BALANCE or 1000)")
+    ap.add_argument("--new-canary-session", action="store_true",
+                    help="LIVE: start a NEW canary budget (orders, fills, spend, rounds, loss) instead of "
+                         "continuing the one that survives restarts; the old state file is kept as .bak")
     args = ap.parse_args(argv)
     if args.paper_balance is not None and args.live:
         ap.error("--paper-balance cannot be combined with --live")
+    if args.new_canary_session and not args.live:
+        ap.error("--new-canary-session is for --live only")
     if args.health and args.dash:
         ap.error("--dash cannot be combined with --health")
     reason = "clean shutdown: run() returned"
     try:
         code = run_quietly(health_only() if args.health else
-                           run(dash=args.dash, paper=not args.live, paper_balance=args.paper_balance))
+                           run(dash=args.dash, paper=not args.live, paper_balance=args.paper_balance,
+                               new_canary_session=args.new_canary_session))
         if code == 143:
             reason = "SIGTERM: stopped by the system or `kill`"
         elif code == 130:

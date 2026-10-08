@@ -52,7 +52,8 @@ def state_path(env_file: Path, name: str, default: str) -> Path:
 
 
 def load_ledger(path: Path) -> dict:
-    data = json.loads(path.read_text(encoding="utf-8"))
+    from accounting.ledger import current_payload
+    data = current_payload(str(path))                   # the snapshot plus its journal
     pos = data.get("positions") or {}
     lots = []
     for p in pos.values():

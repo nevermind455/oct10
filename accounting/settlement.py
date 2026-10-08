@@ -590,8 +590,8 @@ class SettlementWorker:
         # A result surface answered with something that is not a final payout
         # (proposed / disputed / malformed / disagreeing): never settled on.
         rec.error = detail if kind == "bad" else None
-        self._event("RESULT_NOT_FINAL", rec, "bad" if kind == "bad" else "warn", once_per=detail,
-                    detail=detail)
+        name = "RESULT_MISMATCH" if "RESULT_MISMATCH" in detail else "RESULT_NOT_FINAL"
+        self._event(name, rec, "bad" if kind == "bad" else "warn", once_per=detail, detail=detail)
 
     async def _apply_result(self, rec: MarketRecord, r) -> int:
         """An authoritative final result arrived. A second copy (two checks in

@@ -661,7 +661,7 @@ class MoreCases(Base):
 
     def test_accounting_error_is_reported_and_retried_with_the_same_result(self):
         self.fill("t1", A_UP, A, 10.0, 0.45)
-        real = self.led._write_payload
+        real, real_append = self.led._write_payload, self.led._append_journal
         fails = {"n": 2}
 
         def flaky_write(payload):
@@ -670,12 +670,19 @@ class MoreCases(Base):
                 return False
             return real(payload)
 
+        def flaky_append(entry):                    # the journal is the settlement's durable write now
+            if fails["n"] > 0:
+                fails["n"] -= 1
+                return False
+            return real_append(entry)
+
         async def go():
             w = self.worker()
             self.track(w, A, END, A_UP, A_DN)
             self.results[A] = resolved(A, A_UP, A_DN, "Up")
             self.clock["t"] = END + 1
-            with mock.patch.object(self.led, "_write_payload", flaky_write):
+            with (mock.patch.object(self.led, "_write_payload", flaky_write),
+                  mock.patch.object(self.led, "_append_journal", flaky_append)):
                 w.start()
                 try:
                     self.assertTrue(await self.until(lambda: w.records[A].state == S.SETTLED))
@@ -775,11 +782,15 @@ class HotPath(Base):
 
     def test_a_slow_result_source_and_a_slow_ledger_write_never_stall_the_event_loop(self):
         self.fill("t1", A_UP, A, 10.0, 0.45)
-        real = self.led._write_payload
+        real, real_append = self.led._write_payload, self.led._append_journal
 
         def slow_write(payload):
             time.sleep(0.3)                                                     # a slow fsync (OneDrive, a busy disk)
             return real(payload)
+
+        def slow_append(entry):
+            time.sleep(0.3)
+            return real_append(entry)
 
         def slow_fetch(cid):
             time.sleep(0.3)                                                     # a slow RPC
@@ -801,7 +812,8 @@ class HotPath(Base):
             self.results[A] = slow_fetch
             self.clock["t"] = END + 1
             probe = asyncio.create_task(ticker())
-            with mock.patch.object(self.led, "_write_payload", slow_write):
+            with (mock.patch.object(self.led, "_write_payload", slow_write),
+                  mock.patch.object(self.led, "_append_journal", slow_append)):
                 w.start()
                 try:
                     self.assertTrue(await self.until(lambda: w.records[A].state == S.SETTLED, timeout=5))
@@ -858,9 +870,22 @@ class ResolverCases(unittest.TestCase):
             self.gets.append(url)
             return response
 
+        # the outcome-slot proof (audit F5): by default the chain proves slot 0 = "111"
+        self.proof = {"answer": ({"111": 0, "222": 1}, "outcome slots proven on chain (test)")}
+        self.slot_calls = []
+
+        def payouts_for(cid, tokens):
+            self.slot_calls.append(list(tokens))                 # the order the chain is asked in
+            ans = self.chain["answer"]
+            if ans[0] is None:
+                return ans
+            by_slot = list(ans[0].values())                      # the chain's vector, slot order
+            return {tokens[0]: by_slot[0], tokens[1]: by_slot[1]}, ans[1]
+
         self.patches = [mock.patch.object(R.http_pool, "get", get),
-                        mock.patch.object(onchain_resolution, "payouts_for",
-                                          lambda cid, tokens: self.chain["answer"]),
+                        mock.patch.object(onchain_resolution, "payouts_for", payouts_for),
+                        mock.patch.object(onchain_resolution, "slot_positions",
+                                          lambda cid, tokens: self.proof["answer"]),
                         mock.patch.dict(os.environ, {"SETTLE_ONCHAIN": "1"})]
         for p in self.patches:
             p.start()
@@ -897,6 +922,58 @@ class ResolverCases(unittest.TestCase):
             self.assertFalse(self.r.prepare(self.CID))
             res = self.r(self.CID)
         self.assertEqual(res.detail, "CLOB market still open")
+
+    # ---- audit F5: which token each payout slot pays is proven, not assumed
+    def test_a_proven_reversed_slot_order_maps_payouts_by_the_proof(self):
+        self.proof["answer"] = ({"222": 0, "111": 1}, "outcome slots proven on chain (test)")   # CLOB lists them reversed
+        self.chain["answer"] = ({"s0": 1.0, "s1": 0.0}, "on-chain ConditionResolution")         # slot 0 won
+        res = self.r(self.CID)
+        self.assertTrue(res.resolved)
+        self.assertEqual(self.slot_calls[-1], ["222", "111"])                   # asked in proven slot order
+        self.assertEqual((res.payouts, res.winning_label), ({"222": 1.0, "111": 0.0}, "Down"))
+        self.assertIn("proven", res.detail)
+
+    def test_an_unproven_mapping_waits_for_the_mirrors_and_never_settles_alone(self):
+        self.proof["answer"] = (None, "polygon rpc unavailable (test)")
+        self.chain["answer"] = ({"s0": 1.0, "s1": 0.0}, "on-chain ConditionResolution")
+        res = self.r(self.CID)                                                   # mirrors: still open
+        self.assertEqual(res.status, R.PENDING)
+        self.assertIn("not proven", res.detail)
+
+    def mirrors(self, up_wins: bool):
+        clob = self.clob(closed=True)
+        clob["tokens"][0].update(price=1.0 if up_wins else 0.0, winner=up_wins)
+        clob["tokens"][1].update(price=0.0 if up_wins else 1.0, winner=not up_wins)
+        gamma = {"slug": "btc-updown-5m-1791373800", "markets": [{
+            "conditionId": self.CID, "closed": True, "umaResolutionStatus": "resolved",
+            "clobTokenIds": '["111", "222"]', "outcomes": '["Up", "Down"]',
+            "outcomePrices": '["1", "0"]' if up_wins else '["0", "1"]'}]}
+
+        def get(url, **_kw):
+            self.gets.append(url)
+            data = gamma if "gamma" in url else clob
+            return types.SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: data)
+        return mock.patch.object(R.http_pool, "get", get)
+
+    def test_an_unproven_mapping_settles_when_the_mirrors_agree(self):
+        self.proof["answer"] = (None, "no known collateral maps these tokens (test)")
+        self.chain["answer"] = ({"s0": 1.0, "s1": 0.0}, "on-chain ConditionResolution")
+        self.r.prepare(self.CID)
+        with self.mirrors(up_wins=True):
+            res = self.r(self.CID)
+        self.assertTrue(res.resolved)
+        self.assertEqual(res.payouts, {"111": 1.0, "222": 0.0})
+        self.assertIn("confirmed by the CLOB + Gamma mirrors", res.detail)
+
+    def test_conflicting_sources_are_result_mismatch_never_settled(self):
+        self.proof["answer"] = (None, "no known collateral maps these tokens (test)")
+        self.chain["answer"] = ({"s0": 1.0, "s1": 0.0}, "on-chain ConditionResolution")      # chain: "111" won
+        self.r.prepare(self.CID)
+        with self.mirrors(up_wins=False):                                                   # mirrors: "222" won
+            res = self.r(self.CID)
+        self.assertFalse(res.resolved)
+        self.assertEqual(res.status, R.UNKNOWN)
+        self.assertIn("RESULT_MISMATCH", res.detail)
 
     def test_slot_rows_refuse_anything_but_a_clean_up_down_pair(self):
         good = self.clob()

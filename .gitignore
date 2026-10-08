@@ -14,6 +14,7 @@ STOP_LIVE
 *.jsonl
 *.csv
 *.lock
+*.journal
 *.log
 *.txt
 !requirements*.txt

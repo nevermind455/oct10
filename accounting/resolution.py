@@ -372,6 +372,14 @@ class Resolver:
     ``api_every_s`` per market, and only when the chain cannot answer (RPC
     unreachable, SETTLE_ONCHAIN=0): a chain that answers "not resolved yet"
     is ahead of both mirrors, so asking them then only costs requests.
+
+    Which token each payout slot pays is PROVEN, not assumed (audit F5): the
+    Conditional Tokens contract's position id of slot i must equal the token
+    (onchain_resolution.slot_positions). With the proof, the chain's payout
+    vector settles. Without it (RPC trouble, an unknown collateral) the chain
+    result settles only once the CLOB + Gamma mirrors - which name each token
+    explicitly - agree with it; if they disagree it is RESULT_MISMATCH (status
+    UNKNOWN: never settled, reported as an error) until a human looks.
     """
 
     def __init__(self, *, timeout: float = 8.0, api_every_s: float = 5.0,
@@ -381,11 +389,36 @@ class Resolver:
         self._clock = clock
         self._lock = threading.Lock()
         self._slots: dict[str, list[tuple[str, str]]] = {}
+        self._proof: dict[str, dict[str, int]] = {}
         self._api_at: dict[str, float] = {}
 
     def slots(self, condition_id: str) -> list[tuple[str, str]] | None:
         with self._lock:
             return self._slots.get(str(condition_id))
+
+    def proof(self, condition_id: str) -> dict[str, int] | None:
+        """{token: outcome slot} as proven on chain for this market, or None."""
+        with self._lock:
+            return self._proof.get(str(condition_id))
+
+    def prove(self, condition_id: str) -> tuple[dict[str, int] | None, str]:
+        """Prove (once per market, cached) which outcome slot each token is."""
+        cid = str(condition_id)
+        hit = self.proof(cid)
+        if hit:
+            return hit, "outcome slots proven on chain"
+        rows = self.slots(cid)
+        if not rows:
+            return None, "market outcome order not read yet"
+        proof, detail = onchain_resolution.slot_positions(cid, [t for t, _ in rows])
+        if proof and set(proof) == {t for t, _ in rows}:
+            with self._lock:
+                self._proof[cid] = dict(proof)
+                if len(self._proof) > 256:
+                    for old in list(self._proof)[:128]:
+                        self._proof.pop(old, None)
+            return dict(proof), detail
+        return None, detail
 
     def prepare(self, condition_id: str) -> bool:
         """Read and cache the market's outcome-slot order (one CLOB GET).
@@ -411,11 +444,13 @@ class Resolver:
             if len(self._slots) > 256:                     # one per 5-minute round: ~21 hours
                 for old in list(self._slots)[:128]:
                     self._slots.pop(old, None)
+        self.prove(cid)                                    # best effort here; retried at each check
         return True
 
     def forget(self, condition_id: str) -> None:
         with self._lock:
             self._slots.pop(str(condition_id), None)
+            self._proof.pop(str(condition_id), None)
             self._api_at.pop(str(condition_id), None)
 
     def __call__(self, condition_id: str) -> Resolution:
@@ -423,20 +458,28 @@ class Resolver:
         if not CONDITION_RE.fullmatch(cid):
             return Resolution(cid, UNKNOWN, {}, detail="invalid condition id")
         chain_detail = None
+        unproven = None                                    # (payouts, winner) awaiting the mirrors' word
         if onchain_resolution.enabled():
             if not self.prepare(cid):
                 chain_detail = "market outcome order not read yet (CLOB unreachable)"
             else:
                 slots = self.slots(cid) or []
-                payouts, chain_detail = onchain_resolution.payouts_for(cid, [t for t, _ in slots])
+                proof, proof_detail = self.prove(cid)
+                order = ([t for t, _ in sorted(proof.items(), key=lambda kv: kv[1])] if proof
+                         else [t for t, _ in slots])
+                payouts, chain_detail = onchain_resolution.payouts_for(cid, order)
                 if payouts:
                     winner = next((label for token, label in slots
                                    if abs(payouts.get(token, 0.0) - 1.0) <= 1e-9), None)
                     if winner is None and all(abs(v - 0.5) <= 1e-9 for v in payouts.values()):
                         winner = "50/50"
-                    return Resolution(cid, RESOLVED, dict(payouts), winning_label=winner,
-                                      detail=chain_detail)
-                if chain_detail == "not resolved on chain yet":
+                    if proof:
+                        return Resolution(cid, RESOLVED, dict(payouts), winning_label=winner,
+                                          detail=f"{chain_detail}; {proof_detail}")
+                    unproven = (dict(payouts), winner)
+                    chain_detail = (f"{chain_detail}, but which token each slot pays is not proven "
+                                    f"({proof_detail}): waiting for the CLOB + Gamma mirrors to confirm it")
+                elif chain_detail == "not resolved on chain yet":
                     return Resolution(cid, PENDING, {}, detail=chain_detail)
         now = self._clock()
         with self._lock:
@@ -448,6 +491,18 @@ class Resolver:
                 f"{chain_detail}; API mirrors next in {self.api_every_s:g}s" if chain_detail
                 else "awaiting the API mirrors"))
         mirrors = fetch(cid, self.timeout, chain=False)
+        if unproven is not None:
+            payouts, winner = unproven
+            if not mirrors.resolved:
+                return Resolution(cid, PENDING, {}, detail=f"{chain_detail}; mirrors: {mirrors.detail}"[:300])
+            same = (set(mirrors.payouts) == set(payouts) and all(
+                abs(float(mirrors.payouts[t]) - float(payouts[t])) <= 1e-9 for t in payouts))
+            if not same:
+                return Resolution(cid, UNKNOWN, {}, detail=(
+                    f"RESULT_MISMATCH: on chain {payouts} (slot order unproven) but the CLOB + Gamma "
+                    f"mirrors say {mirrors.payouts}: not settled")[:300])
+            return Resolution(cid, RESOLVED, dict(payouts), winning_label=winner,
+                              detail="on-chain result confirmed by the CLOB + Gamma mirrors (slot order unproven)")
         if mirrors.resolved or not chain_detail:
             return mirrors
         return Resolution(cid, mirrors.status, {}, detail=f"{chain_detail}; mirrors: {mirrors.detail}"[:300])

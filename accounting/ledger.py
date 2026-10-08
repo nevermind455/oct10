@@ -164,6 +164,21 @@ class Ledger:
         self.last_persistence_error: str | None = None
         self.last_ingest_error: str | None = None
         self.last_mark_error: str | None = None
+        # Append-only journal beside the snapshot (audit F2). A fill or a
+        # settlement appends one fsynced line instead of rewriting every
+        # position the ledger ever held (188ms a fill at 50,000 positions).
+        # The snapshot records the journal entry it includes (journal_seq);
+        # load() replays the newer ones. Every JOURNAL_COMPACT_EVERY entries,
+        # and on save(), a full snapshot is written and the journal emptied.
+        self.journal_path = self.path + ".journal"
+        self.journal_seq = 0                 # last journal entry applied
+        self._journal_since = 0              # entries since the last snapshot
+        self._journal_dirty = False          # a failed append: next write is a snapshot
+        self.journal_replayed = 0            # entries replayed by the last load()
+        if not os.path.exists(self.path) and _journal_has_entries(self.journal_path):
+            raise RuntimeError(
+                f"ledger file is missing but its journal {self.journal_path!r} holds fills; "
+                f"refusing to start with partial accounting (restore {self.path!r})")
         if os.path.exists(self.path) and not self.load():
             raise RuntimeError(
                 f"ledger {self.path!r} exists but is unreadable or invalid; "
@@ -475,8 +490,10 @@ class Ledger:
     def record_fill(self, trade_id, token_id, *, shares, price, side="BUY",
                     condition_id=None, status="CONFIRMED", theta=None,
                     source="user_ws", fee=None, fee_exponent: int = 1,
-                    order_id=None) -> bool:
-        """Idempotent. Returns True only if this trade id was new."""
+                    order_id=None, wall: float | None = None) -> bool:
+        """Idempotent. Returns True only if this trade id was new. `wall` is
+        the lot's time; only a journal replay passes it (the original one)."""
+        lot_wall = time.time() if wall is None else float(wall)
         tid = str(trade_id or "")
         token = str(token_id or "")
         condition = _s(condition_id)
@@ -554,7 +571,7 @@ class Ledger:
                 basis = notional_basis + fee_basis
                 proceeds = sh * px - f
                 pos.lots.append(Lot(tid, token, condition, order_side,
-                                    sh, px, f, st, time.time(), source_text,
+                                    sh, px, f, st, lot_wall, source_text,
                                     order_text))
                 pos.shares -= sh
                 pos.cost -= basis
@@ -576,7 +593,7 @@ class Ledger:
                 self._seen_rev += 1
                 return True
             pos.lots.append(Lot(tid, token, condition, order_side,
-                                sh, px, f, st, time.time(), source_text,
+                                sh, px, f, st, lot_wall, source_text,
                                 order_text))
             pos.shares += sh
             pos.fees += f
@@ -603,8 +620,12 @@ class Ledger:
                 inserted = self.record_fill(trade_id, token_id, **kwargs)
                 if not inserted:
                     return False
-                payload = self._payload_locked()
-                if self._write_payload(payload):
+                lot = self.positions[token].lots[-1]
+                if self._persist_locked({
+                        "op": "fill", "trade_id": lot.trade_id, "token_id": lot.token_id,
+                        "condition_id": lot.condition_id, "side": lot.side, "shares": lot.shares,
+                        "price": lot.price, "fee": lot.fee, "status": lot.status, "wall": lot.wall,
+                        "source": lot.source, "order_id": lot.order_id}):
                     return True
                 if had_position:
                     self.positions[token] = previous
@@ -731,14 +752,12 @@ class Ledger:
                         f"resolution omitted held token(s): {', '.join(missing[:3])}")
                 settled_wall = time.time()
                 for pos in targets:
-                    pay = payouts[pos.token_id]
-                    pos.payout_per_share = pay
-                    pos.realized = (pos.shares * pay - pos.cost
-                                    + pos.realized_from_sales)
-                    pos.settled = True
-                    pos.settled_wall = settled_wall
+                    self._settle_position_locked(pos, payouts[pos.token_id], settled_wall)
                     done.append(pos)
-                if not self._write_payload(self._payload_locked()):
+                if not self._persist_locked({
+                        "op": "settle", "condition_id": condition, "wall": settled_wall,
+                        "payouts": {pos.token_id: payouts[pos.token_id] for pos in done},
+                        "tokens": [pos.token_id for pos in done]}):
                     # Do not leave volatile state claiming settlement that was
                     # not durably recorded. The worker retries the resolution.
                     for pos in done:
@@ -748,6 +767,130 @@ class Ledger:
                         pos.settled_wall = None
                     raise RuntimeError("settlement could not be persisted")
         return done
+
+    @staticmethod
+    def _settle_position_locked(pos, pay: float, settled_wall: float) -> None:
+        pos.payout_per_share = pay
+        pos.realized = (pos.shares * pay - pos.cost + pos.realized_from_sales)
+        pos.settled = True
+        pos.settled_wall = settled_wall
+
+    # ------------------------------------------------------------- journal
+    JOURNAL_COMPACT_EVERY = 500
+
+    def _persist_locked(self, entry: dict) -> bool:
+        """Make one mutation durable; the caller holds _save_lock and _lock.
+        One journal line when a snapshot is on disk to append to, else (the
+        ledger's first write, or after a failed append) a full snapshot."""
+        if not self.loaded_from_disk or self._journal_dirty or not os.path.exists(self.path):
+            return self._snapshot_locked()
+        entry = {"seq": self.journal_seq + 1, **entry}
+        if not self._append_journal(entry):
+            self._journal_dirty = True
+            return False
+        self.journal_seq += 1
+        self._journal_since += 1
+        if self._journal_since >= self.JOURNAL_COMPACT_EVERY:
+            self._snapshot_locked()          # best effort: the journal still holds everything
+        return True
+
+    def _append_journal(self, entry: dict) -> bool:
+        try:
+            line = (json.dumps(entry, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+            created = not os.path.exists(self.journal_path)
+            fd = os.open(self.journal_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0),
+                         0o600)
+            try:
+                view = memoryview(line)
+                while view:
+                    n = os.write(fd, view)
+                    view = view[n:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            if created:
+                _fsync_directory(os.path.dirname(os.path.abspath(self.journal_path)) or ".")
+            self.last_persistence_error = None
+            return True
+        except Exception as exc:
+            self.last_persistence_error = (
+                f"ledger journal append failed: {type(exc).__name__}: {exc}")[:300]
+            return False
+
+    def _snapshot_locked(self) -> bool:
+        """A full snapshot (it includes every journal entry so far), then an
+        empty journal. A crash between the two is harmless: load() replays
+        only entries newer than the snapshot's journal_seq."""
+        if not self._write_payload(self._payload_locked()):
+            return False
+        self._truncate_journal()
+        return True
+
+    def _truncate_journal(self) -> None:
+        try:
+            if os.path.exists(self.journal_path):
+                with open(self.journal_path, "r+b") as fh:
+                    fh.truncate(0)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+            self._journal_since = 0
+            self._journal_dirty = False
+        except OSError as exc:
+            self._journal_dirty = True         # stale entries are covered by journal_seq anyway
+            self.last_persistence_error = (
+                f"ledger journal truncate failed: {type(exc).__name__}: {exc}")[:300]
+
+    def journal_pending(self) -> int:
+        return self._journal_since
+
+    def _replay_journal(self, after_seq: int) -> int:
+        """Apply the journal's entries newer than the snapshot. Every entry is
+        parsed and checked first; a damaged entry anywhere but a torn final
+        line (an append that never completed, so was never acknowledged)
+        fails the load - the caller then refuses to start."""
+        if not os.path.exists(self.journal_path):
+            return 0
+        with open(self.journal_path, "rb") as fh:
+            raw = fh.read()
+        lines = raw.split(b"\n")
+        torn = lines.pop()                    # b"" when the file ends with a newline
+        entries = []
+        for i, line in enumerate(lines):
+            if not line.strip():
+                raise ValueError("blank line inside the ledger journal")
+            entries.append(_journal_entry(json.loads(line.decode("utf-8"), parse_constant=_reject_json_constant)))
+        if torn.strip():
+            try:
+                json.loads(torn.decode("utf-8"))
+                raise ValueError("ledger journal ends without a newline")
+            except ValueError as exc:
+                if "ends without" in str(exc):
+                    raise
+                # a torn final append: never acknowledged, dropped
+        newer = [e for e in entries if e["seq"] > after_seq]
+        expected = after_seq + 1
+        for e in newer:
+            if e["seq"] != expected:
+                raise ValueError(f"ledger journal gap: entry {e['seq']} where {expected} was expected")
+            expected += 1
+        applied = 0
+        for e in newer:
+            if e["op"] == "fill":
+                if not self.record_fill(e["trade_id"], e["token_id"], shares=e["shares"], price=e["price"],
+                                        side=e["side"], condition_id=e["condition_id"], status=e["status"],
+                                        source=e["source"], fee=e["fee"], order_id=e["order_id"],
+                                        wall=e["wall"]):
+                    raise ValueError(f"ledger journal fill {e['seq']} does not apply")
+            else:
+                targets = [p for p in self.positions.values()
+                           if not p.settled and p.shares > 0 and p.condition_id == e["condition_id"]]
+                if sorted(p.token_id for p in targets) != sorted(e["tokens"]):
+                    raise ValueError(f"ledger journal settlement {e['seq']} does not match the positions")
+                for p in targets:
+                    self._settle_position_locked(p, float(e["payouts"][p.token_id]), float(e["wall"]))
+            self.journal_seq = e["seq"]
+            applied += 1
+        return applied
 
     # -------------------------------------------------------------- reads
     def unrealized(self, mark) -> tuple[float, int]:
@@ -932,6 +1075,7 @@ class Ledger:
             "authorized_orders": copy.deepcopy(self.authorized_orders),
             "positions": self._position_texts_locked(),
             "balance_marks": list(self.balance_marks[-50:]),
+            "journal_seq": self.journal_seq,
         }
 
     def _position_texts_locked(self) -> "_PositionTexts":
@@ -1005,7 +1149,10 @@ class Ledger:
         with self._save_lock:
             with self._lock:
                 payload = self._payload_locked()
-            return self._write_payload(payload)
+            if not self._write_payload(payload):
+                return False
+            self._truncate_journal()             # the snapshot now holds every journal entry
+            return True
 
     def load(self) -> bool:
         try:
@@ -1142,6 +1289,9 @@ class Ledger:
                 raise ValueError("duplicate trade id appears in multiple positions")
             if set(all_lot_ids) != seen:
                 raise ValueError("ledger seen set does not match persisted lots")
+            journal_seq = data.get("journal_seq", 0)
+            if type(journal_seq) is not int or journal_seq < 0:
+                raise ValueError("invalid ledger journal position")
 
             # Commit only after the complete file passes validation. Explicit
             # reloads therefore cannot partially destroy a running ledger.
@@ -1162,12 +1312,58 @@ class Ledger:
                 self.authorized_orders = authorized_orders
                 self.balance_marks = balance_marks
                 self.positions = positions
+                self._pos_text = {}
+                self.journal_seq = journal_seq
+                self.journal_replayed = self._replay_journal(journal_seq)
+                self._journal_since = self.journal_replayed
                 self.last_persistence_error = None
             return True
         except Exception as exc:
             self.last_persistence_error = (
                 f"ledger validation failed: {type(exc).__name__}: {exc}")[:300]
             return False
+
+
+def _journal_has_entries(path: str) -> bool:
+    try:
+        return os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
+_JOURNAL_FILL = {"seq": int, "op": str, "trade_id": str, "token_id": str, "condition_id": (str, type(None)),
+                 "side": str, "shares": (int, float), "price": (int, float), "fee": (int, float), "status": str,
+                 "wall": (int, float), "source": str, "order_id": (str, type(None))}
+_JOURNAL_SETTLE = {"seq": int, "op": str, "condition_id": str, "wall": (int, float), "payouts": dict,
+                   "tokens": list}
+
+
+def _journal_entry(e) -> dict:
+    """One journal line, checked field by field (a malformed one fails the load)."""
+    if not isinstance(e, dict) or e.get("op") not in ("fill", "settle"):
+        raise ValueError("invalid ledger journal entry")
+    shape = _JOURNAL_FILL if e["op"] == "fill" else _JOURNAL_SETTLE
+    if set(e) != set(shape):
+        raise ValueError("ledger journal entry has unexpected fields")
+    for k, t in shape.items():
+        if not isinstance(e[k], t) or isinstance(e[k], bool):
+            raise ValueError(f"ledger journal field {k} has the wrong type")
+    if e["seq"] <= 0:
+        raise ValueError("invalid ledger journal sequence")
+    if e["op"] == "settle":
+        if (sorted(e["payouts"]) != sorted(e["tokens"]) or not e["tokens"]
+                or any(not isinstance(v, (int, float)) or isinstance(v, bool)
+                       or not 0.0 <= float(v) <= 1.0 for v in e["payouts"].values())):
+            raise ValueError("invalid ledger journal settlement")
+    return e
+
+
+def current_payload(path: str) -> dict:
+    """The ledger as a plain dict, journal included - for read-only tools
+    (sniper_check, live_reconcile, ...). Loads it without writing anything."""
+    led = Ledger(path=path)
+    with led._lock:
+        return json.loads(_encode_payload(led._payload_locked()))
 
 
 def _consume_fifo(pos, shares: float):

@@ -94,6 +94,12 @@ def effective_config_lines(settings, *, live: bool, canary_max_shares=None) -> l
         lines.append(f"  {'canary_cap':13s} {float(canary_max_shares):g} shares{'':9s} (SNIPER_CANARY_MAX_SHARES)"
                      + ("" if ok else f"   <- must be >= {target:g}"))
     lines.append(f"  {'signing':13s} {signing_backend()}")
+    # F1 (audit 2026-10-07): say what is a hard limit and what is an estimate.
+    lines.append(f"  {'hard caps':13s} dollars: each IOC signs its stake (makerAmount, USDC) - the venue cannot "
+                 f"take more; the canary spend cap and cash are enforced on it")
+    lines.append(f"  {'share caps':13s} ESTIMATES: target / max target / side cap / canary shares-per-order are "
+                 f"checked at the decision's prices; a dollar-sized IOC buys MORE shares if the ask falls before "
+                 f"the match (journal: over_target)")
     return lines
 
 

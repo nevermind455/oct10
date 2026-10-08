@@ -1389,7 +1389,9 @@ class PaperBroker:
                     order_id, str(token_id), shares=float(quote.shares),
                     price=float(quote.average_price), side="BUY",
                     condition_id=condition_id, status="CONFIRMED",
-                    source="paper_live_book", fee=float(quote.fee))
+                    # the order's source (sniper / manager) rides on the lot, so a shared
+                    # paper account still attributes every fill and its P/L exactly
+                    source=f"paper_live_book/{tag}" if tag else "paper_live_book", fee=float(quote.fee))
                 if not inserted:
                     raise PaperRejected("paper fill id collision")
                 if timing is not None:

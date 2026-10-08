@@ -400,6 +400,166 @@ class CanaryLimits:
         # AMBIGUOUS keeps its exposure until reconciled
 
 
+class CanarySession:
+    """The canary's session budget, durable across restarts (audit F3).
+
+    CanaryLimits counts orders, fills, rounds and spend in memory, and the
+    session's realized loss is counted from session_start - all of which a
+    restart used to reset, re-arming the whole budget (a crash-restart loop
+    would re-arm it each time). This persists them, and the halt reasons, in
+    one small JSON file next to the live ledger:
+
+    - written atomically (temp file, fsync, rename) off the order path: the
+      sender updates its counters on the event loop, a worker persists a
+      change within persist_every_s;
+    - on start every counter is the LARGER of the file and what the live
+      ledger's durable order authorizations prove for this session (orders
+      in rounds ending after it began, their notional, their markets), so a
+      crash inside that window can only over-count, never reset;
+    - fails closed: an unreadable file, another wallet's file, or no file
+      while the ledger shows live orders in the last day, refuses to start.
+      A new budget is a deliberate act (new_session=True / --new-canary-session),
+      which keeps the old file as a .bak.
+    """
+    VERSION = 1
+    RECENT_S = 86_400.0
+    TRANSIENT = ("shutting down",)          # halts that are not about the session's risk
+
+    def __init__(self, path, wallet_key: str) -> None:
+        self.path = Path(path)
+        self.wallet_key = str(wallet_key)
+        self.session_id: str | None = None
+        self.started_wall: float | None = None
+        self._last: tuple | None = None
+        self.last_error: str | None = None
+        self.restored: dict = {}
+
+    @staticmethod
+    def wallet_key_for(address: str) -> str:
+        """A stable, non-reversible account id for the file (never the address)."""
+        import hashlib
+        return hashlib.sha256(str(address or "").strip().lower().encode()).hexdigest()[:16]
+
+    def _read(self) -> dict | None:
+        if not self.path.exists():
+            return None
+        data = json.loads(self.path.read_text(encoding="utf-8"), parse_constant=lambda c: float("nan"))
+        ok = (isinstance(data, dict) and data.get("version") == self.VERSION
+              and isinstance(data.get("session_id"), str) and data["session_id"]
+              and isinstance(data.get("wallet"), str)
+              and isinstance(data.get("rounds"), list) and isinstance(data.get("kill_reasons"), list))
+        if ok:
+            for k in ("started_wall", "orders", "fills", "exposure_usd"):
+                v = data.get(k)
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
+                    ok = False
+        if not ok:
+            raise ValueError("malformed canary session state")
+        return data
+
+    @staticmethod
+    def _ledger_view(ledger, since_wall: float) -> dict:
+        """What the live ledger's durable authorizations prove since since_wall."""
+        orders, spend, rounds, filled = 0, 0.0, set(), set()
+        with ledger._lock:
+            for oid, meta in ledger.authorized_orders.items():
+                if not isinstance(meta, dict) or float(meta.get("window_end") or 0) < since_wall:
+                    continue
+                orders += 1
+                spend += float(meta.get("requested_notional") or 0.0)
+                if meta.get("condition_id"):
+                    rounds.add(str(meta["condition_id"]))
+            ids = {oid for oid, meta in ledger.authorized_orders.items()
+                   if isinstance(meta, dict) and float(meta.get("window_end") or 0) >= since_wall}
+            for pos in ledger.positions.values():
+                for lot in pos.lots:
+                    if lot.order_id in ids:
+                        filled.add(lot.order_id)
+        return {"orders": orders, "spend": spend, "rounds": rounds, "fills": len(filled)}
+
+    def open(self, limits: "CanaryLimits", kill: KillSwitch, ledger, *, new_session: bool = False,
+             now: float | None = None) -> str:
+        """Restore this wallet's session (or start one). Raises RuntimeError:
+        the caller must not trade then. Returns a one-line description."""
+        import uuid
+        now = time.time() if now is None else float(now)
+        try:
+            data = self._read()
+        except Exception as exc:  # noqa: BLE001 - any unreadable state fails closed
+            raise RuntimeError(f"canary session state {self.path} is unreadable ({type(exc).__name__}): "
+                               f"restore it, or start a NEW budget deliberately with --new-canary-session") from None
+        if data is not None and data["wallet"] != self.wallet_key:
+            raise RuntimeError(f"canary session state {self.path} belongs to another wallet: refusing to start")
+        if new_session and data is not None:
+            self.path.replace(self.path.with_name(f"{self.path.name}.{int(now)}.bak"))
+            data = None
+        if data is None:
+            recent = self._ledger_view(ledger, now - self.RECENT_S)
+            if recent["orders"] and not new_session:
+                raise RuntimeError(f"canary session state {self.path} is missing but the live ledger shows "
+                                   f"{recent['orders']} live order(s) in the last day: refusing to start a fresh "
+                                   f"budget silently - pass --new-canary-session to start one deliberately")
+            data = {"version": self.VERSION, "session_id": uuid.uuid4().hex, "wallet": self.wallet_key,
+                    "started_wall": now, "orders": 0, "fills": 0, "exposure_usd": 0.0, "rounds": [],
+                    "kill_reasons": []}
+            how = "new canary session"
+        else:
+            how = "canary session restored"
+        self.session_id, self.started_wall = data["session_id"], float(data["started_wall"])
+        proof = self._ledger_view(ledger, self.started_wall)
+        limits.orders = max(int(data["orders"]), proof["orders"])
+        limits.fills = max(int(data["fills"]), proof["fills"])
+        limits.exposure_usd = max(float(data["exposure_usd"]), proof["spend"])
+        limits.rounds = set(map(str, data["rounds"])) | proof["rounds"]
+        for reason in data["kill_reasons"]:
+            if not str(reason).startswith(self.TRANSIENT):
+                kill.trip(str(reason))
+        self.restored = {"orders": limits.orders, "fills": limits.fills, "spend": round(limits.exposure_usd, 4),
+                         "rounds": len(limits.rounds), "halts": list(kill.reasons)}
+        self._last = None
+        if not self.save(limits, kill):
+            raise RuntimeError(f"canary session state {self.path} cannot be written ({self.last_error}): "
+                               f"refusing to trade without a durable budget")
+        return (f"{how} {self.session_id[:8]} (since {time.strftime('%m-%d %H:%M', time.localtime(self.started_wall))}): "
+                f"{limits.orders} orders, {limits.fills} fills, ${limits.exposure_usd:.2f} spent, "
+                f"{len(limits.rounds)} rounds" + (f"; HALTED: {'; '.join(kill.reasons)}" if kill.reasons else ""))
+
+    def state(self, limits: "CanaryLimits", kill: KillSwitch) -> dict:
+        return {"version": self.VERSION, "session_id": self.session_id, "wallet": self.wallet_key,
+                "started_wall": self.started_wall, "orders": int(limits.orders), "fills": int(limits.fills),
+                "exposure_usd": float(limits.exposure_usd), "rounds": sorted(map(str, limits.rounds)),
+                "kill_reasons": [r for r in kill.reasons if not str(r).startswith(self.TRANSIENT)]}
+
+    def save(self, limits: "CanaryLimits", kill: KillSwitch) -> bool:
+        """Atomic write when something changed (worker thread). True when the
+        file holds the current state."""
+        state = self.state(limits, kill)
+        key = json.dumps(state, sort_keys=True)
+        if key == self._last:
+            return True
+        import tempfile
+        tmp = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({**state, "updated_wall": time.time()}, sort_keys=True))
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.path)
+            tmp = None
+            self._last, self.last_error = key, None
+            return True
+        except Exception as exc:  # noqa: BLE001 - reported; the caller halts on repeated failure
+            self.last_error = f"{type(exc).__name__}: {exc}"[:200]
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+            return False
+
+
 @dataclass
 class Prepared:
     side: str
@@ -874,6 +1034,9 @@ class LiveExecution:
         self._announced: set = set()
         self.hub = None
         self.guard_probe_s = 2.0
+        self.session: CanarySession | None = None     # set by build_live_execution (audit F3)
+        self.persist_every_s = 0.5
+        self._persist_failures = 0
         sender.realized_loss = lambda: self.session_loss
         sender.guard.on_event = self.on_event
 
@@ -915,16 +1078,31 @@ class LiveExecution:
                                                   self.keep_warm_s, self._warm_event)),
                        loop.create_task(self._balance_loop()), loop.create_task(self._reconcile_loop()),
                        loop.create_task(self._rules_loop(hub)), loop.create_task(self._guard_loop())]
+        if self.session is not None:
+            self._tasks.append(loop.create_task(self._session_loop()))
         if self.kill.stop_file is not None and self.kill.stop_file.exists():
             self.on_event("sniper", f"LIVE CANARY: stop file {self.kill.stop_file} present - no orders "
                                     f"(remove it and restart to trade)", "bad")
         self.on_event("sniper", f"LIVE CANARY armed: collateral ${self.balance:.2f}; " + self.limits_line(), "warn")
+
+    async def _session_loop(self) -> None:
+        """Persist the canary's counters and halts within persist_every_s of a
+        change, on a worker. Three failed writes in a row halt new orders: a
+        budget that cannot be made durable is not a budget."""
+        while True:
+            await asyncio.sleep(self.persist_every_s)
+            ok = await asyncio.to_thread(self.session.save, self.sender.limits, self.kill)
+            self._persist_failures = 0 if ok else self._persist_failures + 1
+            if self._persist_failures >= 3:
+                self._trip(f"canary session state cannot be written ({self.session.last_error})")
 
     async def stop(self) -> None:
         for t in self._tasks:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks = []
+        if self.session is not None:
+            await asyncio.to_thread(self.session.save, self.sender.limits, self.kill)
         try:
             await self.sender.http.aclose()
         except Exception:  # noqa: BLE001 - shutting down
@@ -1448,7 +1626,8 @@ class LiveExecution:
                 "rules_ready": bool(self.rules_ready), "guard": self.sender.guard.status(), "counts": dict(self.n)}
 
 
-def build_live_execution(*, ledger, on_event=None, user_ready=None, fills=None, env=None) -> LiveExecution:
+def build_live_execution(*, ledger, on_event=None, user_ready=None, fills=None, env=None,
+                         new_session: bool = False) -> LiveExecution:
     """The canary, built on the audited live client: its L2 credentials, its
     signature type and funder, its market-rules validation and its order
     observer. The private key is read from the environment, never logged.
@@ -1482,7 +1661,16 @@ def build_live_execution(*, ledger, on_event=None, user_ready=None, fills=None, 
                           max_spread=float(config.MAX_ALLOWED_SPREAD),
                           trade_window_seconds=float(config.EXECUTION_WINDOW_SECONDS),
                           min_seconds_to_expiry=float(config.MIN_SECONDS_TO_EXPIRY))
-    return LiveExecution(sender=sender, shim=shim, ledger=ledger, receipt_sink=pt._journal_receipt,
-                         balance_fetch=pt.get_balance_allowance, clock_url=f"{host}/time",
-                         order_status=lambda oid: client.get_order(oid), user_ready=user_ready, fills=fills,
-                         on_event=on_event, assumed_delay_s=float(config.ASSUMED_MATCH_DELAY_SECONDS))
+    ex = LiveExecution(sender=sender, shim=shim, ledger=ledger, receipt_sink=pt._journal_receipt,
+                       balance_fetch=pt.get_balance_allowance, clock_url=f"{host}/time",
+                       order_status=lambda oid: client.get_order(oid), user_ready=user_ready, fills=fills,
+                       on_event=on_event, assumed_delay_s=float(config.ASSUMED_MATCH_DELAY_SECONDS))
+    # The session budget survives restarts (audit F3): restored, reconciled
+    # with the ledger's authorizations, or refused - before anything trades.
+    holder = client.builder.funder or signer.address()
+    state_path = env.get("SNIPER_CANARY_STATE_PATH") or str(Path(ledger.path).with_name("live_canary_state.json"))
+    ex.session = CanarySession(state_path, CanarySession.wallet_key_for(holder))
+    line = ex.session.open(sender.limits, sender.kill, ledger, new_session=new_session)
+    ex.session_start = ex.session.started_wall
+    (on_event or (lambda *a: None))("sniper", f"LIVE CANARY {line}", "warn")
+    return ex

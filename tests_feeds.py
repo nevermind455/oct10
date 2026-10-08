@@ -1478,13 +1478,18 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # min-left / non-positive side cap / stale limit are refused; seed_rounds() counts the
     # ledger's open positions into a round's caps after a restart. Rounds that ended over an
     # hour ago are dropped when a new round starts (one entry per market accumulated forever).
-    "sniper_mode.py": "bfc6edabce21b1feda8397f3775330c60356838d37929697267f299ae49700a0",
+    # Re-approved (F1, decisions unchanged): a fill above its share target is journalled
+    # (over_target) and counted; the in-flight record carries the stake (reserved cash);
+    # round_signals counts each round's signals and gate skips (a round_summary journal row).
+    "sniper_mode.py": "d64df8c7d55f5dd72c6a0d4bf3b9e3500158beb536afc413de8d965deb4568b1",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
     # Re-approved (final audit, D1): the canary caps must parse as finite numbers >= 0 (whole
     # numbers for counts) or the start is refused - "nan" used to switch a cap off.
-    "sniper_live.py": "19c284303c52202dc54eecb919b67305e183857692ce94a0ea3513ecaa44a173",
+    # Re-approved (F3): CanarySession - the canary's counters, halts and loss window survive
+    # restarts, reconciled with the ledger's authorizations; unreadable state fails closed.
+    "sniper_live.py": "ef7e061dc3aa935222547678924d67576df3b25fa4a52789a86ca6adf697b845",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads
@@ -1497,23 +1502,32 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # (no displayed share bought twice); an IOC meeting an empty book is a FAK no-fill.
     # Idle execution locks of past rounds' tokens and expired own-fill lists are dropped
     # (both grew by a few entries per market for the life of the process).
-    "paper_trade.py": "94954454c07748fad99c543a92a99d34d58b826cde80d8b53ab4dfad943c3010",
+    # Re-approved (paper attribution): a paper fill's ledger source carries its tag
+    # (paper_live_book/sniper, /manager) - per-source P/L from actual fills.
+    "paper_trade.py": "c9a160242ada295db79b24f58c1ad2e13f585b43d6698dee3298a22963821032",
     "polymarket_trade.py": "71b5da67c456c2fb30f3578b84019b0152324bdf338c20c53941eba6b72adc94",
     "orderbook.py": "fe3decc44a8f1061c2788c1f2ae85739ade137910033031eac3138f11b22f090",
     "market_discovery.py": "23c605f678eaf1c6caf60259293b9bccf73413e7f632c0a6749c55acc571aa11",
     "timer.py": "3ca35cc64539d45f7e4b982cbe9b6153138f87ee1be79adfae0c8eaccc875d50",
     "config.py": "4a1584c419e24d805c691d3bf8d7885f998c00aba2e2195f647e963154fda45d",
     "fast_h2.py": "768b40391d3c526431997872192ceb62fe1c4371719d5753b2a588886b7a81fb",
-    "accounting/ledger.py": "959aaaea83f8c4f0f1ef3f471a1d6c61d10b6749f76372338310dd70fcb5f7a5",
+    # Re-approved (F2): fills and settlements append one fsynced journal line (the snapshot
+    # records the entry it includes; load replays newer ones, validated, torn tail dropped,
+    # gaps/corruption refused); snapshots every 500 entries and on save(). current_payload().
+    "accounting/ledger.py": "bf59591bc8dad0fef99b7599c6e68022eb60b38ed839e9fd2cd007c7a680381c",
     "accounting/fees.py": "44e45be00c7c3b330ef0ff11950fa42944029ba83a61ec8066af3494c0956dc7",
     # Re-approved (settlement audit): one record per market (condition id), checked from
     # expiry, concurrently, on the worker's own pool; explicit lifecycle events and a journal;
     # REDEEM PENDING / REDEEMED tracked apart from SETTLED. Ledger.settle is unchanged.
-    "accounting/settlement.py": "1aed2d0c223ee75bb8a90f43a521ba16ef207050dbb282a4ec84f44f54aac6ff",
+    # Re-approved (F5): a RESULT_MISMATCH detail raises the RESULT_MISMATCH event (never settled).
+    "accounting/settlement.py": "57965778646c7c3c316b4c0d11d3f64528a4147cf6e6bf65114d4ef5fdcc8c66",
     # Re-approved: Resolver - the chain's payout vector first, the market's outcome order read
     # once per market, the CLOB + Gamma mirrors only when the chain cannot answer. fetch() is
     # unchanged but for its chain=False switch.
-    "accounting/resolution.py": "844a91591f9dba9f8e3cb078bcc788c1051c5ad9687d26aa46498dc3d296e7e9",
+    # Re-approved (F5): which token each payout slot pays is proven on chain (CTF position
+    # ids); unproven, the chain result settles only when the CLOB + Gamma mirrors agree,
+    # and a disagreement is RESULT_MISMATCH (UNKNOWN, never settled).
+    "accounting/resolution.py": "17f0229744797a8df1baaf4c17474731a2d2bcc5a641c741bd2346ab6fdfa7ca",
     # Re-approved (final audit, D5): a refused delta/snapshot (crossed result, malformed values,
     # refused timestamp) on a synced book desyncs its tokens (UNSYNCED until a fresh snapshot)
     # instead of leaving a LIVE book that silently missed a change.

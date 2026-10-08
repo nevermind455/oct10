@@ -47,7 +47,18 @@ _ABI = [
      "name": "balanceOf",
      "outputs": [{"name": "", "type": "uint256"}],
      "stateMutability": "view", "type": "function"},
+    {"inputs": [{"name": "parentCollectionId", "type": "bytes32"}, {"name": "conditionId", "type": "bytes32"},
+                {"name": "indexSet", "type": "uint256"}],
+     "name": "getCollectionId",
+     "outputs": [{"name": "", "type": "bytes32"}],
+     "stateMutability": "view", "type": "function"},
 ]
+# The collateral a market's outcome tokens were minted against. Proved on chain
+# 2026-10-08 for Polymarket's BTC 5-minute markets: USDC.e. py_clob_client_v2's
+# Polygon config names pUSD for V2. Both are tried; only an exact match of BOTH
+# tokens counts (SETTLE_COLLATERALS, comma-separated, replaces the list).
+COLLATERALS = ("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",     # USDC.e
+               "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB")     # pUSD (SDK V2 config)
 # Outcome tokens use the collateral's 6 decimals: 1 share = 1_000_000 units.
 SHARE_UNITS = 1_000_000
 
@@ -174,6 +185,55 @@ def _read_payouts(contract, key: bytes) -> tuple[int, list[int]]:
     if denominator <= 0:
         return denominator, [0, 0]
     return denominator, [int(contract.functions.payoutNumerators(key, i).call()) for i in range(2)]
+
+
+def collaterals() -> tuple[str, ...]:
+    raw = (os.environ.get("SETTLE_COLLATERALS", "") or "").strip()
+    if not raw:
+        return COLLATERALS
+    out = tuple(x.strip() for x in raw.split(",") if x.strip())
+    return tuple(a for a in out if a.startswith("0x") and len(a) == 42) or COLLATERALS
+
+
+def position_id(collateral: str, collection_id: bytes) -> str:
+    """The Conditional Tokens position id (= the ERC-1155 token id) of one
+    outcome: uint(keccak256(abi.encodePacked(collateral, collectionId))) -
+    the contract's own getPositionId, computed here (checked equal on chain)."""
+    from web3 import Web3
+    digest = Web3.solidity_keccak(["address", "bytes32"], [Web3.to_checksum_address(collateral), collection_id])
+    return str(int.from_bytes(digest, "big"))
+
+
+def slot_positions(condition_id: str, token_ids) -> tuple[dict | None, str]:
+    """{token_id: outcome slot} PROVEN from the Conditional Tokens contract, or
+    (None, reason). For outcome slot i (index set 1 << i) the contract's
+    collection id, combined with the market's collateral, IS the token id - so
+    this proves which token each payoutNumerators[i] pays, instead of
+    assuming the CLOB lists the tokens in slot order (finding F5)."""
+    cid = str(condition_id or "")
+    if not cid.startswith("0x") or len(cid) != 66:
+        return None, "invalid condition id"
+    tokens = [str(t or "") for t in (token_ids or [])]
+    if len(tokens) != 2 or not all(tokens) or tokens[0] == tokens[1]:
+        return None, "token ids are not a distinct binary pair"
+    contract = _client()
+    if contract is None:
+        return None, f"polygon rpc unavailable ({_last_error})"
+    try:
+        key = bytes.fromhex(cid[2:])
+        collections = [bytes(contract.functions.getCollectionId(b"\x00" * 32, key, 1 << slot).call())
+                       for slot in (0, 1)]
+    except Exception as exc:
+        return None, f"chain read failed: {type(exc).__name__}"
+    for collateral in collaterals():
+        try:
+            ids = [position_id(collateral, c) for c in collections]
+        except Exception as exc:                 # a malformed configured address
+            return None, f"position id failed: {type(exc).__name__}"
+        if sorted(ids) == sorted(tokens):
+            return ({ids[0]: 0, ids[1]: 1},
+                    f"outcome slots proven on chain (collateral {collateral[:6]}..{collateral[-4:]})")
+    return None, "no known collateral maps these tokens to this condition's outcome slots"
 
 
 def balance_of(holder: str, token_id) -> tuple[float | None, str]:

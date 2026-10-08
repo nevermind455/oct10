@@ -37,6 +37,7 @@ orders without lab coverage are counted, never guessed.
 """
 from __future__ import annotations
 
+
 import argparse
 import collections
 import json
@@ -48,6 +49,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
+from accounting.ledger import current_payload  # noqa: E402
 
 FEE_RATE = 0.07
 MIN_SHARES = 5.0
@@ -123,8 +125,8 @@ def load_orders(args):
     marks = {r.get("order_id"): r for r in journal if r.get("result") == "markout"}
     ledger_path = sc.state_path(env, "PAPER_LEDGER_PATH", "paper_ledger.json")
     try:
-        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        ledger = current_payload(str(ledger_path))     # the snapshot plus its journal
+    except (OSError, ValueError, RuntimeError) as exc:
         # no payouts: everything but the settled column still works
         print(f"paper ledger unreadable ({type(exc).__name__}: {ledger_path}); settled P&L will be blank",
               file=sys.stderr)
