@@ -352,6 +352,41 @@ def expected_fill(asks, want_shares: float, boundary: float, fee) -> Fill:
     return out
 
 
+def expected_fill_dollars(asks, stake: float, boundary: float, fee) -> Fill:
+    """What a dollar stake buys walking the asks up to `boundary` - the paper
+    broker's FOK at that stake (shares = what the money buys, not a count)."""
+    out = Fill(best=asks[0][0] if asks else None, boundary=boundary)
+    left = float(stake)
+    for price, size in asks:
+        if price > boundary + EPS or left <= EPS:
+            break
+        take = min(float(size), left / float(price))
+        if take <= EPS:
+            continue
+        out.qty += take
+        out.notional += take * price
+        out.fees += fee(take, price)
+        out.worst = price
+        left -= take * price
+    if out.qty > EPS:
+        out.vwap = out.notional / out.qty
+    return out
+
+
+def _broker_stake(stake: float, asks, min_shares: float, boundary: float) -> float:
+    """The stake the paper broker will actually send for `stake` (the venue's
+    minimum shares with price headroom, orderbook.venue_minimum_stake)."""
+    from decimal import Decimal
+    import orderbook
+    try:
+        raised = orderbook.venue_minimum_stake(
+            Decimal(str(stake)).quantize(Decimal("0.01")), [(Decimal(str(p)), Decimal(str(q))) for p, q in asks],
+            Decimal(str(min_shares)), Decimal(str(boundary)))
+    except Exception:  # noqa: BLE001 - an unreadable ladder: the broker would not raise it either
+        return stake
+    return float(raised)
+
+
 # ============================================================================ decisions
 @dataclass
 class Decision:
@@ -503,6 +538,17 @@ class Engine:
         cfg = self.cfg
         d = Decision(side, size=q, limit=round(boundary, 4))
         f = expected_fill(s.asks, q, boundary, fee)
+        # FOK: the stake is the cost of exactly these shares, in whole cents (as the
+        # venue quantizes it) - then sized as the BROKER will size it: an order at
+        # the venue's share minimum gets price headroom (orderbook.venue_minimum_stake,
+        # the same function), so it buys more than q when the ask holds. Every check
+        # below is on what that stake buys - the reservation, the caps and the pairs
+        # (live run: 5 asked at 0.23 bought 5.43 for $1.25 against $1.15 reserved).
+        d.stake = round(max(math.ceil(f.notional * 100 - 1e-9) / 100, cfg.venue_min_usd), 2)
+        sized = _broker_stake(d.stake, s.asks, cfg.venue_min_shares, boundary)
+        if sized > d.stake + 1e-9:
+            d.stake = sized
+            f = expected_fill_dollars(s.asks, sized, boundary, fee)
         d.fill = f
         up_add, dn_add = (f.qty, 0.0) if side == "UP" else (0.0, f.qty)
         unpaired_other = port.unpaired_down if side == "UP" else port.unpaired_up
@@ -518,9 +564,7 @@ class Engine:
         comb_after = None
         if avg_after is not None and other_avg is not None:
             comb_after = avg_after + other_avg if side == "UP" else other_avg + avg_after
-        # FOK: the stake is the cost of exactly these shares, in whole cents (as the
-        # venue quantizes it), and the book must hold all of it within the limit.
-        d.stake = round(max(math.ceil(f.notional * 100 - 1e-9) / 100, cfg.venue_min_usd), 2)
+        # the book must hold all of the stake within the limit (checked below)
         capital_max = d.stake + (f.fees * d.stake / f.notional if f.notional > EPS else 0.0)
         d.metrics.update(capital_max=capital_max, order_type="FOK")
         d.metrics.update(

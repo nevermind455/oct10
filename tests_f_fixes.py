@@ -455,6 +455,31 @@ class PaperAttribution(I.PaperIOCBase):
                                places=9)
 
 
+class ManagerSizesAsTheBroker(I.PaperIOCBase):
+    """Found in the real-time paper run (2026-10-08): the manager asked for 5 UP
+    at a 0.23 ask (limit 0.25) and reserved $1.15; the broker sent $1.25 (the
+    venue minimum with price headroom) and bought 5.4348 - more than reserved."""
+
+    def test_the_decision_is_what_the_broker_executes(self):
+        from dataclasses import replace
+        fee = PM.fee_curve(0.0, 1)                     # this harness's rules: fee rate 0
+        m = self.m
+        m.set(m.up_token, [(0.23, 100)])
+        port = PM.Portfolio(PM.SideState(shares=10, cost=3.863, best_bid=0.22, best_ask=0.23, asks=((0.23, 100.0),)),
+                            PM.SideState(shares=10, cost=5.5, best_bid=0.79, best_ask=0.80, asks=((0.80, 100.0),)))
+        cfg = replace(PM.PMConfig(enabled=True), side_avg_min_gain_per_usd=0.0, side_avg_max_added_loss_usd=5.0)
+        d = PM.Engine(cfg).evaluate("UP", port, fee=fee, left_s=190, book_ok=True, active=True,
+                                    hist=PM.MarketHistory(), now_mono=1e6, sniper_busy=False, cash_free=1000)
+        self.assertEqual((d.action, d.size, d.stake), ("BUY", 5.0, 1.25))
+        ok = self.broker.place_trade("UP", d.stake, m.up_token, m.down_token, m.condition_id, m.window_end, d.limit,
+                                     None, latency_ms=0, tag="manager", fak=False)
+        self.assertTrue(ok)
+        fill = self.broker.last_fill
+        self.assertAlmostEqual(fill["requested_amount"], d.stake, places=6)          # the stake it planned
+        self.assertAlmostEqual(fill["shares"], d.fill.qty, places=6)                 # the shares it planned
+        self.assertAlmostEqual(fill["total_cost"], d.metrics["capital_max"], places=6)
+
+
 class StopRequest(unittest.TestCase):
     def test_a_stop_file_asks_for_a_clean_shutdown_and_is_removed(self):
         import run

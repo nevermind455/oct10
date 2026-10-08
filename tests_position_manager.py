@@ -204,7 +204,11 @@ class Liquidity(unittest.TestCase):
         p = port(up=side(20, 0.45), down=side(0, None, asks=((0.50, 7), (0.60, 100))))
         d = evaluate("DOWN", p, replace(CFG, max_order_usd=20, max_market_usd=40))
         self.assertEqual((d.action, d.size, d.metrics["order_type"]), ("BUY", 5.0, "FOK"))
-        self.assertAlmostEqual(d.fill.qty, 5.0)                          # every share of the order
+        # sized as the broker sizes a venue-minimum order: price headroom up to the
+        # limit (2.50 + 5 x 0.02 = 2.60), all of it bought at 0.50 - what the
+        # broker will execute, not the 5.0 the old expectation assumed
+        self.assertEqual(d.stake, 2.60)
+        self.assertAlmostEqual(d.fill.qty, 2.60 / 0.50)                  # every share the stake buys
         self.assertLessEqual(d.stake, 0.50 * 7 + 1e-9)                  # the stake fits the depth in full
         self.assertEqual(d.stake, round(d.stake, 2))                    # whole cents
 
