@@ -348,11 +348,20 @@ MIN_ORDER_USD = 1.0   # venue floor on a marketable BUY (paper_trade.MIN_MARKETA
 
 
 def _env_float(name: str, default: float) -> float:
-    try:
-        v = float(os.environ.get(name, default))
-    except (TypeError, ValueError):
+    """A SNIPER_* number: the default when unset or blank, else the value -
+    which must parse and be finite (ValueError otherwise). A typo used to
+    become the default without a word: SNIPER_MAX_SIDE_SHARES=5O ran at 200,
+    SNIPER_K_BP=1.0bp at 0.5. A bad value stops the start instead."""
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
         return float(default)
-    return v if math.isfinite(v) else float(default)
+    try:
+        v = float(str(raw).strip())
+    except ValueError:
+        raise ValueError(f"invalid {name}={raw!r}: not a number") from None
+    if not math.isfinite(v):
+        raise ValueError(f"invalid {name}={raw!r}: must be finite")
+    return v
 
 
 def signing_price(cap: float, tick: str) -> float:
@@ -661,6 +670,11 @@ class Settings:
             (self.max_fills_round > 0, f"SNIPER_MAX_FILLS_ROUND={self.max_fills_round} (must be > 0)"),
             (self.max_target_shares >= self.shares,
              f"SNIPER_MAX_TARGET_SHARES={self.max_target_shares:g} (must be >= SNIPER_SHARES={self.shares:g})"),
+            (self.cooldown_ms >= 0, f"SNIPER_COOLDOWN_MS={self.cooldown_ms:g} (must be >= 0)"),
+            (self.min_left_s >= 0, f"SNIPER_MIN_LEFT_S={self.min_left_s:g} (must be >= 0)"),
+            (self.max_side_shares > 0, f"SNIPER_MAX_SIDE_SHARES={self.max_side_shares:g} (must be > 0)"),
+            (self.stale_ms > 0, f"SNIPER_STALE_MS={self.stale_ms:g} (must be > 0)"),
+            (self.book_wait_ms >= 0, f"SNIPER_BOOK_WAIT_MS={self.book_wait_ms:g} (must be >= 0)"),
             (min(self.hold_ms, self.server_ms, self.net_default_ms) >= 0,
              "SNIPER_HOLD_MS / SNIPER_SERVER_MS / SNIPER_NET_MS must be >= 0"),
             (self.binance_stale_ms > 0 and self.binance_unknown_ms > 0 and self.binance_backlog_max >= 0
@@ -974,6 +988,10 @@ class Sniper:
         # its fills are told apart by order id (live) / per-order result (paper).
         self.inflight = {"UP": None, "DOWN": None}
         self.rounds = collections.defaultdict(lambda: {"fills": 0, "UP": 0.0, "DOWN": 0.0})
+        # token id -> (shares, fills) the ledger already held when this process
+        # started (seed_rounds). A round's caps count them from its first order
+        # on: a restart must not reset a market's caps to zero.
+        self.round_baseline: dict = {}
         self._fak_pending: dict = {}        # accepted orders awaiting actual trade quantities
         # FAK (IOC): shares an order did not fill, per side, for the next
         # same-side order in the same market. Never moved across sides;
@@ -1006,6 +1024,23 @@ class Sniper:
             self._load_live_delays()
         if live is not None:
             live.attach(self)
+
+    def seed_rounds(self, ledger) -> int:
+        """Count what the ledger already holds into the per-round caps: every
+        unsettled position's confirmed shares and fills (one per lot) by token.
+        Called once at startup, before the first order. Without it a restart
+        mid-round counted that round from zero: max_side_shares 20 held 30.
+        Conservative: the ledger cannot tell a sniper fill from another source's
+        in the same market, so every fill counts. Returns the tokens seeded."""
+        base = {}
+        with ledger._lock:
+            for pos in ledger.positions.values():
+                if pos.settled or pos.shares <= 0:
+                    continue
+                fills = sum(1 for lot in pos.lots if str(lot.side or "").upper() == "BUY")
+                base[str(pos.token_id)] = (float(pos.shares), int(fills))
+        self.round_baseline = base
+        return len(base)
 
     def _load_live_delays(self) -> None:
         """Paper with SNIPER_DELAY_SOURCE=live: refuse to start without enough
@@ -2115,7 +2150,18 @@ class Sniper:
             # The venue refuses a marketable BUY under $1, so under 10c the
             # 10-share clip becomes $1 - the smallest order live could place.
             amount = max(self.s.shares * ask, MIN_ORDER_USD)
-        rd = self.rounds[end]
+        rd = self.rounds.get(end)
+        if rd is None:
+            # A new round: rounds that ended over an hour ago go (one entry per
+            # market otherwise accumulates for the life of the process). An order
+            # still settling holds its own round dict in its plan.
+            for old in [e for e in self.rounds if e < float(end) - 3600]:
+                del self.rounds[old]
+            rd = self.rounds[end]
+            for s_, tok in (("UP", up), ("DOWN", down)):
+                shares, fills = self.round_baseline.get(str(tok), (0.0, 0))
+                rd[s_] += shares
+                rd["fills"] += fills
         # The other side may have an order in flight in this round: it holds a
         # fill slot until its outcome is known, so two sides together never
         # pass the round's fill cap.

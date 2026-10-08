@@ -1151,6 +1151,17 @@ class PaperBroker:
         # stays atomic under self._lock either way.
         with self._lock:
             entry_lock = self._execution_locks.setdefault((str(token), str(tag or "")), threading.Lock())
+            if len(self._execution_locks) > 64:
+                # One lock per token and source, four per five-minute market: drop
+                # the idle ones of tokens that are no longer this round's (they
+                # grew without bound - 370 after 600 rotations in tests_stress).
+                try:
+                    current = {str(t) for t in self._context()[1:] if t}
+                except PaperRejected:                   # no current round: keep only busy locks
+                    current = set()
+                for key, lock in list(self._execution_locks.items()):
+                    if key[0] not in current and not lock.locked():
+                        del self._execution_locks[key]
         if not entry_lock.acquire(blocking=False):
             return self._reject(side, amount, "another paper order is already in flight on this token")
         try:
@@ -1289,7 +1300,8 @@ class PaperBroker:
             if timer.unix() >= cutoff:
                 raise PaperRejected("paper latency reached the round cutoff")
             if arrival_book is None:
-                book = self._net_of_own_fills(self._book_fetch(str(token_id)))
+                raw_book = self._book_fetch(str(token_id))
+                book = self._net_of_own_fills(raw_book)
                 # The instant the order met the book: everything after this (the
                 # durable ledger write) cannot change the price it got.
                 matched_wall = time.time()
@@ -1317,8 +1329,15 @@ class PaperBroker:
                 if arrived is None:
                     raise PaperRejected(
                         f"unknown book state at the modelled arrival: {info.get('why')}")
+                raw_book = arrived
                 book = self._net_of_own_fills(arrived)
                 matched_wall = float(info.get("arrival_wall") or time.time())
+            if fak and isinstance(book, BookSnapshot) and not book.asks:
+                # An IOC that meets an empty book matches nothing - the venue's
+                # NO_MATCH, a zero fill (its whole target is carried), exactly
+                # as when every ask sits above the cap. It used to be refused
+                # as "no asks on the live book", which left the carry untouched.
+                raise PaperRejected("FAK no-fill: no asks on the book at the match")
             rules = self._rules_matching(condition_id, rules, book)
             quiet_s, held_s = self._check_book(book, side)
             book_age_s = quiet_s
@@ -1340,6 +1359,20 @@ class PaperBroker:
             if timer.unix() >= end - self.min_seconds_to_expiry:
                 raise PaperRejected("paper quote reached the round cutoff")
             with self._lock:
+                # Another of our orders on this token (the other source's slot -
+                # the Position Manager's) may have booked since the quote above:
+                # the book is netted again here, where bookings are serialized,
+                # and the order re-quoted on what is left. Quoting both on the
+                # same displayed depth bought it twice (20 shares off a level
+                # showing 10). A no-fill here refuses the order, as live would.
+                again = self._net_of_own_fills(raw_book)
+                if again.asks != book.asks:
+                    book = again
+                    if not book.asks:
+                        raise PaperRejected(f"{'FAK' if fak else 'FOK'} no-fill: our own order on this "
+                                            f"token took the depth first")
+                    quote = (estimate_fak if fak else estimate_fok)(book, spend, cap, rules, min_price=floor)
+                    partial = bool(fak and quote.notional < spend.quantize(MONEY, rounding=ROUND_HALF_UP))
                 if self.cash_balance() + 1e-9 < float(quote.total_cost):
                     raise PaperRejected(
                         f"paper cash ${self.cash_balance():.6f} is below total cost "
@@ -1365,6 +1398,13 @@ class PaperBroker:
                     now_mono = time.monotonic()
                     self._own_fills.setdefault(str(token_id), []).extend(
                         (now_mono, p, sh) for p, sh, _n in quote.levels)
+                    if len(self._own_fills) > 16:
+                        # A token's list is pruned when that token is read again;
+                        # an old round's never is. Drop tokens whose newest fill
+                        # has expired (they no longer net anything).
+                        for tok, fills in list(self._own_fills.items()):
+                            if not fills or now_mono - fills[-1][0] >= self.own_fill_ttl_s:
+                                del self._own_fills[tok]
                 self.filled_orders += 1
                 self.last_error = None
                 self.last_fill = {

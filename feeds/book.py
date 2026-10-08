@@ -110,6 +110,9 @@ class BookState:
         self._cache: dict[str, tuple[int, BookView]] = {}
         self._dirty: dict[str, int] = {}
         self.dropped_inactive = 0
+        # Deltas/snapshots refused on a SYNCED book (crossed result, malformed
+        # values, an untrustworthy timestamp): each one desyncs its tokens.
+        self.rejected_updates = 0
         self.connected = False
         # The last history_s seconds of each book, to read it as it stood at
         # a given VENUE time (the paper sniper's modelled match instant) no
@@ -265,6 +268,23 @@ class BookState:
                 self._dirty[t] = self._dirty.get(t, 0) + 1
                 self._record(t, None, gap=True)
 
+    def _desync_locked(self, tokens, reason: str) -> None:
+        """A message for these tokens was refused: our copy no longer matches
+        the venue's (an update is missing from it), so it is not LIVE any more.
+        UNSYNCED until a fresh snapshot (the hub's REST resync picks it up).
+        A refused delta used to leave the book LIVE without that change - a
+        level the venue no longer had stayed best ask, and the sniper's cap
+        and paper fills were set from it. Caller holds the lock."""
+        for token in dict.fromkeys(tokens):
+            m = self._meta.get(token)
+            if token not in self._active or m is None or not m.get("synced"):
+                continue
+            m["synced"] = False
+            m["desync_reason"] = reason
+            self._dirty[token] = self._dirty.get(token, 0) + 1
+            self._record(token, None, gap=True)
+            self.rejected_updates += 1
+
     # -------------------------------------------------------------- writes
     def apply_snapshot(self, token: str, bids, asks, *, ts_ms=None, hash_=None,
                        tick=None, only_if_unsynced: bool = False,
@@ -290,8 +310,10 @@ class BookState:
             new_bids, valid_bids = _to_map(bids)
             new_asks, valid_asks = _to_map(asks)
             if not valid_bids or not valid_asks:
+                self._desync_locked((token,), "invalid snapshot")
                 return False
             if new_bids and new_asks and max(new_bids) >= min(new_asks):
+                self._desync_locked((token,), "crossed snapshot")
                 return False
             self._bids[token] = new_bids
             self._asks[token] = new_asks
@@ -319,14 +341,17 @@ class BookState:
             try:
                 p, s = float(price), float(size)
             except (TypeError, ValueError):
+                self._desync_locked((token,), "invalid delta")
                 return False
             side = str(side or "").upper()
             if (side not in ("BUY", "BID", "SELL", "ASK")
                     or not math.isfinite(p) or not math.isfinite(s)
                     or not 0 < p < 1 or s < 0):
+                self._desync_locked((token,), "invalid delta")
                 return False
             incoming_ts = _int(ts_ms)
             if require_exchange_ts and not self._fresh_exchange_ts(incoming_ts):
+                self._desync_locked((token,), "delta timestamp refused")
                 return False
             previous_ts = m.get("ts")
             if (incoming_ts is not None and previous_ts is not None
@@ -340,6 +365,7 @@ class BookState:
             else:
                 book[p] = s
             if bids and asks and max(bids) >= min(asks):
+                self._desync_locked((token,), "delta crossed the book")
                 return False
             self._bids[token], self._asks[token] = bids, asks
             m.update(updated=time.monotonic(), ts=incoming_ts,
@@ -364,13 +390,16 @@ class BookState:
         """
         incoming_ts = _int(ts_ms)
         with self._lock:
+            named = [str(c.get("asset_id") or "") for c in (changes or ()) if isinstance(c, dict)]
             if require_exchange_ts and not self._fresh_exchange_ts(incoming_ts):
+                self._desync_locked(named, "event timestamp refused")
                 return False
             staged: dict[str, tuple[dict[float, float], dict[float, float]]] = {}
             touched: set[str] = set()
             skipped_pending = False
             for change in changes or ():
                 if not isinstance(change, dict):
+                    self._desync_locked(named, "malformed event")
                     return False
                 token = str(change.get("asset_id") or "")
                 if token not in self._active:
@@ -390,11 +419,13 @@ class BookState:
                     price = float(change.get("price"))
                     size = float(change.get("size"))
                 except (TypeError, ValueError):
+                    self._desync_locked(named, "invalid delta")
                     return False
                 side = str(change.get("side") or "").upper()
                 if (side not in ("BUY", "BID", "SELL", "ASK")
                         or not math.isfinite(price) or not math.isfinite(size)
                         or not 0 < price < 1 or size < 0):
+                    self._desync_locked(named, "invalid delta")
                     return False
                 if token not in staged:
                     staged[token] = (dict(self._bids[token]), dict(self._asks[token]))
@@ -408,6 +439,7 @@ class BookState:
 
             for bids, asks in staged.values():
                 if bids and asks and max(bids) >= min(asks):
+                    self._desync_locked(list(staged), "delta crossed the book")
                     return False
             now_mono = time.monotonic()
             now_wall = time.time()

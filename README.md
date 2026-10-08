@@ -275,6 +275,8 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 
 `run.py` names, at start, any old main-strategy setting it ignores (`STOP_LOSS_ENABLED`, `BOOK_SOURCE`, ...).
 
+A set `SNIPER_*` number that does not parse, or is NaN or infinite, stops the start and names the variable; so does a negative cooldown, minimum time left or book-wait, or a side cap or stale limit of 0. The `SNIPER_CANARY_MAX_*` caps must be finite numbers >= 0 (whole numbers for the counts). A bad value used to quietly become the default, and `nan` switched a canary cap off.
+
 ## Daily checks (read-only; safe beside a running bot)
 
 ```bash
@@ -367,7 +369,8 @@ python run_tests.py run feeds    # just tests_run.py and tests_feeds.py
 ```
 
 - **No network, no wallet.** The suites never read `.env`: `testing_env.py` turns the load off for the test process and removes the bot's settings from the inherited environment.
-- **Hash-locked trading files.** `tests_feeds.py` locks the trading files to their approved SHA-256. The engine is byte-identical to spe24 aaff811. Any change to a trading file needs review and a new digest.
+- **Hash-locked trading files.** `tests_feeds.py` locks the trading files to their approved SHA-256. Any change to a trading file needs review, a new digest, and a comment beside it saying what changed.
+- **The final audit (2026-10-07).** `tests_final_audit.py` checks every rule against expected values the test computes itself (Decimal/Fraction), never with the production function. `tests_stress.py` runs 10,000 concurrent order races and 10,000 full-system scenarios, then 600 market rotations for resource growth. That suite takes about 5 minutes; `STRESS_SCALE=0.1` runs a tenth. `bench_loop_costs.py` measures what the event loop pays as the ledger grows. `bench_execution.py --pm off|on|stress` compares the order path with the Position Manager off and on.
 - **Regression tests carried over.**
   - b50cb59: a 400 FOK miss is NO_MATCH (`tests_sniper_recovery`).
   - 8abe70f: fill cost comes from the maker legs (`tests_fill_cost`).

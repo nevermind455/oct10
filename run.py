@@ -892,6 +892,11 @@ async def run_runtime(rt: Runtime, *, dash: bool = False, paper_balance: float |
         # A restart can follow an authorized order whose fill never reached the
         # ledger: book it before the sniper can place another.
         await _recover_startup_fills(rt.reconciler, rt.ledger, rt.hub.fill_store)
+        # ... and count what the ledger already holds into the per-round caps:
+        # a restart mid-round must not start that round's caps from zero.
+        seeded = await asyncio.to_thread(rt.sniper.seed_rounds, rt.ledger)
+        if seeded:
+            on_event("startup", f"round caps start from the ledger: {seeded} open position(s) counted", "info")
         _require_live_fill_coverage(paper=rt.paper, user_ws=rt.cfg.user_ws)
         if rt.live_exec is not None:
             try:
@@ -1161,7 +1166,7 @@ async def _ledger_loop(hub, ledger, stop) -> None:
 
 async def _status_loop(rt: Runtime) -> None:
     """Without --dash: one compact line a minute, safe for a log file."""
-    view = DashView(rt)
+    view = DashView(rt, accounting_off_loop=True)
     while not rt.stop.is_set():
         await asyncio.sleep(60)
         try:
@@ -1268,8 +1273,15 @@ class DashView:
     Sniper, the broker/ledger and the canary. Call snapshot() on the event
     loop (it reads state the loop owns); orders() may run on a worker."""
 
-    def __init__(self, rt: Runtime, *, accounting_every_s: float = 1.0) -> None:
+    def __init__(self, rt: Runtime, *, accounting_every_s: float = 1.0, accounting_off_loop: bool = False) -> None:
         self.rt = rt
+        # The bot passes True: the account figures walk every position the ledger
+        # ever held - measured 2.4ms at 5,000 positions and 10ms at 20,000
+        # (bench_loop_costs.py) - and on the event loop every BTC tick arriving
+        # meanwhile waited for them. Off the loop, the newest finished result is
+        # shown (one computation at a time, started at most once per refresh).
+        self.off_loop = accounting_off_loop
+        self._acct_future = None
         self.tail = JournalTail(rt.journal_path, since=getattr(rt, "started", 0.0) - 1.0)
         self._signals: collections.deque = collections.deque()
         self._acct: dict = {}
@@ -1293,7 +1305,30 @@ class DashView:
             self._slow["health"] = self.rt.hub.health()
         except Exception:
             self._slow["health"] = {}
+        if self.off_loop:
+            self._collect_accounting()
+            if self._acct_future is not None:
+                return                          # the previous one is still running
+            try:
+                self._acct_future = asyncio.get_running_loop().run_in_executor(None, self._accounting_nowait)
+                return
+            except RuntimeError:                # no running loop (a final report): compute here
+                pass
         acct = self._accounting_nowait()
+        if acct is not None:
+            self._acct = acct
+
+    def _collect_accounting(self) -> None:
+        """Take a finished off-loop accounting result, if there is one."""
+        fut = self._acct_future
+        if fut is None or not fut.done():
+            return
+        self._acct_future = None
+        try:
+            acct = fut.result()
+        except Exception as exc:                # the figures stay as they were; say why
+            on_event("dashboard", f"accounting refresh failed: {type(exc).__name__}: {exc}", "warn")
+            return
         if acct is not None:
             self._acct = acct
 
@@ -1416,6 +1451,8 @@ class DashView:
     def snapshot(self) -> dict:
         rt, hub, sn = self.rt, self.rt.hub, self.rt.sniper
         self._refresh_slow()
+        if self.off_loop:
+            self._collect_accounting()
         summary = self._slow.get("summary") or {}
         health = self._slow.get("health") or {}
         now_wall, now_mono = time.time(), time.monotonic()
@@ -1617,7 +1654,7 @@ async def _dashboard(rt: Runtime) -> None:
     DASH_FPS (default 2) sets the frame rate: every frame is CPU the sniper
     competes for on a 1-vCPU VPS."""
     from dashboard import ConsoleCapture, build, glyphs, make_renderer, plain_line
-    view = DashView(rt, accounting_every_s=_env_seconds("DASH_ACCOUNTING_S", 1.0))
+    view = DashView(rt, accounting_every_s=_env_seconds("DASH_ACCOUNTING_S", 1.0), accounting_off_loop=True)
     frame_s = 1.0 / max(0.5, min(10.0, _env_seconds("DASH_FPS", 2.0) or 2.0))
     renderer = make_renderer(sys.stdout)
     if not getattr(renderer, "interactive", False):

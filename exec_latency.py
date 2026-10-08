@@ -72,7 +72,8 @@ def spec_violations(settings, canary_max_shares=None) -> list[str]:
             out.append(f"{label}: resolved {fmt.format(got) if got is not None else got} but the frozen spec is "
                        f"{fmt.format(want)} ({src})")
     target = float(getattr(settings, "max_target_shares", 0) or 0)
-    if canary_max_shares is not None and float(canary_max_shares) + 1e-9 < target:
+    # `not >=` rather than `<`: a NaN cap compares false both ways and must fail here too.
+    if canary_max_shares is not None and not float(canary_max_shares) + 1e-9 >= target:
         out.append(f"canary_cap: SNIPER_CANARY_MAX_SHARES={float(canary_max_shares):g} is below the maximum carried "
                    f"target {target:g} - a carried order would be refused")
     return out

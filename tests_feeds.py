@@ -1473,11 +1473,18 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # missing .env line no longer runs paper at ask + 2c; a set value still wins.
     # Re-approved: the SNIPER_K_BP code default is the frozen spec's 0.5bp (was 1.0bp).
     # Re-approved: the SNIPER_SLIP code default is the frozen spec's $0.05 (was $0.04).
-    "sniper_mode.py": "8c1b55db5d9acc3e56ce09f04b51f3fd145ef19de8db4f6de780438daefc4e37",
+    # Re-approved (final audit, D2/R1 - no decision rule changed): a malformed or non-finite
+    # SNIPER_* value refuses the start instead of becoming the default, and negative cooldown /
+    # min-left / non-positive side cap / stale limit are refused; seed_rounds() counts the
+    # ledger's open positions into a round's caps after a restart. Rounds that ended over an
+    # hour ago are dropped when a new round starts (one entry per market accumulated forever).
+    "sniper_mode.py": "bfc6edabce21b1feda8397f3775330c60356838d37929697267f299ae49700a0",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
-    "sniper_live.py": "333adf56eed0f9eebc8bd77e0b671169ac60e489e890a91e2a2d2061a948f359",
+    # Re-approved (final audit, D1): the canary caps must parse as finite numbers >= 0 (whole
+    # numbers for counts) or the start is refused - "nan" used to switch a cap off.
+    "sniper_live.py": "19c284303c52202dc54eecb919b67305e183857692ce94a0ea3513ecaa44a173",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads
@@ -1485,7 +1492,12 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # fsync - and behind a settlement's) and prunes only when the lock is free. Same answer.
     # Re-approved (Position Manager): one order in flight per token PER SOURCE (tag), so another
     # strategy's order can neither refuse nor delay the sniper's on the same token.
-    "paper_trade.py": "3a6ddbba88e10f0a29c632a3454a4412c609836287c28204047b483d2c7a44a4",
+    # Re-approved (final audit, D4/D6): the book is netted against our own fills again under
+    # the booking lock and the order re-quoted if another source booked on that token since
+    # (no displayed share bought twice); an IOC meeting an empty book is a FAK no-fill.
+    # Idle execution locks of past rounds' tokens and expired own-fill lists are dropped
+    # (both grew by a few entries per market for the life of the process).
+    "paper_trade.py": "94954454c07748fad99c543a92a99d34d58b826cde80d8b53ab4dfad943c3010",
     "polymarket_trade.py": "71b5da67c456c2fb30f3578b84019b0152324bdf338c20c53941eba6b72adc94",
     "orderbook.py": "fe3decc44a8f1061c2788c1f2ae85739ade137910033031eac3138f11b22f090",
     "market_discovery.py": "23c605f678eaf1c6caf60259293b9bccf73413e7f632c0a6749c55acc571aa11",
@@ -1502,7 +1514,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # once per market, the CLOB + Gamma mirrors only when the chain cannot answer. fetch() is
     # unchanged but for its chain=False switch.
     "accounting/resolution.py": "844a91591f9dba9f8e3cb078bcc788c1051c5ad9687d26aa46498dc3d296e7e9",
-    "feeds/book.py": "d90704050d0e9537be5ed34fb2e60313d4ea92a2c8d0f73efcd00fd55d603246",
+    # Re-approved (final audit, D5): a refused delta/snapshot (crossed result, malformed values,
+    # refused timestamp) on a synced book desyncs its tokens (UNSYNCED until a fresh snapshot)
+    # instead of leaving a LIVE book that silently missed a change.
+    "feeds/book.py": "07891ccc2e82c37111e934215ca82a11462ee1d58cac34b569ab0c6c4256c432",
     "feeds/poly_user.py": "f0dbd62bd0ef708dc15391915aab39e83802106c26af7780c81712ca42ae6b55",
     "feeds/reconcile.py": "71dea5e832fb970e5cfac1880686cf5eff477a34c48c9b91ba961f77b3e9cb6f",
 }

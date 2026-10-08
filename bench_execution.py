@@ -455,7 +455,8 @@ async def main_async(args) -> dict:
            "platform": platform.platform()}
     res["market"] = bench_market_data(args.updates)
     res["ticks"] = bench_ticks(args.updates)
-    res["live"] = await bench_live(args.orders)
+    res["position_manager"] = args.pm
+    res["live"] = await bench_live(args.orders, with_pm=args.pm != "off", pm_stress=args.pm == "stress")
     res["signing"] = bench_signing(args.sign)
     res["journal"] = bench_journal(args.journal)
     res["wakeup_us"] = {"idle": await bench_wakeup(args.wakeup, dashboard=False),
@@ -473,6 +474,9 @@ def main(argv=None) -> int:
     ap.add_argument("--journal", type=int, default=300)
     ap.add_argument("--wakeup", type=int, default=1000, help="packets per packet->handler run")
     ap.add_argument("--json", default=None, help="also write the results here")
+    ap.add_argument("--pm", choices=("off", "on", "stress"), default="off",
+                    help="Position Manager beside the sniper: off, on (5ms polls, an evaluation whenever the state changed), "
+                         "stress (a full evaluation every 5ms). Use a fresh process per setting.")
     args = ap.parse_args(argv)
     res = asyncio.run(main_async(args))
     print(table(res))

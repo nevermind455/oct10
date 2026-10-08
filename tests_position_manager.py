@@ -975,11 +975,19 @@ class BookingWindow(unittest.TestCase):
         o = w.pm.reserve(w.pm.choose(w.pm.evaluate()))
 
         class Trap(dict):
-            def values(inner):
+            # mid-read, whichever way portfolio() reads the positions (values() or get())
+            def _hit(inner):
                 with w.pm._olock:                       # what the pre-submit guard does, mid-read
                     o.booking = True
                     w.pm._epoch += 1
+
+            def values(inner):
+                inner._hit()
                 return dict.values(inner)
+
+            def get(inner, *a):
+                inner._hit()
+                return dict.get(inner, *a)
         w.led.positions = Trap(w.led.positions)
         self.assertIsNone(w.pm.portfolio(COND, UP_T, DN_T))
         self.assertEqual(w.pm.busy_reason, "BOOKING_IN_PROGRESS")
@@ -1034,11 +1042,19 @@ class EventLoopSlices(unittest.TestCase):
         booked = []
 
         class Trap(dict):
-            def values(inner):
+            # mid-read, whichever way portfolio() reads the positions (values() or get())
+            def _hit(inner):
                 if not booked:
                     booked.append(1)
                     w.led.record_fill("sniper-x", UP_T, shares=5, price=0.45, condition_id=COND, fee=0.0)
+
+            def values(inner):
+                inner._hit()
                 return dict.values(inner)
+
+            def get(inner, *a):
+                inner._hit()
+                return dict.get(inner, *a)
         w.led.positions = Trap(w.led.positions)
         d = w.pm.choose(w.pm.evaluate())
         self.assertIsNotNone(d)

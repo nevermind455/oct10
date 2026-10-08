@@ -729,6 +729,7 @@ class PositionManager:
         self._snap_version = None
         self._inconclusive = False
         self.busy_reason: str | None = None
+        self._cash_cache = None                      # (ledger fill count, mono, cash) - see _cash_free
         self.last_error: str | None = None
         self._task = None
         # Order fields the executor thread writes (its outcome, the booking flag):
@@ -792,11 +793,14 @@ class PositionManager:
             self.busy_reason = "LEDGER_BUSY"
             return None
         try:
+            # The ledger keys positions by token: this market's two are looked up,
+            # not found by walking every position the ledger ever held (that walk,
+            # on the event loop, cost 1.3ms at 5,000 positions, 5ms at 20,000).
             rows = {}
-            for pos in led.positions.values():
-                if pos.condition_id == cond and not pos.settled and pos.shares > 0:
+            for token in (up, down):
+                pos = led.positions.get(str(token))
+                if pos is not None and pos.condition_id == cond and not pos.settled and pos.shares > 0:
                     rows[str(pos.token_id)] = (float(pos.shares), float(pos.cost), float(pos.fees))
-            realized = sum(float(p.realized or 0) for p in led.positions.values() if p.settled)
         finally:
             if lock is not None:
                 lock.release()
@@ -804,7 +808,7 @@ class PositionManager:
             if self._epoch != e0:
                 self.busy_reason = "BOOKING_IN_PROGRESS"
                 return None
-        port = Portfolio(SideState(), SideState(), realized=realized)
+        port = Portfolio(SideState(), SideState())
         for side, token in (("UP", up), ("DOWN", down)):
             st = port.side(side)
             st.shares, st.cost, st.fees = rows.get(str(token), (0.0, 0.0, 0.0))
@@ -865,14 +869,26 @@ class PositionManager:
         b = self.broker
         if not hasattr(b, "cash_balance"):
             return None
-        led_lock = getattr(self.ledger, "_lock", None)
-        if led_lock is not None and not led_lock.acquire(blocking=False):
-            return _BUSY
-        try:
-            cash = float(b.cash_balance())
-        finally:
-            if led_lock is not None:
-                led_lock.release()
+        # cash_balance() walks every position the ledger ever held (0.8ms at 5,000,
+        # 3ms at 20,000, on the event loop). It is reused while no fill has been
+        # booked (the ledger's fill count is unchanged) for at most 1s: a fill -
+        # the only thing that lowers cash - recomputes it at once; a settlement
+        # payout raises it, so a cached figure can only understate cash. The
+        # broker re-checks cash under its lock when it books the order anyway.
+        key, now = len(getattr(self.ledger, "seen", ())), self.mono()
+        hit = self._cash_cache
+        if hit is not None and hit[0] == key and 0 <= now - hit[1] < 1.0:
+            cash = hit[2]
+        else:
+            led_lock = getattr(self.ledger, "_lock", None)
+            if led_lock is not None and not led_lock.acquire(blocking=False):
+                return _BUSY
+            try:
+                cash = float(b.cash_balance())
+            finally:
+                if led_lock is not None:
+                    led_lock.release()
+            self._cash_cache = (key, now, cash)
         return cash - sum(u for _s, _q, u, _b in self._open_orders())
 
     # ---------------------------------------------------------------- one evaluation
@@ -1051,12 +1067,26 @@ class PositionManager:
         # spend counts what was actually spent, not the reservation
         hist.spend += o.cost - o.reserved_usd
         self._gen += 1
+        self._prune_orders()
         self.journal.write({"wall": self.wall(), "event": f"POSITION_MANAGER RESULT {o.side}", "status": o.status,
                             "order_id": o.order_id, "classification": o.classification,
                             "requested_qty": round(o.requested_qty, 4), "filled_qty": round(o.filled_qty, 4),
                             "expected_price": o.expected_price, "actual_price": o.actual_price, "fees": o.fees,
                             "cost": o.cost, "error": o.error, "condition": o.condition, "market_id": o.market_id,
                             "token_id": o.token_id, "reservation_id": o.reservation_id})
+
+    KEEP_FINISHED = 200
+
+    def _prune_orders(self) -> None:
+        """Keep every order still owed an outcome and the newest KEEP_FINISHED
+        finished ones. The rest only cost time: _open_orders walks this dict on
+        the event loop at every evaluation (it grew by up to 6 per market)."""
+        finished = [k for k, o in self.orders.items() if o.finished]
+        if len(finished) <= self.KEEP_FINISHED:
+            return
+        with self._olock:
+            for k in finished[:len(finished) - self.KEEP_FINISHED]:
+                self.orders.pop(k, None)
 
     def settle_order(self, o: ManagerOrder, *, ok: bool, fill: dict | None, error: str | None) -> None:
         """The order's outcome: on the order, then on its market's history.

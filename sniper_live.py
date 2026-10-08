@@ -738,15 +738,29 @@ def lean_view(view, cap: float):
 def limits_from_env(env=None) -> CanaryLimits:
     """Canary caps from the environment. Defaults are deliberately small:
     spend is counted at send and never given back for a fill, so
-    SNIPER_CANARY_MAX_SPEND_USD bounds what the whole session can lose."""
+    SNIPER_CANARY_MAX_SPEND_USD bounds what the whole session can lose.
+
+    A set value must be a finite number >= 0 (a whole number for the counts),
+    else ValueError: these are the live safety caps, so a typo must stop the
+    start, never quietly become the default. "nan" used to pass and switched
+    its cap off entirely (every comparison with NaN is false), and "3O" became
+    the default 25 shares."""
     import os
     env = os.environ if env is None else env
 
     def num(name, default, cast=float):
-        try:
-            return cast(env.get(name, default))
-        except (TypeError, ValueError):
+        raw = env.get(name)
+        if raw is None or not str(raw).strip():
             return cast(default)
+        try:
+            value = float(str(raw).strip())
+        except ValueError:
+            raise ValueError(f"{name}={raw!r} is not a number") from None
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{name}={raw!r} must be a finite number >= 0")
+        if cast is int and value != int(value):
+            raise ValueError(f"{name}={raw!r} must be a whole number")
+        return cast(value)
     return CanaryLimits(max_order_shares=num("SNIPER_CANARY_MAX_SHARES", 25),
                         max_orders=num("SNIPER_CANARY_MAX_ORDERS", 40, int),
                         max_fills=num("SNIPER_CANARY_MAX_FILLS", 20, int),

@@ -1128,9 +1128,20 @@ def t_build_live_execution_refuses_without_assumed_delay():
 
 
 def t_canary_limits_from_env():
-    lim = L.limits_from_env({"SNIPER_CANARY_MAX_SPEND_USD": "25", "SNIPER_CANARY_MAX_ORDERS": "x"})
-    check("limits: env overrides, bad values fall back to the small defaults",
+    lim = L.limits_from_env({"SNIPER_CANARY_MAX_SPEND_USD": "25", "SNIPER_CANARY_MAX_ORDERS": ""})
+    check("limits: env overrides, unset/blank values take the small defaults",
           lim.max_exposure_usd == 25.0 and lim.max_orders == 40 and lim.max_daily_loss_usd == 20.0, str(lim))
+    # These are the live safety caps: a bad value refuses the start. It used to fall
+    # back to the default ("x" -> 40) - and "nan" switched the cap off entirely.
+    for name, raw in (("SNIPER_CANARY_MAX_ORDERS", "x"), ("SNIPER_CANARY_MAX_SPEND_USD", "nan"),
+                      ("SNIPER_CANARY_MAX_SHARES", "inf"), ("SNIPER_CANARY_MAX_LOSS_USD", "-1"),
+                      ("SNIPER_CANARY_MAX_FILLS", "2.5")):
+        try:
+            L.limits_from_env({name: raw})
+            refused = False
+        except ValueError:
+            refused = True
+        check(f"limits: {name}={raw!r} refuses the start", refused)
 
 
 # ---------------------------------------------------------------- fast_h2: the synchronous HTTP/2 write
