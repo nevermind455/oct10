@@ -604,7 +604,11 @@ async def replay(mod, steps, env) -> list:
     book.set_active([T.UP, T.DN])
     hub = types.SimpleNamespace(up_token=T.UP, down_token=T.DN, condition_id=T.COND, window_end=None, book=book)
     journal = pathlib.Path(tempfile.mkdtemp(prefix="replay_")) / "j.jsonl"
-    with patch.object(mod, "time", fake):
+    # One clock for the sniper AND the book: the snapshots are stamped (updated_mono)
+    # on the replay's clock too. Stamped on the real monotonic clock they compared
+    # with the replay's - and right after a reboot (uptime below the replay's ~1,000s)
+    # every book read as stale and no order was replayed at all.
+    with patch.object(mod, "time", fake), patch("feeds.book.time", fake):
         sn = mod.Sniper(hub, ReplayBroker(), journal_path=journal, settings=settings, trade_rows=[], own_rounds=True)
         sn.fresh.enabled = False
         for dt_ms, mid, ask_up, ask_dn, end in steps:

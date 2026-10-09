@@ -136,6 +136,7 @@ def run(args) -> int:
     started = time.time()
     last_check = 0.0
     restarts = 0
+    sampled: dict = {}                                      # pid -> its psutil.Process (cpu_percent needs one)
     try:
         while True:
             time.sleep(2.0)
@@ -163,7 +164,12 @@ def run(args) -> int:
             if time.time() - last_check >= args.every:
                 last_check = time.time()
                 try:
-                    p = psutil.Process(bot.pid)
+                    # one Process object per bot pid: cpu_percent() measures since its
+                    # previous call on the SAME object (a fresh one always says 0.0)
+                    if sampled.get("pid") != bot.pid:
+                        sampled.update(pid=bot.pid, proc=psutil.Process(bot.pid))
+                        sampled["proc"].cpu_percent(interval=None)
+                    p = sampled["proc"]
                     with p.oneshot():
                         note("resources", cpu_pct=p.cpu_percent(interval=None), rss_mb=round(p.memory_info().rss / 2**20, 1),
                              threads=p.num_threads(),
