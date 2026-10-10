@@ -600,6 +600,51 @@ class CoinbaseSocketTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.sn.cb_fresh.enabled)
 
 
+# =========================================================================== bench_network: the race and the budget
+class BenchNetworkTests(unittest.TestCase):
+    def test_one_move_is_one_episode_per_side(self):
+        import bench_network as N
+        sig = [(0, 1), (40, 1), (290, 1), (300, 1), (310, -1), (320, -1), (900, 1)]
+        self.assertEqual(N.episodes(sig, 300.0), [(0, 1), (300, 1), (310, -1), (900, 1)])
+
+    def test_episodes_pair_by_side_within_a_second(self):
+        import bench_network as N
+        cb = [(1_000, 1), (5_000, -1), (9_000, 1), (20_000, 1)]
+        bn = [(1_040, 1), (4_970, -1), (9_100, -1), (30_000, 1)]
+        m = N.match_episodes(cb, bn, 1000.0)
+        self.assertEqual((m["matched"], m["a_first"], m["b_first"], m["only_a"], m["only_b"]), (2, 1, 1, 2, 2))
+        self.assertEqual((m["a_lead_ms"]["p50"], m["b_lead_ms"]["p50"]), (40.0, 30.0))
+        m2 = N.match_episodes([(0, 1)], [(10, 1), (500, 1)], 1000.0)                # the nearest one, used once
+        self.assertEqual((m2["matched"], m2["only_b"], m2["lead_ms"]["p50"]), (1, 1, 10.0))
+
+    def test_the_budget_adds_the_measured_parts(self):
+        import bench_network as N
+        res = {"coinbase": {"match_to_receipt_ms": {"p50": 100.0}}, "clob_warm": {"warm_rtt_ms": {"p50": 20.0}},
+               "coinbase_clock": {"offset_ms": -5.0}}
+        b = N.budget(res)
+        self.assertEqual((b["feed_ms"], b["one_way_ms"]), (95.0, 10.0))
+        self.assertAlmostEqual(b["signal_to_match_ms"], 0.4 + 10.0 + 150.0 + 25.0)
+        self.assertAlmostEqual(b["btc_to_match_ms"], 95.0 + 0.4 + 10.0 + 150.0 + 25.0)
+        self.assertIsNone(N.budget({"coinbase": {"error": "x"}}))
+
+    def test_the_report_renders_every_section_and_errors(self):
+        import bench_network as N
+        st = {"n": 3, "avg": 1.0, "p50": 1.0, "p95": 2.0, "p99": 2.0, "max": 3.0}
+        res = {"host": "vps", "when": "now", "clob_handshake": {"error": "gaierror"}, "clob_warm": {"warm_rtt_ms": st},
+               "coinbase_clock": {"offset_ms": 1.5, "offset_uncertainty_ms": 40.0, "rtt_ms": st},
+               "coinbase": {"seconds": 60, "tickers": 120, "per_s": 2.0, "heartbeats": 60, "gaps_over_2s": 3,
+                            "match_to_receipt_ms": st, "jitter_above_min_ms": st, "gap_ms": st, "connect_ms": 50.0},
+               "binance": {"error": "blocked"},
+               "race": {"seconds": 120, "k_bp": 0.5, "window_ms": 250.0, "ticks": {"coinbase": 200, "binance": 900},
+                        "episodes": {"coinbase": 4, "binance": 6}, "matched": 3, "coinbase_first": 2, "binance_first": 1,
+                        "tie": 0, "only_coinbase": 1, "only_binance": 3, "coinbase_lead_ms": st, "binance_lead_ms": st}}
+        res["budget"] = N.budget(res)
+        text = N.table(res)
+        for part in ("clock offset to Coinbase +1.5ms", "Coinbase match -> receipt", "3 gaps over 2s",
+                     "Coinbase first 2, Binance first 1", "binance: blocked", "latency budget", "from our signal"):
+            self.assertIn(part, text)
+
+
 # =========================================================================== the A/B replay
 class ReplayTests(unittest.TestCase):
     def recording(self, rows) -> str:
