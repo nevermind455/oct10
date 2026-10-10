@@ -19,7 +19,8 @@ import websockets
 import sniper_mode as S
 
 KRK = {"SNIPER_PRIMARY_FEED": "kraken", "SNIPER_LATENCY_MS": "200"}       # a fixed latency: no order signing
-BTC = {"SNIPER_LATENCY_MS": "200"}
+BTC = {"SNIPER_LATENCY_MS": "200", "SNIPER_PRIMARY_FEED": "binance"}
+DEFAULT = {"SNIPER_LATENCY_MS": "200"}                                     # no feed named: the code default
 # Kraken's own acknowledgement, as the live server sent it (2026-10-06)
 ACK = {"method": "subscribe", "req_id": 1, "success": True, "time_in": "2026-10-06T16:25:53.837172Z",
        "time_out": "2026-10-06T16:25:53.837216Z",
@@ -48,7 +49,7 @@ def make(extra_env=None, base=KRK, **sniper_kw):
         sn = S.Sniper(None, None, settings=S.Settings(), **sniper_kw)
     fired = []
 
-    def fire(side, r_bp, t_ms, t_pc=None, feed="binance"):
+    def fire(side, r_bp, t_ms, t_pc=None, feed=None):
         fired.append((side, round(r_bp, 2), feed))
         sn.busy = False
         return object()                      # not None: an order was started, so the cooldown starts
@@ -514,7 +515,15 @@ class KrakenSocketTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SettingsTests(unittest.TestCase):
-    def test_binance_is_the_default_and_its_start_line_is_unchanged(self):
+    def test_coinbase_is_the_default_and_its_start_line_names_it(self):
+        # 2026-10-10: the frozen spec's trigger feed is Coinbase (the operator's change)
+        with env(**DEFAULT):
+            st = S.Settings()
+        self.assertEqual(st.primary_feed, "coinbase")
+        self.assertTrue(st.lines()[0].startswith(
+            "SNIPER paper-only [triggered by Coinbase BTC-USD ticker]: spot mid >= 0.5bp within 250ms"), st.lines()[0])
+
+    def test_the_binance_start_line_is_unchanged(self):
         with env(**BTC):
             st = S.Settings()
         self.assertEqual(st.primary_feed, "binance")
@@ -529,13 +538,15 @@ class SettingsTests(unittest.TestCase):
             "SNIPER paper-only [triggered by Kraken BTC/USD ticker (bbo), not Binance]: spot mid >= 0.5bp"),
             st.lines()[0])
 
-    def test_only_binance_or_kraken(self):
-        for bad in ("coinbase", "binance_tr", "krakenx"):
-            with self.subTest(bad), env(**BTC, SNIPER_PRIMARY_FEED=bad), \
+    def test_only_coinbase_binance_or_kraken(self):
+        for bad in ("bitstamp", "binance_tr", "krakenx", "coinbase-pro"):
+            with self.subTest(bad), env(**{**BTC, "SNIPER_PRIMARY_FEED": bad}), \
                     self.assertRaisesRegex(ValueError, "SNIPER_PRIMARY_FEED"):
                 S.Settings()
-        with env(**BTC, SNIPER_PRIMARY_FEED=" Kraken "):
+        with env(**{**BTC, "SNIPER_PRIMARY_FEED": " Kraken "}):
             self.assertEqual(S.Settings().primary_feed, "kraken")
+        with env(**{**BTC, "SNIPER_PRIMARY_FEED": "COINBASE"}):
+            self.assertEqual(S.Settings().primary_feed, "coinbase")
 
     def test_kraken_is_paper_only_in_the_sniper_itself(self):
         with env(**KRK):
@@ -559,8 +570,9 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual((k["ticks"], k["malformed"]), (1, 0))
         sn_b, _ = make(base=BTC)
         self.assertNotIn("kraken", sn_b.summary())
+        self.assertNotIn("kraken", make(base=DEFAULT)[0].summary())
 
-    def test_binance_ticks_still_fire_with_unsuffixed_counters_by_default(self):
+    def test_binance_ticks_still_fire_with_unsuffixed_counters_when_binance_is_the_trigger(self):
         sn, fired = make(base=BTC)
         sn.on_tick(json.dumps({"u": 1, "s": "BTCUSDT", "b": "100000.0", "B": "1", "a": "100000.2", "A": "1"}))
         sn.trigger.q[0] = (sn.trigger.q[0][0] - 300.0, sn.trigger.q[0][1])          # 300ms ago
@@ -585,7 +597,7 @@ class RunGateTests(unittest.TestCase):
 
     def test_kraken_live_with_the_explicit_switch_is_refused_by_the_frozen_spec(self):
         # The opt-in still clears the Kraken check; the frozen spec (exec_latency.FROZEN_SPEC)
-        # then refuses LIVE on any trigger feed but Binance.
+        # then refuses LIVE on any trigger feed but its own (Coinbase since 2026-10-10).
         with env(SNIPER_PRIMARY_FEED="kraken", SNIPER_KRAKEN_LIVE="1", SNIPER_ONLY="1", SNIPER_LIVE_CANARY="1",
                  SNIPER_K_BP="0.5", SNIPER_SLIP="0.05"), \
                 self.assertRaisesRegex(RuntimeError, "(?s)frozen spec.*trigger feed: resolved kraken"):

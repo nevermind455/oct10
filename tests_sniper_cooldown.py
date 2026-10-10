@@ -4,8 +4,8 @@
     python tests_sniper_cooldown.py
 
 Drives the real Sniper._signal gate on a controlled monotonic clock, with
-the order path replaced by a recorder (and, in the last test, the real
-Binance tick handler). No network.
+the order path replaced by a recorder (and, in the last tests, the real
+Coinbase and Binance tick handlers). No network.
 """
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ def make(env=None, submit_ms=0.0, sent=True):
     clock = Clock()
     orders = []
 
-    def fire(side, r_bp, t_ms, t_pc=None, feed="binance"):
+    def fire(side, r_bp, t_ms, t_pc=None, feed=None):
         clock.ms += submit_ms
         orders.append((side, round(clock.ms - 10_000.0, 1)))
         sn.busy = False                   # the order resolved: only the cooldown gates the next one
@@ -53,10 +53,11 @@ def make(env=None, submit_ms=0.0, sent=True):
     return sn, clock, orders
 
 
-def signal(sn, clock, move, at_ms, feed="binance"):
-    """One signal `at_ms` after the start of the test clock."""
+def signal(sn, clock, move, at_ms, feed=None):
+    """One signal `at_ms` after the start of the test clock, from `feed`
+    (None: the trigger feed, SNIPER_PRIMARY_FEED)."""
     clock.ms = 10_000.0 + at_ms
-    sn._signal(feed, move, 60_000.0, clock.ms, 0)
+    sn._signal(feed or sn.s.primary_feed, move, 60_000.0, clock.ms, 0)
 
 
 class CooldownTests(unittest.TestCase):
@@ -110,7 +111,8 @@ class CooldownTests(unittest.TestCase):
         self.assertEqual(orders, [("UP", 0.0), ("DOWN", 10.0), ("UP", 1000.0)])
 
     def test_a_second_feed_on_the_same_move_is_still_one_order(self):
-        sn, clock, orders = make({"SNIPER_EXTRA_FEEDS": "coinbase"})
+        # Binance as the trigger, Coinbase as the second one (the primary is never its own second trigger)
+        sn, clock, orders = make({"SNIPER_PRIMARY_FEED": "binance", "SNIPER_EXTRA_FEEDS": "coinbase"})
         with patch.object(S.time, "monotonic", clock):
             signal(sn, clock, UP_MOVE, 0, feed="coinbase")
             signal(sn, clock, UP_MOVE, 5, feed="binance")
@@ -140,7 +142,7 @@ class CooldownTests(unittest.TestCase):
         self.assertEqual(sn.last_fire_by_side, {"UP": -1e18, "DOWN": -1e18})
 
     def test_real_binance_ticks_fire_up_then_down_inside_300ms(self):
-        sn, clock, orders = make({"SNIPER_K_BP": "0.5", "SNIPER_BINANCE_FRESHNESS": "0"})
+        sn, clock, orders = make({"SNIPER_K_BP": "0.5", "SNIPER_BINANCE_FRESHNESS": "0", "SNIPER_PRIMARY_FEED": "binance"})
         with patch.object(S.time, "monotonic", clock):
             # the rule compares with the price at least 250ms old: +0.67bp at 260ms
             # (UP), then -0.67bp at 300ms against that same 0ms price (DOWN, 40ms later)
@@ -148,6 +150,18 @@ class CooldownTests(unittest.TestCase):
                 clock.ms = 10_000.0 + at
                 sn.on_tick(json.dumps({"b": f"{mid - 0.01:.2f}", "a": f"{mid + 0.01:.2f}"}))
         self.assertEqual([side for side, _ in orders], ["UP", "DOWN"])
+
+    def test_real_coinbase_tickers_fire_up_then_down_inside_300ms(self):
+        """The same moves as Coinbase BTC-USD tickers - the trigger by default."""
+        sn, clock, orders = make({"SNIPER_K_BP": "0.5"})
+        self.assertEqual(sn.s.primary_feed, "coinbase")
+        with patch.object(S.time, "monotonic", clock):
+            for seq, (at, mid) in enumerate(((0, 60_000.0), (260, 60_004.0), (300, 59_996.0)), 1):
+                clock.ms = 10_000.0 + at
+                sn.on_coinbase(json.dumps({"type": "ticker", "sequence": seq, "product_id": "BTC-USD",
+                                           "best_bid": f"{mid - 0.01:.2f}", "best_ask": f"{mid + 0.01:.2f}"}))
+        self.assertEqual([side for side, _ in orders], ["UP", "DOWN"])
+        self.assertEqual((sn.n["signals"], sn.n["coinbase ticks"]), (2, 3))     # unsuffixed: it is the trigger
 
 
 if __name__ == "__main__":

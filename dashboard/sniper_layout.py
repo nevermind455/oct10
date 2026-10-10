@@ -175,7 +175,7 @@ def _trigger_body(t: dict, w: int) -> list[Row]:
                 else "", Style("blue"))], w),
         _runs([(fit("BTC mid", 9), DIM), (" ", PAPER),
                (f"{_num(t['mid']):,.2f}" if _num(t.get("mid")) is not None else MISSING, Style("ink", bold=True)),
-               # Binance at the round's start, when this process saw it begin (approximate:
+               # the trigger feed at the round's start, when this process saw it begin (approximate:
                # the market's strike is Chainlink's price); N/A after joining mid-round
                ((f"  start ~{_num(t['btc_start']):,.0f}" if _num(t.get("btc_start")) is not None
                  else "  start N/A") if "btc_start" in t else "", FAINT)], w),

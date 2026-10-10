@@ -534,8 +534,9 @@ class DashViewTests(unittest.TestCase):
         self.assertEqual(run.DashView(rt).snapshot()["market"]["carry"]["UP"], {"carry": 4.0, "next": 14.0})
         self.assertIn("carry UP 4 DN 0", run.status_text(run.DashView(rt).snapshot()))
         line = run.status_text(snap)
-        for part in ("PAPER", "binance=", "signals=7", "orders=2", "filled=1", "skips: cooldown 5"):
-            self.assertIn(part, line)
+        for part in ("PAPER", "coinbase=", "signals=7", "orders=2", "filled=1", "skips: cooldown 5"):
+            self.assertIn(part, line)                                    # the trigger feed: Coinbase by default
+        self.assertIn("COINBASE", dict((n, s) for n, s, _ in snap["health"]))
         frame = build(snap, 120, 40, glyphs())
         self.assertEqual(len(frame), 40)
 
@@ -611,7 +612,7 @@ class SettingsErrorTests(unittest.TestCase):
         self.assertIn("SNIPER_K_BP=-1", str(caught.exception))
 
     def test_enum_settings_name_the_value(self):
-        for key, value in (("SNIPER_ORDER_TYPE", "GTC"), ("SNIPER_PRIMARY_FEED", "coinbase"),
+        for key, value in (("SNIPER_ORDER_TYPE", "GTC"), ("SNIPER_PRIMARY_FEED", "bitstamp"),
                            ("SNIPER_DELAY_SOURCE", "guess")):
             with env(**{**SNIPER_ENV, key: value}), self.assertRaises(ValueError) as caught:
                 sniper_mode.Settings()
@@ -631,7 +632,7 @@ class SettingsErrorTests(unittest.TestCase):
             s = sniper_mode.Settings()
         self.assertEqual((s.k_bp, s.window_ms, s.order_type, s.slip, s.cooldown_ms, s.min_left_s,
                           s.max_fills_round, s.max_side_shares, s.primary_feed),
-                         (0.5, 250.0, "FAK", 0.05, 300.0, 10.0, 20, 200.0, "binance"))      # 0.5bp, ask + 5c
+                         (0.5, 250.0, "FAK", 0.05, 300.0, 10.0, 20, 200.0, "coinbase"))     # 0.5bp, ask + 5c
         self.assertEqual(s.shares, 10.0)
 
 

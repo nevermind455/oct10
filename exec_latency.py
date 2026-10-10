@@ -39,9 +39,13 @@ import os
 # 2026-10-07 (later): ask + $0.04 -> ask + $0.05 (the operator's spec): one IOC per
 # signal up to the reference ask + 5c, partial fills kept, the unfilled rest carried
 # to the next same-side signal (cap 20). No retry, no chasing.
+# 2026-10-10: trigger feed binance -> coinbase (the operator's change): the same
+# 0.5bp / 250ms rule on Coinbase Exchange's BTC-USD ticker (best bid/ask as of
+# each match; heartbeats for liveness; its own freshness gate). Binance and
+# Kraken stay selectable in paper.
 FROZEN_SPEC = (
     # (Settings attribute, environment variable, frozen value, label, format)
-    ("primary_feed", "SNIPER_PRIMARY_FEED", "binance", "trigger feed", "{}"),
+    ("primary_feed", "SNIPER_PRIMARY_FEED", "coinbase", "trigger feed", "{}"),
     ("k_bp", "SNIPER_K_BP", 0.5, "trigger", "{:.2f} bp"),
     ("window_ms", "SNIPER_WINDOW_MS", 250.0, "window", "{:.0f} ms"),
     ("order_type", "SNIPER_ORDER_TYPE", "FAK", "execution", "{}"),

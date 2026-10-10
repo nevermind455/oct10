@@ -132,7 +132,7 @@ class PaperPerSideTests(I.PaperIOCBase):
             t0 = time.monotonic()
             for side, at in steps:
                 await asyncio.sleep(max(0.0, t0 + at / 1000.0 - time.monotonic()))
-                self.sn._signal("binance", up if side == "UP" else down, 60_000.0, time.monotonic() * 1000.0, 0)
+                self.sn._signal(self.sn.s.primary_feed, up if side == "UP" else down, 60_000.0, time.monotonic() * 1000.0, 0)
             for _ in range(300):
                 if not self.sn.busy:
                     break

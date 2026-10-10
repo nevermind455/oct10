@@ -114,7 +114,7 @@ class CooldownBoundary(unittest.TestCase):
 
 # =========================================================================== config fail-fast
 class FrozenSpec(unittest.TestCase):
-    FROZEN = {"SNIPER_ONLY": "1", "SNIPER_LIVE_CANARY": "1", "SNIPER_PRIMARY_FEED": "binance", "SNIPER_K_BP": "0.5",
+    FROZEN = {"SNIPER_ONLY": "1", "SNIPER_LIVE_CANARY": "1", "SNIPER_PRIMARY_FEED": "coinbase", "SNIPER_K_BP": "0.5",
               "SNIPER_WINDOW_MS": "250", "SNIPER_ORDER_TYPE": "FAK", "SNIPER_SLIP": "0.05",
               "SNIPER_COOLDOWN_MS": "300", "SNIPER_SHARES": "10", "SNIPER_MAX_TARGET_SHARES": "20",
               "SNIPER_CANARY_MAX_SHARES": "25"}
@@ -127,6 +127,15 @@ class FrozenSpec(unittest.TestCase):
 
     def test_the_frozen_spec_starts_live(self):
         self.assertTrue(self.gate())
+        self.assertTrue(self.gate(SNIPER_PRIMARY_FEED=None))           # the code default IS the spec's feed
+
+    def test_the_trigger_feed_is_coinbase_and_another_refuses_live(self):
+        self.assertEqual(dict((a, v) for a, _n, v, _l, _f in X.FROZEN_SPEC)["primary_feed"], "coinbase")
+        for feed in ("binance", "kraken"):
+            with self.subTest(feed), self.assertRaises(RuntimeError) as ctx:
+                self.gate(SNIPER_PRIMARY_FEED=feed, SNIPER_KRAKEN_LIVE="1")
+            self.assertIn("trigger feed", str(ctx.exception))
+            self.assertIn("SNIPER_PRIMARY_FEED", str(ctx.exception))
 
     def test_an_old_env_value_refuses_live_and_names_it(self):
         for var, value, word in (("SNIPER_K_BP", "1.0", "trigger"), ("SNIPER_SLIP", "0.04", "slip"),
@@ -194,6 +203,7 @@ class LiveFast(unittest.TestCase):
             settings = S.Settings()
         self.sn = S.Sniper(self.hub, self.ex.shim, journal_path=self.journal, settings=settings, trade_rows=[],
                            own_rounds=True, live=self.ex)
+        self.assertEqual(self.sn.s.primary_feed, B.SPEC_FEED)
         self.sn.fresh.enabled = False
         self.n_order = 0
 
@@ -217,8 +227,12 @@ class LiveFast(unittest.TestCase):
         return oid, tid
 
     def raw(self, side: str, bp: float = 1.2) -> str:
+        """The trigger feed's own message (the frozen spec's feed: a Coinbase ticker)."""
         mid = move_mid(60_000.0, bp if side == "UP" else -bp)
-        return json.dumps({"b": f"{mid - 0.005:.3f}", "a": f"{mid + 0.005:.3f}"})
+        return B.tick_raw(self.sn.s.primary_feed, mid)
+
+    def tick(self, raw: str):
+        return B.feed_tick(self.sn, raw)
 
     def arm(self, clear_cooldown=True):
         if clear_cooldown:
@@ -245,11 +259,11 @@ class LiveFast(unittest.TestCase):
             try:
                 self.script("no_match")
                 self.arm()
-                self.sn.on_tick(self.raw("UP"))
+                self.tick(self.raw("UP"))
                 await self.settle("UP")
                 oid, tid = self.script("matched")
                 self.arm()
-                self.sn.on_tick(self.raw("DOWN"))
+                self.tick(self.raw("DOWN"))
                 await self.settle("DOWN")
                 self.store.record_trade(tid, order_id=oid, asset_id=T.DN, market=T.COND, side="BUY", price=0.45,
                                         size=5.0, status="MATCHED")
@@ -301,7 +315,7 @@ class LiveFast(unittest.TestCase):
                 self.ex.sender.http.post_now = spy_post
                 with patch.object(builtins, "open", spy_open), \
                         patch("dashboard.sniper_layout.build", spy_build), patch("dashboard.build", spy_build):
-                    self.sn.on_tick(self.raw("UP"))                    # trigger -> decide -> sign -> write: synchronous
+                    self.tick(self.raw("UP"))                    # trigger -> decide -> sign -> write: synchronous
                 self.assertIn(("post", None), events)
                 before = events[:events.index(("post", None))]
                 self.assertEqual(before, [], before)
@@ -320,8 +334,8 @@ class LiveFast(unittest.TestCase):
                 self.script("no_match")
                 self.arm()
                 raw = self.raw("UP")
-                self.sn.on_tick(raw)
-                self.sn.on_tick(raw)                                   # the same message delivered twice
+                self.tick(raw)
+                self.tick(raw)                                   # the same message delivered twice
                 trig = S.Trigger(1.0, 250)                             # and a second feed seeing the same move
                 trig.update(time.monotonic() * 1000.0 - 300.0, 60_000.0)
                 self.sn._signal("coinbase", trig, move_mid(60_000.0, 1.2), time.monotonic() * 1000.0,
@@ -341,12 +355,12 @@ class LiveFast(unittest.TestCase):
             try:
                 up_oid, up_tid = self.script("matched", delay_s=0.4)        # UP's ACK is slow
                 self.arm()
-                self.sn.on_tick(self.raw("UP"))
+                self.tick(self.raw("UP"))
                 await asyncio.sleep(0.15)
                 self.assertIsNotNone(self.sn.inflight["UP"])                # UP still waiting
                 dn_oid, dn_tid = self.script("matched")
                 self.arm(clear_cooldown=False)
-                self.sn.on_tick(self.raw("DOWN"))                            # DOWN: its own cooldown is clear
+                self.tick(self.raw("DOWN"))                            # DOWN: its own cooldown is clear
                 await self.settle("DOWN")
                 await self.settle("UP", timeout=3.0)
                 sides = [json.loads(json.dumps(o))["order"]["tokenId"] for o in self.posted()]
@@ -374,14 +388,14 @@ class LiveFast(unittest.TestCase):
             try:
                 self.script("no_match", delay_s=0.25)
                 self.arm()
-                self.sn.on_tick(self.raw("UP"))
+                self.tick(self.raw("UP"))
                 await asyncio.sleep(0.05)
                 self.script("no_match")
                 self.arm()
-                self.sn.on_tick(self.raw("UP"))                              # same side, in flight: no order
+                self.tick(self.raw("UP"))                              # same side, in flight: no order
                 self.assertEqual(self.sn.n["skip: previous order in flight"], 1)
                 self.arm(clear_cooldown=False)
-                self.sn.on_tick(self.raw("DOWN"))                            # other side: sent
+                self.tick(self.raw("DOWN"))                            # other side: sent
                 await self.settle("DOWN")
                 await self.settle("UP", timeout=3.0)
                 self.assertEqual(len(self.posted()), 2)
@@ -398,7 +412,7 @@ class LiveFast(unittest.TestCase):
             try:
                 self.script(body={"success": False, "errorMsg": "order rejected: market is closed"}, status=400)
                 self.arm()
-                self.sn.on_tick(self.raw("UP"))
+                self.tick(self.raw("UP"))
                 await self.settle("UP")
                 await asyncio.sleep(0.05)
                 r = self.rows("refused")[-1]
@@ -417,14 +431,14 @@ class LiveFast(unittest.TestCase):
             try:
                 self.script("no_match")
                 self.arm()
-                self.sn.on_tick(self.raw("UP"))
+                self.tick(self.raw("UP"))
                 await self.settle("UP")
                 now_ms = int(time.time() * 1000)
                 self.book.apply_snapshot(T.UP, [(0.57, 500)], [(0.58, 500), (0.59, 500)], ts_ms=now_ms,
                                          require_exchange_ts=False)
                 self.script("no_match")
                 self.arm()
-                self.sn.on_tick(self.raw("UP"))
+                self.tick(self.raw("UP"))
                 await self.settle("UP")
                 caps = [r["cap"] for r in self.rows("refused")]
                 self.assertEqual(caps, [0.60, 0.63])                         # ask + 0.05 at each decision
@@ -446,7 +460,7 @@ class LiveFast(unittest.TestCase):
             try:
                 def attempt():
                     self.arm()
-                    self.sn.on_tick(self.raw("UP"))
+                    self.tick(self.raw("UP"))
                 self.book.connected = False                                   # socket down
                 attempt()
                 self.assertEqual(self.sn.n["skip: book not live"], 1)
@@ -593,11 +607,12 @@ class ReplayBroker:
         return True
 
 
-async def replay(mod, steps, env) -> list:
-    """Feed one module's Sniper the same ticks and books; return its decisions."""
+async def replay(mod, steps, env, feed: str = "binance") -> list:
+    """Feed one module's Sniper the same ticks and books; return its decisions.
+    feed: whose wire message carries each mid (the old module knows Binance only)."""
     from feeds.book import BookState
     fake = FakeTime()
-    with patch.dict(os.environ, env):
+    with patch.dict(os.environ, dict(env, SNIPER_PRIMARY_FEED=feed)):
         settings = mod.Settings()
     book = BookState(history_s=30)
     book.connected = True
@@ -621,7 +636,10 @@ async def replay(mod, steps, env) -> list:
             book.apply_snapshot(T.DN, [(round(ask_dn - 0.01, 2), 500)], [(ask_dn, 40), (round(ask_dn + 0.01, 2), 500)],
                                 ts_ms=int(fake.wall * 1000), require_exchange_ts=False)
             with patch("feeds.book.time", fake):
-                sn.on_tick(json.dumps({"b": f"{mid - 0.005:.3f}", "a": f"{mid + 0.005:.3f}"}))
+                if feed == "coinbase":
+                    sn.on_coinbase(B.tick_raw("coinbase", mid, stamp=False))
+                else:
+                    sn.on_tick(json.dumps({"b": f"{mid - 0.005:.3f}", "a": f"{mid + 0.005:.3f}"}))
                 for _ in range(400):                                         # this order resolves before the next tick
                     if all(v is None for v in sn.inflight.values()):
                         break
@@ -665,6 +683,23 @@ class StrategyEquivalence(unittest.TestCase):
             env = dict(SPEC_ENV, SNIPER_SHADOW_MS="", **mode_env)
             a = asyncio.run(replay(old, steps, env))
             b = asyncio.run(replay(S, steps, env))
+            self.assertGreater(sum(1 for r in a if r["result"] in ("filled", "refused")), 20, "too few orders replayed")
+            self.assertEqual(len(a), len(b))
+            for i, (x, y) in enumerate(zip(a, b)):
+                self.assertEqual(x, y, f"decision {i} differs ({mode_env})")
+
+    def test_the_coinbase_trigger_decides_as_the_old_binance_one_on_the_same_mids(self):
+        """2026-10-10: the trigger feed changed, the rule did not. The same mids
+        as Coinbase tickers (new) and as Binance book tickers (the old layer):
+        every decision identical."""
+        old = load_old_sniper_mode()
+        if old is None:
+            self.skipTest(f"git history with {OLD_COMMIT} is not available")
+        steps = replay_steps(11, 1500)
+        for mode_env in ({"SNIPER_LATENCY_MS": "5"}, {"SNIPER_LATENCY_MS": ""}):
+            env = dict(SPEC_ENV, SNIPER_SHADOW_MS="", **mode_env)
+            a = asyncio.run(replay(old, steps, env, feed="binance"))
+            b = asyncio.run(replay(S, steps, env, feed="coinbase"))
             self.assertGreater(sum(1 for r in a if r["result"] in ("filled", "refused")), 20, "too few orders replayed")
             self.assertEqual(len(a), len(b))
             for i, (x, y) in enumerate(zip(a, b)):

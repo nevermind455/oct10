@@ -320,7 +320,8 @@ class Trigger(unittest.TestCase):
     def test_sniper_sides_and_the_frozen_feed(self):
         with env(SPEC):
             s = S.Settings()
-        self.assertEqual((s.primary_feed, s.k_bp, s.window_ms), ("binance", 0.5, 250.0))
+        # 2026-10-10: the trigger feed is Coinbase's BTC-USD ticker (the operator's change)
+        self.assertEqual((s.primary_feed, s.k_bp, s.window_ms), ("coinbase", 0.5, 250.0))
 
 
 # =========================================================================== BOOK
@@ -593,9 +594,9 @@ class CooldownAndConcurrency(unittest.TestCase):
             self.sn = S.Sniper(types.SimpleNamespace(), types.SimpleNamespace(), settings=S.Settings())
         self.sent = []
         self.now = [1_000_000.0]                                            # monotonic ms
-        self.sn.fresh.why_not = lambda t: None
+        self.sn.fresh.why_not = self.sn.cb_fresh.why_not = lambda t: None
 
-        def fire(side, r, t, t_pc=None, feed="binance"):
+        def fire(side, r, t, t_pc=None, feed=None):
             self.sent.append((side, t))
             if not self.hold:
                 self.sn._release(side)                                       # answered at once
@@ -607,7 +608,7 @@ class CooldownAndConcurrency(unittest.TestCase):
 
     def signal(self, side, at_ms):
         with patch.object(S.time, "monotonic", lambda: at_ms / 1000.0):
-            self.sn._signal("binance", self.trig[1 if side == "UP" else -1], 60_000.0, at_ms, 0)
+            self.sn._signal(self.sn.s.primary_feed, self.trig[1 if side == "UP" else -1], 60_000.0, at_ms, 0)
 
     def test_300ms_per_side_boundary(self):
         self.signal("UP", 0.0)

@@ -7,11 +7,13 @@
 What runs (all in this process, on one event loop, as in the bot):
 
   1. market data   N Polymarket book messages through PolyMarketFeed._handle
-                   (the socket's own parser and BookState), and N Binance
-                   bookTicker messages through Sniper.on_tick (parse + the
-                   250ms / 0.5bp rule) that do not trigger.
+                   (the socket's own parser and BookState), and N messages
+                   of the trigger feed (the frozen spec's: Coinbase BTC-USD
+                   tickers through Sniper.on_coinbase; also Binance bookTicker
+                   through Sniper.on_tick) that do not trigger: parse + the
+                   250ms / 0.5bp rule.
   2. live orders   M triggers through the LIVE path end to end:
-                   Binance message -> Sniper.on_tick -> Trigger -> per-side
+                   trigger-feed message -> its handler -> Trigger -> per-side
                    gates -> book -> IOC sizing -> LiveExecution.prepare ->
                    LeanSender (FastOrderBuilder: real EIP-712 signing with a
                    throwaway key made in memory, real POST body + L2 HMAC
@@ -36,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import itertools
 import json
 import os
 import pathlib
@@ -49,17 +52,43 @@ ROOT = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 import testing_env  # noqa: E402,F401 - never reads the bot's .env; the benchmark has no secrets
+import exec_latency as X  # noqa: E402
 import sniper_live as L  # noqa: E402
 import sniper_mode as S  # noqa: E402
 import tests_sniper_live as T  # noqa: E402  (FakeH2Clob, live_book, rules_fetch, paper_rules, UP/DN/COND)
 
+SPEC_FEED = str(dict((a, v) for a, _n, v, _l, _f in X.FROZEN_SPEC)["primary_feed"])
 BENCH_ENV = {"SNIPER_ONLY": "1", "SNIPER_K_BP": "0.5", "SNIPER_WINDOW_MS": "250", "SNIPER_ORDER_TYPE": "FAK",
              "SNIPER_SLIP": "0.05", "SNIPER_SHARES": "10", "SNIPER_MAX_TARGET_SHARES": "20",
              "SNIPER_COOLDOWN_MS": "300", "SNIPER_SHADOW_MS": "", "SNIPER_STALL_MS": "0",
+             "SNIPER_PRIMARY_FEED": SPEC_FEED, "SNIPER_EXTRA_FEEDS": "",
              # the per-round caps would stop a 1000-order run after 20 fills; they are
              # risk limits, not latency - lifted for the benchmark only
              "SNIPER_MAX_FILLS_ROUND": "1000000", "SNIPER_MAX_SIDE_SHARES": "100000000"}
 NO_MATCH = {"success": False, "errorMsg": "no orders found to match with FAK order"}
+_SEQ = itertools.count(1)
+
+
+def tick_raw(feed: str, mid: float, *, stamp: bool = True) -> str:
+    """One BTC best bid/ask (mid -/+ 0.005) as the trigger feed's own wire
+    message. Coinbase: a full ticker - every field the venue sends, a rising
+    sequence and (stamp) the match time - so parsing costs what it costs live."""
+    bid, ask = f"{mid - 0.005:.3f}", f"{mid + 0.005:.3f}"
+    if feed != "coinbase":
+        return json.dumps({"b": bid, "a": ask})
+    import datetime as _dt
+    msg = {"type": "ticker", "sequence": next(_SEQ), "product_id": S.COINBASE_PRODUCT, "price": ask,
+           "open_24h": "60125.01", "volume_24h": "6112.31524733", "low_24h": "59511.2", "high_24h": "60850",
+           "volume_30d": "275519.46224301", "best_bid": bid, "best_bid_size": "0.08217445", "best_ask": ask,
+           "best_ask_size": "0.31221000", "side": "buy", "trade_id": 812345678, "last_size": "0.00012"}
+    if stamp:
+        msg["time"] = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return json.dumps(msg)
+
+
+def feed_tick(sn, raw: str):
+    """Hand one trigger-feed message to the handler its socket would call."""
+    return (sn.on_coinbase if sn.s.primary_feed == "coinbase" else sn.on_tick)(raw)
 
 
 def stats(xs) -> dict | None:
@@ -109,20 +138,27 @@ def bench_market_data(n: int) -> dict:
 
 
 def bench_ticks(n: int) -> dict:
-    with _env(BENCH_ENV):
-        settings = S.Settings()
-    hub = types.SimpleNamespace(up_token=None, down_token=None, condition_id=None, window_end=None, book=None)
-    sn = S.Sniper(hub, types.SimpleNamespace(), settings=settings, trade_rows=None)
-    sn.fresh.enabled = False
-    per = []
-    mid = 60_000.0
-    for i in range(n):
-        mid += 0.01 if i % 2 else -0.01                       # tiny moves: the rule runs, never fires
-        raw = json.dumps({"b": f"{mid - 0.005:.3f}", "a": f"{mid + 0.005:.3f}"})
-        t = time.perf_counter_ns()
-        sn.on_tick(raw)
-        per.append((time.perf_counter_ns() - t) / 1000.0)
-    return {"tick_no_trigger_us": stats(per), "signals": sn.n["signals"]}
+    """The trigger feed's handler on n messages that do not trigger - the
+    frozen spec's feed, and Binance's for comparison."""
+    out = {"feed": SPEC_FEED}
+    for feed in dict.fromkeys((SPEC_FEED, "binance")):
+        with _env(dict(BENCH_ENV, SNIPER_PRIMARY_FEED=feed)):
+            settings = S.Settings()
+        hub = types.SimpleNamespace(up_token=None, down_token=None, condition_id=None, window_end=None, book=None)
+        sn = S.Sniper(hub, types.SimpleNamespace(), settings=settings, trade_rows=None)
+        sn.fresh.enabled = False
+        per = []
+        mid = 60_000.0
+        for i in range(n):
+            mid += 0.01 if i % 2 else -0.01                   # tiny moves: the rule runs, never fires
+            raw = tick_raw(feed, mid)
+            t = time.perf_counter_ns()
+            feed_tick(sn, raw)
+            per.append((time.perf_counter_ns() - t) / 1000.0)
+        key = "tick_no_trigger_us" if feed == SPEC_FEED else f"{feed}_tick_no_trigger_us"
+        out[key] = stats(per)
+        out["signals" if feed == SPEC_FEED else f"{feed}_signals"] = sn.n["signals"]
+    return out
 
 
 # --------------------------------------------------------------------------- 2. the live path
@@ -230,7 +266,7 @@ async def bench_live(m: int, matched_every: int = 5, with_pm: bool = False, pm_s
         ref = 60_000.0
         sn.trigger.q.append((now - 300.0, ref))
         mid = ref * (1 + (0.6 if side == "UP" else -0.6) / 1e4)        # past the 0.5bp trigger
-        sn.on_tick(json.dumps({"b": f"{mid - 0.005:.3f}", "a": f"{mid + 0.005:.3f}"}))
+        feed_tick(sn, tick_raw(sn.s.primary_feed, mid))
         return oid, tid, n_order % matched_every == 0
 
     async def settle_side(side, oid, tid, matched):
@@ -432,7 +468,8 @@ def table(res: dict) -> str:
                          f"p99 {f(s['p99'])}  max {f(s['max'])} {unit}")
     lines.append("market data")
     add("book update (PolyMarketFeed._handle)", res["market"]["book_update_us"], "us")
-    add("binance tick, no trigger (on_tick)", res["ticks"]["tick_no_trigger_us"], "us")
+    add(f"{res['ticks'].get('feed', 'binance')} tick, no trigger", res["ticks"]["tick_no_trigger_us"], "us")
+    add("binance tick, no trigger (on_tick)", res["ticks"].get("binance_tick_no_trigger_us"), "us")
     lines.append(f"live path ({res['live']['orders_sent']} orders, {res['live']['pairs']} UP+DOWN pairs, "
                  f"{res['live']['connections']} connection(s), new conns on hot path: "
                  f"{res['live']['new_connection_on_hot_path']})")

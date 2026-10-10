@@ -1481,7 +1481,12 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved (F1, decisions unchanged): a fill above its share target is journalled
     # (over_target) and counted; the in-flight record carries the stake (reserved cash);
     # round_signals counts each round's signals and gate skips (a round_summary journal row).
-    "sniper_mode.py": "d64df8c7d55f5dd72c6a0d4bf3b9e3500158beb536afc413de8d965deb4568b1",
+    # Re-approved 2026-10-10 (the operator's change: Coinbase is the primary trigger): the
+    # default SNIPER_PRIMARY_FEED is coinbase - _coinbase_loop (ticker + heartbeat, BTC-USD;
+    # ack checked, out-of-order tickers dropped, starvation/silence reconnect) and a
+    # freshness gate on each ticker's match time (cb_fresh). Same rule, gates and sizing;
+    # Binance/Kraken still selectable. A Binance tick moves no rule unless Binance is the trigger.
+    "sniper_mode.py": "836c763bac17a8c5cfcbb9c7bcc18f9b4013101f65c539efbc957f0ad7c6a0cb",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.

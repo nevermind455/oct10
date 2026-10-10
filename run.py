@@ -8,7 +8,8 @@
     python run.py --paper-balance 500   # starting paper cash (first launch of a paper ledger only)
 
 The sniper (sniper_mode.Sniper) is the only strategy: when the BTC mid
-(Binance BTCUSDT bookTicker, or Kraken BTC/USD) moves >= SNIPER_K_BP within
+(SNIPER_PRIMARY_FEED: Coinbase BTC-USD ticker by default, or Binance BTCUSDT
+bookTicker, or Kraken BTC/USD) moves >= SNIPER_K_BP within
 SNIPER_WINDOW_MS it buys the side BTC moved toward in the current 5-minute
 btc-updown market, and holds to settlement. Paper fills against Polymarket's
 book; live sends real orders under the canary's hard limits (sniper_live).
@@ -1699,6 +1700,8 @@ class DashView:
             if s.primary_feed == "kraken":
                 quiet = (now_mono * 1000.0 - q[-1][0]) / 1000.0 if q else None
                 status = "LIVE" if quiet is not None and quiet < 10 else "STALE"
+            elif s.primary_feed == "coinbase" and getattr(sn, "cb_fresh", None) is not None:
+                status = sn.cb_fresh.status(now_mono)
             else:
                 status = sn.fresh.status(now_mono)
             last = self.tail.last_signal
@@ -1723,7 +1726,7 @@ class DashView:
                         "paper": rt.paper}
         start = getattr(hub, "window_start", None)
         if start and trig.get("mid") and start != getattr(self, "_btc_start_round", None):
-            # Binance mid when this process first saw the round, if that was at its
+            # the trigger feed's mid when this process first saw the round, if that was at its
             # start: an approximation (the market's strike is Chainlink's price)
             self._btc_start_round = start
             self._btc_start = trig["mid"] if now_wall - float(start) <= 5.0 else None
@@ -1792,7 +1795,15 @@ class DashView:
         rt = self.rt
         rows = []
         b = summary.get("binance") or {}
-        if (rt.sniper is not None and rt.sniper.s.primary_feed == "kraken"):
+        primary = rt.sniper.s.primary_feed if rt.sniper is not None else None
+        if primary == "coinbase":
+            c = summary.get("coinbase") or {}
+            ex = c.get("excess_ms") or {}
+            behind = "--" if ex.get("p50") is None else f"{ex['p50']}ms"
+            rows.append(("COINBASE", str(c.get("status") or "--"),
+                         f"behind p50 {behind} gap max {c.get('gap_ms_max')}ms backlog max {c.get('backlog_max')} "
+                         f"rc {c.get('reconnects')}"))
+        elif primary == "kraken":
             k = summary.get("kraken") or {}
             lag = k.get("lag_ms") or {}
             p50 = "--" if lag.get("p50") is None else f"{lag['p50']}ms"

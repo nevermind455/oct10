@@ -1817,7 +1817,11 @@ def t_sniper_coinbase_second_trigger_shares_one_cooldown():
     import sniper_mode
     # a deployment's .env may set SNIPER_EXTRA_FEEDS (config loads it into the environment): clear it here
     check("no second trigger unless asked", _fixed_sniper_settings(SNIPER_EXTRA_FEEDS="").extra_feeds == ())
-    st = _fixed_sniper_settings(SNIPER_EXTRA_FEEDS="coinbase")
+    # Coinbase is the trigger by default (2026-10-10): never its own second trigger
+    check("the primary is dropped from the second triggers",
+          _fixed_sniper_settings(SNIPER_EXTRA_FEEDS="coinbase", SNIPER_PRIMARY_FEED="").extra_feeds == ())
+    # Binance as the trigger, Coinbase as the second one
+    st = _fixed_sniper_settings(SNIPER_EXTRA_FEEDS="coinbase", SNIPER_PRIMARY_FEED="binance")
     check("SNIPER_EXTRA_FEEDS=coinbase parsed; the settings line says so",
           st.extra_feeds == ("coinbase",) and "second trigger: coinbase" in st.lines()[0], st.lines()[0])
     try:
@@ -1828,17 +1832,19 @@ def t_sniper_coinbase_second_trigger_shares_one_cooldown():
     sn = sniper_mode.Sniper(None, None, settings=st)
     fired = []
 
-    def fake_fire(side, r, t, t_pc=None, feed="binance"):
+    def fake_fire(side, r, t, t_pc=None, feed=None):
         fired.append((side, feed))
         sn.busy = False
         return True  # emulate a prepared attempt (None means a skipped signal)
     sn._fire_now = fake_fire
     now = time.monotonic() * 1000.0
-    sn.on_coinbase(_json.dumps({"type": "subscriptions", "channels": []}))
+    sn.on_coinbase(_json.dumps({"type": "subscriptions", "channels": [
+        {"name": "ticker", "product_ids": ["BTC-USD"]}, {"name": "heartbeat", "product_ids": ["BTC-USD"]}]}))
     sn.on_coinbase(_json.dumps({"type": "heartbeat", "sequence": 1}))
     check("acks and heartbeats are not prices", not sn.triggers["coinbase"].q, str(sn.triggers["coinbase"].q))
     sn.triggers["coinbase"].q.append((now - 300, 60000.0))
-    sn.on_coinbase(_json.dumps({"type": "ticker", "best_bid": "60008.5", "best_ask": "60009.5"}))
+    sn.on_coinbase(_json.dumps({"type": "ticker", "product_id": "BTC-USD", "best_bid": "60008.5",
+                                "best_ask": "60009.5"}))
     check("a 1.5bp Coinbase move fires Up, tagged coinbase", fired == [("UP", "coinbase")], str(fired))
     sn.trigger.q.append((now - 300, 60100.0))
     sn.on_tick(_json.dumps({"b": "60109", "a": "60111"}))

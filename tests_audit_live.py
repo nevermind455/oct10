@@ -6,7 +6,8 @@
 Inspects and tests only - no strategy change. The live tests run the real
 chain end to end:
 
-    Binance bookTicker message -> Sniper.on_tick -> Trigger (250ms, 0.5bp)
+    trigger-feed message (Coinbase BTC-USD ticker, the frozen spec's feed) ->
+    Sniper.on_coinbase -> Trigger (250ms, 0.5bp)
     -> side -> per-side cooldown -> Polymarket book (BookState) -> reference
     ask -> IOC sizing -> LiveExecution.prepare -> LeanSender (real signing,
     real POST body) -> a fake Polymarket CLOB that records the exact bytes ->
@@ -36,6 +37,7 @@ ROOT = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 import testing_env  # noqa: E402,F401 - first: tests never read the bot's .env
+import bench_execution as B  # noqa: E402  (tick_raw / feed_tick: the trigger feed's own message)
 import sniper_live as L  # noqa: E402
 import sniper_mode as S  # noqa: E402
 import tests_sniper_live as T  # noqa: E402  (FakeClob, make_canary, live_book, round_end)
@@ -193,13 +195,13 @@ class LivePathBase(unittest.TestCase):
         return oid, tid
 
     async def tick(self, ref, mid, side_token=None, clear_cooldown=True):
-        """A real Binance bookTicker message moving the mid from ref (300ms ago) to mid."""
+        """A real trigger-feed message (a Coinbase ticker) moving the mid from ref (300ms ago) to mid."""
         if clear_cooldown:
             self.sn.last_fire = -1e18
         now = time.monotonic() * 1000.0
         self.sn.trigger.q.clear()
         self.sn.trigger.q.append((now - 300.0, ref))
-        self.sn.on_tick(json.dumps({"b": f"{mid - 0.005:.3f}", "a": f"{mid + 0.005:.3f}"}))
+        B.feed_tick(self.sn, B.tick_raw(self.sn.s.primary_feed, mid))
         for _ in range(500):
             if not self.sn.busy:
                 break
@@ -459,7 +461,7 @@ class LivePathAudit(LivePathBase):
                 now = time.monotonic() * 1000.0
                 self.sn.trigger.q.append((now - 300.0, 60_000.0))
                 for i in range(40):                                              # 40 qualifying ticks, ~instant
-                    self.sn.on_tick(json.dumps({"b": f"{60_003.6 + i * 0.01:.2f}", "a": f"{60_003.62 + i * 0.01:.2f}"}))
+                    B.feed_tick(self.sn, B.tick_raw(self.sn.s.primary_feed, 60_003.61 + i * 0.01))
                 for _ in range(300):
                     if not self.sn.busy:
                         break

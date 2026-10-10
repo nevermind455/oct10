@@ -262,7 +262,9 @@ class SignalTests(unittest.TestCase):
 
     def test_skipped_signal_does_not_consume_cooldown_next_eligible_signal_does(self):
         from unittest.mock import patch
-        with patch.dict("os.environ", {"SNIPER_LATENCY_MS": "200", "SNIPER_COOLDOWN_MS": "1000"}):
+        # Binance the trigger, a Coinbase signal as a second feed's (suffixed counters)
+        with patch.dict("os.environ", {"SNIPER_LATENCY_MS": "200", "SNIPER_COOLDOWN_MS": "1000",
+                                       "SNIPER_PRIMARY_FEED": "binance"}):
             sn = S.Sniper(None, None, settings=S.Settings())
         called = []
         clock = {"ms": 1000.0}

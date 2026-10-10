@@ -4,13 +4,16 @@ on identical recorded markets. Paper only - no orders, no wallet.
 
     python replay_ab.py                          # every recording in LAB_DATA / --data
     python replay_ab.py --data DIR --data DIR2 --json out.json
+    python replay_ab.py --feed binance           # replay the Binance trigger instead of Coinbase
 
 What runs: the REAL sniper_mode.Sniper (its trigger, gates, sizing, carry,
 cooldown - the production settings in exec_latency.FROZEN_SPEC) and, in B,
 the REAL position_manager.PositionManager, both on a virtual clock driven by
-recorded messages (latency_lab recorder: Binance spot bookTicker, Polymarket
-books). Every round in the recordings is used - none picked or dropped - and
-settles on its authoritative venue result (accounting.resolution, cached).
+recorded messages (latency_lab recorder: the trigger feed - Coinbase BTC-USD
+ticker by default, the frozen spec's; --feed binance replays Binance spot
+bookTicker - and Polymarket books). Every round in the recordings is used -
+none picked or dropped - and settles on its authoritative venue result
+(accounting.resolution, cached).
 
 How an order fills: it reaches the venue latency_ms after the decision (the
 modelled taker hold + network) and is matched against the recorded book at
@@ -23,7 +26,10 @@ paper fill). Decisions only see the past; fills see the book at arrival.
 
 Limits of the method (stated, not hidden): the recorded book holds the top 5
 levels within 5c of the best; our orders do not move the recorded market; a
-paper fill is not a live fill.
+paper fill is not a live fill. The recorder writes a Coinbase ticker only when
+its best bid or ask changed, so a run of matches at an unchanged quote is one
+recorded tick: a quiet spell can exceed the rule's max gap in the replay where
+live heard a ticker inside it (the replay's rule restarts a little more often).
 """
 from __future__ import annotations
 
@@ -52,6 +58,7 @@ import position_manager as PMM  # noqa: E402
 import sniper_mode as S  # noqa: E402
 from accounting.ledger import Ledger  # noqa: E402
 from feeds.book import BookState  # noqa: E402
+from latency_lab import feeds as XF  # noqa: E402
 from latency_lab.load import Book, _lines  # noqa: E402
 from paper_trade import MarketRules  # noqa: E402
 
@@ -67,10 +74,19 @@ def recording_files(dirs) -> list[str]:
     return sorted(set(out), key=lambda p: os.path.basename(p))
 
 
-def events(paths):
+REPLAY_FEEDS = ("coinbase", "binance")
+COINBASE_CODE = XF.CODE["coinbase"]
+
+
+def events(paths, feed: str = "coinbase"):
     """("round", wall, info) / ("aid", wall, asset, idx, side) / ("btc", wall, bid, ask) /
     ("pm", wall, {asset: (bids, asks)}) in recording order. Books rebuilt per
-    asset from snapshots and level changes (latency_lab.load.Book)."""
+    asset from snapshots and level changes (latency_lab.load.Book). "btc" is
+    the trigger feed's best bid/ask: Coinbase's ticker ("xb" rows of its code)
+    or Binance's bookTicker ("bsb" rows) - only that one feed, so a replay on
+    one feed is not timed by the other's messages."""
+    if feed not in REPLAY_FEEDS:
+        raise ValueError(f"replay feed {feed!r}: {' or '.join(REPLAY_FEEDS)}")
     books = collections.defaultdict(Book)
     idx_asset: dict = {}
     for path in paths:
@@ -82,7 +98,11 @@ def events(paths):
             k = r[0]
             wall = r[2] / 1e9
             if k == "bsb":
-                yield ("btc", wall, float(r[4]), float(r[6]))
+                if feed == "binance":
+                    yield ("btc", wall, float(r[4]), float(r[6]))
+            elif k == "xb":
+                if feed == "coinbase" and r[3] == COINBASE_CODE:
+                    yield ("btc", wall, float(r[5]), float(r[6]))
             elif k == "round":
                 yield ("round", wall, r[3])
             elif k == "aid":
@@ -110,15 +130,19 @@ def events(paths):
                     yield ("pm", wall, upd)
 
 
-def scan_rounds(paths) -> dict:
+def scan_rounds(paths, feed: str = "coinbase") -> dict:
     """window_start -> round info, and how many book updates each round has.
     Also fixes the replay's end ("__until__"): a recording still being written
-    grows between the two runs, and A and B must see identical events."""
+    grows between the two runs, and A and B must see identical events.
+    "__btc_ticks__": how many trigger-feed ticks the recordings hold."""
     rounds, counts = {}, collections.Counter()
     asset_round = {}
     last = 0.0
-    for ev in events(paths):
+    ticks = 0
+    for ev in events(paths, feed):
         last = max(last, ev[1])
+        if ev[0] == "btc":
+            ticks += 1
         if ev[0] == "round":
             info = ev[2]
             rounds[int(info["window_start"])] = info
@@ -131,6 +155,7 @@ def scan_rounds(paths) -> dict:
                     counts[w] += 1
     out = {w: dict(info, book_updates=counts[w]) for w, info in rounds.items()}
     out["__until__"] = last
+    out["__btc_ticks__"] = ticks
     return out
 
 
@@ -322,12 +347,24 @@ SNIPER_ENV = {k: v for k, v in (
     ("SNIPER_MAX_FILLS_ROUND", "20"), ("SNIPER_MAX_SIDE_SHARES", "200"), ("SNIPER_BINANCE_FRESHNESS", "0"))}
 for _attr, _var, _val, _l, _f in exec_latency.FROZEN_SPEC:
     SNIPER_ENV[_var] = str(_val)
+SPEC_FEED = SNIPER_ENV["SNIPER_PRIMARY_FEED"]
+# no extra trigger in a replay (a deployment's .env may name one): the recordings
+# replay one feed
+SNIPER_ENV["SNIPER_EXTRA_FEEDS"] = ""
+
+
+def btc_message(feed: str, bid: float, ask: float) -> str:
+    """One recorded best bid/ask as the trigger feed's own message."""
+    if feed == "coinbase":
+        return json.dumps({"type": "ticker", "product_id": S.COINBASE_PRODUCT, "best_bid": repr(bid),
+                           "best_ask": repr(ask)})
+    return json.dumps({"b": f"{bid:.2f}", "a": f"{ask:.2f}"})
 
 
 async def run_variant(paths, rounds, results, *, with_pm: bool, pm_cfg: PMM.PMConfig, latency_ms: float,
-                      start_cash: float, label: str) -> dict:
+                      start_cash: float, label: str, feed: str = SPEC_FEED) -> dict:
     until = rounds.get("__until__", math.inf)
-    rounds = {w: i for w, i in rounds.items() if w != "__until__"}
+    rounds = {w: i for w, i in rounds.items() if not str(w).startswith("__")}
     clock = Clock()
     tmp = pathlib.Path(tempfile.mkdtemp(prefix=f"replay_{label}_"))
     ledger = Ledger(path=str(tmp / "ledger.json"))
@@ -336,7 +373,7 @@ async def run_variant(paths, rounds, results, *, with_pm: bool, pm_cfg: PMM.PMCo
     hub = types.SimpleNamespace(up_token=None, down_token=None, condition_id=None, window_start=None,
                                 window_end=None, book=book)
     broker = ReplayBroker(ledger, clock, book, start_cash=start_cash, latency_ms=latency_ms)
-    env = dict(SNIPER_ENV, SNIPER_LATENCY_MS=str(latency_ms))
+    env = dict(SNIPER_ENV, SNIPER_LATENCY_MS=str(latency_ms), SNIPER_PRIMARY_FEED=feed)
     metrics = {"label": label, "max_open_cost": 0.0, "max_worst_loss": 0.0, "max_one_side": 0.0}
     asset_side = {}
     latest = {}                                            # asset -> (bids, asks) latest recorded ladder
@@ -345,7 +382,8 @@ async def run_variant(paths, rounds, results, *, with_pm: bool, pm_cfg: PMM.PMCo
     with patch.dict(os.environ, env), patch.object(S, "time", clock), patch("feeds.book.time", clock):
         sn = S.Sniper(hub, broker, journal_path=tmp / "sniper.jsonl", settings=S.Settings(), trade_rows=[],
                       own_rounds=True)
-        sn.fresh.enabled = False
+        sn.fresh.enabled = sn.cb_fresh.enabled = False
+        on_btc = sn.on_coinbase if feed == "coinbase" else sn.on_tick
         pm = None
         if with_pm:
             pm = PMM.PositionManager(replace(pm_cfg, enabled=True), hub=hub, ledger=ledger, broker=broker, sniper=sn,
@@ -416,7 +454,7 @@ async def run_variant(paths, rounds, results, *, with_pm: bool, pm_cfg: PMM.PMCo
                         equity_curve.append(sum(float(p.realized or 0) for p in ledger.positions.values()
                                                 if p.settled))
 
-        for ev in events(paths):
+        for ev in events(paths, feed):
             kind, now = ev[0], ev[1]
             if now > until:
                 break                                       # identical input for A and B
@@ -448,7 +486,7 @@ async def run_variant(paths, rounds, results, *, with_pm: bool, pm_cfg: PMM.PMCo
                                                                                             error=err))
             elif kind == "btc":
                 before, received = sn.n["orders"], broker.received      # both counted BEFORE the tick
-                sn.on_tick(json.dumps({"b": f"{ev[2]:.2f}", "a": f"{ev[3]:.2f}"}))
+                on_btc(btc_message(feed, ev[2], ev[3]))
                 if sn.n["orders"] > before:
                     await drain(expect_orders=received + (sn.n["orders"] - before))
         # the end: whatever is in flight, then every round that has a result
@@ -598,30 +636,38 @@ def main(argv=None) -> int:
     ap.add_argument("--latency-ms", type=float, default=170.0, help="decision -> venue match (150ms hold + network)")
     ap.add_argument("--cash", type=float, default=1000.0)
     ap.add_argument("--json", default=None)
+    ap.add_argument("--feed", choices=REPLAY_FEEDS, default=SPEC_FEED,
+                    help=f"the trigger feed to replay (default: the frozen spec's, {SPEC_FEED})")
     args = ap.parse_args(argv)
     dirs = args.data or [os.environ.get("LAB_DATA", str(ROOT / "latency_lab" / "data"))]
     paths = recording_files(dirs)
     if not paths:
         print("no recordings found in", dirs)
         return 1
-    rounds = scan_rounds(paths)
+    rounds = scan_rounds(paths, args.feed)
     until = rounds.pop("__until__")
+    ticks = rounds.pop("__btc_ticks__")
+    if not ticks:
+        print(f"the recordings hold no {args.feed} ticks: nothing to trigger on (recorded with --feeds none? "
+              f"try --feed {'binance' if args.feed == 'coinbase' else 'coinbase'})")
+        return 1
     res = outcomes(rounds, pathlib.Path(dirs[-1]) / "replay_outcomes.json")
     rounds["__until__"] = until
     pm_cfg = PMM.PMConfig.from_env({}, global_max_buy_price=0.95, global_max_side_shares=200)
     t0 = time.time()
     a = asyncio.run(run_variant(paths, rounds, res, with_pm=False, pm_cfg=pm_cfg, latency_ms=args.latency_ms,
-                                start_cash=args.cash, label="A"))
+                                start_cash=args.cash, label="A", feed=args.feed))
     b = asyncio.run(run_variant(paths, rounds, res, with_pm=True, pm_cfg=pm_cfg, latency_ms=args.latency_ms,
-                                start_cash=args.cash, label="B"))
+                                start_cash=args.cash, label="B", feed=args.feed))
     cmp = compare_sniper(a, b)
     rounds.pop("__until__", None)
     print(f"{len(paths)} recordings, {len(rounds)} rounds ({sum(1 for i in rounds.values() if i['condition_id'] in res)}"
-          f" with a venue result), replayed twice in {time.time() - t0:.0f}s\n")
+          f" with a venue result), {ticks} {args.feed} ticks, replayed twice in {time.time() - t0:.0f}s\n")
     print(report(a, b, cmp))
     if args.json:
         pathlib.Path(args.json).write_text(json.dumps({"A": a, "B": b, "compare": cmp, "files": paths,
-                                                       "latency_ms": args.latency_ms}, indent=1, default=str),
+                                                       "latency_ms": args.latency_ms, "feed": args.feed},
+                                                      indent=1, default=str),
                                            encoding="utf-8")
     return 0
 

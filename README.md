@@ -14,10 +14,23 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
 ## The strategy
 
 - **Trigger.** The BTC mid moves at least `SNIPER_K_BP` (0.5bp) within `SNIPER_WINDOW_MS` (250ms).
-  The mid comes from Binance BTCUSDT bookTicker by default, or Kraken BTC/USD.
+  The mid comes from **Coinbase Exchange's BTC-USD ticker** by default (the frozen
+  spec's feed since 2026-10-10), or Binance BTCUSDT bookTicker, or Kraken BTC/USD.
   The move is measured against the last price at or before the lookback, and
   that reference must be no more than 2s old. Kraken heartbeats carry the price
-  forward. A move up buys **UP**; a move down buys **DOWN**, in the current round.
+  forward; Coinbase heartbeats do not (its ticker speaks on matches, so the book
+  can move between messages unseen). A move up buys **UP**; a move down buys
+  **DOWN**, in the current round.
+  - **Coinbase.** One socket to `wss://ws-feed.exchange.coinbase.com`, channels
+    `ticker` + `heartbeat` for BTC-USD. The ack must cover both; an `error` or a
+    wrong ack reconnects. A ticker older (by sequence) than one already used is
+    dropped. No message for `SNIPER_COINBASE_SILENT_S` (5s; heartbeats come every
+    second), or heartbeats with no ticker for 60s, reconnect (0.25s..8s,
+    jittered); every reconnect starts the rule afresh.
+  - Measured from the PC on 2026-10-10 (45s, a quiet Saturday): 103 tickers,
+    match -> receipt 64ms min / 104ms median, but gaps between tickers up to
+    10.7s, 4 of them over 2s. In quiet spells the rule restarts more often than on
+    Binance's book ticker. Measure it on the VPS before trading live.
 - **Gates.** An order only goes out if all of these hold:
   - Cooldown: 300ms per side, started when an order is submitted. An UP order never blocks a DOWN signal, and vice versa.
   - At most one order in flight.
@@ -25,7 +38,8 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
   - The book is LIVE and fresh, and has asks on the chosen side.
   - The ask is between `MIN_BUY_PRICE` and `MAX_BUY_PRICE`.
   - The per-round caps (`SNIPER_MAX_FILLS_ROUND`, `SNIPER_MAX_SIDE_SHARES`) are not reached.
-  - The Binance freshness gate passes: the feed is not behind, has no backlog,
+  - The trigger feed's freshness gate passes: the feed is not behind (each
+    Coinbase ticker's own match time; Binance's trade events), has no backlog,
     and its age is known.
 - **Order.** An IOC limit order (Polymarket's FAK) with a share target:
   - **Target.** 10 shares, plus whatever this side's last order in this market
@@ -154,7 +168,11 @@ round twice: the sniper alone, then the sniper + manager. Both get identical eve
 each round settles on its venue result, and the output includes the manager's
 capital, its attributable P/L, the P/L per extra dollar, the extra drawdown and
 exposure, and any sniper order that differs. Record with
-`python -m latency_lab.recorder` (public data only).
+`python -m latency_lab.recorder` (public data only). The replay triggers from the
+frozen spec's feed (Coinbase, the recorder's `xb` rows); `--feed binance` replays
+the Binance trigger instead. The recorder keeps a Coinbase ticker only when its
+best bid or ask changed, so the replay's rule restarts after quiet spells a
+little more often than live.
 
 ## Settlement
 
@@ -217,6 +235,7 @@ ACTIVE -> EXPIRED -> PENDING SETTLEMENT -> SETTLING -> SETTLED
 - `SNIPER_ONLY=1` is missing.
 - `--live` is given without `SNIPER_LIVE_CANARY=1`.
 - The trigger is Kraken under `--live` without `SNIPER_KRAKEN_LIVE=1`.
+- `--live` is given and any setting differs from the frozen spec (`exec_latency.FROZEN_SPEC`), including a trigger feed other than `coinbase`.
 - `--live` is given and the old bot in `/opt/btcbot` holds its lock file.
   - Paper refuses in this case too, unless `ALLOW_OTHER_BOT=1`.
   - The lock files checked are set by `OTHER_BOT_LOCKS`.
@@ -235,7 +254,7 @@ The dashboard shows:
 - **Settlement.** The oldest market still waiting (status, PENDING AGE, what it waits on), or one just settled (WINNER, SETTLE PRICE, REALIZED P/L, SETTLE TIME, REDEEM), and the last settled market.
 - **Markets.** The active market, every market pending settlement with its age, and the latest settled ones.
 - **Live canary.** Limits used, the latency guard, and every HALT reason.
-- **Feed health.** Binance freshness or Kraken lag, Polymarket book, user channel, settlement, ledger, clock and loop lag.
+- **Feed health.** The trigger feed (Coinbase or Binance freshness, or Kraken lag), Polymarket book, user channel, settlement, ledger, clock and loop lag.
 - **Skips and events.** The skip reasons, and recent events.
 
 On the 1-vCPU VPS the dashboard is cheap: 2 frames/s (`DASH_FPS`), and frames are built off the event loop.
@@ -247,7 +266,9 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | setting | value | meaning |
 | --- | --- | --- |
 | `SNIPER_ONLY` | 1 | required: this build is the sniper only |
-| `SNIPER_PRIMARY_FEED` | binance | trigger feed: `binance` or `kraken` |
+| `SNIPER_PRIMARY_FEED` | coinbase | trigger feed: `coinbase` (the frozen spec; LIVE refuses any other), `binance` or `kraken` |
+| `SNIPER_COINBASE_FRESHNESS` | 1 (unset) | skip a Coinbase signal unless the feed is shown current: `_STALE_MS` 1000 (match age above its 5-min best), `_BACKLOG_MAX` 20, `_UNKNOWN_MS` 5000 |
+| `SNIPER_COINBASE_SILENT_S` | 5 (unset) | no Coinbase message (heartbeats included) this long: reconnect |
 | `SNIPER_K_BP` / `SNIPER_WINDOW_MS` | 0.5 / 250 | trigger: a move of >= 0.5bp within 250ms |
 | `SNIPER_SHARES` | 10 | base target shares per order (at least $1) |
 | `SNIPER_MAX_TARGET_SHARES` | 20 | cap on base + same-side unfilled carry |
@@ -414,6 +435,7 @@ python run_tests.py run feeds    # just tests_run.py and tests_feeds.py
 - **Regression tests written here.** spe24 had none for these two; they are in `tests_run.py`:
   - aa3adc7: a present STOP_LIVE makes preflight FAIL.
   - 7eedf06: a settings error names the bad value.
+- **The Coinbase trigger (2026-10-10).** `tests_sniper_coinbase.py`: the venue's message shapes, the ack, out-of-order and malformed tickers, heartbeats that do not carry the price, the freshness gate, the socket loop against a local server (silence, starvation, errors, reconnects), and the replay. `tests_latency.py` checks the Coinbase-triggered sniper decides exactly as the old Binance one on the same mids.
 
 ## Keeping up with spe24
 

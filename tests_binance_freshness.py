@@ -1,13 +1,19 @@
 """Binance freshness gate (sniper_mode.BinanceFreshness): no signal is acted on
-unless the Binance feed is shown current. Run: python -m pytest -q tests_binance_freshness.py"""
+unless the Binance feed is shown current. Run: python -m pytest -q tests_binance_freshness.py
+
+The Binance trigger is SNIPER_PRIMARY_FEED=binance (the frozen spec's feed is
+Coinbase since 2026-10-10): this suite selects it for the whole process."""
 import collections
 import json
+import os
 import time
 import types
 import unittest
 
 import testing_env  # noqa: E402,F401 - first: tests never read the bot's .env
 import sniper_mode as S
+
+os.environ["SNIPER_PRIMARY_FEED"] = "binance"
 
 
 def trade(E_ms):

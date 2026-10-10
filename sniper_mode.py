@@ -8,7 +8,9 @@ nothing below changes what or when it trades, only who executes.
 The latency lab's frozen plan, run on the bot's own paper broker, ledger and
 settlement so its fills land in the same account:
 
-  * when the Binance SPOT mid moves >= SNIPER_K_BP within SNIPER_WINDOW_MS,
+  * when the BTC mid of the trigger feed (SNIPER_PRIMARY_FEED: Coinbase's
+    BTC-USD ticker by default, or Binance's BTCUSDT book ticker, or Kraken's
+    BTC/USD bbo) moves >= SNIPER_K_BP within SNIPER_WINDOW_MS,
     buy the side BTC moved toward (Up on a rise, Down on a fall)
   * fill-or-kill, SNIPER_SHARES shares, price cap = the ask seen + SNIPER_SLIP
   * live-like execution (the default): every order is really built and
@@ -22,9 +24,9 @@ settlement so its fills land in the same account:
     fills, refusing if the price ran past the cap.
     SNIPER_LATENCY_MS=<ms> instead gives the old fixed delay with no signing.
 
-It fires from its own Binance book-ticker socket, not from the strategy's
-decision loop: the edge is gone within ~300ms of the BTC move and the loop
-runs about once a second. Every paper-broker guard still applies (price band,
+It fires from its own trigger socket, not from the strategy's decision loop:
+the edge is gone within ~300ms of the BTC move and the loop runs about once a
+second. Every paper-broker guard still applies (price band,
 MIN_SECONDS_TO_EXPIRY, spread, cash, round mapping), so it is a slightly
 stricter version of the lab plan, never a looser one.
 
@@ -41,6 +43,15 @@ untouched:
     SNIPER_LATENCY_MS=(unset)   SNIPER_COOLDOWN_MS=300 (per side, from the order's submission)
     SNIPER_MIN_LEFT_S=10        SNIPER_MAX_FILLS_ROUND=20
     SNIPER_MAX_SIDE_SHARES=200  SNIPER_STALE_MS=2000
+    SNIPER_PRIMARY_FEED=coinbase  the trigger feed (exec_latency.FROZEN_SPEC):
+                                coinbase | binance | kraken (kraken: paper only
+                                unless SNIPER_KRAKEN_LIVE=1)
+    SNIPER_COINBASE_FRESHNESS=1 no Coinbase signal is acted on unless the feed is
+                                shown current, from each ticker's own match time
+                                (the same gate as Binance's, below):
+    SNIPER_COINBASE_STALE_MS=1000 / _UNKNOWN_MS=5000 / _BACKLOG_MAX=20
+    SNIPER_COINBASE_SILENT_S=5  no message that long (heartbeats come every
+                                second): reconnect (0.25s..8s, jittered)
     SNIPER_BINANCE_FRESHNESS=1  the Binance socket also carries btcusdt@trade (it has
                                 Binance's event time; bookTicker has none) and no
                                 signal is acted on unless the feed is shown current:
@@ -55,7 +66,8 @@ untouched:
     SNIPER_BINANCE_UNKNOWN_MS=5000 no trade timestamp that recent -> "binance age unknown"
     SNIPER_BINANCE_SILENT_S=5   no message that long: reconnect (0.25s..8s, jittered)
     SNIPER_EXTRA_FEEDS=         off; "coinbase" adds Coinbase's BTC-USD ticker as a
-                                SECOND TRIGGER: the same rule on its own mid, and
+                                SECOND TRIGGER (when it is not the primary already):
+                                the same rule on its own mid, and
                                 whichever feed signals first fires (one shared
                                 cooldown and in-flight flag: one move, one order).
                                 Every decision is journalled with the feed that fired.
@@ -148,11 +160,18 @@ class BinanceFreshness:
     hundred ms (measured), so the excess bounds a tick's age only coarsely and
     the default threshold (1s) catches stalls, not jitter. The receive backlog
     is the exact check for our own lag. The minimum itself is reported as a
-    clock check, never used to gate."""
+    clock check, never used to gate.
 
-    def __init__(self, stale_ms: float, unknown_ms: float, backlog_max: int, baseline_s: float = 300.0) -> None:
+    The Coinbase trigger has its own (name="coinbase"): there the exchange
+    time is each ticker's own - the match it reports - so the excess bounds
+    the very tick that signals, not a neighbour's."""
+
+    def __init__(self, stale_ms: float, unknown_ms: float, backlog_max: int, baseline_s: float = 300.0,
+                 name: str = "binance") -> None:
         self.stale_ms, self.unknown_ms, self.backlog_max = stale_ms, unknown_ms, backlog_max
         self.baseline_s = baseline_s
+        self.name = name
+        self._why = {k: f"{name} {k}" for k in ("disconnected", "receive backlog", "age unknown", "feed behind")}
         self.enabled = False
         self.connected = False
         self._min: collections.deque = collections.deque()      # (mono, lag) increasing lag: rolling min
@@ -206,13 +225,13 @@ class BinanceFreshness:
         if not self.enabled:
             return None
         if not self.connected:
-            return "binance disconnected"
+            return self._why["disconnected"]
         if self.backlog > self.backlog_max:
-            return "binance receive backlog"
+            return self._why["receive backlog"]
         if self.last_trade_mono is None or (now_mono - self.last_trade_mono) * 1000.0 > self.unknown_ms:
-            return "binance age unknown"
+            return self._why["age unknown"]
         if self.last_excess is not None and self.last_excess > self.stale_ms:
-            return "binance feed behind"
+            return self._why["feed behind"]
         return None
 
     def status(self, now_mono: float | None = None) -> str:
@@ -251,7 +270,7 @@ class BinanceFreshness:
 # depth-1 alternative. Heartbeats ({"channel":"heartbeat"}, ~1/s while nothing
 # else is sent) are the liveness signal: a silent socket is a dead one.
 # Measured from the PC 2026-10-06: ~12 BTC/USD updates a second, longest gap 1.4s.
-PRIMARY_FEEDS = ("binance", "kraken")
+PRIMARY_FEEDS = ("coinbase", "binance", "kraken")
 KRAKEN_TICKER_URL = "wss://ws.kraken.com/v2"
 KRAKEN_HOSTS = ("ws.kraken.com",)
 KRAKEN_SYMBOL = "BTC/USD"
@@ -335,14 +354,97 @@ def kraken_mid(row, symbol: str = KRAKEN_SYMBOL) -> float | None:
     return (bid + ask) / 2.0
 
 
+# Coinbase trigger (SNIPER_PRIMARY_FEED=coinbase - the default, and the frozen
+# spec's feed since 2026-10-10): Coinbase Exchange's public WebSocket, BTC-USD.
+# Its engine is ~40ms from Amsterdam against Binance's ~127ms, so a BTC move
+# that starts in the US reaches the VPS sooner through it. The "ticker" channel
+# speaks on every match (a cascade of matches comes as one message) and
+# carries the book's best bid/ask as of that match - on trades, NOT on every
+# top-of-book change. The "heartbeat" channel (one a second, whatever the
+# market does) proves a quiet socket alive.
+COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
+COINBASE_HOSTS = ("ws-feed.exchange.coinbase.com",)
+COINBASE_PRODUCT = "BTC-USD"
+COINBASE_CHANNELS = ("ticker", "heartbeat")
+
+
+def coinbase_subscribe(product: str = COINBASE_PRODUCT) -> dict:
+    return {"type": "subscribe", "product_ids": [product], "channels": list(COINBASE_CHANNELS)}
+
+
+COINBASE_SUBSCRIBE = coinbase_subscribe()
+# Heartbeats with no BTC-USD ticker this long: the subscription is lost (BTC-USD
+# trades many times a second; a minute without one is not a quiet market).
+COINBASE_STARVED_S = 60.0
+
+
+def coinbase_url(raw: str | None) -> str:
+    """Only Coinbase Exchange's public market-data WebSocket - mirrors
+    binance_url(): the signal itself can never change by pointing this at
+    another host."""
+    if not raw or not str(raw).strip():
+        return COINBASE_WS_URL
+    from urllib.parse import urlsplit
+    u = urlsplit(str(raw).strip())
+    if (u.scheme != "wss" or u.hostname not in COINBASE_HOSTS or u.port not in (None, 443)
+            or u.username or u.password or u.path not in ("", "/") or u.query or u.fragment):
+        raise ValueError(f"SNIPER_COINBASE_URL must be Coinbase Exchange's public WebSocket "
+                         f"(wss://{COINBASE_HOSTS[0]}[:443]), got {raw!r}")
+    return str(raw).strip()
+
+
+class CoinbaseFeedError(RuntimeError):
+    """The Coinbase socket is open but is not carrying the feed asked for: reconnect."""
+
+
+class CoinbaseSubscribeError(CoinbaseFeedError):
+    """Coinbase answered the subscription with an error, or acknowledged a
+    different one (another product, a channel missing): reconnect rather than
+    trade on it."""
+
+
+def coinbase_ack(d: dict, product: str = COINBASE_PRODUCT) -> None:
+    """Accept only an acknowledgement that covers ticker AND heartbeat for the
+    product. Without the heartbeat a quiet minute would read as a dead socket;
+    without the ticker there is no price."""
+    got = {}
+    for ch in d.get("channels") if isinstance(d.get("channels"), list) else ():
+        if isinstance(ch, dict) and isinstance(ch.get("product_ids"), list):
+            got[ch.get("name")] = set(ch["product_ids"])
+    missing = [c for c in COINBASE_CHANNELS if product not in got.get(c, ())]
+    if missing:
+        raise CoinbaseSubscribeError(f"acknowledged {sorted((k, sorted(v)) for k, v in got.items() if k)}"[:160]
+                                     + f", missing {'/'.join(missing)} for {product}")
+
+
+def _dec(v) -> float | None:
+    """A Coinbase price - a decimal string, or a JSON number - as a finite
+    positive float, else None (never a bool)."""
+    if isinstance(v, bool) or not isinstance(v, (str, int, float)):
+        return None
+    try:
+        x = float(v)
+    except ValueError:
+        return None
+    return x if math.isfinite(x) and x > 0 else None
+
+
+def coinbase_mid(d, product: str = COINBASE_PRODUCT) -> float | None:
+    """(best bid + best ask) / 2 of one ticker message, or None for anything
+    but a well-formed ticker of that product: another product, a missing/zero/
+    negative/non-numeric side, a crossed book."""
+    if not isinstance(d, dict) or d.get("product_id") != product:
+        return None
+    bid, ask = _dec(d.get("best_bid")), _dec(d.get("best_ask"))
+    if bid is None or ask is None or bid > ask:
+        return None
+    return (bid + ask) / 2.0
+
+
 # Second-trigger feeds (SNIPER_EXTRA_FEEDS): name -> (url, subscribe message).
-# Coinbase's engine is ~40ms from Amsterdam against Binance's ~127ms, so a BTC
-# move that starts in the US reaches the VPS sooner through it. Its ticker
-# carries the best bid/ask after every match; heartbeats keep a quiet
-# socket provably alive.
+# A feed is never its own second trigger: Settings drops the primary from it.
 EXTRA_FEEDS = {
-    "coinbase": ("wss://ws-feed.exchange.coinbase.com",
-                 {"type": "subscribe", "product_ids": ["BTC-USD"], "channels": ["ticker", "heartbeat"]}),
+    "coinbase": (COINBASE_WS_URL, COINBASE_SUBSCRIBE),
 }
 MIN_ORDER_USD = 1.0   # venue floor on a marketable BUY (paper_trade.MIN_MARKETABLE_BUY_USD)
 
@@ -647,18 +749,31 @@ class Settings:
         self.binance_unknown_ms = _env_float("SNIPER_BINANCE_UNKNOWN_MS", 5000)
         self.binance_backlog_max = int(_env_float("SNIPER_BINANCE_BACKLOG_MAX", 20))
         self.binance_silent_s = _env_float("SNIPER_BINANCE_SILENT_S", 5)
-        # Which feed triggers the sniper: Binance's BTCUSDT book ticker (the
-        # default) or Kraken's BTC/USD best bid/offer - paper only (Sniper and
-        # run_feeds refuse a live canary on it).
-        self.primary_feed = str(os.environ.get("SNIPER_PRIMARY_FEED", "binance")).strip().lower() or "binance"
+        # Which feed triggers the sniper: Coinbase's BTC-USD ticker (the default,
+        # and the frozen spec's feed since 2026-10-10), Binance's BTCUSDT book
+        # ticker, or Kraken's BTC/USD best bid/offer - paper only unless
+        # SNIPER_KRAKEN_LIVE=1 (Sniper and run.py refuse a live canary on it).
+        # LIVE also refuses any feed but the frozen spec's (exec_latency).
+        self.primary_feed = str(os.environ.get("SNIPER_PRIMARY_FEED", "coinbase")).strip().lower() or "coinbase"
         if self.primary_feed not in PRIMARY_FEEDS:
             raise ValueError(f"invalid SNIPER_PRIMARY_FEED {self.primary_feed!r}: {' or '.join(PRIMARY_FEEDS)}")
         self.kraken_url = kraken_url(os.environ.get("SNIPER_KRAKEN_URL"))
+        self.coinbase_url = coinbase_url(os.environ.get("SNIPER_COINBASE_URL"))
+        # Coinbase freshness gate (BinanceFreshness on each ticker's match time):
+        # on by default; 0 acts on every ticker whatever its age.
+        self.coinbase_freshness = str(os.environ.get("SNIPER_COINBASE_FRESHNESS", "1")).strip() not in ("0", "false", "off")
+        self.coinbase_stale_ms = _env_float("SNIPER_COINBASE_STALE_MS", 1000)
+        self.coinbase_unknown_ms = _env_float("SNIPER_COINBASE_UNKNOWN_MS", 5000)
+        self.coinbase_backlog_max = int(_env_float("SNIPER_COINBASE_BACKLOG_MAX", 20))
+        self.coinbase_silent_s = _env_float("SNIPER_COINBASE_SILENT_S", 5)
         raw = os.environ.get("SNIPER_EXTRA_FEEDS", "")
         self.extra_feeds = tuple(dict.fromkeys(x.strip().lower() for x in raw.split(",") if x.strip()))
         unknown = [x for x in self.extra_feeds if x not in EXTRA_FEEDS]
         if unknown:
             raise ValueError(f"invalid SNIPER_EXTRA_FEEDS {unknown}: supported {sorted(EXTRA_FEEDS)}")
+        # The primary is never also its own second trigger (an older .env may still
+        # name coinbase there): one socket, one rule.
+        self.extra_feeds = tuple(x for x in self.extra_feeds if x != self.primary_feed)
         bad = [text for ok, text in (
             (self.k_bp > 0, f"SNIPER_K_BP={self.k_bp:g} (must be > 0)"),
             (self.window_ms > 0, f"SNIPER_WINDOW_MS={self.window_ms:g} (must be > 0)"),
@@ -679,7 +794,10 @@ class Settings:
              "SNIPER_HOLD_MS / SNIPER_SERVER_MS / SNIPER_NET_MS must be >= 0"),
             (self.binance_stale_ms > 0 and self.binance_unknown_ms > 0 and self.binance_backlog_max >= 0
              and self.binance_silent_s > 0,
-             "SNIPER_BINANCE_STALE_MS / _UNKNOWN_MS / _SILENT_S must be > 0, _BACKLOG_MAX >= 0")) if not ok]
+             "SNIPER_BINANCE_STALE_MS / _UNKNOWN_MS / _SILENT_S must be > 0, _BACKLOG_MAX >= 0"),
+            (self.coinbase_stale_ms > 0 and self.coinbase_unknown_ms > 0 and self.coinbase_backlog_max >= 0
+             and self.coinbase_silent_s > 0,
+             "SNIPER_COINBASE_STALE_MS / _UNKNOWN_MS / _SILENT_S must be > 0, _BACKLOG_MAX >= 0")) if not ok]
         if bad:
             raise ValueError("invalid SNIPER_* settings: " + "; ".join(bad))
 
@@ -687,12 +805,16 @@ class Settings:
         route = "" if self.binance_url == BOOK_TICKER_URL else f"; Binance via {self.binance_url}"
         if self.primary_feed == "kraken" and self.kraken_url != KRAKEN_TICKER_URL:
             route += f"; Kraken via {self.kraken_url}"
+        if self.primary_feed == "coinbase" and self.coinbase_url != COINBASE_WS_URL:
+            route += f"; Coinbase via {self.coinbase_url}"
         return route + (("; second trigger: " + ",".join(self.extra_feeds)
                          + " (whichever feed signals first; each side's cooldown is shared)") if self.extra_feeds else "")
 
     def lead_text(self) -> str:
         """Names the trigger on every start line when it is not Binance, so a
         journal says which feed decided its orders."""
+        if self.primary_feed == "coinbase":
+            return f" [triggered by Coinbase {COINBASE_PRODUCT} ticker]"
         return f" [triggered by Kraken {KRAKEN_SYMBOL} ticker (bbo), not Binance]" if self.primary_feed == "kraken" else ""
 
     def carry_text(self) -> str:
@@ -965,11 +1087,11 @@ class Sniper:
         self.broker = broker
         self.on_event = on_event or (lambda *a, **k: None)
         self.s = settings or Settings()
-        if live is not None and self.s.primary_feed != "binance" and not kraken_live():
-            raise ValueError(f"SNIPER_PRIMARY_FEED={self.s.primary_feed} is paper-only: the live canary "
-                             f"triggers from Binance unless SNIPER_KRAKEN_LIVE=1 is set")
+        if live is not None and self.s.primary_feed == "kraken" and not kraken_live():
+            raise ValueError("SNIPER_PRIMARY_FEED=kraken is paper-only: the live canary triggers from "
+                             "Kraken only with SNIPER_KRAKEN_LIVE=1 set")
         self.trigger = Trigger(self.s.k_bp, self.s.window_ms)       # the primary feed's mid
-        self.last_mid: float | None = None         # the Kraken mid last heard
+        self.last_mid: float | None = None         # the Kraken / Coinbase mid last heard
         # Kraken feed quality (summary rows): arrival lag, gaps, the venue's own status.
         self.kraken_lag: collections.deque = collections.deque(maxlen=3000)
         self.kraken_gap_max = 0.0
@@ -978,7 +1100,16 @@ class Sniper:
         # One trigger per second-trigger feed: each feed's own mid (Coinbase
         # BTC-USD and Binance BTCUSDT sit at different levels).
         self.triggers = {name: Trigger(self.s.k_bp, self.s.window_ms) for name in self.s.extra_feeds}
+        self.triggers[self.s.primary_feed] = self.trigger
         self.fresh = BinanceFreshness(self.s.binance_stale_ms, self.s.binance_unknown_ms, self.s.binance_backlog_max)
+        # Coinbase: its freshness gate (enabled by _coinbase_loop only, like Binance's
+        # by run()), the last ticker sequence used (an older one is out of order) and
+        # feed-quality figures for the summary rows.
+        self.cb_fresh = BinanceFreshness(self.s.coinbase_stale_ms, self.s.coinbase_unknown_ms,
+                                         self.s.coinbase_backlog_max, name="coinbase")
+        self._coinbase_seq: int | None = None
+        self._coinbase_prev_t: float | None = None  # None after a (re)connect: an outage is not a market gap
+        self.coinbase_gap_max = 0.0
         self.journal = Path(journal_path) if journal_path else None
         # When each side's last order was submitted (monotonic ms, the ticks'
         # clock). An UP order cools down UP only; DOWN stays free, and back.
@@ -1195,9 +1326,11 @@ class Sniper:
 
     # ---------------------------------------------------------------- ticks
     def on_tick(self, raw) -> None:
-        """Binance spot bookTicker - the primary trigger. On the live socket the
-        messages come wrapped by the combined stream ({"stream", "data"}), with
-        btcusdt@trade events between them that only time the feed."""
+        """Binance spot bookTicker - the trigger when SNIPER_PRIMARY_FEED=binance.
+        On the live socket the messages come wrapped by the combined stream
+        ({"stream", "data"}), with btcusdt@trade events between them that only
+        time the feed. With another primary, a Binance tick (a replay, a bench)
+        moves no rule: it is counted and dropped."""
         t = time.monotonic() * 1000.0
         t_pc = time.perf_counter_ns()
         try:
@@ -1214,22 +1347,78 @@ class Sniper:
         if not (math.isfinite(mid) and mid > 0):
             self.n["binance parse errors"] += 1
             return
+        if self.s.primary_feed != "binance":
+            self.n["binance ticks ignored (not the trigger)"] += 1
+            return
         self._signal("binance", self.trigger, mid, t, t_pc)
 
-    def on_coinbase(self, raw) -> None:
-        """Coinbase BTC-USD ticker - a second trigger (SNIPER_EXTRA_FEEDS)."""
+    def on_coinbase(self, raw) -> str:
+        """Coinbase BTC-USD ticker - the trigger when SNIPER_PRIMARY_FEED=coinbase
+        (the default), or a second trigger (SNIPER_EXTRA_FEEDS). Returns what
+        the message was: "tick" (a usable BTC-USD best bid/ask, fed to the
+        rule), "heartbeat", "subscribed" (an ack covering ticker + heartbeat for
+        BTC-USD - any other ack, or an error message, raises
+        CoinbaseSubscribeError), "late" (a ticker older than one already used),
+        "other" or "malformed".
+
+        A ticker comes on a match, with the best bid/ask as of that match: the
+        book can move between matches without a message. So, unlike Kraken's
+        bbo heartbeats, a Coinbase heartbeat does NOT carry the last price
+        forward - it only proves the socket alive, and a spell with no match
+        longer than the max gap restarts the rule (a quiet feed must not turn
+        seconds of drift into a 250ms move).
+
+        The ticker's own match time is noted BEFORE the rule runs, so the
+        freshness gate judges the very tick that signals."""
         t = time.monotonic() * 1000.0
         t_pc = time.perf_counter_ns()
         try:
             d = _loads(raw)
-            if d.get("type") != "ticker":
-                return                                  # subscriptions ack, heartbeats
-            mid = (float(d["best_bid"]) + float(d["best_ask"])) / 2.0
-        except (ValueError, KeyError, TypeError, AttributeError):
-            return
-        trig = self.triggers.get("coinbase")
-        if trig is not None:
-            self._signal("coinbase", trig, mid, t, t_pc)
+        except (ValueError, TypeError):
+            d = None
+        if not isinstance(d, dict):
+            self.n["coinbase malformed"] += 1
+            return "malformed"
+        kind = d.get("type")
+        if kind != "ticker":
+            if kind == "heartbeat":
+                self.n["coinbase heartbeats"] += 1
+                return "heartbeat"
+            if kind == "subscriptions":
+                coinbase_ack(d)                              # raises unless ticker + heartbeat / BTC-USD
+                return "subscribed"
+            if kind == "error":
+                raise CoinbaseSubscribeError(f"{d.get('message')}: {d.get('reason')}"[:160])
+            return "other"
+        mid = coinbase_mid(d)
+        if mid is None:
+            self.n["coinbase malformed"] += 1
+            return "malformed"
+        seq = d.get("sequence")
+        if isinstance(seq, int) and not isinstance(seq, bool):
+            if self._coinbase_seq is not None and seq <= self._coinbase_seq:
+                self.n["coinbase out of order"] += 1         # older than a ticker already used
+                return "late"
+            self._coinbase_seq = seq
+        primary = self.s.primary_feed == "coinbase"
+        trig = self.trigger if primary else self.triggers.get("coinbase")
+        # (no match time -> note_trade counts "trade without E"; the gate then says "age unknown")
+        self.cb_fresh.note_trade(_exchange_ms(d.get("time")), time.time() * 1000.0, t / 1000.0)
+        self.n["coinbase ticks"] += 1
+        if trig is None:
+            return "tick"
+        if primary:
+            self.last_mid = mid
+        q = trig.q
+        reset = bool(q) and t - q[-1][0] > trig.max_gap_ms      # no match for that long: the rule restarts
+        self._signal("coinbase", trig, mid, t, t_pc)
+        # Feed quality, after the decision so it costs the decision nothing.
+        if self._coinbase_prev_t is not None:
+            self.coinbase_gap_max = max(self.coinbase_gap_max, t - self._coinbase_prev_t)
+        if reset:
+            self.n["coinbase gaps over max gap"] += 1
+        self._coinbase_prev_t = t
+        return "tick"
 
     def on_kraken(self, raw) -> str:
         """Kraken v2 ticker - the primary trigger when SNIPER_PRIMARY_FEED=kraken.
@@ -1339,8 +1528,9 @@ class Sniper:
         primary = feed == self.s.primary_feed          # its counters keep the names the reports read
         tag = "" if primary else f" ({feed})"
         self.n["signals" + ("" if primary else f" {feed}")] += 1
-        if feed == "binance":
-            why = self.fresh.why_not(t / 1000.0)
+        gate = self.fresh if feed == "binance" else self.cb_fresh if feed == "coinbase" else None
+        if gate is not None:
+            why = gate.why_not(t / 1000.0)
             if why is not None:
                 # The move was measured on ticks that cannot be shown current
                 # (a backlog compresses seconds of movement into milliseconds):
@@ -1349,9 +1539,9 @@ class Sniper:
                 trigger.q.clear()
                 side = "UP" if direction > 0 else "DOWN"
                 self._skip(why, {"wall": time.time(), "id": f"{time.time():.3f}-{side}", "side": side,
-                                 "bp": round(r, 3), "feed": feed, **window, "binance_backlog": self.fresh.backlog,
-                                 "binance_excess_ms": (round(self.fresh.last_excess, 1)
-                                                       if self.fresh.last_excess is not None else None)})
+                                 "bp": round(r, 3), "feed": feed, **window, f"{feed}_backlog": gate.backlog,
+                                 f"{feed}_excess_ms": (round(gate.last_excess, 1)
+                                                       if gate.last_excess is not None else None)})
                 return
         side = "UP" if direction > 0 else "DOWN"
         per_round = self.round_signals[getattr(self.hub, "window_end", None)]   # diagnostics: never read here
@@ -1795,9 +1985,10 @@ class Sniper:
         self._write(row)
 
     async def _fire(self, side: str, r_bp: float, t_ms: float, t_pc: int | None = None,
-                    feed: str = "binance") -> None:
+                    feed: str | None = None) -> None:
         """Decide, send and wait for the outcome - for callers that await one
-        order. The tick handler uses _fire_now and does not wait."""
+        order. The tick handler uses _fire_now and does not wait. feed: the
+        feed that signalled (None: the trigger feed, SNIPER_PRIMARY_FEED)."""
         task = self._fire_now(side, r_bp, t_ms, t_pc, feed=feed)
         if task is not None:
             await task
@@ -1831,7 +2022,7 @@ class Sniper:
             row["t_send_to_fill_confirmed_ms"] = round(ms - row["t_signal_to_send_ms"], 2)
         row["t_signal_to_fill_known_ms"] = round(time.monotonic() * 1000.0 - t0_ms, 2)
 
-    def _fire_now(self, side: str, r_bp: float, t_ms: float, t_pc: int | None = None, feed: str = "binance"):
+    def _fire_now(self, side: str, r_bp: float, t_ms: float, t_pc: int | None = None, feed: str | None = None):
         """Decide on the spot and hand the order to the sender at once.
 
         Runs synchronously inside the BTC tick handler: every check, the size,
@@ -1843,6 +2034,7 @@ class Sniper:
         """
         start_pc = time.perf_counter_ns()
         t_pc = start_pc if t_pc is None else t_pc
+        feed = feed or self.s.primary_feed                              # None: the trigger feed
         trig_pc, mid = getattr(self, "_t1", None) or (None, None)      # T1 and the mid, from _signal
         row = {"wall": time.time(), "id": f"{time.time():.3f}-{side}", "side": side, "bp": round(r_bp, 3),
                "feed": feed,
@@ -1853,6 +2045,8 @@ class Sniper:
             row["signal_mid"] = mid
         if feed == "binance" and self.fresh.last_excess is not None:
             row["binance_excess_ms"] = round(self.fresh.last_excess, 1)    # feed age past its usual (exchange stamps)
+        elif feed == "coinbase" and self.cb_fresh.last_excess is not None:
+            row["coinbase_excess_ms"] = round(self.cb_fresh.last_excess, 1)
         try:
             plan = self._decide(side, row, t_ms)
             if plan is None:
@@ -2465,6 +2659,8 @@ class Sniper:
                                               open_timeout=10) as ws:
                     await ws.send(json.dumps(sub))
                     self.triggers[name] = Trigger(self.s.k_bp, self.s.window_ms)
+                    if name == "coinbase":
+                        self._coinbase_seq = self._coinbase_prev_t = None    # a new connection's own order
                     backoff = 1.0
                     self.on_event("sniper", f"{name} ticker connected (second trigger)", "good")
                     while True:
@@ -2496,13 +2692,22 @@ class Sniper:
                                "gap_ms_max": round(self.kraken_gap_max, 1),
                                "lag_ms": BinanceFreshness._q(self.kraken_lag), "system": self.kraken_system}}
                    if self.s.primary_feed == "kraken" else {}),
+                **({"coinbase": {**self.cb_fresh.summary(), "ticks": self.n["coinbase ticks"],
+                                 "heartbeats": self.n["coinbase heartbeats"],
+                                 "malformed": self.n["coinbase malformed"],
+                                 "out_of_order": self.n["coinbase out of order"], "reconnects": self.n["reconnects"],
+                                 "gaps_over_max_gap": self.n["coinbase gaps over max gap"],
+                                 "gap_ms_max": round(self.coinbase_gap_max, 1)}}
+                   if self.s.primary_feed == "coinbase" else {}),
                 **({"carry": self.carry_view()} if self.s.order_type == "FAK" else {}),
                 "errors": self.n["errors"], "shadow_errors": self.n["shadow errors"],
                 "latency_ms": round(self.latency_plan()[0], 1),       # paper's MODELLED flight, not a measurement
                 "exec_latency": self.latency.summary(), "exec_quality": self.quality.summary(),
                 "clob_rtt_ms": round(sorted(self.net_rtt)[len(self.net_rtt) // 2], 1) if self.net_rtt else None,
                 "loop_lag_ms": self._lag_summary(),
-                "binance": {**self.fresh.summary(), "reconnects": self.n["reconnects"],
+                # (the trigger socket's reconnects: Binance's only when it is the trigger)
+                "binance": {**self.fresh.summary(),
+                            "reconnects": self.n["reconnects"] if self.s.primary_feed == "binance" else 0,
                             "parse_errors": self.n["binance parse errors"]},
                 "book_feed_age_ms": (self.hub.book.feed_age_summary()
                                      if hasattr(getattr(self.hub, "book", None), "feed_age_summary") else None),
@@ -2560,6 +2765,9 @@ class Sniper:
         if self.s.primary_feed == "kraken":
             await self._kraken_loop()
             return
+        if self.s.primary_feed == "coinbase":
+            await self._coinbase_loop()
+            return
         from feeds.supervisor import backoff_delay
         from feeds.tls import ws_ssl
         fresh = self.fresh
@@ -2609,6 +2817,81 @@ class Sniper:
                 fresh.on_disconnect()
             # Fast, jittered retries (0.25s .. 8s); the ladder only resets after
             # a connection has held for 30s, so a connect/drop loop cannot spin.
+            if opened is not None and time.monotonic() - opened >= 30:
+                attempt = 0
+            await asyncio.sleep(backoff_delay(attempt))
+            attempt += 1
+
+    async def _coinbase_loop(self) -> None:
+        """The trigger's socket when SNIPER_PRIMARY_FEED=coinbase (the default):
+        Coinbase Exchange's public BTC-USD ticker + heartbeat channels. Every
+        (re)connect starts the rule afresh - a price from before a gap is no
+        reference for "moved within 250ms" - and retries come fast and jittered
+        (0.25s .. 8s), the ladder resetting only after a connection has held
+        30s, so a connect/drop loop cannot spin. Heartbeats arrive every second
+        whatever the market does, so SNIPER_COINBASE_SILENT_S of silence is a
+        dead socket, and heartbeats with no BTC-USD ticker for
+        COINBASE_STARVED_S are a lost subscription. The freshness gate
+        (cb_fresh) is on for this socket only. No permessage-deflate: inflating
+        every message is CPU the 1-vCPU VPS spends before the tick can be read."""
+        from feeds.supervisor import backoff_delay
+        from feeds.tls import ws_ssl
+        fresh = self.cb_fresh
+        fresh.enabled = self.s.coinbase_freshness
+        if not fresh.enabled:
+            self.on_event("sniper", "SNIPER_COINBASE_FRESHNESS=0: Coinbase ticks are NOT checked for age", "warn")
+        url = self.s.coinbase_url
+        report_at = time.monotonic() + 300
+        attempt = 0
+        while True:
+            opened = None
+            try:
+                async with websockets.connect(url, ssl=ws_ssl(url), ping_interval=20, ping_timeout=20,
+                                              open_timeout=10, compression=None) as ws:
+                    opened = time.monotonic()
+                    self.trigger = Trigger(self.s.k_bp, self.s.window_ms)
+                    self.triggers["coinbase"] = self.trigger
+                    self.last_mid = None
+                    self._coinbase_seq = self._coinbase_prev_t = None
+                    fresh.on_connect()
+                    await ws.send(json.dumps(COINBASE_SUBSCRIBE))
+                    ticked = False
+                    last_tick = time.monotonic()
+                    while True:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=self.s.coinbase_silent_s)
+                        now = time.monotonic()
+                        fresh.note_message(now, rx_backlog(ws))
+                        kind = self.on_coinbase(raw.decode() if isinstance(raw, bytes) else raw)
+                        if kind == "tick":
+                            last_tick = now
+                            if not ticked:
+                                ticked = True
+                                self.on_event("sniper", f"Coinbase {COINBASE_PRODUCT} ticker connected"
+                                              + (" (freshness gate on)" if fresh.enabled else ""), "good")
+                        elif now - last_tick >= COINBASE_STARVED_S:
+                            raise CoinbaseFeedError(f"no {COINBASE_PRODUCT} ticker for {COINBASE_STARVED_S:.0f}s "
+                                                    f"(heartbeats only): subscription lost")
+                        if now >= report_at:
+                            report_at = now + 300
+                            s = self.summary()
+                            c = s.get("coinbase") or {}
+                            ex = c.get("excess_ms") or {}
+                            self.on_event("sniper", f"orders {s['orders']} filled {s['filled']} "
+                                                    f"refused {s['refused']} markout 5s {s['markout_5s_c']}c; "
+                                                    f"coinbase {c.get('status')} {c.get('ticks')} tickers, excess "
+                                                    f"p50/p99 {ex.get('p50')}/{ex.get('p99')}ms, longest gap "
+                                                    f"{c.get('gap_ms_max')}ms", "info")
+                            self._write({"wall": time.time(), "result": "summary", **s})
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - reconnect; the bot keeps running
+                self.n["reconnects"] += 1
+                self.on_event("sniper", f"Coinbase ticker {type(exc).__name__}"
+                                        f"{': ' + str(exc)[:100] if isinstance(exc, CoinbaseFeedError) else ''}"
+                                        f"{' (silent ' + format(self.s.coinbase_silent_s, 'g') + 's)' if isinstance(exc, asyncio.TimeoutError) else ''}"
+                                        f"; reconnecting", "warn")
+            finally:
+                fresh.on_disconnect()
             if opened is not None and time.monotonic() - opened >= 30:
                 attempt = 0
             await asyncio.sleep(backoff_delay(attempt))
