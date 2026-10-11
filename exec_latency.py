@@ -46,10 +46,13 @@ import os
 # 2026-10-11: trigger 0.50bp -> 0.30bp (the operator's change): the same 250ms
 # window on the Coinbase mid, a smaller move.
 # 2026-10-11 (later): 0.30bp -> 0.50bp again (the operator's change).
-# 2026-10-11: every buy only at or under the share's fair value (sniper_mode.
-# FairValue: BTC against its round-start price, 5-minute volatility, time left)
-# less the taker fee and a $0.01 margin (the operator's rule); the limit is
-# capped there too.
+# 2026-10-11: every buy only at or under the share's fair value less the taker
+# fee and a $0.01 margin (the operator's rule); the limit is capped there too.
+# 2026-10-11 (later): the fair value is MARKET-ANCHORED (sniper_mode.anchored_fair:
+# the market's mid for the side, moved by the BTC move over the volatility and time
+# left) - the start-price model disagreed with the market by 10-30c and bought the
+# losing side; and FAK orders are sized at 1/4 Kelly on it, 5 to 20 shares, from the
+# account's cash (the operator's choice), replacing the fixed 10 shares + carry.
 FROZEN_SPEC = (
     # (Settings attribute, environment variable, frozen value, label, format)
     ("primary_feed", "SNIPER_PRIMARY_FEED", "coinbase", "trigger feed", "{}"),
@@ -62,6 +65,8 @@ FROZEN_SPEC = (
     ("max_target_shares", "SNIPER_MAX_TARGET_SHARES", 20.0, "max_target", "{:g}"),
     ("fair", "SNIPER_FAIR", True, "fair value", "{}"),
     ("fair_margin", "SNIPER_FAIR_MARGIN", 0.01, "fair margin", "${:.2f}"),
+    ("kelly", "SNIPER_KELLY", True, "kelly size", "{}"),
+    ("kelly_fraction", "SNIPER_KELLY_FRACTION", 0.25, "kelly fraction", "{:g}"),
 )
 
 

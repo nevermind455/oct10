@@ -182,15 +182,22 @@ def _trigger_body(t: dict, w: int) -> list[Row]:
                  else "  start N/A") if "btc_start" in t else "", FAINT)], w),
     ]
     if fair is not None:
-        # the fair-value gate (SNIPER_FAIR): what each side is worth now, or why it is unknown
-        up = _num(fair.get("up"))
-        rows.append(_runs([(fit("fair", 9), DIM), (" ", PAPER)]
-                          + ([(f"UP {up:.2f}", Style("green", bold=True)), ("  ", PAPER),
-                              (f"DN {1 - up:.2f}", Style("red", bold=True)),
-                              (f"  vol {_num(fair.get('vol_bp')):.2f}bp" if _num(fair.get("vol_bp")) is not None
-                               else "", FAINT)]
-                             if up is not None else
-                             [(f"unknown: {_text(fair.get('why'))} - no buys", Style("amber"))]), w))
+        # the fair-value gate (SNIPER_FAIR): its volatility and the last decision -
+        # the market's mid -> the anchored fair value, the limit, the Kelly size
+        vol = _num(fair.get("vol_bp"))
+        last = fair.get("last") if isinstance(fair.get("last"), dict) else None
+        c = lambda x: f"{_num(x):.2f}".lstrip("0") if _num(x) is not None else MISSING  # noqa: E731
+        if vol is None:
+            rows.append(_runs([(fit("fair", 9), DIM), (" ", PAPER),
+                               (f"unknown: {_text(fair.get('why'))} - no buys", Style("amber"))], w))
+        else:
+            parts = [(fit("fair", 9), DIM), (" ", PAPER), (f"vol {vol:.2f}bp", FAINT)]
+            if last:
+                sh = _num(last.get("shares"))
+                parts += [("  ", PAPER), (_text(last.get("side")), Style("green" if last.get("side") == "UP" else "red", bold=True)),
+                          (f" {c(last.get('market_mid'))}->{c(last.get('fair'))}", Style("ink", bold=True)),
+                          (f" <={c(last.get('limit'))}", DIM), (f" {sh:g}sh" if sh else "", Style("ink"))]
+            rows.append(_runs(parts, w))
     rows += [
         _runs([(fit("move", 9), DIM), (" ", PAPER), (bp(move), Style("red", bold=True) if hot else Style("ink")),
                (f" /{window:.0f}ms" if window is not None else "", DIM),

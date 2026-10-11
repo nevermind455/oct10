@@ -89,6 +89,7 @@ import gc
 import json
 import math
 import os
+import statistics
 import time
 from datetime import datetime
 from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
@@ -479,20 +480,38 @@ def _env_bool(name: str, default: bool) -> bool:
     raise ValueError(f"invalid {name}={raw!r}: 1 or 0")
 
 
-# ---------------------------------------------------------------- fair value
-ROUND_S = 300                 # btc-updown-5m: a round starts every 5 minutes on the epoch grid
+# ---------------------------------------------------------------- fair value and Kelly size
 FAIR_MIN_SAMPLES = 60         # 1s volatility samples before a fair value is trusted (a minute)
 FAIR_MIN_VOL_BP = 0.2         # volatility floor, bp per sqrt(second): a dead-calm minute is not zero risk
-FAIR_START_STALE_S = 30.0     # a price older than this at the round's first instant does not set its start
+FAIR_MID_CLAMP = 0.005        # a market mid is read as a probability inside [0.005, 0.995]
+KELLY_MIN_SHARES = 5          # the venue's minimum order size
+_NORMAL = statistics.NormalDist()
 
 
 def norm_cdf(z: float) -> float:
-    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+    return _NORMAL.cdf(z)
 
 
 def taker_fee(price: float, rate: float) -> float:
     """The venue's taker fee per share at this price: rate * p * (1 - p)."""
     return rate * price * (1.0 - price)
+
+
+def anchored_fair(market_mid: float, move_bp: float, sigma: float, tau: float) -> float:
+    """What the side BTC moved toward is worth right after the move, ANCHORED to
+    the market's own price for it just before (the operator's model since
+    2026-10-11): the market's mid read as a probability, as a z-score, moved by
+    the BTC move over the volatility left in the round, and back:
+
+        fair = Phi( Phi^-1(mid) + |move| / (sigma * sqrt(tau)) )
+
+    The market sets the level - where BTC stands against the round's strike, the
+    start price, momentum: everything it knows better than one feed. The model
+    adds only what a move of this size should do to it, which the market has
+    not priced yet. sigma per sqrt(second), tau seconds left, move in bp."""
+    m = min(max(float(market_mid), FAIR_MID_CLAMP), 1.0 - FAIR_MID_CLAMP)
+    dz = (abs(float(move_bp)) / 1e4) / (float(sigma) * math.sqrt(float(tau)))
+    return _NORMAL.cdf(_NORMAL.inv_cdf(m) + dz)
 
 
 def fair_limit(fair: float, margin: float, tick: float, fee_rate: float) -> float:
@@ -504,51 +523,40 @@ def fair_limit(fair: float, margin: float, tick: float, fee_rate: float) -> floa
     return round(max(p, 0.0), 4)
 
 
-class FairValue:
-    """What a btc-updown-5m share is worth now, from the trigger feed alone.
+def kelly_shares(fair: float, ask: float, fee_rate: float, fraction: float, bankroll: float,
+                 max_shares: float) -> tuple[float, float]:
+    """(shares, Kelly fraction) for one binary share bought at the ask: Kelly
+    f* = (q - p) / (1 - p) of the bankroll, q the fair value, p the ask plus its
+    fee; the order is `fraction` of it in whole shares, at most max_shares.
+    (0, f*) when there is no edge or no bankroll."""
+    p = float(ask) + taker_fee(float(ask), fee_rate)
+    if not 0.0 < p < 1.0 or not bankroll or bankroll <= 0:
+        return 0.0, 0.0
+    f = (float(fair) - p) / (1.0 - p)
+    if f <= 0:
+        return 0.0, f
+    return float(min(math.floor(fraction * f * bankroll / p + 1e-9), max_shares)), f
 
-    A market pays UP when BTC at the round's end is at or above BTC at its
-    start. With BTC a driftless random walk over the seconds left:
 
-        P(UP) = Phi( ln(S / S0) / (sigma * sqrt(tau)) )       P(DOWN) = 1 - P(UP)
+class Volatility:
+    """The trigger feed's realized volatility per sqrt(second): one sample a
+    second, over the last window_s, floored at FAIR_MIN_VOL_BP; None with fewer
+    than min_samples steps (a bot that just started does not guess)."""
 
-    S: the trigger feed's mid now. S0: its mid standing at the round's first
-    instant (Polymarket settles on Chainlink's price; the feed's is an
-    approximation, usually a few dollars off). sigma: the feed's realized
-    volatility per sqrt(second) over the last vol_window_s, from one sample a
-    second (floored). tau: the seconds left.
-
-    None whenever an input is unknown: a start price the bot did not see (it
-    joined mid-round) or too few volatility samples. Never guessed."""
-
-    def __init__(self, vol_window_s: float = 300.0, min_samples: int = FAIR_MIN_SAMPLES,
+    def __init__(self, window_s: float = 300.0, min_samples: int = FAIR_MIN_SAMPLES,
                  min_vol_bp: float = FAIR_MIN_VOL_BP) -> None:
-        self.vol_window_s, self.min_samples, self.min_vol = float(vol_window_s), int(min_samples), min_vol_bp / 1e4
-        self.starts: dict = {}                      # round start (epoch s) -> S0, or None (unknown)
+        self.window_s, self.min_samples, self.min_vol = float(window_s), int(min_samples), min_vol_bp / 1e4
         self.last_mid: float | None = None
-        self._prev: tuple[float, float] | None = None       # (wall, mid) of the previous tick
         self._last: tuple[float, float] | None = None       # (mono, ln mid) of the last 1s sample
         self._incs: collections.deque = collections.deque()  # (mono, dx^2, dt) per sample step
         self._sq = self._dt = 0.0
         self._steps = 0
 
-    def observe(self, wall: float, mono: float, mid: float) -> None:
+    def observe(self, mono: float, mid: float) -> None:
         """One trigger-feed price. Cheap: called on every tick, before the rule."""
         if isinstance(mid, bool) or not isinstance(mid, (int, float)) or not (math.isfinite(mid) and mid > 0):
             return
         mid = float(mid)
-        rs = int(wall // ROUND_S) * ROUND_S
-        if rs not in self.starts:
-            prev = self._prev
-            if prev is not None and prev[0] <= rs and rs - prev[0] <= FAIR_START_STALE_S:
-                self.starts[rs] = prev[1]           # the price standing at the round's first instant
-            elif wall - rs <= 5.0:
-                self.starts[rs] = mid               # the round's first tick, within its first 5s
-            else:
-                self.starts[rs] = None              # joined mid-round: unknown, never guessed
-            while len(self.starts) > 4:
-                self.starts.pop(min(self.starts))
-        self._prev = (wall, mid)
         self.last_mid = mid
         last = self._last
         if last is not None and mono - last[0] < 1.0:
@@ -560,7 +568,7 @@ class FairValue:
             self._sq += dx2
             self._dt += dt
             self._steps += 1
-            cut = mono - self.vol_window_s
+            cut = mono - self.window_s
             while self._incs and self._incs[0][0] < cut:
                 _m, a, b = self._incs.popleft()
                 self._sq -= a
@@ -575,21 +583,6 @@ class FairValue:
         if len(self._incs) < self.min_samples or self._dt <= 0:
             return None
         return max(math.sqrt(max(self._sq, 0.0) / self._dt), self.min_vol)
-
-    def fair_up(self, mid: float, now_wall: float, round_end: float):
-        """(P(UP), detail) for the round ending at round_end, or (None, why)."""
-        start = int(round(float(round_end))) - ROUND_S
-        s0 = self.starts.get(start)
-        if s0 is None:
-            return None, "no start price"
-        sigma = self.vol()
-        if sigma is None:
-            return None, "volatility warming up"
-        tau = float(round_end) - now_wall
-        if tau <= 0:
-            return None, "round over"
-        z = math.log(mid / s0) / (sigma * math.sqrt(tau))
-        return norm_cdf(z), {"start_px": s0, "vol_bp": sigma * 1e4, "tau_s": tau, "z": z}
 
 
 def signing_price(cap: float, tick: str) -> float:
@@ -839,14 +832,21 @@ class Settings:
         # same-side order in the same market, the target never above this.
         self.max_target_shares = _env_float("SNIPER_MAX_TARGET_SHARES", 20)
         # Fair value (the frozen spec since 2026-10-11, the operator's rule): every buy
-        # only at or under the share's fair value (FairValue: BTC against its price at
-        # the round's start, its 5-minute volatility, the seconds left) less the taker
-        # fee and SNIPER_FAIR_MARGIN; the limit is capped there too. Unknown fair value
-        # (no start price seen, volatility warming up) skips: never guessed.
+        # only at or under the MARKET-ANCHORED fair value (anchored_fair: the market's
+        # own mid for the side just before the move, moved by what a BTC move of this
+        # size should do with the volatility and time left) less the taker fee and
+        # SNIPER_FAIR_MARGIN; the limit is capped there too. Under a minute of price
+        # history, or no market mid, skips: never guessed.
         self.fair = _env_bool("SNIPER_FAIR", True)
         self.fair_margin = _env_float("SNIPER_FAIR_MARGIN", 0.01)
         self.fair_vol_s = _env_float("SNIPER_FAIR_VOL_S", 300)
         self.fair_fee_rate = _env_float("SNIPER_FAIR_FEE_RATE", 0.07)
+        # Kelly size (the frozen spec since 2026-10-11, with the fair value): FAK orders
+        # buy SNIPER_KELLY_FRACTION of the Kelly bet on that fair value, in whole shares,
+        # at most SNIPER_MAX_TARGET_SHARES, from the account's cash; under the venue's
+        # 5-share minimum it skips. Replaces the fixed SNIPER_SHARES + carry.
+        self.kelly = _env_bool("SNIPER_KELLY", True)
+        self.kelly_fraction = _env_float("SNIPER_KELLY_FRACTION", 0.25)
         self.stale_ms = _env_float("SNIPER_STALE_MS", 2000)
         # Which book a paper order fills against. "exchange": the book as it
         # stood at the modelled match instant on the venue's own clock (the
@@ -936,7 +936,8 @@ class Settings:
              "SNIPER_COINBASE_STALE_MS / _UNKNOWN_MS / _SILENT_S must be > 0, _BACKLOG_MAX >= 0"),
             (0 <= self.fair_margin < 0.5, f"SNIPER_FAIR_MARGIN={self.fair_margin:g} (must be 0 to 0.49)"),
             (self.fair_vol_s >= 60, f"SNIPER_FAIR_VOL_S={self.fair_vol_s:g} (must be >= 60)"),
-            (0 <= self.fair_fee_rate < 0.25, f"SNIPER_FAIR_FEE_RATE={self.fair_fee_rate:g} (must be 0 to 0.25)")) if not ok]
+            (0 <= self.fair_fee_rate < 0.25, f"SNIPER_FAIR_FEE_RATE={self.fair_fee_rate:g} (must be 0 to 0.25)"),
+            (0 < self.kelly_fraction <= 1, f"SNIPER_KELLY_FRACTION={self.kelly_fraction:g} (must be above 0, at most 1)")) if not ok]
         if bad:
             raise ValueError("invalid SNIPER_* settings: " + "; ".join(bad))
 
@@ -961,8 +962,12 @@ class Settings:
                 if self.order_type == "FAK" else "")
 
     def fair_text(self) -> str:
-        return (f"; every buy at or under fair value - fee - ${self.fair_margin:.2f} (BTC vs its round-start "
-                f"price, {self.fair_vol_s:.0f}s volatility, time left)" if self.fair else "")
+        if not self.fair:
+            return ""
+        return (f"; every buy at or under the market-anchored fair value - fee - ${self.fair_margin:.2f} "
+                f"(the market's mid moved by the BTC move over {self.fair_vol_s:.0f}s volatility and the time left)"
+                + (f"; size {self.kelly_fraction:g} Kelly, {KELLY_MIN_SHARES}-{self.max_target_shares:g} sh"
+                   if self.kelly and self.order_type == "FAK" else ""))
 
     def lines(self, live: bool = False) -> list[str]:
         if live:
@@ -1249,8 +1254,13 @@ class Sniper:
         # Coinbase: its freshness gate (enabled by _coinbase_loop only, like Binance's
         # by run()), the last ticker sequence used (an older one is out of order) and
         # feed-quality figures for the summary rows.
-        # What a share is worth now (SNIPER_FAIR): fed every trigger-feed price.
-        self.fair_model = FairValue(vol_window_s=self.s.fair_vol_s)
+        # The trigger feed's volatility for the fair value (SNIPER_FAIR): fed every price.
+        self.vol_model = Volatility(window_s=self.s.fair_vol_s)
+        # Kelly sizing reads the account's cash from here: refreshed off the order path
+        # (the paper broker sums every ledger position for it) - see _bankroll_now.
+        self._bankroll: float | None = None
+        self._bankroll_at = -1e18
+        self.last_fair: dict | None = None          # the last fair-value decision (the dashboard)
         self.cb_fresh = BinanceFreshness(self.s.coinbase_stale_ms, self.s.coinbase_unknown_ms,
                                          self.s.coinbase_backlog_max, name="coinbase")
         self._coinbase_seq: int | None = None
@@ -1444,6 +1454,34 @@ class Sniper:
                              "collected": found, "left_s": round(left, 2)})
             await asyncio.sleep(0.5)
 
+    BANKROLL_EVERY_S = 5.0     # the cash Kelly sizes from is re-read this often, off the order path
+    BANKROLL_STALE_S = 30.0    # older than this (no refresher running): read it on the spot
+
+    def _read_bankroll(self) -> float | None:
+        """The account's cash: live, the canary's collateral reading; paper, the
+        broker's cash (which sums every ledger position - never per tick)."""
+        try:
+            if self.live is not None:
+                v = getattr(self.live, "balance", None)
+            else:
+                read = getattr(self.broker, "cash_balance", None)
+                v = read() if callable(read) else None
+            v = None if v is None else float(v)
+        except Exception:  # noqa: BLE001 - no reading: Kelly then skips, it never guesses
+            v = None
+        return v if v is not None and math.isfinite(v) else None
+
+    def _bankroll_now(self) -> float | None:
+        if self._bankroll is None or time.monotonic() - self._bankroll_at > self.BANKROLL_STALE_S:
+            self._bankroll, self._bankroll_at = self._read_bankroll(), time.monotonic()
+        return self._bankroll
+
+    async def _bankroll_loop(self) -> None:
+        while True:
+            v = await asyncio.to_thread(self._read_bankroll)
+            self._bankroll, self._bankroll_at = v, time.monotonic()
+            await asyncio.sleep(self.BANKROLL_EVERY_S)
+
     async def _round_watch(self) -> None:
         while True:
             self.roll_rounds()
@@ -1496,7 +1534,7 @@ class Sniper:
         if self.s.primary_feed != "binance":
             self.n["binance ticks ignored (not the trigger)"] += 1
             return
-        self.fair_model.observe(time.time(), t / 1000.0, mid)
+        self.vol_model.observe(t / 1000.0, mid)
         self._signal("binance", self.trigger, mid, t, t_pc)
 
     def on_coinbase(self, raw) -> str:
@@ -1557,7 +1595,7 @@ class Sniper:
             return "tick"
         if primary:
             self.last_mid = mid
-            self.fair_model.observe(wall, t / 1000.0, mid)
+            self.vol_model.observe(t / 1000.0, mid)
         q = trig.q
         reset = bool(q) and t - q[-1][0] > trig.max_gap_ms      # no match for that long: the rule restarts
         self._signal("coinbase", trig, mid, t, t_pc)
@@ -1624,7 +1662,7 @@ class Sniper:
         self.last_mid = mid
         q = self.trigger.q
         reset = bool(q) and t - q[-1][0] > self.trigger.max_gap_ms     # no tick and no heartbeat for that long
-        self.fair_model.observe(time.time(), t / 1000.0, mid)
+        self.vol_model.observe(t / 1000.0, mid)
         self._signal("kraken", self.trigger, mid, t, t_pc)
         # Feed quality, measured after the decision so it costs the decision nothing:
         # gaps between updates (one longer than the max gap resets the rule) and how
@@ -2515,30 +2553,54 @@ class Sniper:
         # The price ceiling is fixed here, once, from the ask this decision saw:
         # never recomputed from a later ask, so it cannot chase the book.
         cap = min(0.99, round(ask + self.s.slip, 4))
+        fair = None
         if self.s.fair:
-            # Buy only at or under what the share is worth now, less the fee and the
-            # margin (SNIPER_FAIR): first buys and add-ons alike.
-            mid = row.get("signal_mid") or self.fair_model.last_mid
-            p_up, info = (self.fair_model.fair_up(float(mid), time.time(), end) if mid
-                          else (None, "no BTC price"))
-            if p_up is None:
-                return self._skip(f"fair value unknown: {info}", row)
-            fair = p_up if side == "UP" else 1.0 - p_up
+            # Buy only at or under what the side is worth right after this move,
+            # anchored to the market's own price for it (anchored_fair), less the fee
+            # and the margin (SNIPER_FAIR): first buys and add-ons alike.
+            sigma = self.vol_model.vol()
+            mkt = getattr(view, "mid", None)
+            tau = float(end) - time.time()
+            move = abs(float(row.get("bp") or 0.0))
+            why = ("volatility warming up" if sigma is None else "no market price" if mkt is None
+                   else "no move" if move <= 0 else "round over" if tau <= 0 else None)
+            if why is not None:
+                return self._skip(f"fair value unknown: {why}", row)
+            fair = anchored_fair(float(mkt), move, sigma, tau)
             tick = getattr(view, "tick_size", None)
             limit = fair_limit(fair, self.s.fair_margin, float(tick) if tick else 0.01, self.s.fair_fee_rate)
-            row.update(fair=round(fair, 4), fair_limit=limit, start_px=info["start_px"],
-                       vol_bp=round(info["vol_bp"], 3), tau_s=round(info["tau_s"], 1))
+            row.update(market_mid=round(float(mkt), 4), fair=round(fair, 4), fair_limit=limit,
+                       vol_bp=round(sigma * 1e4, 3), tau_s=round(tau, 1))
+            self.last_fair = {"side": side, "market_mid": round(float(mkt), 4), "fair": round(fair, 4),
+                              "limit": limit, "ask": ask, "wall": time.time()}
             if ask > limit + 1e-9:
                 row.update(ask_seen=ask)
                 return self._skip("ask not below fair value", row)
             cap = min(cap, limit)
         target = carry = None
+        kelly = False
         if self.s.order_type == "FAK":
-            # IOC: a share target - the base clip plus what this side's last
-            # order in this market did not fill - sized on the visible levels
-            # up to the ceiling (and never past the account's MAX_BUY_PRICE).
-            carry = self._carry_for(cond, end)[side]
-            target = min(self.s.shares + carry, self.s.max_target_shares)
+            if fair is not None and self.s.kelly:
+                # Kelly size on the fair value (SNIPER_KELLY): a fraction of the Kelly
+                # bet from the account's cash, whole shares, the venue minimum up to the
+                # max target. Each order is sized fresh: no carry.
+                bank = self._bankroll_now()
+                if bank is None:
+                    return self._skip("kelly size unknown: no cash reading", row)
+                shares, f = kelly_shares(fair, ask, self.s.fair_fee_rate, self.s.kelly_fraction, bank,
+                                         self.s.max_target_shares)
+                row.update(kelly_f=round(f, 4), bankroll=round(bank, 2), kelly_shares=shares)
+                self.last_fair["shares"] = shares
+                if shares < KELLY_MIN_SHARES:
+                    row.update(ask_seen=ask)
+                    return self._skip(f"kelly size under the {KELLY_MIN_SHARES}-share minimum", row)
+                target, carry, kelly = shares, 0.0, True
+            else:
+                # IOC: a share target - the base clip plus what this side's last
+                # order in this market did not fill - sized on the visible levels
+                # up to the ceiling (and never past the account's MAX_BUY_PRICE).
+                carry = self._carry_for(cond, end)[side]
+                target = min(self.s.shares + carry, self.s.max_target_shares)
             amount = max(self.ioc_spend(self._visible_levels(str(token), view), target, ask, min(cap, hi)),
                          MIN_ORDER_USD)
         else:
@@ -2575,7 +2637,8 @@ class Sniper:
         row.update(latency_ms=round(lat, 1), **parts)
         tick = getattr(view, "tick_size", None)
         return {"end": end, "token": str(token), "amount": amount, "rd": rd, "cap": cap, "lat": lat, "view": view,
-                "target": target, "carry_market": self.carry_market if target is not None else None,
+                # a Kelly-sized order carries nothing to the next: each is sized fresh
+                "target": target, "carry_market": self.carry_market if target is not None and not kelly else None,
                 "order_type": self.s.order_type, "tick": f"{float(tick):g}" if tick else "0.01",
                 "other": str(down if side == "UP" else up), "cond": str(cond), "t0": t_ms / 1000.0,
                 "decided_pc": decided_pc, "built_pc": time.perf_counter_ns(),
@@ -2867,9 +2930,9 @@ class Sniper:
                                  "gap_ms_max": round(self.coinbase_gap_max, 1)}}
                    if self.s.primary_feed == "coinbase" else {}),
                 **({"carry": self.carry_view()} if self.s.order_type == "FAK" else {}),
-                **({"fair": {"vol_bp": (round(v * 1e4, 3) if (v := self.fair_model.vol()) is not None else None),
-                             "samples": len(self.fair_model._incs),
-                             "starts": {str(k): v for k, v in sorted(self.fair_model.starts.items())}}}
+                **({"fair": {"vol_bp": (round(v * 1e4, 3) if (v := self.vol_model.vol()) is not None else None),
+                             "samples": len(self.vol_model._incs), "bankroll": self._bankroll,
+                             "last": self.last_fair}}
                    if self.s.fair else {}),
                 "errors": self.n["errors"], "shadow_errors": self.n["shadow errors"],
                 "latency_ms": round(self.latency_plan()[0], 1),       # paper's MODELLED flight, not a measurement
@@ -2925,6 +2988,8 @@ class Sniper:
             self._spawn(self._extra_feed(name))
         self._spawn(self._loop_lag_probe())
         self._spawn(self._gc_schedule())
+        if self.s.fair and self.s.kelly:
+            self._spawn(self._bankroll_loop())
         stall_ms = _env_float("SNIPER_STALL_MS", 50)
         if stall_ms > 0 and self.journal is not None:
             self.stallwatch = StallWatch(asyncio.get_running_loop(), self._write, threshold_ms=stall_ms).start()

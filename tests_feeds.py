@@ -1495,7 +1495,13 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # volatility; unknown inputs skip ("fair value unknown"). The feeds feed the model.
     # Re-approved 2026-10-11 (later, the operator's change): the SNIPER_K_BP default is the
     # frozen spec's 0.5bp again (0.3bp for part of the day); nothing else changed.
-    "sniper_mode.py": "86a976feca84701cb4e46d2508b278009d787854ea2a00c11a9655bbbe292525",
+    # Re-approved 2026-10-11 (later, the operator's changes): the fair value is MARKET-
+    # ANCHORED (anchored_fair: the market's mid for the side as a z-score, moved by
+    # |move| / (sigma sqrt tau)) - the start-price model is removed (FairValue -> Volatility,
+    # one sample a second); FAK orders are sized at SNIPER_KELLY_FRACTION Kelly on it
+    # (kelly_shares, 5..SNIPER_MAX_TARGET_SHARES, no carry) from a cash reading cached off
+    # the order path (_bankroll_now / _bankroll_loop); unknown inputs skip.
+    "sniper_mode.py": "7152a85b28f6df925167564c64fc36672775e21a2dd900704b119aef77c353fc",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
