@@ -29,6 +29,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .test-tmp/
+data/audit_tmp/
 *.tmp
 *.bak
 

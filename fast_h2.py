@@ -71,17 +71,25 @@ class Resp:
 
 
 class Stream:
-    __slots__ = ("sid", "future", "events", "status", "headers", "body")
+    __slots__ = ("sid", "future", "events", "status", "headers", "body", "abandon")
 
     def __init__(self, sid: int, future) -> None:
         self.sid, self.future = sid, future
         self.events: list = []                       # (httpcore-style name, perf_counter_ns)
         self.status, self.headers, self.body = None, [], bytearray()
+        self.abandon = None
 
     async def response(self, timeout: float | None) -> Resp:
-        if timeout is None:
-            return await asyncio.shield(self.future)
-        return await asyncio.wait_for(asyncio.shield(self.future), timeout)
+        try:
+            if timeout is None:
+                return await asyncio.shield(self.future)
+            return await asyncio.wait_for(asyncio.shield(self.future), timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            # A timeout says nothing about order acceptance. Only release the
+            # transport's resources; the sender still records AMBIGUOUS.
+            if self.abandon is not None:
+                self.abandon(self)
+            raise
 
 
 class _Proto(asyncio.Protocol):
@@ -117,7 +125,11 @@ class _Proto(asyncio.Protocol):
 
     # ---- the synchronous write
     def request(self, method: str, path: str, headers: dict, body: bytes) -> Stream:
+        if not self.alive or self.transport is None or self.transport.is_closing():
+            raise NotConnected("no live HTTP/2 connection")
         conn = self.conn
+        if conn.open_outbound_streams >= conn.remote_settings.max_concurrent_streams:
+            raise NotProcessed("peer's concurrent stream limit reached; nothing written")
         sid = conn.get_next_available_stream_id()
         hdrs = [(":method", method), (":authority", self.client.authority), (":scheme", self.client.scheme),
                 (":path", path)]
@@ -127,17 +139,52 @@ class _Proto(asyncio.Protocol):
             # yet, so use the window it will open with
             if len(body) > min(conn.outbound_flow_control_window, conn.remote_settings.initial_window_size,
                                conn.max_outbound_frame_size):
-                raise ValueError("request body larger than one flow-control window / frame")
+                raise NotProcessed("request body exceeds available flow-control window / frame; nothing written")
             hdrs.append(("content-length", str(len(body))))
         s = Stream(sid, asyncio.get_running_loop().create_future())
+        s.abandon = self._abandon
         self.streams[sid] = s
+        try:
+            conn.send_headers(sid, hdrs, end_stream=not body)
+            if body:
+                conn.send_data(sid, body, end_stream=True)
+            encoded = conn.data_to_send()
+        except Exception as exc:
+            self.streams.pop(sid, None)
+            s.future.cancel()
+            # Encoding may have partially advanced h2 state. Never let those
+            # buffered bytes escape on a later request.
+            self.alive = False
+            self._fail_all(lambda old: ConnectionError("HTTP/2 request encoding failed"))
+            self.transport.close()
+            raise NotProcessed("request encoding failed before write") from exc
         s.events.append(("http2.send_request_headers.started", time.perf_counter_ns()))
-        conn.send_headers(sid, hdrs, end_stream=not body)
-        if body:
-            conn.send_data(sid, body, end_stream=True)
-        self.transport.write(conn.data_to_send())
+        try:
+            self.transport.write(encoded)
+        except Exception as exc:
+            # write() may have handed bytes to the kernel before failing. Return
+            # the failed stream so start() cannot turn this into a second POST.
+            self.alive = False
+            self._fail_all(lambda old: ConnectionError(f"transport write failed: {type(exc).__name__}"))
+            self.transport.close()
+            return s
         s.events.append(("http2.send_request_body.complete", time.perf_counter_ns()))
         return s
+
+    def _abandon(self, s: Stream) -> None:
+        if self.streams.pop(s.sid, None) is None:
+            return
+        if not s.future.done():
+            s.future.cancel()
+        s.body.clear()
+        if self.alive and not self.transport.is_closing():
+            try:
+                self.conn.reset_stream(s.sid, error_code=h2.errors.ErrorCodes.CANCEL)
+                self.transport.write(self.conn.data_to_send())
+            except Exception:
+                self.alive = False
+                self._fail_all(lambda old: ConnectionError("HTTP/2 stream cleanup failed"))
+                self.transport.close()
 
     # ---- replies
     def data_received(self, data: bytes) -> None:
@@ -155,7 +202,16 @@ class _Proto(asyncio.Protocol):
                 s.events.append(("http2.receive_response_headers.complete", time.perf_counter_ns()))
                 for k, v in ev.headers:
                     if k == ":status":
-                        s.status = int(v)
+                        try:
+                            status = int(v)
+                            if not 100 <= status <= 599:
+                                raise ValueError("invalid HTTP status")
+                            s.status = status
+                        except (TypeError, ValueError):
+                            self.alive = False
+                            self._fail_all(lambda old: ConnectionError("malformed HTTP/2 response status"))
+                            self.transport.close()
+                            return
                     else:
                         s.headers.append((k, v))
             elif isinstance(ev, h2.events.DataReceived):
@@ -172,6 +228,7 @@ class _Proto(asyncio.Protocol):
                     refused = ev.error_code == h2.errors.ErrorCodes.REFUSED_STREAM
                     s.future.set_exception(NotProcessed("stream refused") if refused else
                                            ConnectionError(f"stream reset by the server ({ev.error_code!r})"))
+                    s.future.exception()
             elif isinstance(ev, h2.events.ConnectionTerminated):
                 self.alive = False                     # GOAWAY: no new streams on this connection
                 last = ev.last_stream_id if ev.last_stream_id is not None else 2 ** 31
@@ -179,9 +236,19 @@ class _Proto(asyncio.Protocol):
                     st = self.streams.pop(sid)
                     if not st.future.done():
                         st.future.set_exception(NotProcessed(f"GOAWAY (last stream {last})"))
+                        st.future.exception()
+                # hyper-h2 has entered CLOSED; older streams cannot safely be
+                # drained through it. Their outcome remains unknown.
+                self._fail_all(lambda old: ConnectionError("GOAWAY after request write"))
+                self.transport.close()
         out = self.conn.data_to_send()
         if out and self.transport is not None and not self.transport.is_closing():
-            self.transport.write(out)
+            try:
+                self.transport.write(out)
+            except Exception as exc:
+                self.alive = False
+                self._fail_all(lambda old: ConnectionError(f"HTTP/2 control write failed: {type(exc).__name__}"))
+                self.transport.close()
 
 
 class FastH2:
@@ -196,6 +263,7 @@ class FastH2:
         self.timeout_s, self.connect_timeout_s = timeout_s, connect_timeout_s
         self._proto: _Proto | None = None
         self._lock: asyncio.Lock | None = None
+        self._ssl_context: ssl.SSLContext | None = None
         self.connects = 0
         self.is_closed = False
 
@@ -205,8 +273,11 @@ class FastH2:
 
     def _path(self, url: str, params=None) -> str:
         u = urlsplit(url)
-        if u.scheme and (u.hostname != self.host or (u.port or self.port) != self.port):
-            raise ValueError(f"{url} is not on {self.host}")
+        if u.netloc or u.scheme:
+            effective_port = u.port or (443 if u.scheme == "https" else 80)
+            if (u.scheme != self.scheme or u.hostname != self.host or effective_port != self.port
+                    or u.username is not None or u.password is not None):
+                raise ValueError("request URL is outside the configured HTTP/2 origin")
         path = (u.path or "/") + (f"?{u.query}" if u.query else "")
         if params:
             path += ("&" if "?" in path else "?") + urlencode(params)
@@ -216,17 +287,29 @@ class FastH2:
         if self._lock is None:
             self._lock = asyncio.Lock()
         async with self._lock:
+            if self.is_closed:
+                raise RuntimeError("client closed")
             if self.connected:
                 return
+            old, self._proto = self._proto, None
+            if old is not None and old.transport is not None:
+                old.transport.close()
             loop = asyncio.get_running_loop()
             ctx = None
             if self.scheme == "https":
-                ctx = ssl.create_default_context()
-                ctx.set_alpn_protocols(["h2"])
+                if self._ssl_context is None:
+                    # Loading Windows/system trust stores can block for tens
+                    # of milliseconds. Do it once, away from the feed loop.
+                    self._ssl_context = await asyncio.to_thread(ssl.create_default_context)
+                    self._ssl_context.set_alpn_protocols(["h2"])
+                ctx = self._ssl_context
             transport, proto = await asyncio.wait_for(
                 loop.create_connection(lambda: _Proto(self), self.host, self.port, ssl=ctx,
                                        server_hostname=self.host if ctx else None),
                 self.connect_timeout_s)
+            if self.is_closed:
+                transport.close()
+                raise RuntimeError("client closed during connect")
             if ctx is not None:
                 alpn = transport.get_extra_info("ssl_object").selected_alpn_protocol()
                 if alpn != "h2":
@@ -254,13 +337,26 @@ class FastH2:
             await self._connect()
             if trace:
                 await trace("connection.start_tls.complete", {})
+        before_write = (extensions or {}).get("before_write")
+        if before_write is not None:
+            before_write()
         s = self._proto.request(method, self._path(url, params), headers or {}, body)
-        if trace:
-            for name, _t in s.events:
-                await trace(name, {})
-        r = await s.response(self.timeout_s if timeout is None else timeout)
-        if trace:
-            await trace("http2.receive_response_headers.complete", {})
+        sent_events = len(s.events)
+        try:
+            if trace:
+                for name, _t in s.events:
+                    await trace(name, {"timestamp_ns": _t})
+            r = await s.response(self.timeout_s if timeout is None else timeout)
+        except BaseException:
+            # A tracing callback can fail after bytes have left the process,
+            # before response() gets a chance to clean up a cancelled waiter.
+            if s.abandon is not None:
+                s.abandon(s)
+            raise
+        finally:
+            if trace:
+                for name, _t in s.events[sent_events:]:
+                    await trace(name, {"timestamp_ns": _t})
         return r
 
     async def get(self, url, *, params=None, headers=None, extensions=None, timeout=None) -> Resp:

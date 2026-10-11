@@ -139,6 +139,8 @@ class BookState:
     def note_exchange_ts(self, ts_ms) -> None:
         """Any feed message's exchange time (trades too): advances ts_hwm."""
         ts = _int(ts_ms)
+        if not self._fresh_exchange_ts(ts):
+            return
         with self._lock:
             self._note_ts(ts)
 
@@ -263,6 +265,9 @@ class BookState:
         that happened while we were away are gone for good."""
         with self._lock:
             for t, m in self._meta.items():
+                # An in-flight REST read from before the gap must not sync
+                # the new socket session with a pre-gap snapshot.
+                self._generation[t] = self._generation.get(t, 0) + 1
                 m["synced"] = False
                 m["desync_reason"] = reason
                 self._dirty[t] = self._dirty.get(t, 0) + 1
@@ -280,6 +285,7 @@ class BookState:
             if token not in self._active or m is None or not m.get("synced"):
                 continue
             m["synced"] = False
+            self._generation[token] = self._generation.get(token, 0) + 1
             m["desync_reason"] = reason
             self._dirty[token] = self._dirty.get(token, 0) + 1
             self._record(token, None, gap=True)
@@ -289,6 +295,8 @@ class BookState:
     def apply_snapshot(self, token: str, bids, asks, *, ts_ms=None, hash_=None,
                        tick=None, only_if_unsynced: bool = False,
                        expected_generation: int | None = None,
+                       expected_updates: int | None = None,
+                       refresh_if_older_than: float | None = None,
                        require_exchange_ts: bool = False) -> bool:
         """Full replace. Returns False if the token is not active."""
         with self._lock:
@@ -298,10 +306,21 @@ class BookState:
             m = self._meta[token]
             if expected_generation is not None and self._generation.get(token) != expected_generation:
                 return False
-            if only_if_unsynced and m.get("synced"):
+            if expected_updates is not None and m.get("updates", 0) != expected_updates:
                 return False
+            if only_if_unsynced and m.get("synced") and self._status(token) != STALE:
+                # A quiet but connected book may hit a consumer's shorter
+                # freshness budget before the feed's own stale threshold.
+                # Revalidation is safe only when no WS update or session gap
+                # happened since the REST fetch began.
+                updated = m.get("updated")
+                if (refresh_if_older_than is None or expected_generation is None
+                        or expected_updates is None or updated is None
+                        or time.monotonic() - updated < refresh_if_older_than):
+                    return False
             incoming_ts = _int(ts_ms)
             if require_exchange_ts and not self._fresh_exchange_ts(incoming_ts):
+                self._desync_locked((token,), "snapshot timestamp refused")
                 return False
             previous_ts = m.get("ts")
             if (m.get("synced") and incoming_ts is not None and previous_ts is not None
@@ -339,8 +358,10 @@ class BookState:
                 # know what it is being applied to. Wait for the snapshot.
                 return False
             try:
+                if isinstance(price, bool) or isinstance(size, bool):
+                    raise ValueError("boolean delta value")
                 p, s = float(price), float(size)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 self._desync_locked((token,), "invalid delta")
                 return False
             side = str(side or "").upper()
@@ -390,11 +411,15 @@ class BookState:
         """
         incoming_ts = _int(ts_ms)
         with self._lock:
+            if not isinstance(changes, (list, tuple)):
+                self._desync_locked(self._active, "malformed price-change collection")
+                return False
             named = [str(c.get("asset_id") or "") for c in (changes or ()) if isinstance(c, dict)]
             if require_exchange_ts and not self._fresh_exchange_ts(incoming_ts):
                 self._desync_locked(named, "event timestamp refused")
                 return False
             staged: dict[str, tuple[dict[float, float], dict[float, float]]] = {}
+            token_hashes: dict[str, str] = {}
             touched: set[str] = set()
             skipped_pending = False
             for change in changes or ():
@@ -416,9 +441,11 @@ class BookState:
                         and incoming_ts < previous_ts):
                     continue
                 try:
+                    if isinstance(change.get("price"), bool) or isinstance(change.get("size"), bool):
+                        raise ValueError("boolean delta value")
                     price = float(change.get("price"))
                     size = float(change.get("size"))
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     self._desync_locked(named, "invalid delta")
                     return False
                 side = str(change.get("side") or "").upper()
@@ -436,6 +463,8 @@ class BookState:
                 else:
                     book[price] = size
                 touched.add(token)
+                if change.get("hash"):
+                    token_hashes[token] = change["hash"]
 
             for bids, asks in staged.values():
                 if bids and asks and max(bids) >= min(asks):
@@ -452,10 +481,7 @@ class BookState:
                 meta = self._meta[token]
                 meta.update(updated=now_mono, ts=incoming_ts,
                             updates=meta.get("updates", 0) + 1)
-                token_hash = next((c.get("hash") for c in (changes or ())
-                                   if isinstance(c, dict)
-                                   and str(c.get("asset_id") or "") == token
-                                   and c.get("hash")), None)
+                token_hash = token_hashes.get(token)
                 if token_hash or hash_:
                     meta["hash"] = token_hash or hash_
                 self._dirty[token] = self._dirty.get(token, 0) + 1
@@ -466,8 +492,10 @@ class BookState:
         with self._lock:
             if token in self._meta:
                 try:
+                    if isinstance(tick, bool):
+                        raise ValueError("boolean tick")
                     parsed = float(tick)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     return
                 if not math.isfinite(parsed) or parsed <= 0 or parsed >= 1:
                     return
@@ -538,10 +566,11 @@ class BookState:
             from .health import worst
             return worst(*[self._status(t) for t in selected])
 
-    def needs_resync(self) -> list[str]:
+    def needs_resync(self, *, include_stale: bool = False) -> list[str]:
         with self._lock:
             return [t for t in sorted(self._active)
-                    if not self._meta.get(t, {}).get("synced")]
+                    if (not self._meta.get(t, {}).get("synced")
+                        or (include_stale and self._status(t) == STALE))]
 
     def _fresh_exchange_ts(self, ts_ms: int | None) -> bool:
         """Sanity-check an event timestamp. Liveness is NOT measured here.
@@ -561,32 +590,42 @@ class BookState:
             return False
         try:
             age_s = timer.exchange_age_s(ts_ms)
-        except ValueError:
+        except (ValueError, OverflowError):
             return False
         return -self.future_tolerance <= age_s <= self.max_quiet
 
 
 def _to_map(levels) -> tuple[dict[float, float], bool]:
     out: dict[float, float] = {}
+    if not isinstance(levels, (list, tuple)):
+        return {}, False
     for lv in levels or ():
         try:
             if isinstance(lv, dict):
+                if isinstance(lv.get("price"), bool) or isinstance(lv.get("size"), bool):
+                    return {}, False
                 p, s = float(lv.get("price")), float(lv.get("size"))
             else:
+                if isinstance(lv[0], bool) or isinstance(lv[1], bool):
+                    return {}, False
                 p, s = float(lv[0]), float(lv[1])
-        except (IndexError, KeyError, TypeError, ValueError):
+        except (IndexError, KeyError, TypeError, ValueError, OverflowError):
             return {}, False
         if math.isfinite(p) and math.isfinite(s) and 0 < p < 1 and s > 0:
             out[p] = out.get(p, 0.0) + s
+            if not math.isfinite(out[p]):
+                return {}, False
         else:
             return {}, False
     return out, True
 
 
 def _int(v):
+    if isinstance(v, bool):
+        return None
     try:
         return int(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 

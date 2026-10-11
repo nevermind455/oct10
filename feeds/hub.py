@@ -18,6 +18,8 @@ round's ask, or a book that is half-way through a delta.
 from __future__ import annotations
 
 import asyncio
+import math
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -80,11 +82,24 @@ class FeedHub:
 
     def __init__(self, *, creds: dict | None = None, on_event=None,
                  btc_stale_after: float = 3.0, book_stale_after: float = 8.0,
-                 rest_book_fetch=None, urls: dict | None = None) -> None:
+                 rest_book_fetch=None, urls: dict | None = None,
+                 book_refresh_after: float | None = None) -> None:
         urls = urls or {}
         self._lock = threading.RLock()
         self._on_event = on_event
         self.book = BookState(stale_after=book_stale_after)
+        if book_refresh_after is None:
+            try:
+                sniper_budget = float(os.environ.get("SNIPER_STALE_MS", "2000")) / 1000.0
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("SNIPER_STALE_MS must be a finite positive number") from exc
+            if not math.isfinite(sniper_budget) or sniper_budget <= 0:
+                raise ValueError("SNIPER_STALE_MS must be a finite positive number")
+            book_refresh_after = 0.75 * min(book_stale_after, sniper_budget)
+        if (not math.isfinite(book_refresh_after) or book_refresh_after <= 0):
+            raise ValueError("book refresh age must be finite and positive")
+        self.book_refresh_after = book_refresh_after
+        self._book_refresh_check_s = min(0.25, book_refresh_after / 4.0)
         self.fill_store = FillStore()
 
         kw = {"on_event": on_event}
@@ -92,7 +107,8 @@ class FeedHub:
             urls.get("binance") or DEFAULT_BINANCE,
             stale_after=btc_stale_after, on_price=self._on_price, **kw)
         self.market = PolyMarketFeed(urls.get("poly_market", DEFAULT_MARKET),
-                                     book=self.book, stale_after=book_stale_after, **kw)
+                                     book=self.book, stale_after=book_stale_after,
+                                     request_resync=self._request_resync, **kw)
         self.user = PolyUserFeed(creds, urls.get("poly_user", DEFAULT_USER),
                                  store=self.fill_store, **kw)
 
@@ -107,8 +123,11 @@ class FeedHub:
 
         self._rest_book_fetch = rest_book_fetch   # callable(token) -> (bids, asks)
         self._resync_wanted: set[str] = set()
+        self._next_book_fetch_at: dict[str, tuple[int, float]] = {}
         self._tasks: list[asyncio.Task] = []
         self._stop = asyncio.Event()
+        self._resync_event = asyncio.Event()
+        self._resync_loop_owner: asyncio.AbstractEventLoop | None = None
         self.rest_resyncs = 0
         self.rest_fallbacks = 0
 
@@ -182,6 +201,7 @@ class FeedHub:
             # Do not early-return on equal hub fields: a prior interrupted or
             # buggy transition may have left a downstream consumer divergent.
             self._reconcile_round_consumers_locked()
+            self._wake_resync()
             return changed
 
     def prepare_round(self, tokens: dict) -> bool:
@@ -207,6 +227,7 @@ class FeedHub:
             # As with set_round, equal state must still be able to repair a
             # downstream subscription that was interrupted or corrupted.
             self._reconcile_round_consumers_locked()
+            self._wake_resync()
             return changed
 
     def recent_markets(self) -> tuple[str, ...]:
@@ -294,45 +315,86 @@ class FeedHub:
         a REST call inside a message handler stalls every later message
         behind it.
         """
+        self._resync_loop_owner = asyncio.get_running_loop()
+        limiter = asyncio.Semaphore(4)
         while not self._stop.is_set():
             try:
-                await asyncio.sleep(0.5)
-                if self._rest_book_fetch is None:
-                    continue
+                self._resync_event.clear()
                 with self._lock:
-                    need = set(self.book.needs_resync()) | set(self._resync_wanted)
+                    need = set(self.book.needs_resync(include_stale=True)) | set(self._resync_wanted)
+                for token, view in self.book.views().items():
+                    age = view.book_age_ms()
+                    if age is not None and age >= self.book_refresh_after * 1000.0:
+                        need.add(token)
                 need &= set(self.book.active)
-                for token in sorted(need):
-                    if self._stop.is_set():
-                        break
-                    generation = self.book.view(token).generation
-                    try:
-                        bids, asks = await asyncio.to_thread(self._rest_book_fetch, token)
-                    except Exception as exc:
-                        self.market.health.mark_error(exc)
-                        self._event("resync",
-                                    f"REST snapshot failed for {token[-6:]}: "
-                                    f"{type(exc).__name__}: {exc}", "warn")
-                        continue
-                    if self.book.apply_snapshot(
-                            token, bids, asks, only_if_unsynced=True,
-                            expected_generation=generation):
-                        self.rest_resyncs += 1
-                        with self._lock:
-                            self._resync_wanted.discard(token)
-                        self._event("resync", f"REST snapshot {token[-6:]}", "info")
-                    elif self.book.view(token).status == LIVE:
-                        # A websocket snapshot won the race while REST was in
-                        # flight.  Never overwrite that newer state.
-                        with self._lock:
-                            self._resync_wanted.discard(token)
-                await asyncio.sleep(1.5)
+                active = set(self.book.active)
+                self._next_book_fetch_at = {token: deadline
+                                           for token, deadline in self._next_book_fetch_at.items()
+                                           if token in active}
+                if self._rest_book_fetch is not None and need:
+                    await asyncio.gather(*(self._resync_token(token, limiter)
+                                           for token in sorted(need)))
+                try:
+                    await asyncio.wait_for(self._resync_event.wait(), timeout=self._book_refresh_check_s)
+                except asyncio.TimeoutError:
+                    pass
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self.market.health.mark_error(exc)
                 self._event("resync", f"loop error: {type(exc).__name__}: {exc}", "warn")
                 await asyncio.sleep(1.0)
+
+    async def _resync_token(self, token: str, limiter: asyncio.Semaphore) -> None:
+        async with limiter:
+            if self._stop.is_set():
+                return
+            now = time.monotonic()
+            view = self.book.view(token)
+            prior_attempt = self._next_book_fetch_at.get(token)
+            if (prior_attempt is not None and prior_attempt[0] == view.generation
+                    and now < prior_attempt[1]):
+                return
+            age = view.book_age_ms()
+            if (view.status == LIVE and age is not None
+                    and age < self.book_refresh_after * 1000.0):
+                with self._lock:
+                    self._resync_wanted.discard(token)
+                return
+            # Also rate-limit failed and WS-raced refreshes. A fast HTTP error
+            # must not turn the background deadline check into an API hot loop.
+            self._next_book_fetch_at[token] = (view.generation, now + max(0.25, self.book_refresh_after))
+            try:
+                bids, asks = await asyncio.to_thread(self._rest_book_fetch, token)
+            except Exception as exc:
+                self.market.health.mark_error(exc)
+                self._event("resync", f"REST snapshot failed for {token[-6:]}: "
+                            f"{type(exc).__name__}: {exc}", "warn")
+                return
+            if self.book.apply_snapshot(
+                    token, bids, asks, only_if_unsynced=True,
+                    expected_generation=view.generation, expected_updates=view.updates,
+                    refresh_if_older_than=self.book_refresh_after):
+                self.rest_resyncs += 1
+                with self._lock:
+                    self._resync_wanted.discard(token)
+                self._event("resync", f"REST snapshot {token[-6:]}", "info")
+            elif self.book.view(token).status == LIVE:
+                with self._lock:
+                    self._resync_wanted.discard(token)
+
+    def _wake_resync(self) -> None:
+        loop = self._resync_loop_owner
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(self._resync_event.set)
+            except RuntimeError:
+                pass
+
+    def _request_resync(self, tokens) -> None:
+        with self._lock:
+            self._resync_wanted.update(tokens)
+        self._wake_resync()
 
     def _event(self, source: str, text: str, level: str) -> None:
         if self._on_event:

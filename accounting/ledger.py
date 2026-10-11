@@ -30,8 +30,10 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field, fields
+from decimal import DecimalException
 
 from . import fees as fee_mod
+from durable_io import replace_atomic
 
 # MATCHED and MINED are non-terminal. They can still transition to FAILED,
 # so inventory and P&L must only use the terminal successful state.
@@ -493,7 +495,12 @@ class Ledger:
                     order_id=None, wall: float | None = None) -> bool:
         """Idempotent. Returns True only if this trade id was new. `wall` is
         the lot's time; only a journal replay passes it (the original one)."""
-        lot_wall = time.time() if wall is None else float(wall)
+        try:
+            lot_wall = time.time() if wall is None else float(wall)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(lot_wall) or lot_wall <= 0:
+            return False
         tid = str(trade_id or "")
         token = str(token_id or "")
         condition = _s(condition_id)
@@ -526,19 +533,42 @@ class Ledger:
                 return False
             try:
                 sh, px = float(shares), float(price)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError, DecimalException):
                 return False
             if not math.isfinite(sh) or not math.isfinite(px) or sh <= 0 or not (0.0 < px <= 1.0):
                 return False
             try:
+                if fee is None and (type(fee_exponent) is not int or not 1 <= fee_exponent <= 8):
+                    return False
                 f = (fee_mod.taker_fee(
                     sh, px, theta, self.category, exponent=fee_exponent)
                      if fee is None else float(fee))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError, DecimalException):
                 return False
             if not math.isfinite(f) or f < 0:
                 return False
             pos = self.positions.get(token)
+            # A rejected exit must not create an empty position or reopen a
+            # settled one. Check inventory before changing either state.
+            if order_side == "SELL":
+                available = (sum(l.open_shares for l in pos.lots
+                                 if str(l.side or "").upper() == "BUY") if pos else 0.0)
+                if (pos is None or available <= 0 or pos.shares <= 0
+                        or sh > available + 1e-9 or sh > pos.shares + 1e-9):
+                    self.skipped_side += 1
+                    return False
+                notional_basis, fee_basis, shortfall = _consume_fifo(pos, sh, consume=False)
+                basis = notional_basis + fee_basis
+                proceeds = sh * px - f
+                if shortfall > 1e-9 or any(not math.isfinite(value) for value in (
+                        proceeds, basis, pos.shares - sh, pos.cost - basis,
+                        pos.fees - fee_basis, pos.sell_fees + f,
+                        pos.realized_from_sales + proceeds - basis)):
+                    return False
+            elif (not math.isfinite(sh * px + f)
+                  or (pos is not None and any(not math.isfinite(value) for value in
+                      (pos.shares + sh, pos.cost + sh * px + f, pos.fees + f)))):
+                return False
             if pos is None:
                 pos = self.positions[token] = Position(
                     token_id=token, condition_id=condition)
@@ -557,11 +587,6 @@ class Ledger:
                 # An exit can only ever reduce inventory we actually hold.
                 # Probing FIFO first means a short is refused before any lot
                 # is mutated, so a rejected sell leaves the ledger untouched.
-                available = sum(l.open_shares for l in pos.lots
-                                if str(l.side or "").upper() == "BUY")
-                if sh > available + 1e-9 or sh > pos.shares + 1e-9:
-                    self.skipped_side += 1
-                    return False
                 notional_basis, fee_basis, shortfall = _consume_fifo(pos, sh)
                 if shortfall > 1e-9:
                     # Unreachable given the check above; refuse rather than
@@ -1018,8 +1043,8 @@ class Ledger:
 
         Resolution changes the value of outcome tokens but does not itself
         redeem them into pUSD. Therefore the only deterministic wallet movement
-        this ledger can predict is the cost of confirmed BUY fills that landed
-        between the two balance observations. Redemptions, deposits, manual
+        this ledger can predict is the cost of confirmed BUY fills, less net
+        SELL proceeds, between the two balance observations. Redemptions, deposits, manual
         activity, or missing fills correctly appear as a mismatch.
         """
         try:
@@ -1036,9 +1061,13 @@ class Ledger:
             observed = b1 - b0
             purchased = sum(
                 lot.cost for position in self.positions.values()
-                for lot in position.lots if t0 <= lot.wall <= t1
+                for lot in position.lots if lot.side == "BUY" and t0 <= lot.wall <= t1
             )
-            expected = -purchased
+            sold = sum(
+                lot.notional - lot.fee for position in self.positions.values()
+                for lot in position.lots if lot.side == "SELL" and t0 <= lot.wall <= t1
+            )
+            expected = sold - purchased
             diff = observed - expected
             ok = abs(diff) <= max(tolerance, abs(expected) * 0.01)
             return {
@@ -1047,6 +1076,7 @@ class Ledger:
                 "balance_observed_delta": observed,
                 "expected_delta": expected,
                 "confirmed_buy_cost_in_window": purchased,
+                "confirmed_sell_proceeds_in_window": sold,
                 "difference": diff,
                 "detail": "" if ok else
                           "wallet movement includes missing fills, redemption, "
@@ -1125,7 +1155,7 @@ class Ledger:
                 fh.write(text)
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp, self.path)
+            replace_atomic(tmp, self.path)
             tmp = None
             _fsync_directory(d)
             self.schema_version = 4
@@ -1366,7 +1396,7 @@ def current_payload(path: str) -> dict:
         return json.loads(_encode_payload(led._payload_locked()))
 
 
-def _consume_fifo(pos, shares: float):
+def _consume_fifo(pos, shares: float, *, consume: bool = True):
     """Consume `shares` from the oldest open BUY lots, oldest first.
 
     Returns ``(notional_basis, fee_basis, shortfall)``. A non-zero shortfall
@@ -1388,7 +1418,8 @@ def _consume_fifo(pos, shares: float):
         fee_per_share = (lot.fee / lot.shares) if lot.shares else 0.0
         notional += take * lot.price
         fees += take * fee_per_share
-        lot.consumed += take
+        if consume:
+            lot.consumed += take
         remaining -= take
     return notional, fees, remaining
 
@@ -1638,17 +1669,15 @@ def _replay_realized_from_sales(position: "Position") -> float:
     so it never mutates the lots it is validating, and returns the total
     proceeds-minus-basis a faithful replay would produce.
     """
-    open_shares: dict[int, float] = {
-        i: lot.shares for i, lot in enumerate(position.lots)
-        if str(lot.side or "").upper() == "BUY"
-    }
+    open_shares: dict[int, float] = {}
     realized = 0.0
-    for lot in position.lots:
-        if str(lot.side or "").upper() != "SELL":
+    for index, lot in enumerate(position.lots):
+        if str(lot.side or "").upper() == "BUY":
+            open_shares[index] = lot.shares
             continue
         remaining = lot.shares
         notional = fees = 0.0
-        for j, buy_lot in enumerate(position.lots):
+        for j, buy_lot in enumerate(position.lots[:index]):
             if remaining <= 1e-12:
                 break
             if str(buy_lot.side or "").upper() != "BUY":
@@ -1662,9 +1691,15 @@ def _replay_realized_from_sales(position: "Position") -> float:
             fees += take * fee_per_share
             open_shares[j] = avail - take
             remaining -= take
+        if remaining > 1e-9:
+            raise ValueError("persisted SELL exceeds inventory available at that time")
         basis = notional + fees
         proceeds = lot.shares * lot.price - lot.fee
         realized += proceeds - basis
+    for index, lot in enumerate(position.lots):
+        if str(lot.side or "").upper() == "BUY" and abs(
+                lot.consumed - (lot.shares - open_shares[index])) > 1e-8:
+            raise ValueError("persisted FIFO consumption does not match SELL lots")
     return realized
 
 
@@ -1729,6 +1764,9 @@ def _validate_loaded_position(key: str, position: Position) -> None:
             raise ValueError("invalid position sales amount")
     if position.sell_fees < 0:
         raise ValueError("invalid position sales amount")
+    if abs(position.sell_fees - sum(lot.fee for lot in position.lots
+                                   if str(lot.side or "").upper() == "SELL")) > tolerance:
+        raise ValueError("sell fees do not match the recorded SELL lots")
     if position.settled:
         payout = position.payout_per_share
         realized = position.realized

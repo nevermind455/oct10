@@ -39,6 +39,7 @@ import http_pool
 import orderbook
 import timer
 from accounting.ledger import Ledger, _fsync_directory
+from durable_io import replace_atomic
 
 
 MONEY = Decimal("0.000001")
@@ -750,7 +751,7 @@ class PaperBroker:
         # different tokens (a market's UP and DOWN) may be in flight together;
         # each books atomically under _lock (cash re-checked against its own
         # actual cost there), so they cannot overspend between them.
-        self._execution_locks: dict[str, threading.Lock] = {}
+        self._execution_locks: dict[tuple[str, str], threading.Lock] = {}
         # last_fill / last_error / last_timing per thread too: a caller
         # matching two orders at once reads ITS order's outcome on the thread
         # that placed it (other readers see the latest, as before).
@@ -896,7 +897,7 @@ class PaperBroker:
                 json.dump(payload, fh, indent=2, sort_keys=True, allow_nan=False)
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp, self.account_path)
+            replace_atomic(tmp, self.account_path)
             _fsync_directory(self.account_path.parent)
         except Exception:
             try:
@@ -1043,14 +1044,13 @@ class PaperBroker:
                 # Re-read AFTER the delay: whatever the book did while the
                 # order was in flight is what the exit actually gets.
                 book = self._book_fetch(token)
-                if not isinstance(book, BookSnapshot):
-                    raise PaperRejected("invalid public order book response")
-                if not math.isfinite(book.received_wall) or book.received_wall <= 0:
-                    raise PaperRejected("public order book omitted receipt time")
-                if timer.wall() - book.received_wall > self.max_book_age_s:
-                    raise PaperRejected("public order book is stale in hand")
+                self._check_book(book, "SELL", expected_token=token, require_asks=False)
                 quote = estimate_sell_fak(book, want, min_price, rules)
                 with self._lock:
+                    if self._context()[0] != condition_id:
+                        raise PaperRejected("paper market changed before exit booking")
+                    if window_end is not None and timer.unix() >= cutoff:
+                        raise PaperRejected("exit booking reached the cutoff")
                     held = self.ledger.positions.get(token)
                     if held is None or held.shares + 1e-9 < float(quote.shares):
                         raise PaperRejected("cannot sell more than the position holds")
@@ -1151,20 +1151,26 @@ class PaperBroker:
         # stays atomic under self._lock either way.
         with self._lock:
             entry_lock = self._execution_locks.setdefault((str(token), str(tag or "")), threading.Lock())
+            # Claim the published lock before pruning or releasing the registry
+            # lock. Otherwise an idle lock could be removed while a caller was
+            # about to acquire it, allowing a second lock for the same order slot.
+            owns_slot = entry_lock.acquire(blocking=False)
             if len(self._execution_locks) > 64:
                 # One lock per token and source, four per five-minute market: drop
                 # the idle ones of tokens that are no longer this round's (they
                 # grew without bound - 370 after 600 rotations in tests_stress).
                 try:
                     current = {str(t) for t in self._context()[1:] if t}
-                except PaperRejected:                   # no current round: keep only busy locks
+                except Exception:                       # no readable round: keep only busy locks
                     current = set()
                 for key, lock in list(self._execution_locks.items()):
                     if key[0] not in current and not lock.locked():
                         del self._execution_locks[key]
-        if not entry_lock.acquire(blocking=False):
+        if not owns_slot:
             return self._reject(side, amount, "another paper order is already in flight on this token")
         try:
+            self.last_fill = None
+            self.last_error = None
             self.last_timing = timing
             return self._place_trade(side, amount, up_token_id, down_token_id,
                                      condition_id, window_end, max_price,
@@ -1262,7 +1268,7 @@ class PaperBroker:
             # is information a real order never has.
             decision_book = self._net_of_own_fills(self._book_fetch(str(token_id)))
             rules = self._rules_matching(condition_id, rules, decision_book)
-            self._check_book(decision_book, side)
+            self._check_book(decision_book, side, expected_token=str(token_id))
             decision_bid = decision_book.best_bid
             if decision_bid is None:
                 raise PaperRejected("public order book has no bid; spread is unknown")
@@ -1339,7 +1345,7 @@ class PaperBroker:
                 # as "no asks on the live book", which left the carry untouched.
                 raise PaperRejected("FAK no-fill: no asks on the book at the match")
             rules = self._rules_matching(condition_id, rules, book)
-            quiet_s, held_s = self._check_book(book, side)
+            quiet_s, held_s = self._check_book(book, side, expected_token=str(token_id))
             book_age_s = quiet_s
             # A real executable spread requires both sides of the same,
             # timestamped venue snapshot.
@@ -1359,6 +1365,8 @@ class PaperBroker:
             if timer.unix() >= end - self.min_seconds_to_expiry:
                 raise PaperRejected("paper quote reached the round cutoff")
             with self._lock:
+                if self._context() != (condition_id, context_up, context_down):
+                    raise PaperRejected("paper market changed before order booking")
                 # Another of our orders on this token (the other source's slot -
                 # the Position Manager's) may have booked since the quote above:
                 # the book is netted again here, where bookings are serialized,
@@ -1638,7 +1646,7 @@ class PaperBroker:
                     "ask": float(book.asks[0][0]) if getattr(book, "asks", None) else None}
         return {"fill": True, "px": round(float(q.average_price), 4)}
 
-    def _check_book(self, book, side: str) -> tuple:
+    def _check_book(self, book, side: str, *, expected_token=None, require_asks=True) -> tuple:
         """Validate a book and return (quiet_s, held_s). Raises otherwise.
 
         Both the book an order is SIZED from and the book it FILLS against
@@ -1649,6 +1657,8 @@ class PaperBroker:
         """
         if not isinstance(book, BookSnapshot):
             raise PaperRejected("invalid public order book response")
+        if expected_token is not None and str(book.token_id) != str(expected_token):
+            raise PaperRejected("public order book token does not match the order")
         if book.timestamp is None:
             raise PaperRejected("public order book omitted exchange timestamp")
         if not math.isfinite(book.received_wall) or book.received_wall <= 0:
@@ -1669,13 +1679,15 @@ class PaperBroker:
         if quiet_s < -self.future_tol_s:
             raise PaperRejected(
                 f"public order book is future-dated (age={quiet_s:.3f}s)")
+        if held_s < -self.future_tol_s:
+            raise PaperRejected("public order book receipt is future-dated")
         if held_s > self.max_book_age_s:
             raise PaperRejected(
                 f"public order book is stale in hand (held={held_s:.3f}s)")
         if quiet_s > self.max_quiet_s:
             raise PaperRejected(
                 f"public order book has not changed for {quiet_s:.3f}s")
-        if not book.asks:
+        if require_asks and not book.asks:
             raise PaperRejected(
                 f"cannot FOK buy {side}: no asks on the live book "
                 "(liquidity pulled or one-sided)")

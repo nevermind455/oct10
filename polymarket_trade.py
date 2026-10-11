@@ -6,7 +6,7 @@ import re
 import threading
 import uuid
 import time
-from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
+from decimal import Decimal, DecimalException, InvalidOperation, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 from urllib.parse import urlsplit
 
 import config  # noqa: F401 — loads .env first
@@ -30,6 +30,7 @@ _execution_lock = threading.Lock()
 # another.
 _exit_lock = threading.Lock()
 _state_lock = threading.RLock()
+_client_lock = threading.RLock()
 _order_observer = None
 _journal_fault = None
 _market_fee_by_token: dict[str, tuple[float, int]] = {}
@@ -38,6 +39,7 @@ _ambiguous_condition = None
 _ambiguous_until = 0.0
 _ambiguous_tokens: set[str] = set()
 _ambiguous_all_tokens = False
+_ambiguous_exit_tokens: set[str] = set()
 last_order_error = None
 last_order_status = None
 last_order_receipt = None
@@ -81,19 +83,28 @@ def _pusd_amount(value) -> float | None:
     """Convert six-decimal base units; malformed values stay unknown."""
     try:
         out = Decimal(str(value)) / PUSD_BASE_UNITS
-    except (InvalidOperation, TypeError, ValueError):
+    except (DecimalException, TypeError, ValueError, OverflowError):
         return None
     if not out.is_finite() or out < 0:
         return None
-    return float(out)
+    try:
+        amount = float(out)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return amount if math.isfinite(amount) else None
 
 
 def disable_live_execution() -> None:
     """Irreversible process-local paper-mode firewall."""
     global _live_disabled, _client
     with _execution_lock:
-        _live_disabled = True
-        _client = None
+        # An exit already owns its client while it signs/posts. Wait for that
+        # action to finish before declaring the paper firewall installed. Lock
+        # order agrees with entries (execution -> client) and exits (exit -> client).
+        with _exit_lock:
+            with _client_lock:
+                _live_disabled = True
+                _client = None
 
 
 def live_execution_disabled() -> bool:
@@ -122,7 +133,8 @@ def market_fee_parameters(token_id) -> dict | None:
 def reset_client():
     global _client
     with _execution_lock:
-        _client = None
+        with _client_lock:
+            _client = None
 
 
 def _validate_live_host(host: str) -> str:
@@ -215,6 +227,14 @@ def _install_api_creds(client) -> None:
 
 
 def _get_client() -> ClobClient:
+    # Entries, exits and startup/read-only probes use different execution
+    # locks. Credential derivation and replacing the SDK HTTP pool must happen
+    # once; a competing initialization used to close another caller's pool.
+    with _client_lock:
+        return _get_client_unlocked()
+
+
+def _get_client_unlocked() -> ClobClient:
     global _client
     if _live_disabled:
         raise RuntimeError("live CLOB client is disabled by paper mode")
@@ -332,6 +352,13 @@ def _is_no_match(err: str) -> bool:
             or "fok_order_not_filled" in e
             # FAK with nothing at or under its limit (documented 400 reply)
             or "no orders found to match" in e or "partially filled or killed" in e)
+
+
+def _explicit_no_match_exception(exc: Exception) -> bool:
+    # An exception string is not venue rejection evidence: a transport timeout
+    # can contain an old response body or diagnostic text. Retry only a
+    # documented client-error response from the venue.
+    return getattr(exc, "status_code", None) in (400, 422) and _is_no_match(str(exc))
 
 
 _FAILED_ORDER_STATUSES = {
@@ -484,6 +511,8 @@ def _size_to_venue_minimum(amount, asks, rules, cap) -> float:
 def _validate_market_mapping(info, condition_id, up_token_id, down_token_id):
     if not isinstance(info, dict):
         raise RuntimeError("CLOB market-info response is not an object")
+    if not _valid_token(up_token_id) or not _valid_token(down_token_id):
+        raise RuntimeError("invalid expected UP/DOWN token ids")
     returned = str(info.get("condition_id") or info.get("conditionId") or "")
     # The current CLOB V2 response is keyed by condition in the URL but does
     # not echo it.  If a future response does echo it, verify it.
@@ -496,7 +525,10 @@ def _validate_market_mapping(info, condition_id, up_token_id, down_token_id):
     for row in rows:
         if not isinstance(row, dict):
             raise RuntimeError("malformed CLOB token mapping")
-        labelled[str(row.get("o") or "").strip().lower()] = str(row.get("t") or "")
+        raw_token = row.get("t")
+        if not _valid_token(raw_token):
+            raise RuntimeError("malformed CLOB token mapping")
+        labelled[str(row.get("o") or "").strip().lower()] = str(raw_token)
     if (set(labelled) != {"up", "down"} or not all(_valid_token(v) for v in labelled.values())
             or labelled["up"] == labelled["down"]):
         raise RuntimeError("CLOB outcomes are not exactly UP and DOWN")
@@ -559,8 +591,16 @@ def _validate_market_mapping(info, condition_id, up_token_id, down_token_id):
 
 
 def _valid_token(token) -> bool:
-    text = str(token or "")
-    return text.isdigit() and int(text) > 0
+    try:
+        text = str(token or "")
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not text or not text.isascii() or not text.isdecimal():
+        return False
+    # Venue token IDs are uint256 decimal values. Strip harmless leading zeros
+    # before bounding/parsing so even enormous strings cannot hit int()'s limit.
+    digits = text.lstrip("0")
+    return bool(digits) and len(digits) <= 78 and int(digits) <= (1 << 256) - 1
 
 
 def _round_limit(max_price, tick: Decimal) -> Decimal:
@@ -609,10 +649,10 @@ def _quote_fok(asks, amount: Decimal, limit: Decimal,
 def _validate_round_end(window_end) -> float:
     try:
         end = float(window_end)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise RuntimeError("missing current round end timestamp") from exc
     now = time.time()
-    if (int(end) % 300 != 0
+    if (not math.isfinite(end) or end != int(end) or int(end) % 300 != 0
             or not end - config.EXECUTION_WINDOW_SECONDS <= now
             or not now < end - config.MIN_SECONDS_TO_EXPIRY):
         raise RuntimeError("order is outside the current round execution interval")
@@ -628,28 +668,32 @@ def _mark_ambiguous(condition_id: str, window_end: float,
     first FOK had already matched.
     """
     global _ambiguous_condition, _ambiguous_until, _ambiguous_all_tokens
-    cid = str(condition_id)
-    end = float(window_end)
-    if _ambiguous_condition != cid or time.time() >= _ambiguous_until:
-        _ambiguous_tokens.clear()
-        _ambiguous_all_tokens = False
-    _ambiguous_condition = cid
-    _ambiguous_until = end
-    if token_id:
-        _ambiguous_tokens.add(str(token_id))
-    else:
-        _ambiguous_all_tokens = True
-        _ambiguous_tokens.clear()
+    with _state_lock:
+        cid = str(condition_id)
+        end = float(window_end)
+        if _ambiguous_condition != cid or time.time() >= _ambiguous_until:
+            _ambiguous_tokens.clear()
+            _ambiguous_all_tokens = False
+        _ambiguous_condition = cid
+        _ambiguous_until = end
+        if token_id:
+            _ambiguous_tokens.add(str(token_id))
+        else:
+            _ambiguous_all_tokens = True
+            _ambiguous_tokens.clear()
 
 
 def _ambiguous_blocks(condition_id: str, token_id: str) -> bool:
-    if _ambiguous_condition != str(condition_id):
-        return False
-    if time.time() >= _ambiguous_until:
-        return False
-    if _ambiguous_all_tokens:
-        return True
-    return str(token_id) in _ambiguous_tokens
+    with _state_lock:
+        if str(token_id) in _ambiguous_exit_tokens:
+            return True
+        if _ambiguous_condition != str(condition_id):
+            return False
+        if time.time() >= _ambiguous_until:
+            return False
+        if _ambiguous_all_tokens:
+            return True
+        return str(token_id) in _ambiguous_tokens
 
 
 attempt_log_failures = 0
@@ -824,14 +868,14 @@ def sell_shares(token_id: str, shares: float, *, min_price: float = 0.0,
     if _live_disabled:
         last_order_error = "live execution is disabled by paper mode"
         return 0.0
-    token = str(token_id or "")
-    if not _valid_token(token):
+    if not _valid_token(token_id):
         last_order_error = "invalid token id"
         return 0.0
+    token = str(token_id)
     try:
         size = float(shares)
         floor = float(min_price)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         last_order_error = "invalid sell size or floor"
         return 0.0
     if not math.isfinite(size) or size <= 0 or not 0.0 <= floor < 1.0:
@@ -841,6 +885,10 @@ def sell_shares(token_id: str, shares: float, *, min_price: float = 0.0,
         last_order_error = "timed out waiting for the live API"
         return 0.0
     try:
+        with _state_lock:
+            if token in _ambiguous_exit_tokens:
+                last_order_error = "prior live exit has an ambiguous result; token blocked until reconciliation"
+                return 0.0
         try:
             if window_end is not None:
                 _validate_round_end(window_end)
@@ -857,14 +905,40 @@ def sell_shares(token_id: str, shares: float, *, min_price: float = 0.0,
             # only the one token. Letting the client resolve them from the token
             # is correct here and avoids asserting a mapping we cannot check.
             signed = client.create_market_order(mo)
+            # Signing can fetch tick/neg-risk metadata and take long enough to
+            # cross the expiry boundary. Preserve this helper's existing
+            # eligibility check at the irreversible boundary as well.
+            if window_end is not None:
+                _validate_round_end(window_end)
+        except Exception as exc:
+            last_order_error = _safe_error(exc)
+            print(f"[LIVE] Sell failed before submission: {last_order_error}")
+            return 0.0
+        try:
             resp = client.post_order(signed, OrderType.FAK)
         except Exception as exc:
             last_order_error = _safe_error(exc)
+            if not _explicit_no_match_exception(exc):
+                with _state_lock:
+                    _ambiguous_exit_tokens.add(token)
+                last_order_error = f"ambiguous live exit submission; token blocked until reconciliation: {last_order_error}"
             print(f"[LIVE] Sell failed: {last_order_error}")
             return 0.0
         oid, status, err = _accepted_order_response(resp)
         if err is not None:
             last_order_error = _safe_error(err)
+            pending_oid, _status, pending_kind = _accepted_pending_response(resp)
+            if pending_oid and pending_kind:
+                with _state_lock:
+                    _ambiguous_exit_tokens.add(token)
+                last_order_error = "accepted live exit awaiting authoritative outcome; token blocked until reconciliation"
+                # This is a submission, not evidence that every requested
+                # share sold. The helper's documented return is size submitted.
+                return size
+            if not _definitive_rejection(resp):
+                with _state_lock:
+                    _ambiguous_exit_tokens.add(token)
+                last_order_error = f"ambiguous live exit response; token blocked until reconciliation: {last_order_error}"
             print(f"[LIVE] Sell rejected: {last_order_error}")
             return 0.0
         last_order_error = None
@@ -937,7 +1011,7 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
         return False
     try:
         amount = round(float(amount), 2)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         last_order_error = "invalid order amount"
         return False
     if not math.isfinite(amount) or amount <= 0:
@@ -1103,7 +1177,8 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
                 _validate_round_end(end)
                 # The stake and price cap were fixed for the first attempt.
                 # Recheck that this exact order is still executable after the
-                # no-fill backoff; do not size it up or widen its limit.
+                # no-fill response; do not size it up or widen its limit.
+                book_read_mono = time.monotonic()
                 _bids, asks = orderbook.validate_buy_liquidity(
                     token_id, amount, float(limit), config.MAX_ALLOWED_SPREAD,
                     min_price=float(floor))
@@ -1137,6 +1212,8 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
                 return False
         try:
             _validate_round_end(end)
+            if time.monotonic() - book_read_mono > config.ORDERBOOK_MAX_AGE_SECONDS:
+                raise RuntimeError("priced order book became stale during preflight")
             options = PartialCreateOrderOptions(
                 tick_size=str(rules["tick"]), neg_risk=rules["neg_risk"])
             mo = MarketOrderArgs(
@@ -1158,6 +1235,11 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
             last_order_error = guard_error
             print(f"[LIVE] Order blocked before submission: {last_order_error}")
             return False
+        # Balance/network checks and signing can outlive the priced snapshot.
+        # A newer background book does not freshen the book used for this order.
+        if time.monotonic() - book_read_mono > config.ORDERBOOK_MAX_AGE_SECONDS:
+            last_order_error = "priced order book became stale before submission"
+            return False
         submitted_wall = time.time()
         # Age of the same book at the moment of submission, monotonic only.
         submit_book_age_s = _book_age_s(_book_meta(token_id))
@@ -1175,10 +1257,10 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
                 "order_id": None, "status": "POST_RAISED",
                 "final_status": "SUBMIT_FAILED", "reason": err[:200],
             })
-            if _is_no_match(err) and attempt < 2:
-                time.sleep(0.5)
+            known_no_fill = _explicit_no_match_exception(exc)
+            if known_no_fill and attempt < 2:
                 continue
-            if not _is_no_match(err):
+            if not known_no_fill:
                 _mark_ambiguous(condition_id, end, token_id)
                 err = f"ambiguous submission; outcome blocked: {err}"
             last_order_error = err
@@ -1201,8 +1283,8 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
         })
         if err is not None:
             err = _safe_error(err)
-            if _is_no_match(err) and attempt < 2:
-                time.sleep(0.5)
+            known_no_fill = _is_no_match(err) and _definitive_rejection(resp)
+            if known_no_fill and attempt < 2:
                 continue
             pending_oid, pending_status, pending_kind = _accepted_pending_response(resp)
             if pending_oid and pending_kind:
@@ -1246,7 +1328,7 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
             # A response received after POST that is not an explicit no-fill
             # may describe an accepted order incompletely. Block this token
             # only: the complementary MULTI leg is a different order.
-            if not _is_no_match(err) and not _definitive_rejection(resp):
+            if not _definitive_rejection(resp):
                 _mark_ambiguous(condition_id, end, token_id)
                 # Say WHAT came back, not just that it was unclassifiable.
                 # A venue with a taker matching delay can acknowledge an order

@@ -513,6 +513,7 @@ def t_one_slow_reply_then_healthy_venue_recovers_and_orders_continue():
             journal = []
             ex.sender.guard.journal = journal.append
             b = live_book()
+            ex.hub.book = b
             r1 = await ex.send(ex.prepare(live_plan(b.view(UP))))
             refused = None
             try:
@@ -549,6 +550,7 @@ def t_repeated_slow_replies_hard_halt():
             ex.sender.guard.slow_ms = 100.0
             ex.hub = types.SimpleNamespace(condition_id=COND, up_token=UP, down_token=DN)
             b = live_book()
+            ex.hub.book = b
             states = []
             for _ in range(3):
                 fake.script.append(("sleep", 0.15, ("json", 200, MATCHED_REPLY)))
@@ -583,6 +585,7 @@ def t_disconnected_venue_never_resumes_unsafely():
             ex.sender.guard.mono = mono
             ex.hub = types.SimpleNamespace(condition_id=COND, up_token=UP, down_token=DN)
             b = live_book()
+            ex.hub.book = b
             await ex.send(ex.prepare(live_plan(b.view(UP))))
             await fake.stop()                                    # the venue goes away
             await ex.sender.http.aclose()

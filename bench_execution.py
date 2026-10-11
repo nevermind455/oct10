@@ -225,7 +225,8 @@ async def make_live(tmp: str):
     return fake, ex, store
 
 
-async def bench_live(m: int, matched_every: int = 5, with_pm: bool = False, pm_stress: bool = False) -> dict:
+async def bench_live(m: int, matched_every: int = 5, with_pm: bool = False, pm_stress: bool = False,
+                     with_fair: bool = False) -> dict:
     tmp = tempfile.mkdtemp(prefix="bench_live_")
     fake, ex, store = await make_live(tmp)
     if with_pm:
@@ -238,11 +239,17 @@ async def bench_live(m: int, matched_every: int = 5, with_pm: bool = False, pm_s
     hub = types.SimpleNamespace(up_token=T.UP, down_token=T.DN, condition_id=T.COND,
                                 window_end=T.round_end(min_left=200.0), book=book)
     journal = os.path.join(tmp, "live_sniper.jsonl")
-    with _env(BENCH_ENV):
+    with _env(dict(BENCH_ENV, SNIPER_FAIR="1" if with_fair else "0")):
         settings = S.Settings()
     sn = S.Sniper(hub, ex.shim, journal_path=journal, settings=settings, trade_rows=[], own_rounds=True, live=ex)
     sn.fresh.enabled = False
     ex.attach(sn) if hasattr(ex, "attach") else None
+    if with_fair:
+        # Valid synthetic history lets the actual fair-value and Kelly gates
+        # execute. Nothing in the production rule or its defaults is changed.
+        now = time.monotonic()
+        for i in range(301):
+            sn.vol_model.observe(now - 300 + i, 60_000.0)
     pm = None
     if with_pm:
         import position_manager as PMM
@@ -269,7 +276,8 @@ async def bench_live(m: int, matched_every: int = 5, with_pm: bool = False, pm_s
         sn.trigger.q.clear()
         ref = 60_000.0
         sn.trigger.q.append((now - 300.0, ref))
-        mid = ref * (1 + (0.6 if side == "UP" else -0.6) / 1e4)        # past the trigger (0.6bp)
+        move = 2.0 if with_fair else 0.6  # enough synthetic edge to pass the real fair-value gate
+        mid = ref * (1 + (move if side == "UP" else -move) / 1e4)
         feed_tick(sn, tick_raw(sn.s.primary_feed, mid))
         return oid, tid, n_order % matched_every == 0
 
@@ -317,12 +325,15 @@ async def bench_live(m: int, matched_every: int = 5, with_pm: bool = False, pm_s
     await asyncio.gather(*sn._tasks, return_exceptions=True)
     await ex.sender.http.aclose()
     await fake.stop()
-    rows = [json.loads(x) for x in open(journal, encoding="utf-8")]
+    with open(journal, encoding="utf-8") as journal_file:
+        rows = [json.loads(x) for x in journal_file]
     # the Sniper's own order rows (the sender's "live_send" rows and later
     # fill updates repeat an order; they are not new orders)
     orders = [r for r in rows if r.get("live") and r.get("result") in ("filled", "refused", "pending", "error")]
-    out = {"orders_sent": len(orders), "pairs": pairs, "elapsed_s": round(elapsed, 2),
-           "connections": fake.conns, "skips": {k[6:]: v for k, v in sn.n.items() if k.startswith("skip: ") and v}}
+    out = {"orders_sent": len(orders), "pairs": pairs, "elapsed_s": round(elapsed, 2), "fair_value_enabled": with_fair,
+           "connections": fake.conns, "halted": list(ex.kill.reasons),
+           "persistence_error": ex.ledger.last_persistence_error,
+           "skips": {k[6:]: v for k, v in sn.n.items() if k.startswith("skip: ") and v}}
 
     def us(r, a, b):
         ts = r.get("live_ts_us") or {}
@@ -402,7 +413,8 @@ def bench_journal(n: int) -> dict:
 
 
 # --------------------------------------------------------------------------- 5. packet -> handler
-async def bench_wakeup(n: int, *, dashboard: bool, switch_ms: float | None = None, gap_ms: float = 3.0) -> dict:
+async def bench_wakeup(n: int, *, dashboard: bool, switch_ms: float | None = None, gap_ms: float = 3.0,
+                       frame_every_s: float = 0.0) -> dict:
     """A thread writes n small packets to a loopback socket, each stamped with
     perf_counter_ns at the write; the event loop's protocol stamps when its
     handler runs. The difference is what no stamp inside on_tick can see: the
@@ -440,6 +452,8 @@ async def bench_wakeup(n: int, *, dashboard: bool, switch_ms: float | None = Non
         snap = td.populated("LIVE")
         while not stop.is_set():
             build(snap, 160, 48, UNICODE)
+            if frame_every_s > 0:
+                stop.wait(frame_every_s)
 
     def sender():
         c = socket.create_connection(("127.0.0.1", port))
@@ -497,10 +511,13 @@ async def main_async(args) -> dict:
     res["market"] = bench_market_data(args.updates)
     res["ticks"] = bench_ticks(args.updates)
     res["position_manager"] = args.pm
-    res["live"] = await bench_live(args.orders, with_pm=args.pm != "off", pm_stress=args.pm == "stress")
+    res["live"] = await bench_live(args.orders, with_pm=args.pm != "off", pm_stress=args.pm == "stress",
+                                   with_fair=args.fair)
     res["signing"] = bench_signing(args.sign)
     res["journal"] = bench_journal(args.journal)
     res["wakeup_us"] = {"idle": await bench_wakeup(args.wakeup, dashboard=False),
+                        "dashboard at 2 frames/s": await bench_wakeup(args.wakeup, dashboard=True,
+                                                                      frame_every_s=0.5),
                         "dashboard thread, 5ms GIL switch": await bench_wakeup(args.wakeup, dashboard=True),
                         "dashboard thread, 1ms GIL switch": await bench_wakeup(args.wakeup, dashboard=True,
                                                                                switch_ms=1.0)}
@@ -515,6 +532,7 @@ def main(argv=None) -> int:
     ap.add_argument("--journal", type=int, default=300)
     ap.add_argument("--wakeup", type=int, default=1000, help="packets per packet->handler run")
     ap.add_argument("--json", default=None, help="also write the results here")
+    ap.add_argument("--fair", action="store_true", help="exercise real fair-value and Kelly gates on synthetic history")
     ap.add_argument("--pm", choices=("off", "on", "stress"), default="off",
                     help="Position Manager beside the sniper: off, on (5ms polls, an evaluation whenever the state changed), "
                          "stress (a full evaluation every 5ms). Use a fresh process per setting.")

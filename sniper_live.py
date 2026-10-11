@@ -336,6 +336,8 @@ async def keep_warm(http, clock: ServerClock, url: str, every_s: float = 10.0, o
     cancelled. on_event(dict) gets each round: whether a new connection had to
     be opened (the old one died while idle) and any error. A failed refresh
     just ages the clock; ServerClock refuses orders once it is too old."""
+    from feeds.supervisor import backoff_delay
+    attempt = 0
     while True:
         events = []
 
@@ -354,7 +356,15 @@ async def keep_warm(http, clock: ServerClock, url: str, every_s: float = 10.0, o
         row["new_connection"] = any("connect_tcp" in n or "start_tls" in n for n in events)
         if on_event:
             on_event(row)
-        await asyncio.sleep(every_s)
+        if row.get("ok"):
+            attempt = 0
+            delay = every_s
+        else:
+            # A failed idle probe must not leave the order connection down for
+            # the whole keep-warm interval. Only public probes are retried.
+            delay = backoff_delay(attempt)
+            attempt += 1
+        await asyncio.sleep(delay)
 
 
 @dataclass
@@ -426,6 +436,7 @@ class CanarySession:
     TRANSIENT = ("shutting down",)          # halts that are not about the session's risk
 
     def __init__(self, path, wallet_key: str) -> None:
+        import threading
         self.path = Path(path)
         self.wallet_key = str(wallet_key)
         self.session_id: str | None = None
@@ -433,6 +444,7 @@ class CanarySession:
         self._last: tuple | None = None
         self.last_error: str | None = None
         self.restored: dict = {}
+        self._save_lock = threading.Lock()
 
     @staticmethod
     def wallet_key_for(address: str) -> str:
@@ -533,6 +545,13 @@ class CanarySession:
     def save(self, limits: "CanaryLimits", kill: KillSwitch) -> bool:
         """Atomic write when something changed (worker thread). True when the
         file holds the current state."""
+        # Cancelling a periodic to_thread waiter does not stop its write. The
+        # final shutdown save must follow it, including taking the newer state,
+        # so an older in-flight snapshot cannot overwrite final risk counters.
+        with self._save_lock:
+            return self._save_unlocked(limits, kill)
+
+    def _save_unlocked(self, limits: "CanaryLimits", kill: KillSwitch) -> bool:
         state = self.state(limits, kill)
         key = json.dumps(state, sort_keys=True)
         if key == self._last:
@@ -546,7 +565,8 @@ class CanarySession:
                 fh.write(json.dumps({**state, "updated_wall": time.time()}, sort_keys=True))
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp, self.path)
+            from durable_io import replace_atomic
+            replace_atomic(tmp, self.path)
             tmp = None
             self._last, self.last_error = key, None
             return True
@@ -653,9 +673,29 @@ class LeanSender:
         st["ready_pc"] = time.perf_counter_ns()       # REQUEST READY (not sent)
         salt = getattr(getattr(signed, "order", signed), "salt", None) or payload.get("order", {}).get("salt")
         return Prepared(side, str(token), str(condition), float(end), float(amount), float(cap),
-                        float(exact), tick, str(salt), body, headers, rules, st, order_type)
+                        float(exact), tick, str(salt), body, headers, dict(rules), st, order_type)
 
     # ------------------------------------------------------------ the write, synchronous
+    def _check_send(self, p: Prepared, *, budget: bool = True) -> None:
+        self.kill.check()
+        self.guard.check()
+        self.clock.now_s()
+        current_rules = self.rules.get(p.condition, p.rules["up_token"], p.rules["down_token"])
+        if current_rules != p.rules:
+            raise Refused("market rules changed after the order was prepared")
+        if p.end <= time.time():
+            raise Refused("market expired before dispatch")
+        check = getattr(p, "send_guard", None)
+        if check is not None:
+            check()
+        if budget:
+            self.limits.check(p.amount, p.amount / p.price, p.condition, self.kill,
+                              self.realized_loss() if self.realized_loss else None)
+
+    def _record_send(self, p: Prepared) -> None:
+        self.limits.record_send(p.amount, p.condition)
+        p.stamps["budget_recorded"] = True
+
     def start(self, p: Prepared):
         """Write the order to the wire NOW - inside the caller's own step, no
         event-loop turn - when the HTTP client has a live HTTP/2 connection
@@ -667,10 +707,22 @@ class LeanSender:
             return None
         p.stamps["post_call_pc"] = time.perf_counter_ns()
         try:
+            self._check_send(p)
             stream = post_now(self.url, p.body.encode("utf-8"), p.headers)
-        except Exception:  # noqa: BLE001 - raised before any byte is written: the async path decides
+        except Exception as exc:
+            from fast_h2 import NotConnected, Stream
+            if not isinstance(exc, NotConnected):
+                # An arbitrary transport failure cannot prove nothing left the
+                # process. Pass it to send() as a failed attempt, never retry it.
+                stream = Stream(-1, asyncio.get_running_loop().create_future())
+                from fast_h2 import NotProcessed
+                stream.future.set_exception(NotProcessed(str(exc)) if isinstance(exc, (Halted, Refused)) else exc)
+                stream.future.exception()
+                if not isinstance(exc, (Halted, Refused, NotProcessed)):
+                    self._record_send(p)
+                return stream
             return None
-        self.limits.record_send(p.amount, p.condition)
+        self._record_send(p)
         return stream
 
     # ------------------------------------------------------------ the send, async
@@ -704,11 +756,16 @@ class LeanSender:
         st["post_call_pc"] = time.perf_counter_ns()
 
         async def trace(name, info):
-            events.append((name, time.perf_counter_ns()))
-        self.limits.record_send(p.amount, p.condition)
+            if name.endswith("send_request_headers.started") and not hasattr(self.http, "post_now"):
+                self._check_send(p, budget=False)
+            events.append((name, info.get("timestamp_ns", time.perf_counter_ns())))
         try:
+            self._check_send(p)
+            self._record_send(p)
             r = await self.http.post(self.url, content=p.body.encode("utf-8"), headers=p.headers,
-                                     extensions={"trace": trace}, timeout=self.timeout_s)
+                                     extensions={"trace": trace,
+                                                 "before_write": lambda: self._check_send(p, budget=False)},
+                                     timeout=self.timeout_s)
             st["response_body_pc"] = time.perf_counter_ns()
             status = r.status_code
             row["retry_after"] = self._retry_after(r)
@@ -824,7 +881,8 @@ class LeanSender:
 
     def _after(self, p: Prepared, row: dict, st: dict) -> None:
         kind = row["kind"]
-        self.limits.record_outcome(kind, p.amount)
+        if st.get("budget_recorded"):
+            self.limits.record_outcome(kind, p.amount)
         if kind == AMBIGUOUS:
             self.pt._mark_ambiguous(p.condition, p.end, p.token)
             self.kill.trip(f"order {p.client_order_id} outcome unknown ({row['error']}): reconcile before trading")
@@ -1021,6 +1079,7 @@ class LiveExecution:
         self.balance: float | None = None
         self.balance_at: float | None = None
         self.reserved = 0.0
+        self._balance_revision = 0
         self.awaiting: dict = {}            # order id -> what we expect the ledger to confirm
         self.fak_orders: dict = {}          # retained metadata for validating partial-fill updates
         self._sync_fak = lambda: None       # event-loop callback, never invoked from a worker
@@ -1051,6 +1110,7 @@ class LiveExecution:
         self.sender.guard.journal = sniper._write
         self._journal = sniper._write
         self._sync_fak = sniper._sync_live_fak
+        self._sniper_settings = sniper.s
 
     def limits_line(self) -> str:
         lim = self.sender.limits
@@ -1115,10 +1175,24 @@ class LiveExecution:
             self.n["keep-warm errors"] += 1
 
     async def _read_balance(self) -> None:
+        revision = self._balance_revision
         bal = await asyncio.to_thread(self.balance_fetch)
         if isinstance(bal, dict) and bal.get("balance") is not None and bal.get("allowance") is not None:
             # Spendable is the smaller of what we hold and what the exchange may move.
-            self.balance = min(float(bal["balance"]), float(bal["allowance"]))
+            try:
+                values = (float(bal["balance"]), float(bal["allowance"]))
+                if not all(math.isfinite(v) and v >= 0 for v in values):
+                    raise ValueError("invalid collateral reading")
+            except (TypeError, ValueError, OverflowError):
+                self.n["balance read errors"] += 1
+                return
+            available = min(values)
+            if (self.balance is not None and (revision != self._balance_revision or self.reserved > 0
+                                              or self.awaiting)):
+                # A read concurrent with an order can return its pre-fill cash.
+                # Until confirmation, it may lower our bound but never refund it.
+                available = min(available, self.balance)
+            self.balance = available
             self.balance_at = time.monotonic()
         else:
             self.n["balance read errors"] += 1
@@ -1535,7 +1609,32 @@ class LiveExecution:
                                 amount=spend, cap=cap, decided_pc=decided_pc, order_type=order_type)
         p.reserve = spend + reserve_fee
         p.estimate = {"shares": float(quote.shares), "price": float(quote.average_price), "fee": fee}
+        def send_guard():
+            if self.balance_at is None or time.monotonic() - self.balance_at > self.balance_max_age_s:
+                raise Refused("collateral balance became stale before dispatch")
+            if self.balance is None or self.reserved > self.balance + 1e-9:
+                raise Refused("collateral fell below outstanding reservations before dispatch")
+            if self.user_ready is not None and not self.user_ready(cond):
+                raise Refused("private fill coverage lost before dispatch")
+            left = end - time.time()
+            cutoff = max(float(self.shim.min_seconds_to_expiry),
+                         self.assumed_delay_s if order_rules.get("taker_delay") else 0.0)
+            if left <= cutoff:
+                raise Refused("inside the matching-delay/expiry window before dispatch")
+            if self.hub is not None:
+                key = (str(getattr(self.hub, "condition_id", "")),
+                       str(getattr(self.hub, "up_token", "")), str(getattr(self.hub, "down_token", "")))
+                if key != (str(cond), str(up), str(down)):
+                    raise Refused("market changed before dispatch")
+                latest = self.hub.book.view(token)
+                from feeds.health import LIVE
+                age = latest.book_age_ms()
+                max_age = getattr(getattr(self, "_sniper_settings", None), "stale_ms", 2000.0)
+                if latest.status != LIVE or age is None or not math.isfinite(age) or age < 0 or age > max_age:
+                    raise Refused("book became stale before dispatch")
+        p.send_guard = send_guard
         self.reserved += p.reserve
+        self._balance_revision += 1
         return p
 
     def start_send(self, p: Prepared):
@@ -1546,8 +1645,16 @@ class LiveExecution:
         reserve = getattr(p, "reserve", p.amount)
         try:
             row = await self.sender.send(p, started)
+        except BaseException:
+            # Cancellation after a write is still an unknown order. Retain its
+            # cash bound even though the waiter cannot return its outcome.
+            if self.balance is not None:
+                self.balance -= reserve
+            self._trip("order waiter interrupted: reconcile before trading")
+            raise
         finally:
             self.reserved = max(0.0, self.reserved - reserve)
+            self._balance_revision += 1
         kind = row["kind"]
         if kind in (MATCHED, PENDING, AMBIGUOUS) and self.balance is not None:
             self.balance -= reserve                         # spent, or may be; the next read corrects it
@@ -1615,6 +1722,8 @@ class LiveExecution:
             if row["kind"] == PENDING:
                 self.sender.limits.fills += 1     # pending FAK also reserves a session fill slot
         if not ok:
+            row.setdefault("authorize_error", getattr(self.ledger, "last_persistence_error", None)
+                           or "receipt sink refused authorization")
             self._trip(f"order {oid} could not be authorized in the live ledger: reconcile")
 
     def status(self) -> dict:

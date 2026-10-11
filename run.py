@@ -1088,6 +1088,11 @@ async def shutdown(rt: Runtime) -> None:
     fills are drained into the ledger last and the report is printed."""
     log = rt.shutdown_log
     rt.stop.set()
+    pm = rt.pm if rt.pm is not None and rt.pm.cfg.enabled else None
+    if pm is not None:
+        # A paper manager must not dispatch while outstanding sniper orders
+        # drain. Its stop() below also drains workers before closing the journal.
+        pm._closing = True
     if rt.live_exec is not None:
         rt.live_exec.kill.trip("shutting down")                 # no new orders from here on
         log.append("kill")
@@ -1096,11 +1101,12 @@ async def shutdown(rt: Runtime) -> None:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await rt.sniper_task
         log.append("sniper")
+    if rt.sniper is not None and hasattr(rt.sniper, "stop"):
+        await rt.sniper.stop()
     if rt.live_exec is not None:
         with contextlib.suppress(Exception):
             await rt.live_exec.stop()
         log.append("live_exec")
-    pm = rt.pm if rt.pm is not None and rt.pm.cfg.enabled else None     # stopped (journal flushed) when it ran
     for name, service in (("reconciler", rt.reconciler), ("settler", rt.settler), ("manager", pm),
                           ("hub", rt.hub)):
         if service is None:

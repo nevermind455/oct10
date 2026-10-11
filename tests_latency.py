@@ -516,7 +516,8 @@ class Performance(unittest.TestCase):
 
     def test_1000_triggers_rapid_up_down_switching_and_opposite_pairs(self):
         res = asyncio.run(B.bench_live(1000))
-        self.assertEqual(res["orders_sent"], 1100)                            # 900 singles + 100 UP+DOWN pairs
+        self.assertEqual(res["orders_sent"], 1100,
+                         {k: res[k] for k in ("halted", "persistence_error", "skips")})  # 900 singles + 100 pairs
         self.assertEqual(res["posted"], 1100)                                 # no duplicate POST
         self.assertEqual(res["skips"], {})
         self.assertEqual(res["matched_unresolved"], 0)

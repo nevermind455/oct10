@@ -44,6 +44,22 @@ class SupervisedFeed:
         self._stop = asyncio.Event()
         self._attempt = 0
         self._on_event = on_event
+        # Subscription intent may arrive from discovery workers. Notify the
+        # owning event loop instead of imposing a polling delay on every round.
+        self._intent_event = asyncio.Event()
+        self._intent_loop: asyncio.AbstractEventLoop | None = None
+
+    def _bind_intent_loop(self) -> None:
+        self._intent_loop = asyncio.get_running_loop()
+
+    def _wake_intent(self) -> None:
+        loop = self._intent_loop
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(self._intent_event.set)
+            except RuntimeError:
+                # The loop can close between is_closed() and notification.
+                pass
 
     # ---------------------------------------------------------------- api
     def start(self) -> asyncio.Task:

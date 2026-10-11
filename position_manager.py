@@ -68,6 +68,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import concurrent.futures
 import functools
 import json
 import math
@@ -785,6 +786,9 @@ class PositionManager:
         self.run_id = uuid.uuid4().hex[:12]           # this process: reservation ids restart at 1 in each
         self.last_error: str | None = None
         self._task = None
+        self._closing = False
+        self._executor = None
+        self._workers: dict = {}  # concurrent future -> uncancellable completion signal
         # Order fields the executor thread writes (its outcome, the booking flag):
         # held for microseconds only, never across I/O.
         self._olock = threading.Lock()
@@ -889,7 +893,11 @@ class PositionManager:
             return False
         upd = getattr(view, "updated_mono", None)
         stale_ms = float(getattr(getattr(self.sniper, "s", None), "stale_ms", 2000.0) or 2000.0)
-        return upd is None or (self.mono() - float(upd)) * 1000.0 <= stale_ms
+        try:
+            age_ms = (self.mono() - float(upd)) * 1000.0
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(age_ms) and 0 <= age_ms <= stale_ms
 
     def _sniper_busy(self) -> bool:
         """The sniper owns this instant: an order of its in flight, or one sent
@@ -1080,6 +1088,14 @@ class PositionManager:
         with self._olock:
             if o.booked:
                 return False
+            if (ok and not fill) or str(error or "").startswith("broker outcome unknown:"):
+                # An exception after the booking guard may follow a committed
+                # ledger write. A missing outcome is not proof of a zero fill.
+                o.status = "UNKNOWN"
+                o.error = str(error or "accepted order has no fill outcome")[:200]
+                o.booking = False
+                self._epoch += 1
+                return False
             if ok and fill:
                 o.order_id = fill.get("order_id")
                 o.filled_qty = float(fill.get("shares") or 0.0)
@@ -1102,9 +1118,10 @@ class PositionManager:
 
     def _finish(self, o: ManagerOrder) -> None:
         """Release the reservation in the order's OWN market's history, once."""
-        if o.finished or not o.booked:
-            return
-        o.finished = True
+        with self._olock:
+            if o.finished or not o.booked:
+                return
+            o.finished = True
         if o.timer is not None:
             try:
                 o.timer.cancel()
@@ -1112,7 +1129,10 @@ class PositionManager:
                 pass
         hist = self._hist_for(o.condition)
         h = hist.sides[o.side]
-        h.in_flight = False
+        with self._olock:
+            h.in_flight = any(other.condition == o.condition and other.side == o.side
+                              and other.status in OPEN_STATUSES and not other.booked
+                              for other in self.orders.values())
         h.last_done_mono = self.mono()
         o.t_done = self.wall()
         if o.status in ("FILLED", "PARTIAL"):
@@ -1172,7 +1192,8 @@ class PositionManager:
                     lat = None
 
             def guard() -> bool:
-                if not (self.hub.condition_id == cond and float(end) - self.wall() >= self.cfg.min_left_s):
+                if not (self.hub.condition_id == cond and self.hub.up_token == up and self.hub.down_token == down
+                        and float(end) - self.wall() >= self.cfg.min_left_s and not self._sniper_busy()):
                     return False
                 if o is not None:
                     with self._olock:                 # the broker books right after this, under its own lock
@@ -1185,24 +1206,45 @@ class PositionManager:
                                              latency_ms=lat, tag="manager", fak=False, pre_submit_guard=guard)
                 fill, err = getattr(self.broker, "last_fill", None), getattr(self.broker, "last_error", None)
             except Exception as exc:  # noqa: BLE001 - an outcome all the same
-                ok, fill, err = False, None, f"{type(exc).__name__}: {exc}"
+                fill = getattr(self.broker, "last_fill", None)
+                # PaperBroker publishes the committed fill before audit/UI
+                # callbacks. Preserve it when a later diagnostic write fails.
+                committed = (o is not None and o.booking and isinstance(fill, dict)
+                             and str(fill.get("token_id")) == str(o.token_id)
+                             and str(fill.get("condition_id")) == str(cond)
+                             and fill.get("tag") == "manager")
+                ok = bool(committed)
+                err = f"{type(exc).__name__}: {exc}"
+                if not committed and o is not None and o.booking:
+                    err = f"broker outcome unknown: {err}"
+                if not committed:
+                    fill = None
         if o is not None:
             self._book(o, ok=bool(ok), fill=fill, error=err)
         return ok, fill, err
 
     # ---------------------------------------------------------------- the task
     def start(self):
-        if self._task is None and self.cfg.enabled:
+        if self._task is None and self.cfg.enabled and not self._closing:
             self._task = asyncio.get_running_loop().create_task(self.run(), name="position-manager")
         return self._task
 
     async def stop(self) -> None:
+        self._closing = True
         if self._task is not None:
             self._task.cancel()
             try:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        # A cancelled asyncio waiter cannot stop a thread which already owns
+        # an order. Wait for its independent completion signal and result
+        # bookkeeping before the journal and final ledger snapshot are closed.
+        while self._workers:
+            await asyncio.gather(*(asyncio.shield(done) for done in list(self._workers.values())))
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
         self.journal.close()
 
     def _state_version(self):
@@ -1267,6 +1309,8 @@ class PositionManager:
         reservation. The state the decision was made on must still be the state
         now, and the sniper must not own this instant; then the exposure is
         reserved (FILLED + PENDING) and the order handed to a worker."""
+        if self._closing:
+            return None
         if self._state_version() != self._snap_version:
             d.action, d.reason = "BLOCKED", "STATE_CHANGED"
             self._version = None
@@ -1281,9 +1325,39 @@ class PositionManager:
         o = self.reserve(d)
         self.last_trade = (self.wall(), d.side, d.classification)
         o.timer = loop.call_later(max(0.05, self.cfg.order_timeout_s), self._timed_out, o)
-        fut = loop.run_in_executor(None, functools.partial(self._execute_paper, d, cond, up, down, end, o=o))
-        fut.add_done_callback(lambda f, o=o: self._done(o, f))
+        try:
+            if self._executor is None:
+                # Keep manager book/ledger work from occupying the sniper's
+                # default executor. At most one order per side may be open.
+                self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="manager-order")
+            done = loop.create_future()
+            fut = self._executor.submit(functools.partial(self._execute_paper, d, cond, up, down, end, o=o))
+        except Exception as exc:
+            # No worker exists, so no order was sent. Release this reservation
+            # explicitly instead of leaving a phantom UNKNOWN after its timer.
+            self.settle_order(o, ok=False, fill=None,
+                              error=f"cancelled before send: executor unavailable ({type(exc).__name__})")
+            raise
+        self._workers[fut] = done
+        # Attach to the underlying concurrent future, not an asyncio wrapper:
+        # cancelling a waiter must not lose the eventual worker result.
+        fut.add_done_callback(lambda f, o=o, done=done:
+                              loop.call_soon_threadsafe(self._worker_done, o, f, done))
         return o
+
+    def _worker_done(self, o: ManagerOrder, fut, completion) -> None:
+        try:
+            if fut.cancelled():
+                # The concurrent executor accepted cancellation before starting
+                # its callable. Unlike an asyncio cancellation, this proves no
+                # worker ran and no order was sent.
+                self.settle_order(o, ok=False, fill=None, error="cancelled before send: executor cancelled")
+            else:
+                self._done(o, fut)
+        finally:
+            self._workers.pop(fut, None)
+            if not completion.done():
+                completion.set_result(None)
 
     def _timed_out(self, o: ManagerOrder) -> None:
         """No outcome within order_timeout_s. That does NOT mean 'did not
@@ -1305,6 +1379,13 @@ class PositionManager:
                                  f"- UNKNOWN, reservation kept until it is known", "warn")
 
     def _done(self, o: ManagerOrder, fut) -> None:
+        if fut.cancelled():
+            # Cancelling an asyncio executor future does not stop its thread.
+            # The worker can still commit; retain exposure until it returns.
+            self._timed_out(o)
+            if o.booked:
+                self._finish(o)
+            return
         try:
             ok, fill, err = fut.result()
         except Exception as exc:  # noqa: BLE001

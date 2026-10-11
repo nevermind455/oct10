@@ -213,7 +213,8 @@ class LivePathBase(unittest.TestCase):
                                 price=price, size=shares, status=status)
 
     def rows(self, result=None):
-        out = [json.loads(x) for x in open(self.journal, encoding="utf-8")]
+        with open(self.journal, encoding="utf-8") as journal_file:
+            out = [json.loads(x) for x in journal_file]
         return out if result is None else [r for r in out if r.get("result") == result]
 
     def last_post(self):
@@ -640,7 +641,9 @@ class OldPathAudit(unittest.TestCase):
         out = []
         for path in sorted(ROOT.glob("**/*.py")):
             rel = path.relative_to(ROOT).as_posix()
-            if rel.startswith(("tests_", ".venv")) or "/tests_" in rel or rel == "testing_env.py":
+            # Historical strategy copies are fixtures, including leftovers
+            # from an interrupted run whose TEMP pointed into the workspace.
+            if rel.startswith(("tests_", ".venv", ".test-tmp/", "data/audit_tmp/")) or "/tests_" in rel or rel == "testing_env.py":
                 continue
             for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
                 if isinstance(node, ast.Call):

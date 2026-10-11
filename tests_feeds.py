@@ -138,6 +138,7 @@ class PolyServer(MockServer):
         self.subs: list[dict] = []
         self.auths: list[dict] = []
         self.pings = 0
+        self.respond_pongs = True
 
     async def _handler(self, ws):
         self.conns += 1
@@ -147,7 +148,8 @@ class PolyServer(MockServer):
                 self.received.append(raw)
                 if str(raw).strip().upper() == "PING":
                     self.pings += 1
-                    await ws.send("PONG")
+                    if self.respond_pongs:
+                        await ws.send("PONG")
                     continue
                 try:
                     msg = json.loads(raw)
@@ -854,6 +856,7 @@ async def t_user_auth_and_no_secret_leak():
 
 async def t_user_execution_readiness_requires_sent_filter_and_real_pong():
     srv = await PolyServer().start()
+    srv.respond_pongs = False
     feed = PolyUserFeed({"apiKey": "a", "secret": "b", "passphrase": "c"},
                         f"ws://127.0.0.1:{srv.port}", markets=["0xold"],
                         ping_every=1.0, recv_timeout=30.0)
@@ -861,8 +864,11 @@ async def t_user_execution_readiness_requires_sent_filter_and_real_pong():
     try:
         ok = await until(lambda: bool(srv.auths), 5)
         check("private subscription frame is sent", ok, str(srv.subs))
+        check("private heartbeat request is sent before readiness", await until(lambda: srv.pings > 0, 3))
         check("sent subscription alone is not execution-ready before PONG",
               not feed.ready_for_market("0xold"), str(feed.health.as_dict()))
+        srv.respond_pongs = True
+        await srv.broadcast("PONG")
         ok = await until(lambda: feed.ready_for_market("0xold"), 3)
         check("matching sent filter plus application PONG becomes ready",
               ok, str(feed.health.as_dict()))
@@ -1453,6 +1459,11 @@ TRADING_FILES = ["sniper_mode.py", "sniper_live.py", "paper_trade.py", "polymark
                  "accounting/ledger.py", "accounting/fees.py", "accounting/settlement.py",
                  "accounting/resolution.py", "feeds/book.py", "feeds/poly_user.py", "feeds/reconcile.py"]
 BASELINE_SHA = {  # approved trading-file baseline; intentional changes require review
+    # Reviewed 2026-10-11 deep audit: transport/dispatch ambiguity, freshness,
+    # subscription and REST recovery races, paper slot publication, accounting
+    # validation, proven resolution mapping and durable replacement. Trading
+    # formulas, strategy settings, caps and cooldowns are unchanged; regression
+    # and strategy/oracle suites validate the reviewed behavior.
     # sniper_mode.py re-approved at spe24 ace4d41: the paper model's taker hold
     # is Polymarket's documented 250ms (was 150). SNIPER_DELAY_SOURCE=live is unchanged.
     # Re-approved at spe24 aaff811: order rows also journal condition_id and the
@@ -1512,7 +1523,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # sent order's spend off at once (_bankroll_spent / _set_bankroll). The Coinbase trigger
     # runs on SNIPER_COINBASE_CONNS sockets (default 2), each ticker used once by sequence
     # from the first socket to deliver it (_coinbase_conn / _cb_race).
-    "sniper_mode.py": "f86383c7f11c4d37cec05d09c99ee5f31a4c305dfef0ce8f413e00063250a947",
+    # Re-approved 2026-10-11 (operator's audit): hardened parsing of feed prices and
+    # timestamps, order tasks drained on stop(), Kelly stakes trimmed to the side's round
+    # room at the cap (skip "kelly room under venue minimum at price cap").
+    "sniper_mode.py": "2fd97aed3769fd95793bd8dd0143d1bbae46077ec951cfdba813a66275edf708",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
@@ -1520,7 +1534,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # numbers for counts) or the start is refused - "nan" used to switch a cap off.
     # Re-approved (F3): CanarySession - the canary's counters, halts and loss window survive
     # restarts, reconciled with the ledger's authorizations; unreadable state fails closed.
-    "sniper_live.py": "ef7e061dc3aa935222547678924d67576df3b25fa4a52789a86ca6adf697b845",
+    "sniper_live.py": "64aa14526c291c8dbfee6b9cf3dcac746d4c88c68d4cd41adff86b5a6c06a37e",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads
@@ -1535,35 +1549,37 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # (both grew by a few entries per market for the life of the process).
     # Re-approved (paper attribution): a paper fill's ledger source carries its tag
     # (paper_live_book/sniper, /manager) - per-source P/L from actual fills.
-    "paper_trade.py": "c9a160242ada295db79b24f58c1ad2e13f585b43d6698dee3298a22963821032",
-    "polymarket_trade.py": "71b5da67c456c2fb30f3578b84019b0152324bdf338c20c53941eba6b72adc94",
+    "paper_trade.py": "57df2739a670cf5fb125304747ed83bbace45384c80ec064b3f7ee12fc4458b5",
+    "polymarket_trade.py": "1f9d29896d39e9d83005fbb4d95f3de1cda3fc1cd8cbbc5d5998c6287fdba88b",
     "orderbook.py": "fe3decc44a8f1061c2788c1f2ae85739ade137910033031eac3138f11b22f090",
-    "market_discovery.py": "23c605f678eaf1c6caf60259293b9bccf73413e7f632c0a6749c55acc571aa11",
+    "market_discovery.py": "ca15ccc4c1b0da18248abc91143604d15fe00b1638d727bf5209d6f9ff059dc1",
     "timer.py": "3ca35cc64539d45f7e4b982cbe9b6153138f87ee1be79adfae0c8eaccc875d50",
     "config.py": "4a1584c419e24d805c691d3bf8d7885f998c00aba2e2195f647e963154fda45d",
-    "fast_h2.py": "768b40391d3c526431997872192ceb62fe1c4371719d5753b2a588886b7a81fb",
+    "fast_h2.py": "5b9f222bbc3e3ae134d28c13e28db0c8063a35e19ff98b0548d405f0b87cca71",
     # Re-approved (F2): fills and settlements append one fsynced journal line (the snapshot
     # records the entry it includes; load replays newer ones, validated, torn tail dropped,
     # gaps/corruption refused); snapshots every 500 entries and on save(). current_payload().
-    "accounting/ledger.py": "bf59591bc8dad0fef99b7599c6e68022eb60b38ed839e9fd2cd007c7a680381c",
+    "accounting/ledger.py": "a76729c0e98607acbbc9990e40751f4bea06b906fd884f38a07ca74689645572",
     "accounting/fees.py": "44e45be00c7c3b330ef0ff11950fa42944029ba83a61ec8066af3494c0956dc7",
     # Re-approved (settlement audit): one record per market (condition id), checked from
     # expiry, concurrently, on the worker's own pool; explicit lifecycle events and a journal;
     # REDEEM PENDING / REDEEMED tracked apart from SETTLED. Ledger.settle is unchanged.
     # Re-approved (F5): a RESULT_MISMATCH detail raises the RESULT_MISMATCH event (never settled).
-    "accounting/settlement.py": "57965778646c7c3c316b4c0d11d3f64528a4147cf6e6bf65114d4ef5fdcc8c66",
+    "accounting/settlement.py": "66bbd90695e971aa7d164edd46eafd4534d5b2dd870bebb051551301f3a72ae6",
     # Re-approved: Resolver - the chain's payout vector first, the market's outcome order read
     # once per market, the CLOB + Gamma mirrors only when the chain cannot answer. fetch() is
     # unchanged but for its chain=False switch.
     # Re-approved (F5): which token each payout slot pays is proven on chain (CTF position
     # ids); unproven, the chain result settles only when the CLOB + Gamma mirrors agree,
     # and a disagreement is RESULT_MISMATCH (UNKNOWN, never settled).
-    "accounting/resolution.py": "17f0229744797a8df1baaf4c17474731a2d2bcc5a641c741bd2346ab6fdfa7ca",
+    "accounting/resolution.py": "131566abda8c01fc8c1688e24a4348974ba8e63e0b90ad0cf6941158218fb45c",
     # Re-approved (final audit, D5): a refused delta/snapshot (crossed result, malformed values,
     # refused timestamp) on a synced book desyncs its tokens (UNSYNCED until a fresh snapshot)
     # instead of leaving a LIVE book that silently missed a change.
-    "feeds/book.py": "07891ccc2e82c37111e934215ca82a11462ee1d58cac34b569ab0c6c4256c432",
-    "feeds/poly_user.py": "f0dbd62bd0ef708dc15391915aab39e83802106c26af7780c81712ca42ae6b55",
+    # Re-approved 2026-10-11 (operator's audit): malformed updates and invalid
+    # exchange timestamps fail closed; REST snapshots cannot overwrite newer socket data.
+    "feeds/book.py": "098272dd3343ba59eee56bb7435b5cb46c1f5c901d8d2f830277ac9867269b4a",
+    "feeds/poly_user.py": "a6d8c60e2feb6088dd5c68babb5d74b0a0cbea3ae4d54493946959255ed91436",
     "feeds/reconcile.py": "71dea5e832fb970e5cfac1880686cf5eff477a34c48c9b91ba961f77b3e9cb6f",
 }
 SIDES = (None, "UP", "DOWN")

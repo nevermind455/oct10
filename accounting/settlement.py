@@ -329,6 +329,9 @@ class SettlementWorker:
             await self._in_pool(self._write_journal, rows)
             self.journal_error = None
         except Exception as exc:
+            # Retain unacknowledged events for the next flush. Otherwise a
+            # transient disk failure silently deletes the lifecycle journal.
+            self._journal = rows + self._journal
             self.journal_error = f"settlement journal write failed: {type(exc).__name__}: {exc}"[:200]
             self._emit("settle", f"SETTLEMENT_ERROR | {self.journal_error}", "warn")
         finally:

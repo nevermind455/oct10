@@ -12,8 +12,37 @@ tools are untouched - they still read .env exactly as before.
 """
 import os
 import sys
+import ipaddress
 
 import dotenv
+
+
+def _loopback_host(host) -> bool:
+    if isinstance(host, bytes):
+        host = host.decode("ascii", errors="replace")
+    if isinstance(host, str) and host.rstrip(".").lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except (TypeError, ValueError):
+        return False
+
+
+def _offline_network(event, args) -> None:
+    """Allow fake CLOBs on loopback; reject venue/DNS traffic before I/O.
+
+    An audit hook also covers sockets opened by HTTP clients and native
+    asyncio transports. Removing .env alone cannot guarantee offline tests.
+    """
+    if event == "socket.getaddrinfo" and not _loopback_host(args[0]):
+        raise PermissionError("offline tests forbid non-loopback DNS")
+    if event == "socket.connect":
+        address = args[1]
+        if not isinstance(address, tuple) or not _loopback_host(address[0]):
+            raise PermissionError("offline tests forbid non-loopback connections")
+
+
+sys.addaudithook(_offline_network)
 
 if "config" in sys.modules:
     raise RuntimeError("import testing_env before anything that imports config (it has already read .env)")
@@ -33,6 +62,7 @@ _NAMES = {
     "TRADE_INTERVAL_SECONDS", "MIN_SECONDS_TO_EXPIRY", "MIN_BUY_PRICE", "MAX_BUY_PRICE", "BET_SIZE",
     "ASSUMED_MATCH_DELAY_SECONDS", "MARKET_CATEGORY", "CLOB_HOST", "BOT_LOCK_PATH", "ALLOW_OTHER_BOT",
     "MAX_ALLOWED_SPREAD", "MAX_ROUND_EXPOSURE", "MAX_UNSETTLED_EXPOSURE", "SETTLE_ONCHAIN",
+    "GAMMA_HOST", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
 }
 for _key in list(os.environ):
     if _key.startswith(_PREFIXES) or _key in _NAMES:

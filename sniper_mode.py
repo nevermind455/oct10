@@ -144,6 +144,8 @@ def rx_backlog(ws) -> int | None:
     frames = getattr(rm, "frames", None)
     if frames is not None and hasattr(frames, "qsize"):
         return frames.qsize()
+    if frames is not None and hasattr(frames, "__len__"):
+        return len(frames)                                  # websockets 14-15 SimpleQueue
     msgs = getattr(ws, "messages", None)                         # legacy implementation (12-13)
     return len(msgs) if msgs is not None and hasattr(msgs, "__len__") else None
 
@@ -202,11 +204,13 @@ class BinanceFreshness:
     def note_trade(self, event_ms, recv_wall_ms: float, mono: float) -> None:
         try:
             lag = recv_wall_ms - float(event_ms)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             self.n["trade without E"] += 1
+            self.last_trade_mono = self.last_excess = None
             return
         if not math.isfinite(lag):
             self.n["trade without E"] += 1
+            self.last_trade_mono = self.last_excess = None
             return
         q = self._min
         while q and q[-1][1] >= lag:
@@ -331,8 +335,9 @@ def _exchange_ms(ts) -> float | None:
     if not isinstance(ts, str):
         return None
     try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() * 1000.0
-    except ValueError:
+        stamp = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return stamp.timestamp() * 1000.0 if stamp.tzinfo is not None else None
+    except (ValueError, OverflowError, OSError):
         return None
 
 
@@ -340,7 +345,10 @@ def _num(v) -> float | None:
     """A finite positive JSON number (never a bool or a string), else None."""
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         return None
-    return float(v) if math.isfinite(v) and v > 0 else None
+    try:
+        return float(v) if math.isfinite(v) and v > 0 else None
+    except OverflowError:
+        return None
 
 
 def kraken_mid(row, symbol: str = KRAKEN_SYMBOL) -> float | None:
@@ -425,7 +433,7 @@ def _dec(v) -> float | None:
         return None
     try:
         x = float(v)
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
     return x if math.isfinite(x) and x > 0 else None
 
@@ -1322,6 +1330,8 @@ class Sniper:
         self.own_rounds = own_rounds
         self.rows_round = None
         self._tasks: set = set()
+        self._order_tasks: set = set()
+        self._closing = False
         self.code = code_version()
         self._live_delays: list = []
         if live is None and self.s.delay_source == "live":
@@ -1551,13 +1561,36 @@ class Sniper:
                          "cooldown_skips": c["cooldown"], "in_flight_skips": c["in_flight"]})
         self.round_signals.pop(None, None)
 
-    def _spawn(self, coro) -> None:
+    def _spawn(self, coro, *, order: bool = False):
         # Keep a reference: the loop holds tasks weakly, so an unreferenced
         # markout or shadow task can be collected before it finishes.
+        if self._closing and not order:
+            coro.close()
+            return None
         task = asyncio.get_running_loop().create_task(coro)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+        if order:
+            self._order_tasks.add(task)
+            task.add_done_callback(self._order_tasks.discard)
         return task
+
+    async def stop(self) -> None:
+        """Stop auxiliary feeds first, then finish orders before ledger teardown.
+
+        A worker may still be booking a fill after its asyncio waiter is
+        cancelled. Draining those waiters keeps authorization and fills ahead
+        of the runner's final snapshot and session persistence.
+        """
+        self._closing = True
+        auxiliary = list(self._tasks - self._order_tasks)
+        for task in auxiliary:
+            task.cancel()
+        await asyncio.gather(*auxiliary, return_exceptions=True)
+        await asyncio.gather(*list(self._order_tasks), return_exceptions=True)
+        watch = getattr(self, "stallwatch", None)
+        if watch is not None:
+            watch.stop()
 
     # ---------------------------------------------------------------- ticks
     def on_tick(self, raw) -> None:
@@ -1575,8 +1608,11 @@ class Sniper:
                 if d.get("e") == "trade":
                     self.fresh.note_trade(d.get("E"), time.time() * 1000.0, t / 1000.0)
                     return
-            mid = (float(d["b"]) + float(d["a"])) / 2.0
-        except (ValueError, KeyError, TypeError, AttributeError):
+            bid, ask = _dec(d["b"]), _dec(d["a"])
+            if bid is None or ask is None or bid > ask:
+                raise ValueError("invalid best bid/ask")
+            mid = (bid + ask) / 2.0
+        except (ValueError, KeyError, TypeError, AttributeError, OverflowError):
             self.n["binance parse errors"] += 1
             return
         if not (math.isfinite(mid) and mid > 0):
@@ -1651,12 +1687,20 @@ class Sniper:
         self.n["coinbase ticks"] += 1
         if trig is None:
             return "tick"
+        fresh_enough = self.cb_fresh.why_not(t / 1000.0) is None
         if primary:
             self.last_mid = mid
-            self.vol_model.observe(t / 1000.0, mid)
+            if fresh_enough:
+                self.vol_model.observe(t / 1000.0, mid)
         q = trig.q
         reset = bool(q) and t - q[-1][0] > trig.max_gap_ms      # no match for that long: the rule restarts
         self._signal("coinbase", trig, mid, t, t_pc)
+        if not fresh_enough:
+            # _signal already journals an unsafe threshold crossing, but an
+            # unsafe tick below the threshold also cannot become a future
+            # reference or a volatility sample. Clear it on every refusal.
+            trig.q.clear()
+            trig.ref = None
         # Feed quality, after the decision so it costs the decision nothing.
         if self._coinbase_prev_t is not None:
             self.coinbase_gap_max = max(self.coinbase_gap_max, t - self._coinbase_prev_t)
@@ -2342,7 +2386,7 @@ class Sniper:
                 # After the send: the shadow sleeps until absolute times anyway.
                 self._spawn(self._shadow(row, plan["token"], plan["other"], plan["cond"],
                                          plan["amount"], plan["cap"], plan["t0"]))
-            return self._spawn(self._finish(side, r_bp, row, plan, fut, t_pc, start_pc, st["sign_pc"]))
+            return self._spawn(self._finish(side, r_bp, row, plan, fut, t_pc, start_pc, st["sign_pc"]), order=True)
         except Exception as exc:  # noqa: BLE001 - a sniper fault must never stop the bot
             self.n["errors"] += 1
             row.update(result="error", reason=f"{type(exc).__name__}: {exc}")
@@ -2370,7 +2414,7 @@ class Sniper:
         # event-loop turn between the decision and the wire (None: no warm
         # HTTP/2 connection - the task below then connects and sends).
         started = self.live.start_send(p)
-        task = self._spawn(self._finish_live(side, r_bp, row, plan, p, t_pc, started))
+        task = self._spawn(self._finish_live(side, r_bp, row, plan, p, t_pc, started), order=True)
         if self.s.shadow_ms:
             self._spawn(self._shadow(row, plan["token"], plan["other"], plan["cond"],
                                      plan["amount"], plan["cap"], plan["t0"]))
@@ -2690,6 +2734,25 @@ class Sniper:
                 target = min(self.s.shares + carry, self.s.max_target_shares)
             amount = max(self.ioc_spend(self._visible_levels(str(token), view), target, ask, min(cap, hi)),
                          MIN_ORDER_USD)
+            if kelly:
+                # The round gate deliberately estimates shares at the best ask.
+                # Paying deeper levels (or rounding the stake up a cent) can
+                # exceed that estimate even after Kelly trimmed its target to
+                # the available room. Submit a smaller, conservatively bounded
+                # stake instead of rejecting the whole otherwise eligible order.
+                max_spend = (Decimal(str(max(room, 0.0))) * Decimal(str(ask))).quantize(
+                    Decimal("0.01"), rounding=ROUND_FLOOR)
+                amount = min(amount, float(max_spend))
+                # Both senders size to at least five shares at the signed limit.
+                # A stake below that floor would be enlarged after this gate,
+                # defeating the room bound. Keep an unfillable remainder closed.
+                tick = Decimal(str(getattr(view, "tick_size", None) or 0.01))
+                limit = (Decimal(str(min(cap, hi))) / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+                minimum = (Decimal(str(KELLY_MIN_SHARES)) * limit).quantize(
+                    Decimal("0.01"), rounding="ROUND_CEILING")
+                if amount < max(MIN_ORDER_USD, float(minimum)):
+                    row.update(ask_seen=ask, amount=round(amount, 4), room_shares=round(room, 4))
+                    return self._skip("kelly room under venue minimum at price cap", row)
         else:
             # The venue refuses a marketable BUY under $1, so under 10c the
             # 10-share clip becomes $1 - the smallest order live could place.
@@ -2968,28 +3031,49 @@ class Sniper:
         from before a gap is no reference for "moved within 250ms"."""
         url, sub = EXTRA_FEEDS[name]
         handler = getattr(self, f"on_{name}")
-        backoff = 1.0
+        from feeds.supervisor import backoff_delay
+        fresh = self.cb_fresh if name == "coinbase" else None
+        if fresh is not None:
+            fresh.enabled = self.s.coinbase_freshness
+        attempt = 0
         while True:
+            opened = None
             try:
                 from feeds.tls import ws_ssl
                 async with websockets.connect(url, ssl=ws_ssl(url), ping_interval=20, ping_timeout=20,
-                                              open_timeout=10) as ws:
+                                              open_timeout=10, compression=None) as ws:
+                    opened = time.monotonic()
                     await ws.send(json.dumps(sub))
                     self.triggers[name] = Trigger(self.s.k_bp, self.s.window_ms)
                     if name == "coinbase":
                         self._coinbase_seq = self._coinbase_prev_t = None    # a new connection's own order
-                    backoff = 1.0
+                    if fresh is not None:
+                        fresh.on_connect()
+                    last_tick = time.monotonic()
                     self.on_event("sniper", f"{name} ticker connected (second trigger)", "good")
                     while True:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=30)
-                        handler(raw.decode() if isinstance(raw, bytes) else raw)
+                        timeout = self.s.coinbase_silent_s if name == "coinbase" else 30
+                        raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                        now = time.monotonic()
+                        if fresh is not None:
+                            fresh.note_message(now, rx_backlog(ws))
+                        kind = handler(raw.decode() if isinstance(raw, bytes) else raw)
+                        if kind in ("tick", "late"):
+                            last_tick = now
+                        elif name == "coinbase" and now - last_tick >= COINBASE_STARVED_S:
+                            raise CoinbaseFeedError("second trigger subscription starved")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - reconnect; Binance keeps triggering meanwhile
                 self.n[f"{name} reconnects"] += 1
                 self.on_event("sniper", f"{name} ticker {type(exc).__name__}; reconnecting", "warn")
-            await asyncio.sleep(backoff)
-            backoff = min(30.0, backoff * 2)
+            finally:
+                if fresh is not None:
+                    fresh.on_disconnect()
+            if opened is not None and time.monotonic() - opened >= 30:
+                attempt = 0
+            await asyncio.sleep(backoff_delay(attempt))
+            attempt += 1
 
     # ---------------------------------------------------------------- status
     def summary(self) -> dict:
@@ -3112,7 +3196,7 @@ class Sniper:
             opened = None
             try:
                 async with websockets.connect(url, ssl=ws_ssl(url), ping_interval=20,
-                                              ping_timeout=20, open_timeout=10) as ws:
+                                              ping_timeout=20, open_timeout=10, compression=None) as ws:
                     opened = time.monotonic()
                     self.trigger = Trigger(self.s.k_bp, self.s.window_ms)
                     self.triggers["binance"] = self.trigger

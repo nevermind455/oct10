@@ -248,7 +248,7 @@ class FillStore:
                 rec.size_matched = max(rec.size_matched, sm)   # cumulative
             if state:
                 new_state = str(state).upper()
-                if rec.state != "CANCELLATION":
+                if rec.state not in ("CANCELLATION", "CONFLICT"):
                     if new_state in ("PLACEMENT", "UPDATE", "CANCELLATION"):
                         rec.state = new_state
                     else:
@@ -374,6 +374,7 @@ class PolyUserFeed(SupervisedFeed):
             if markets == self._want:
                 return
             self._want = markets
+        self._wake_intent()
         self.event(f"markets -> {len(markets)}")
 
     def refresh_status(self) -> str:
@@ -398,6 +399,7 @@ class PolyUserFeed(SupervisedFeed):
 
     # ------------------------------------------------------------ session
     async def _session(self) -> None:
+        self._bind_intent_loop()
         if not self.authed:
             self.health.status = UNSYNCED
             self.health.detail = "no L2 credentials"
@@ -408,18 +410,19 @@ class PolyUserFeed(SupervisedFeed):
         # Wait until discovery provides an explicit bot market instead of
         # contaminating this ledger with unrelated/manual trades.
         while not self.stopping:
+            self._intent_event.clear()
             with self._sub_lock:
                 has_markets = bool(self._want)
             if has_markets:
                 break
             self.health.status = UNSYNCED
             self.health.detail = "waiting for explicit market filter"
-            await asyncio.sleep(0.2)
+            await self._intent_event.wait()
         if self.stopping:
             return
         async with websockets.connect(
             self.url, ssl=ws_ssl(self.url), ping_interval=None, close_timeout=2,
-            max_size=2 ** 20, open_timeout=10,
+            max_size=2 ** 20, open_timeout=10, compression=None,
         ) as ws:
             self._ws = ws
             self.health.mark_connected()
@@ -429,6 +432,7 @@ class PolyUserFeed(SupervisedFeed):
             self._pong_at = None
             self._ping_sent = None
             self._pong_event.clear()
+            self.health.status = UNSYNCED
             with self._sub_lock:
                 wanted = list(self._want)
             sub = {"auth": {"apiKey": self._creds["apiKey"],
@@ -437,14 +441,15 @@ class PolyUserFeed(SupervisedFeed):
                    "type": "user"}
             if wanted:
                 sub["markets"] = wanted
-            await ws.send(json.dumps(sub))
-            with self._sub_lock:
-                self._sent = set(wanted)
-                self._subscription_generation += 1
-            self.event("connected + subscribed", "good")   # never logs the payload
-            ping_task = asyncio.create_task(self._ping_loop(ws))
-            sub_task = asyncio.create_task(self._sub_loop(ws))
+            tasks = []
             try:
+                await ws.send(json.dumps(sub))
+                with self._sub_lock:
+                    self._sent = set(wanted)
+                    self._subscription_generation += 1
+                self.event("connected + subscribed", "good")   # never logs the payload
+                tasks = [asyncio.create_task(self._ping_loop(ws)),
+                         asyncio.create_task(self._sub_loop(ws))]
                 while not self.stopping:
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=self.recv_timeout)
@@ -453,14 +458,17 @@ class PolyUserFeed(SupervisedFeed):
                         return
                     self._handle(raw)
             finally:
-                ping_task.cancel()
-                sub_task.cancel()
-                await asyncio.gather(ping_task, sub_task, return_exceptions=True)
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
                 self._ws = None
+                self._pong_at = None
+                with self._sub_lock:
+                    self._sent.clear()
 
     async def _sub_loop(self, ws) -> None:
         while True:
-            await asyncio.sleep(0.5)
+            self._intent_event.clear()
             with self._sub_lock:
                 want = set(self._want)
                 sent = set(self._sent)
@@ -492,10 +500,13 @@ class PolyUserFeed(SupervisedFeed):
                     except Exception as close_exc:
                         self.health.mark_error(close_exc)
                     return
+            if add or drop:
+                continue
+            await self._intent_event.wait()
 
     async def _ping_loop(self, ws) -> None:
         while True:
-            await asyncio.sleep(self.ping_every)
+            cycle_started = time.monotonic()
             try:
                 self._ping_sent = time.monotonic()
                 self._pong_event.clear()
@@ -514,6 +525,7 @@ class PolyUserFeed(SupervisedFeed):
                 except Exception as close_exc:
                     self.health.mark_error(close_exc)
                 return
+            await asyncio.sleep(max(0.0, cycle_started + self.ping_every - time.monotonic()))
 
     def _handle(self, raw) -> None:
         self.health.mark_message()
@@ -595,15 +607,19 @@ def taker_paid(asset_id, maker_orders, size=None) -> float | None:
             return None
         shares += sh
         total += sh * (p if str(m["asset_id"]) == str(asset_id) else 1.0 - p)
+        if not math.isfinite(shares) or not math.isfinite(total):
+            return None
     if size is not None and not math.isclose(shares, float(size), rel_tol=1e-6, abs_tol=1e-6):
         return None
     return round(total, 6)
 
 
 def _f(v):
+    if isinstance(v, bool):
+        return None
     try:
         parsed = float(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return parsed if math.isfinite(parsed) else None
 

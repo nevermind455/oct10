@@ -252,6 +252,55 @@ class Gate(I.PaperIOCBase):
         self.assertIsNotNone(plan)
         self.assertLessEqual(plan["target"], 25.0)
 
+    def test_thin_best_ask_trims_stake_to_round_room_instead_of_missing_the_order(self):
+        self.make(SNIPER_SLIP="0.02")
+        rd = self.sn.rounds[self.m.window_end]
+        rd["UP"] = 180.0
+        # Kelly wants the 20 shares left. Their ladder cost is $8.58, but
+        # the unchanged round guard conservatively counts $8.58/.41 > 20.
+        r = self.order("UP", [(0.41, 1), (0.43, 1000)], mid=0.40, move_bp=5.0)
+        self.assertEqual(r["result"], "filled")
+        self.assertEqual((r["target_shares"], r["amount"], r["cap"]), (20.0, 8.20, 0.43))
+        self.assertLessEqual(r["amount"] / r["ask_seen"], 20.0)
+        self.assertGreater(r["shares"], 18.0)
+        self.assertLessEqual(rd["UP"], self.sn.s.max_side_shares)
+        self.assertEqual(self.sn.carry["UP"], 0.0)
+
+    def test_cent_rounding_floors_stake_to_fractional_round_room(self):
+        self.make(SNIPER_SLIP="0.02")
+        rd = self.sn.rounds[self.m.window_end]
+        rd["UP"] = 180.01
+        # 19.99 * .41 = $8.1959. Rounding UP to $8.20 would count
+        # 20 shares and miss a valid smaller order; $8.19 stays within room.
+        r = self.order("UP", [(0.41, 1000)], mid=0.40, move_bp=5.0)
+        self.assertEqual((r["result"], r["amount"]), ("filled", 8.19))
+        self.assertLessEqual(r["amount"] / r["ask_seen"], 19.99)
+        self.assertLessEqual(rd["UP"], self.sn.s.max_side_shares)
+
+    def test_minimum_at_the_signed_limit_cannot_enlarge_stake_past_round_room(self):
+        self.make(SNIPER_SLIP="0.02")
+        rd = self.sn.rounds[self.m.window_end]
+        rd["UP"] = 195.0
+        # $2.05 buys five at .41, but the sender would need $2.15 to
+        # sign five at .43. That enlargement would violate the same guard.
+        r = self.order("UP", [(0.41, 1000)], mid=0.40, move_bp=5.0)
+        self.assertEqual((r["result"], r["reason"]),
+                         ("skipped", "kelly room under venue minimum at price cap"))
+        self.assertEqual(self.broker.filled_orders, 0)
+        self.assertEqual(rd["UP"], 195.0)
+
+    def test_thin_best_ask_keeps_the_live_per_order_room_conservative(self):
+        import types
+        self.make(SNIPER_SLIP="0.02")
+        self.sn.live = types.SimpleNamespace(balance=1000.0, sender=types.SimpleNamespace(
+            limits=types.SimpleNamespace(max_order_shares=20.0)))
+        self.mids[self.m.up_token] = 0.40
+        self.m.set(self.m.up_token, [(0.41, 1), (0.43, 1000)])
+        plan = self.sn._decide("UP", {"bp": 5.0}, time.monotonic() * 1000.0)
+        self.assertIsNotNone(plan)
+        self.assertEqual((plan["target"], plan["amount"]), (20.0, 8.20))
+        self.assertLessEqual(plan["amount"] / plan["view"].best_ask, 20.0)
+
     def anchored_order(self, then, now, move_bp=5.0, ask=0.41):
         """An UP order whose book stood at mid `then` when the move began
         (window_ms before the tick) and stands at `now` when it signals."""

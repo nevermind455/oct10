@@ -20,13 +20,29 @@ ROOT = pathlib.Path(__file__).resolve().parent
 def main(argv) -> int:
     suites = sorted(ROOT.glob("tests_*.py"))
     if argv:
+        unknown = [a for a in argv if not any(s.stem in (a, f"tests_{a}") for s in suites)]
+        if unknown:
+            print(f"Unknown test suites: {', '.join(unknown)}", file=sys.stderr)
+            return 2
         suites = [s for s in suites if any(s.stem == f"tests_{a}" or s.stem == a for a in argv)]
+    if not suites:
+        print("No test suites found", file=sys.stderr)
+        return 2
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    return _run_suites(suites, env)
+
+
+def _run_suites(suites, env) -> int:
     failed = []
     for suite in suites:
         t0 = time.monotonic()
-        proc = subprocess.run([sys.executable, str(suite)], cwd=ROOT, env=env, capture_output=True,
-                              text=True, encoding="utf-8", errors="replace", timeout=1200)
+        try:
+            proc = subprocess.run([sys.executable, str(suite)], cwd=ROOT, env=env, capture_output=True,
+                                  text=True, encoding="utf-8", errors="replace", timeout=1200)
+        except subprocess.TimeoutExpired:
+            failed.append(suite.name)
+            print(f"FAIL  {suite.name:30s} {time.monotonic() - t0:6.1f}s  suite timed out", flush=True)
+            continue
         out = proc.stdout + proc.stderr
         summary = re.findall(r"^(?:\d+ passed, \d+ failed|Ran \d+ tests? in [\d.]+s|OK.*|FAILED.*)$", out, re.M)
         ok = proc.returncode == 0

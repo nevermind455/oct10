@@ -102,10 +102,14 @@ def _true(v) -> bool:
 
 def parse_market(m: dict) -> Resolution:
     """Turn one Gamma market object into a Resolution. Pure - unit testable."""
+    if not isinstance(m, dict):
+        return Resolution("", UNKNOWN, {}, detail="Gamma market is not an object")
     cid = str(m.get("conditionId") or m.get("condition_id") or "")
     tokens = _loads(m.get("clobTokenIds")) or []
     outcomes = _loads(m.get("outcomes")) or []
     prices = _loads(m.get("outcomePrices")) or []
+    if any(not isinstance(values, list) for values in (tokens, outcomes, prices)):
+        return Resolution(cid, UNKNOWN, {}, detail="Gamma outcome fields are not arrays")
 
     closed = _true(m.get("closed"))
     if not closed:
@@ -134,7 +138,9 @@ def parse_market(m: dict) -> Resolution:
                           detail=f"shape mismatch tokens={len(tokens)} "
                                  f"outcomes={len(outcomes)} prices={len(prices)}")
 
-    if len({str(token) for token in tokens}) != 2:
+    if (any(token is None or isinstance(token, bool) or not str(token).strip()
+            or not str(token).isprintable() or any(c.isspace() for c in str(token))
+            for token in tokens) or len({str(token) for token in tokens}) != 2):
         return Resolution(cid, UNKNOWN, {}, detail="duplicate outcome token id")
 
     labels = {str(o).strip().lower() for o in outcomes}
@@ -146,8 +152,10 @@ def parse_market(m: dict) -> Resolution:
     total = 0.0
     for tok, label, px in zip(tokens, outcomes, prices):
         try:
+            if isinstance(px, bool):
+                raise ValueError("boolean payout")
             v = float(px)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return Resolution(cid, UNKNOWN, {}, detail=f"unparsable price {px!r}")
         if not 0.0 <= v <= 1.0:
             return Resolution(cid, UNKNOWN, {}, detail=f"invalid payout {v}")
@@ -198,8 +206,10 @@ def parse_clob_market(m: dict, condition_id: str) -> Resolution:
                 or label_l not in {"up", "down"} or token in payouts):
             return Resolution(cid, UNKNOWN, {}, detail="invalid CLOB token mapping")
         try:
+            if isinstance(row.get("price"), bool):
+                raise ValueError("boolean payout")
             payout = float(row.get("price"))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return Resolution(cid, UNKNOWN, {}, detail="invalid CLOB payout price")
         if not 0.0 <= payout <= 1.0:
             return Resolution(cid, UNKNOWN, {}, detail="out-of-range CLOB payout")
@@ -256,22 +266,23 @@ def fetch(condition_id: str, timeout: float = 10.0, *, chain: bool = True) -> Re
         return Resolution(cid, PENDING, {},
                           detail=(f"CLOB resolution fetch failed: {type(exc).__name__}: "
                                   f"{exc}")[:240])
-    # The chain resolves ~85s after a round ends; CLOB and Gamma are mirrors
-    # that trail it by about ten minutes. Ask the source first, using the token
-    # order this same CLOB response carries - verified across 9 rounds to match
-    # the on-chain outcome-slot order. Any failure falls straight through to
-    # the API path below, so an unreachable RPC costs nothing but the attempt.
+    if not isinstance(clob_data, dict) or str(clob_data.get("condition_id") or "") != cid:
+        return Resolution(cid, UNKNOWN, {}, detail="CLOB condition id/object mismatch")
+    # CLOB row order is not proof of an on-chain outcome slot. Use exactly
+    # the same contract-derived mapping as Resolver before accepting payouts.
     if chain and onchain_resolution.enabled():
-        slot_tokens = [str((row or {}).get("token_id") or "")
-                       for row in (clob_data.get("tokens") or [])]
-        chain_payouts, chain_detail = onchain_resolution.payouts_for(
-            cid, slot_tokens)
+        rows = slot_rows(clob_data, cid)
+        if rows is None:
+            return Resolution(cid, UNKNOWN, {}, detail="invalid CLOB token mapping")
+        proof, _ = onchain_resolution.slot_positions(cid, [token for token, _ in rows])
+        valid_proof = _valid_slot_proof(proof, rows)
+        chain_payouts, chain_detail = (onchain_resolution.payouts_for(
+            cid, sorted(proof, key=proof.get)) if valid_proof else (None, "outcome slots unproven"))
         if chain_payouts:
             winner = None
-            for row in (clob_data.get("tokens") or []):
-                token = str((row or {}).get("token_id") or "")
+            for token, label in rows:
                 if abs(chain_payouts.get(token, 0.0) - 1.0) <= 1e-9:
-                    winner = str((row or {}).get("outcome") or "") or None
+                    winner = label or None
             if winner is None and all(
                     abs(v - 0.5) <= 1e-9 for v in chain_payouts.values()):
                 winner = "50/50"
@@ -359,6 +370,12 @@ def slot_rows(m: dict, condition_id: str) -> list[tuple[str, str]] | None:
     return out
 
 
+def _valid_slot_proof(proof, rows) -> bool:
+    return (isinstance(proof, dict) and set(proof) == {token for token, _ in rows}
+            and all(type(slot) is int for slot in proof.values())
+            and sorted(proof.values()) == [0, 1])
+
+
 class Resolver:
     """resolver(condition_id) -> Resolution: the chain first, the API mirrors
     as a slower fallback. Thread-safe; one instance per settlement worker.
@@ -394,12 +411,14 @@ class Resolver:
 
     def slots(self, condition_id: str) -> list[tuple[str, str]] | None:
         with self._lock:
-            return self._slots.get(str(condition_id))
+            rows = self._slots.get(str(condition_id))
+            return None if rows is None else list(rows)
 
     def proof(self, condition_id: str) -> dict[str, int] | None:
         """{token: outcome slot} as proven on chain for this market, or None."""
         with self._lock:
-            return self._proof.get(str(condition_id))
+            proof = self._proof.get(str(condition_id))
+            return None if proof is None else dict(proof)
 
     def prove(self, condition_id: str) -> tuple[dict[str, int] | None, str]:
         """Prove (once per market, cached) which outcome slot each token is."""
@@ -411,7 +430,7 @@ class Resolver:
         if not rows:
             return None, "market outcome order not read yet"
         proof, detail = onchain_resolution.slot_positions(cid, [t for t, _ in rows])
-        if proof and set(proof) == {t for t, _ in rows}:
+        if _valid_slot_proof(proof, rows):
             with self._lock:
                 self._proof[cid] = dict(proof)
                 if len(self._proof) > 256:

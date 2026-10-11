@@ -205,7 +205,12 @@ def get_btc_5m_tokens(window_start_unix=None):
         return None
     slug = f"btc-updown-5m-{window}"
     # There is deliberately no previous-round fallback.
-    return _parse_event(_fetch_slug(slug), expected_window=window)
+    event = _fetch_slug(slug)
+    # Discovery can straddle a round boundary while waiting for Gamma. The
+    # flags on that response can lag expiry, so re-check our own clock.
+    if window < _current_5m_window_start_unix():
+        return None
+    return _parse_event(event, expected_window=window)
 
 
 def get_tokens_for_current_round(window_start_unix=None):

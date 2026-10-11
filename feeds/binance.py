@@ -55,6 +55,7 @@ class BinanceTradeFeed(SupervisedFeed):
         self.trade_id: int | None = None    # monotonically increasing per symbol
         self.skew_ms: float | None = None   # our clock vs exchange
         self.invalid_messages = 0
+        self.accepted_trades = 0
 
     # ------------------------------------------------------------- status
     def refresh_status(self) -> str:
@@ -77,7 +78,8 @@ class BinanceTradeFeed(SupervisedFeed):
         clearly labelled with its age.
         """
         age = self.price_age_ms
-        if age is None or age > self.stale_after * 1000.0:
+        if (self.refresh_status() != LIVE or age is None
+                or age > self.stale_after * 1000.0):
             return None
         return self.price
 
@@ -86,17 +88,20 @@ class BinanceTradeFeed(SupervisedFeed):
         url = self.urls[self._url_i % len(self.urls)]
         host = url.split("/", 3)[2] if "/" in url else "<invalid-url>"
         self.event(f"connecting {host}")
-        got = self.health.messages              # baseline for THIS attempt
+        got = self.accepted_trades              # valid prices for THIS attempt
         try:
             async with websockets.connect(
                 url, ssl=ws_ssl(url),
-                ping_interval=self.ping_interval,
-                ping_timeout=self.ping_timeout,
+                # The explicit latency task below already sends protocol
+                # pings and closes half-open sockets. Avoid two ping timers.
+                ping_interval=None,
                 close_timeout=2,
                 max_size=2 ** 20,
                 open_timeout=10,
+                compression=None,
             ) as ws:
                 self.health.mark_connected()
+                self.price_mono = None          # a prior socket cannot prove freshness
                 self.health.status = STALE      # not LIVE until data arrives
                 self.health.subscribed = ("btcusdt@trade",)
                 self.event("connected", "good")
@@ -118,6 +123,10 @@ class BinanceTradeFeed(SupervisedFeed):
                                 f"no data for {self.recv_timeout:.0f}s - reconnecting", "warn")
                             return
                         self._handle(raw)
+                        valid_at = self.price_mono or self.health.connected_at
+                        if (valid_at is not None
+                                and time.monotonic() - valid_at > self.recv_timeout):
+                            raise ConnectionError("no valid price inside receive timeout")
                 finally:
                     latency_task.cancel()
                     results = await asyncio.gather(latency_task, return_exceptions=True)
@@ -130,7 +139,7 @@ class BinanceTradeFeed(SupervisedFeed):
             # context.  It still has to advance the endpoint ladder; otherwise
             # a blocked primary makes the configured mirror unreachable.
             if not self.stopping:
-                if self.health.messages > got:
+                if self.accepted_trades > got:
                     self._dry_sessions = 0
                 else:
                     self._dry_sessions += 1
@@ -163,8 +172,10 @@ class BinanceTradeFeed(SupervisedFeed):
         if p is None:
             return
         try:
+            if isinstance(p, bool):
+                raise ValueError("boolean price")
             price = float(p)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             self.invalid_messages += 1
             self.health.detail = "invalid Binance trade price"
             return
@@ -176,14 +187,16 @@ class BinanceTradeFeed(SupervisedFeed):
         ts = msg.get("T") or msg.get("E")
         try:
             trade_ms = int(ts)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             self.invalid_messages += 1
             self.health.detail = "invalid Binance exchange timestamp"
             return
         raw_trade_id = msg.get("t")
         try:
+            if isinstance(raw_trade_id, bool):
+                raise ValueError("boolean sequence id")
             trade_id = int(raw_trade_id) if raw_trade_id is not None else None
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             self.invalid_messages += 1
             self.health.detail = "invalid Binance trade sequence id"
             return
@@ -200,7 +213,12 @@ class BinanceTradeFeed(SupervisedFeed):
             self.invalid_messages += 1
             self.health.detail = "rejected out-of-order exchange timestamp"
             return
-        skew_ms = timer.exchange_age_s(trade_ms) * 1000.0
+        try:
+            skew_ms = timer.exchange_age_s(trade_ms) * 1000.0
+        except (ValueError, OverflowError):
+            self.invalid_messages += 1
+            self.health.detail = "invalid Binance exchange timestamp"
+            return
         # Receipt freshness is monotonic (fresh_price / stale_after). Exchange
         # age only rejects garbage stamps: CLOB time and Binance time are not
         # the same clock, and a 3s cross-venue offset must not drop a live tape.
@@ -214,6 +232,7 @@ class BinanceTradeFeed(SupervisedFeed):
         if trade_id is not None:
             self.trade_id = trade_id
         self.skew_ms = skew_ms
+        self.accepted_trades += 1
         self.health.status = LIVE
         if self._on_price is not None:
             self._on_price(price, now, trade_ms)

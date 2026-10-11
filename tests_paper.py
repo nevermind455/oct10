@@ -355,7 +355,10 @@ def t_sniper_stallwatch_names_what_blocked_the_loop_and_stays_quiet_otherwise():
 
 def t_book_history_reads_the_book_as_it_stood_at_a_venue_time():
     from feeds.book import BookState
-    T = 1_790_000_000_000
+    # The high-water marker now rejects stale/future venue timestamps. Keep
+    # the history fixture within its valid age instead of a fixed old date.
+    import timer
+    T = int(timer.wall() * 1000) - 1000
     b = BookState(history_s=30)
     b.connected = True
     b.set_active(["up", "down"])

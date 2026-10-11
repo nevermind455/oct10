@@ -302,22 +302,40 @@ class GateTests(unittest.TestCase):
         self.assertIn("coinbase_backlog", row)
 
     def test_a_receive_backlog_is_skipped(self):
-        sn, fired, _ = self.armed(backlog=50)
-        self.move(sn)
+        sn, fired, _ = self.armed()
+        sn.on_coinbase(ticker(60_000.0))                                    # a sound baseline ...
+        age(sn, 300)
+        sn.cb_fresh.note_message(time.monotonic(), 50)                     # ... then a burst behind the move
+        sn.on_coinbase(ticker(60_012.0))
         self.assertEqual((fired, sn.n["skip: coinbase receive backlog"]), ([], 1))
+        self.assertEqual(len(sn.trigger.q), 0)
 
     def test_a_disconnected_feed_is_skipped(self):
         sn, fired, _ = self.armed()
+        sn.on_coinbase(ticker(60_000.0))
+        age(sn, 300)
         sn.cb_fresh.on_disconnect()
-        self.move(sn)
+        sn.on_coinbase(ticker(60_012.0))
         self.assertEqual((fired, sn.n["skip: coinbase disconnected"]), ([], 1))
 
     def test_no_match_time_is_unknown_age(self):
         sn, fired, _ = self.armed()
-        sn.on_coinbase(ticker(60_000.0, lag_ms=None))
-        age(sn, 300)
-        sn.on_coinbase(ticker(60_012.0, lag_ms=None))
+        sn.cb_fresh.last_trade_mono = time.monotonic() - 10.0             # the last dated match: 10s ago
+        sn.trigger.q.append((time.monotonic() * 1000.0 - 300.0, 60_000.0))
+        sn.on_coinbase(ticker(60_012.0, lag_ms=None))                       # an undated one moves the price
         self.assertEqual((fired, sn.n["skip: coinbase age unknown"]), ([], 1))
+
+    def test_a_tick_the_gate_refuses_is_never_a_reference(self):
+        """An unsafe tick below the threshold is not kept either: a later
+        sound tick is not measured against it."""
+        sn, fired, _ = self.armed(backlog=50)
+        sn.on_coinbase(ticker(60_000.0))
+        self.assertEqual(len(sn.trigger.q), 0)
+        sn.cb_fresh.note_message(time.monotonic(), 0)
+        age(sn, 300)
+        sn.on_coinbase(ticker(60_012.0))
+        self.assertEqual(fired, [])
+        self.assertEqual(sn.n["signals"], 0)
 
     def test_the_gate_is_off_unless_the_socket_loop_turns_it_on(self):     # replays, benches
         sn, fired = make()

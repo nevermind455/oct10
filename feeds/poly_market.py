@@ -79,11 +79,10 @@ class PolyMarketFeed(SupervisedFeed):
                     token: timestamp for token, timestamp in self.last_trade_ts.items()
                     if token in keep
                 }
-        # Reconcile BookState even when subscription intent is unchanged. An
-        # interrupted older transition can leave `_want` correct while the
-        # active set is empty or stale. BookState.set_active is idempotent: a
-        # healthy repeat neither resets generations nor emits a rotate event.
-        added, removed = self.book.set_active(tokens)
+            # Intent and the active set are one serialized transition.
+            # Same-state calls can still repair an interrupted transition.
+            added, removed = self.book.set_active(tokens)
+        self._wake_intent()
         if added or removed:
             self.event(f"rotate +{len(added)} -{len(removed)} -> {[t[-6:] for t in tokens]}")
 
@@ -96,9 +95,11 @@ class PolyMarketFeed(SupervisedFeed):
 
     # ------------------------------------------------------------ session
     async def _session(self) -> None:
+        self._bind_intent_loop()
         async with websockets.connect(
             self.url, ssl=ws_ssl(self.url), ping_interval=None,      # this venue wants app-level PING
             close_timeout=2, max_size=4 * 2 ** 20, open_timeout=10,
+            compression=None,
         ) as ws:
             self._ws = ws
             with self._sub_lock:
@@ -111,14 +112,16 @@ class PolyMarketFeed(SupervisedFeed):
             self.book.connected = True
             # Everything we knew is now a guess: deltas during the gap are lost.
             self.book.desync_all("connect")
+            self._request_resync()
             self.health.mark_connected()
             self.health.status = UNSYNCED
             self.event("connected", "good")
 
-            await self._sync_subscriptions(initial=True)
-            ping_task = asyncio.create_task(self._ping_loop(ws))
-            sub_task = asyncio.create_task(self._subscription_loop(ws))
+            tasks = []
             try:
+                await self._sync_subscriptions(initial=True)
+                tasks = [asyncio.create_task(self._ping_loop(ws)),
+                         asyncio.create_task(self._subscription_loop(ws))]
                 while not self.stopping:
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=self.recv_timeout)
@@ -127,10 +130,12 @@ class PolyMarketFeed(SupervisedFeed):
                         return
                     self._handle(raw)
             finally:
-                ping_task.cancel()
-                sub_task.cancel()
-                await asyncio.gather(ping_task, sub_task, return_exceptions=True)
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
                 self._ws = None
+                with self._sub_lock:
+                    self._sent.clear()
                 self.book.connected = False
                 self.book.desync_all("disconnect")
 
@@ -170,7 +175,9 @@ class PolyMarketFeed(SupervisedFeed):
 
     async def _subscription_loop(self, ws) -> None:
         while True:
-            await asyncio.sleep(0.25)
+            # Clear before reading state: a worker notification during send
+            # remains pending, and changed intent is reconciled immediately.
+            self._intent_event.clear()
             with self._sub_lock:
                 changed = set(self._want) != self._sent
             if changed:
@@ -183,10 +190,12 @@ class PolyMarketFeed(SupervisedFeed):
                     except Exception as close_exc:
                         self.health.mark_error(close_exc)
                     return
+                continue
+            await self._intent_event.wait()
 
     async def _ping_loop(self, ws) -> None:
         while True:
-            await asyncio.sleep(self.ping_every)
+            cycle_started = time.monotonic()
             try:
                 self._ping_sent = time.monotonic()
                 self._pong_event.clear()
@@ -205,6 +214,10 @@ class PolyMarketFeed(SupervisedFeed):
                 except Exception as close_exc:
                     self.health.mark_error(close_exc)
                 return
+            # Send immediately after subscription, then on a fixed cadence.
+            # Waiting a full interval after PONG made every RTT add heartbeat
+            # drift and delayed initial connection proof by ten seconds.
+            await asyncio.sleep(max(0.0, cycle_started + self.ping_every - time.monotonic()))
 
     # ------------------------------------------------------------- receive
     def _handle(self, raw) -> None:
@@ -246,6 +259,7 @@ class PolyMarketFeed(SupervisedFeed):
             if not applied:
                 self.invalid_messages += 1
                 self.health.detail = "rejected invalid/stale book snapshot"
+                self._request_resync()
         elif et == "price_change":
             ts, h = m.get("timestamp"), m.get("hash")
             applied = self.book.apply_price_changes(
@@ -254,6 +268,7 @@ class PolyMarketFeed(SupervisedFeed):
             if not applied:
                 self.invalid_messages += 1
                 self.health.detail = "rejected invalid/stale price-change event"
+                self._request_resync()
         elif et == "tick_size_change":
             tok = str(m.get("asset_id"))
             self.book.set_tick_size(tok, m.get("new_tick_size"))
@@ -267,7 +282,7 @@ class PolyMarketFeed(SupervisedFeed):
             try:
                 price = float(m.get("price"))
                 timestamp = int(m.get("timestamp")) if m.get("timestamp") is not None else None
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 self.invalid_messages += 1
                 self.health.detail = "rejected invalid last-trade price"
                 return
@@ -288,9 +303,14 @@ class PolyMarketFeed(SupervisedFeed):
         elif et == "best_bid_ask":
             # top-of-book only; the full book is authoritative here - but its
             # time still shows how far the feed has got
-            self.book.note_exchange_ts(m.get("timestamp"))
+            if str(m.get("asset_id") or "") in self.book.active:
+                self.book.note_exchange_ts(m.get("timestamp"))
         elif et == "market_resolved":
             self.event(f"market resolved: winner {m.get('winning_outcome')}", "warn")
         else:
             self.invalid_messages += 1
             self.health.detail = f"ignored unknown market event {str(et)[:40]!r}"
+
+    def _request_resync(self) -> None:
+        if self._resync is not None:
+            self._resync(self.book.needs_resync())
