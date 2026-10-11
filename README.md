@@ -63,10 +63,11 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
     history, or no market mid, there are no buys ("fair value unknown"). A first version
     priced from Coinbase against the round's start price disagreed with the market by
     10-30c and bought the losing side; it was replaced the same day.
-  - **Kelly size (2026-10-11).** Each FAK order buys `SNIPER_KELLY_FRACTION` (¼) of the
+  - **Kelly size (2026-10-11).** Each FAK order buys `SNIPER_KELLY_FRACTION` (1: full Kelly; ¼ before) of the
     Kelly bet on that fair value: f* = (fair − p) / (1 − p), p the ask plus its fee,
     times the account's cash (re-read every 5s, off the order path), in whole shares,
-    5 to `SNIPER_MAX_TARGET_SHARES` (20); under 5 it skips. Each order is sized fresh:
+    from 5 with no per-order cap - only what is left of `SNIPER_MAX_SIDE_SHARES` (200)
+    for the side in the round, and live the canary's per-order cap; under 5 it skips. Each order is sized fresh:
     no carry. The dashboard's "fair" line shows the volatility and the last decision
     (market mid -> fair, the limit, the size).
   - **FOK.** `SNIPER_ORDER_TYPE=FOK` keeps the old all-or-nothing order with no carry.
@@ -101,7 +102,7 @@ is left of trigger -> ACK is outside the process:
 **The frozen spec.** `--live` refuses to start unless the resolved settings are
 exactly the frozen spec (`exec_latency.FROZEN_SPEC`: Coinbase, 0.50bp in 250ms, FAK,
 ask+$0.05, 300ms per side, 10 shares, every buy at or under the market-anchored fair value
-− fee − $0.01, ¼ Kelly size 5-20 shares) and `SNIPER_CANARY_MAX_SHARES` admits the 20-share carried target. A missing
+− fee − $0.01, full Kelly size from 5 shares) and `SNIPER_CANARY_MAX_SHARES` admits the 20-share carried target. A missing
 `.env` value falls back to a code default; for the trigger and the limit those are the
 spec (0.5bp, ask+$0.05). Every
 start prints the resolved configuration and which ECDSA backend signs (install
@@ -291,7 +292,7 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | `SNIPER_ORDER_TYPE` | FAK | IOC limit: partial fills kept, the rest cancelled; FOK is all-or-nothing |
 | `SNIPER_SLIP` | 0.05 | limit = the ask seen + 0.05, clipped at `MAX_BUY_PRICE`: never pays more |
 | `SNIPER_FAIR` / `SNIPER_FAIR_MARGIN` | 1 / 0.01 | every buy at or under the market-anchored fair value − fee − margin (the limit capped there) |
-| `SNIPER_KELLY` / `SNIPER_KELLY_FRACTION` | 1 / 0.25 | FAK size: ¼ Kelly on the fair value from the account's cash, 5 to `SNIPER_MAX_TARGET_SHARES` shares |
+| `SNIPER_KELLY` / `SNIPER_KELLY_FRACTION` | 1 / 1 | FAK size: full Kelly on the fair value from the account's cash, from 5 shares, no per-order cap (side cap 200 per round) |
 | `SNIPER_FAIR_VOL_S` / `SNIPER_FAIR_FEE_RATE` | 300 / 0.07 | the volatility window (s) and the taker fee rate the fair limit uses |
 | `SNIPER_COOLDOWN_MS` | 300 | per side: an order starts a pause on ITS side only, from its submission |
 | `SNIPER_MIN_LEFT_S` | 10 | no order with fewer seconds left in the round |

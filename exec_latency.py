@@ -53,6 +53,9 @@ import os
 # left) - the start-price model disagreed with the market by 10-30c and bought the
 # losing side; and FAK orders are sized at 1/4 Kelly on it, 5 to 20 shares, from the
 # account's cash (the operator's choice), replacing the fixed 10 shares + carry.
+# 2026-10-11 (later): 1/4 Kelly -> full Kelly, and no per-order cap (the operator's
+# changes): an order is bounded only by what is left of the side's 200-share cap in
+# the round, the cash, and live, the canary's per-order cap.
 FROZEN_SPEC = (
     # (Settings attribute, environment variable, frozen value, label, format)
     ("primary_feed", "SNIPER_PRIMARY_FEED", "coinbase", "trigger feed", "{}"),
@@ -66,7 +69,7 @@ FROZEN_SPEC = (
     ("fair", "SNIPER_FAIR", True, "fair value", "{}"),
     ("fair_margin", "SNIPER_FAIR_MARGIN", 0.01, "fair margin", "${:.2f}"),
     ("kelly", "SNIPER_KELLY", True, "kelly size", "{}"),
-    ("kelly_fraction", "SNIPER_KELLY_FRACTION", 0.25, "kelly fraction", "{:g}"),
+    ("kelly_fraction", "SNIPER_KELLY_FRACTION", 1.0, "kelly fraction", "{:g}"),
 )
 
 

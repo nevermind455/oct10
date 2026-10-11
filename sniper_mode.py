@@ -843,10 +843,11 @@ class Settings:
         self.fair_fee_rate = _env_float("SNIPER_FAIR_FEE_RATE", 0.07)
         # Kelly size (the frozen spec since 2026-10-11, with the fair value): FAK orders
         # buy SNIPER_KELLY_FRACTION of the Kelly bet on that fair value, in whole shares,
-        # at most SNIPER_MAX_TARGET_SHARES, from the account's cash; under the venue's
-        # 5-share minimum it skips. Replaces the fixed SNIPER_SHARES + carry.
+        # from the account's cash - no per-order cap, only what is left of the side's
+        # SNIPER_MAX_SIDE_SHARES in the round (live: also the canary's per-order cap);
+        # under the venue's 5-share minimum it skips. Replaces the fixed SNIPER_SHARES + carry.
         self.kelly = _env_bool("SNIPER_KELLY", True)
-        self.kelly_fraction = _env_float("SNIPER_KELLY_FRACTION", 0.25)
+        self.kelly_fraction = _env_float("SNIPER_KELLY_FRACTION", 1.0)       # full Kelly (0.25 earlier on 2026-10-11)
         self.stale_ms = _env_float("SNIPER_STALE_MS", 2000)
         # Which book a paper order fills against. "exchange": the book as it
         # stood at the modelled match instant on the venue's own clock (the
@@ -966,7 +967,8 @@ class Settings:
             return ""
         return (f"; every buy at or under the market-anchored fair value - fee - ${self.fair_margin:.2f} "
                 f"(the market's mid moved by the BTC move over {self.fair_vol_s:.0f}s volatility and the time left)"
-                + (f"; size {self.kelly_fraction:g} Kelly, {KELLY_MIN_SHARES}-{self.max_target_shares:g} sh"
+                + (f"; size {self.kelly_fraction:g} Kelly from {KELLY_MIN_SHARES} sh, no per-order cap "
+                   f"(<= {self.max_side_shares:.0f} sh/side per round)"
                    if self.kelly and self.order_type == "FAK" else ""))
 
     def lines(self, live: bool = False) -> list[str]:
@@ -1453,6 +1455,14 @@ class Sniper:
                 self._write({"wall": time.time(), "result": "gc", "ms": round((time.perf_counter() - t) * 1000, 1),
                              "collected": found, "left_s": round(left, 2)})
             await asyncio.sleep(0.5)
+
+    def _side_held(self, end, side: str, token) -> float:
+        """Shares this side already counts in the round ending at `end` (its round
+        entry, else what the ledger held at startup) - never creates the entry."""
+        rd = self.rounds.get(end)
+        if rd is not None:
+            return float(rd[side])
+        return float(self.round_baseline.get(str(token), (0.0, 0))[0])
 
     BANKROLL_EVERY_S = 5.0     # the cash Kelly sizes from is re-read this often, off the order path
     BANKROLL_STALE_S = 30.0    # older than this (no refresher running): read it on the spot
@@ -2587,8 +2597,15 @@ class Sniper:
                 bank = self._bankroll_now()
                 if bank is None:
                     return self._skip("kelly size unknown: no cash reading", row)
+                # No per-order cap (the operator's choice): only what is left of this
+                # side's per-market cap (SNIPER_MAX_SIDE_SHARES), and live, the canary's
+                # per-order cap - never a bigger order than the account's limits allow.
+                room = self.s.max_side_shares - self._side_held(end, side, token)
+                live_cap = getattr(getattr(getattr(self.live, "sender", None), "limits", None), "max_order_shares", None)
+                if live_cap is not None:
+                    room = min(room, float(live_cap))
                 shares, f = kelly_shares(fair, ask, self.s.fair_fee_rate, self.s.kelly_fraction, bank,
-                                         self.s.max_target_shares)
+                                         max(room, 0.0))
                 row.update(kelly_f=round(f, 4), bankroll=round(bank, 2), kelly_shares=shares)
                 self.last_fair["shares"] = shares
                 if shares < KELLY_MIN_SHARES:

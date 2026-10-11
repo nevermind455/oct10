@@ -1501,7 +1501,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # one sample a second); FAK orders are sized at SNIPER_KELLY_FRACTION Kelly on it
     # (kelly_shares, 5..SNIPER_MAX_TARGET_SHARES, no carry) from a cash reading cached off
     # the order path (_bankroll_now / _bankroll_loop); unknown inputs skip.
-    "sniper_mode.py": "7152a85b28f6df925167564c64fc36672775e21a2dd900704b119aef77c353fc",
+    # Re-approved 2026-10-11 (later, the operator's changes): SNIPER_KELLY_FRACTION defaults
+    # to the frozen spec's 1.0 (full Kelly; was 0.25), and a Kelly order has no per-order cap -
+    # only what is left of SNIPER_MAX_SIDE_SHARES for the side in the round (_side_held) and,
+    # live, the canary's max_order_shares.
+    "sniper_mode.py": "9f4cf0719e3825e7b6c2cdfa17563356e3dd33705c27b5372abc2bbe487884b0",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.

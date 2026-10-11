@@ -7,7 +7,8 @@ spec since 2026-10-11).
 The fair value is MARKET-ANCHORED: the market's own mid for the side just
 before the move, read as a probability, moved by the BTC move over the
 volatility and time left. Every buy must be at or under it less the taker fee
-and a margin, and FAK orders buy 1/4 Kelly on it (5 to 20 shares).
+and a margin, and FAK orders buy full Kelly on it: from 5 shares, no per-order
+cap - only what is left of the side's per-round cap (live: the canary's too).
 
 Expected values are computed here from the formulas themselves (math.erf, a
 bisection inverse, brute force over the tick grid), never with the functions
@@ -191,7 +192,7 @@ class Gate(I.PaperIOCBase):
         self.check_fair(r, 0.40, 5.0)
         self.assertEqual(r["result"], "filled")
         self.assertAlmostEqual(r["cap"], min(0.46, r["fair_limit"]))
-        want, f = oracle_kelly(r["fair"], 0.41, 1000.0)
+        want, f = oracle_kelly(r["fair"], 0.41, 1000.0, fraction=self.sn.s.kelly_fraction, cap=200)
         self.assertLessEqual(abs(r["target_shares"] - want), 1.0)    # the row's fair is rounded to 4 places
         self.assertEqual((r["bankroll"], r["carry_in"]), (1000.0, 0.0))
         self.assertAlmostEqual(r["kelly_f"], f, places=3)
@@ -221,13 +222,35 @@ class Gate(I.PaperIOCBase):
         self.assertEqual(r["reason"], "fair value unknown: no market price")
 
     def test_too_little_cash_for_the_venue_minimum_skips(self):
-        self.sn._read_bankroll = lambda: 20.0                    # $20: 1/4 Kelly is a share or two
+        self.sn._read_bankroll = lambda: 2.0                     # $2: even full Kelly is a share or two
         r = self.order("UP", [(0.41, 200)], mid=0.40, move_bp=5.0)
         self.assertEqual((r["result"], r["reason"]), ("skipped", "kelly size under the 5-share minimum"))
         self.sn._read_bankroll = lambda: None
         self.sn._bankroll = None
         r = self.order("UP", [(0.41, 200)], mid=0.40, move_bp=6.0)
         self.assertEqual(r["reason"], "kelly size unknown: no cash reading")
+
+    def test_no_per_order_cap_only_the_sides_room_in_the_round(self):
+        r = self.order("UP", [(0.41, 1000)], mid=0.40, move_bp=5.0)
+        self.assertGreater(r["target_shares"], 20)                   # the old 20-share cap is gone
+        self.assertLessEqual(r["target_shares"], 200)
+        rd = self.sn.rounds[self.m.window_end]
+        rd["UP"] = 180.0                                             # 180 already held this round
+        r = self.order("UP", [(0.41, 1000)], mid=0.40, move_bp=5.0)
+        self.assertLessEqual(r["target_shares"], 20.0)               # trimmed to the 20 left, not skipped
+        rd["UP"] = 198.0                                             # 2 left: under the 5-share minimum
+        r = self.order("UP", [(0.41, 1000)], mid=0.40, move_bp=5.0)
+        self.assertEqual(r["reason"], "kelly size under the 5-share minimum")
+
+    def test_live_keeps_the_canary_per_order_cap(self):
+        import types
+        self.sn.live = types.SimpleNamespace(balance=1000.0, sender=types.SimpleNamespace(
+            limits=types.SimpleNamespace(max_order_shares=25.0)))
+        self.mids[self.m.up_token] = 0.40
+        self.m.set(self.m.up_token, [(0.41, 1000)])
+        plan = self.sn._decide("UP", {"bp": 5.0}, time.monotonic() * 1000.0)
+        self.assertIsNotNone(plan)
+        self.assertLessEqual(plan["target"], 25.0)
 
     def test_kelly_orders_carry_nothing(self):
         r = self.order("UP", [(0.41, 3)], mid=0.40, move_bp=5.0)        # only 3 shares at the ask, then nothing
@@ -315,13 +338,13 @@ class Settings(unittest.TestCase):
             s = S.Settings()
             self.assertEqual(X.spec_violations(s, 25), [])
         self.assertEqual((s.fair, s.fair_margin, s.kelly, s.kelly_fraction, s.max_target_shares),
-                         (True, 0.01, True, 0.25, 20.0))
+                         (True, 0.01, True, 1.0, 20.0))
         spec = dict((a, v) for a, _n, v, _l, _f in X.FROZEN_SPEC)
         self.assertEqual((spec["fair"], spec["fair_margin"], spec["kelly"], spec["kelly_fraction"]),
-                         (True, 0.01, True, 0.25))
+                         (True, 0.01, True, 1.0))
         for line in (s.lines()[0], s.lines(live=True)[0]):
             self.assertIn("market-anchored fair value - fee - $0.01", line)
-            self.assertIn("size 0.25 Kelly, 5-20 sh", line)
+            self.assertIn("size 1 Kelly from 5 sh, no per-order cap (<= 200 sh/side per round)", line)
 
     def test_live_refuses_them_off_or_changed(self):
         for kw, word in (({"SNIPER_FAIR": "0"}, "fair value"), ({"SNIPER_FAIR_MARGIN": "0.02"}, "fair margin"),
