@@ -54,6 +54,13 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
     same-side signal. It is never retried. A zero fill is not a fill.
   - **Carry.** UP and DOWN carries are kept apart, and both are cleared when the
     market changes.
+  - **Only below the average (2026-10-11).** After a side's first fill in a market,
+    its next buy must lower that side's average: the limit becomes the highest tick
+    under the average (UP held at 0.789 -> limit 0.78), and a signal whose ask is not
+    under it is skipped ("not below this side's average"). The other side's first buy
+    is not limited. A restart rebuilds the average from the ledger; shares with no
+    known price skip ("side average unknown"). `SNIPER_AVG_DOWN=0` turns it off
+    (paper only: it is in the frozen spec).
   - **FOK.** `SNIPER_ORDER_TYPE=FOK` keeps the old all-or-nothing order with no carry.
 - **Paper fills.** Paper fills against Polymarket's book at the modelled match
   instant. With `SNIPER_DELAY_SOURCE=live`, each order's delay is drawn from real
@@ -274,6 +281,7 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | `SNIPER_MAX_TARGET_SHARES` | 20 | cap on base + same-side unfilled carry |
 | `SNIPER_ORDER_TYPE` | FAK | IOC limit: partial fills kept, the rest cancelled; FOK is all-or-nothing |
 | `SNIPER_SLIP` | 0.05 | limit = the ask seen + 0.05, clipped at `MAX_BUY_PRICE`: never pays more |
+| `SNIPER_AVG_DOWN` | 1 | after a side's first fill in a market, its next buy only below that side's average (limit = the tick under it) |
 | `SNIPER_COOLDOWN_MS` | 300 | per side: an order starts a pause on ITS side only, from its submission |
 | `SNIPER_MIN_LEFT_S` | 10 | no order with fewer seconds left in the round |
 | `SNIPER_MAX_FILLS_ROUND` / `SNIPER_MAX_SIDE_SHARES` | 20 / 200 | per-round caps |

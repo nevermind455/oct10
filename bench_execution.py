@@ -62,6 +62,9 @@ BENCH_ENV = {"SNIPER_ONLY": "1", "SNIPER_K_BP": "0.5", "SNIPER_WINDOW_MS": "250"
              "SNIPER_SLIP": "0.05", "SNIPER_SHARES": "10", "SNIPER_MAX_TARGET_SHARES": "20",
              "SNIPER_COOLDOWN_MS": "300", "SNIPER_SHADOW_MS": "", "SNIPER_STALL_MS": "0",
              "SNIPER_PRIMARY_FEED": SPEC_FEED, "SNIPER_EXTRA_FEEDS": "",
+             # 1000 orders at one ask: the below-average rule would stop every rebuy -
+             # a strategy rule, not latency; off for the benchmark like the round caps
+             "SNIPER_AVG_DOWN": "0",
              # the per-round caps would stop a 1000-order run after 20 fills; they are
              # risk limits, not latency - lifted for the benchmark only
              "SNIPER_MAX_FILLS_ROUND": "1000000", "SNIPER_MAX_SIDE_SHARES": "100000000"}

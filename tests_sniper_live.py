@@ -1081,6 +1081,7 @@ def t_sniper_live_end_to_end_and_halted_skips():
             out["table"] = [r["result"] for r in sn.trade_rows]
             out["no_throwaway_builder"] = sn._builder is None
             out["lines"] = sn.lines()
+            sn.s.avg_down = False   # the rebuy below tests the halt, not the below-average rule
             ex.kill.trip("test halt")
             sn.last_fire = -1e18
             await sn._fire("UP", 1.5, time.monotonic() * 1000.0)

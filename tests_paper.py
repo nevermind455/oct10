@@ -1878,7 +1878,9 @@ def _fixed_sniper_settings(**env):
     real order signer would rightly refuse to build. Their caps are priced at
     ask + 2c, set here (the code default is the spec's 4c)."""
     import sniper_mode
-    env = {"SNIPER_SLIP": "0.02", **env}
+    # these tests rebuy a side at one price; the below-average rule (SNIPER_AVG_DOWN)
+    # has its own tests with it on
+    env = {"SNIPER_SLIP": "0.02", "SNIPER_AVG_DOWN": "0", **env}
     keys = ("SNIPER_LATENCY_MS", *env)
     saved = {k: os.environ.get(k) for k in keys}
     os.environ["SNIPER_LATENCY_MS"] = "200"
@@ -2211,6 +2213,7 @@ def t_sniper_live_like_mode_signs_and_uses_measured_latency():
         if saved is not None:
             os.environ["SNIPER_LATENCY_MS"] = saved
     s.shadow_ms = ()
+    s.avg_down = False          # the second order rebuys UP at the same ask to test signing, not the average
     check("SNIPER_LATENCY_MS unset -> live-like mode", not s.fixed_latency and "live-like" in s.lines()[0])
     hub, broker = Hub(), Broker()
     sn = sniper_mode.Sniper(hub, broker, settings=s)
@@ -2420,6 +2423,7 @@ def t_sniper_end_to_end_on_the_real_paper_broker():
             if saved is not None:
                 os.environ["SNIPER_LATENCY_MS"] = saved
         s.hold_ms, s.server_ms, s.shadow_ms = 0.0, 0.0, (0, 30)
+        s.avg_down = False      # the second order rebuys UP at the same ask to test own-fill netting
         journal = os.path.join(tmp, "j.jsonl")
         table = []
         sn = sniper_mode.Sniper(hub, broker, settings=s, journal_path=journal, trade_rows=table, own_rounds=True)

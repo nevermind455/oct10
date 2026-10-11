@@ -466,6 +466,25 @@ def _env_float(name: str, default: float) -> float:
     return v
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    """A SNIPER_* switch: the default when unset or blank, else 1/true/yes/on
+    or 0/false/no/off - anything else stops the start (as _env_float)."""
+    raw = str(os.environ.get(name, "")).strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"invalid {name}={raw!r}: 1 or 0")
+
+
+def below_average(avg: float, tick: float) -> float:
+    """The highest price on the tick grid strictly below avg: the limit of a
+    buy that must lower its side's average (avg 0.789 -> 0.78, 0.78 -> 0.77)."""
+    return round(math.floor((float(avg) - 1e-9) / float(tick)) * float(tick), 4)
+
+
 def signing_price(cap: float, tick: str) -> float:
     """The limit price to sign: the cap floored exactly to the tick, plus a
     nudge far below any tick.
@@ -711,6 +730,12 @@ class Settings:
         # FAK (IOC) only: what an order did not fill is added to the next
         # same-side order in the same market, the target never above this.
         self.max_target_shares = _env_float("SNIPER_MAX_TARGET_SHARES", 20)
+        # After a side's first fill in a market, its next buy only BELOW that
+        # side's average price (the frozen spec since 2026-10-11, the operator's
+        # rule): the limit is the highest tick under the average, and a signal
+        # whose ask is not under it is skipped - every add-on buy lowers the
+        # side's average. The other side's first buy is not limited.
+        self.avg_down = _env_bool("SNIPER_AVG_DOWN", True)
         self.stale_ms = _env_float("SNIPER_STALE_MS", 2000)
         # Which book a paper order fills against. "exchange": the book as it
         # stood at the modelled match instant on the venue's own clock (the
@@ -821,12 +846,15 @@ class Settings:
         return (f" (+ same-side unfilled carry, <= {self.max_target_shares:g} sh)"
                 if self.order_type == "FAK" else "")
 
+    def avg_text(self) -> str:
+        return "; after a side's first fill in a market, it buys only below its average" if self.avg_down else ""
+
     def lines(self, live: bool = False) -> list[str]:
         if live:
             return [f"SNIPER LIVE CANARY{self.lead_text()}: spot mid >= {self.k_bp}bp within {self.window_ms:.0f}ms -> real {self.order_type} "
                     f"{self.shares:.0f} sh{self.carry_text()} at ask+{self.slip:.2f}, cooldown {self.cooldown_ms:.0f}ms per side, "
                     f">= {self.min_left_s:.0f}s left, <= {self.max_fills_round} fills and "
-                    f"{self.max_side_shares:.0f} sh/side per round"
+                    f"{self.max_side_shares:.0f} sh/side per round" + self.avg_text()
                     + (f"; shadow fills at {','.join(map(str, self.shadow_ms))}ms (arithmetic only)"
                        if self.shadow_ms else "") + self.feeds_text()]
         return [f"SNIPER paper-only{self.lead_text()}: spot mid >= {self.k_bp}bp within {self.window_ms:.0f}ms -> {self.order_type} "
@@ -837,6 +865,7 @@ class Settings:
                    f"+ {self.server_ms:.0f}ms server allowance; ")
                 + f"cooldown {self.cooldown_ms:.0f}ms per side, >= {self.min_left_s:.0f}s left, "
                 f"<= {self.max_fills_round} fills and {self.max_side_shares:.0f} sh/side per round"
+                + self.avg_text()
                 + (f"; shadow fills at {','.join(map(str, self.shadow_ms))}ms (arithmetic only)"
                    if self.shadow_ms else "")
                 + ("" if self.fixed_latency else
@@ -1118,7 +1147,10 @@ class Sniper:
         # order waiting for its venue answer holds UP only; DOWN may trade -
         # its fills are told apart by order id (live) / per-order result (paper).
         self.inflight = {"UP": None, "DOWN": None}
-        self.rounds = collections.defaultdict(lambda: {"fills": 0, "UP": 0.0, "DOWN": 0.0})
+        # per round: fills, shares per side, and each side's notional (shares x
+        # price paid, fees apart) - its average price is notional / shares
+        self.rounds = collections.defaultdict(lambda: {"fills": 0, "UP": 0.0, "DOWN": 0.0,
+                                                       "UP_notional": 0.0, "DOWN_notional": 0.0})
         # signals per round by side, and how many each gate stopped (journalled as
         # a round_summary row once the round has ended; no decision reads it)
         self.round_signals = collections.defaultdict(collections.Counter)
@@ -1171,8 +1203,10 @@ class Sniper:
             for pos in ledger.positions.values():
                 if pos.settled or pos.shares <= 0:
                     continue
-                fills = sum(1 for lot in pos.lots if str(lot.side or "").upper() == "BUY")
-                base[str(pos.token_id)] = (float(pos.shares), int(fills))
+                buys = [lot for lot in pos.lots if str(lot.side or "").upper() == "BUY"]
+                # the notional its average price comes from (fees apart), for SNIPER_AVG_DOWN
+                notional = sum(float(lot.shares) * float(lot.price) for lot in buys)
+                base[str(pos.token_id)] = (float(pos.shares), len(buys), notional)
         self.round_baseline = base
         return len(base)
 
@@ -2181,6 +2215,7 @@ class Sniper:
                 shares = float(fill.get("shares") or est.get("shares") or p.amount / p.price)
                 rd["fills"] += 1
                 rd[side] += shares
+                rd[side + "_notional"] += shares * float(fill.get("price") or est.get("price") or p.price)
             if kind == MATCHED:
                 self.n["filled"] += 1
                 fill = res.get("fill")
@@ -2260,6 +2295,7 @@ class Sniper:
                                  "ORDER_STATUS" if fill.get("source") == "terminal order status" else "PRIVATE_WS")
         if shares > 0:
             rd[side] += shares
+            rd[side + "_notional"] += shares * float(fill.get("price") or 0.0)
             self._note_over_target(row, plan, shares)
             self.n["filled"] += 1
             row.update(result="filled", outcome="FILLED")
@@ -2362,9 +2398,36 @@ class Sniper:
         if not lo <= ask <= hi:
             row.update(ask_seen=ask)
             return self._skip("ask outside price band", row)
+        rd = self.rounds.get(end)
+        if rd is None:
+            # A new round: rounds that ended over an hour ago go (one entry per
+            # market otherwise accumulates for the life of the process). An order
+            # still settling holds its own round dict in its plan.
+            for old in [e for e in self.rounds if e < float(end) - 3600]:
+                del self.rounds[old]
+            rd = self.rounds[end]
+            for s_, tok in (("UP", up), ("DOWN", down)):
+                shares, fills, *notional = self.round_baseline.get(str(tok), (0.0, 0, 0.0))
+                rd[s_] += shares
+                rd["fills"] += fills
+                rd[s_ + "_notional"] += float(notional[0]) if notional else 0.0
         # The price ceiling is fixed here, once, from the ask this decision saw:
         # never recomputed from a later ask, so it cannot chase the book.
         cap = min(0.99, round(ask + self.s.slip, 4))
+        if self.s.avg_down and rd[side] > 1e-9:
+            # This side already holds shares in this market: buy only below their
+            # average, so every add-on buy lowers it (SNIPER_AVG_DOWN).
+            held, notional = float(rd[side]), float(rd.get(side + "_notional") or 0.0)
+            if notional <= 0.0:
+                return self._skip("side average unknown", row)          # cannot enforce it: never guess
+            avg = notional / held
+            tick = getattr(view, "tick_size", None)
+            below = below_average(avg, float(tick) if tick else 0.01)
+            row.update(side_avg=round(avg, 4), side_shares=round(held, 4))
+            if ask > below + 1e-9:
+                row.update(ask_seen=ask)
+                return self._skip("not below this side's average", row)
+            cap = min(cap, below)
         target = carry = None
         if self.s.order_type == "FAK":
             # IOC: a share target - the base clip plus what this side's last
@@ -2378,18 +2441,6 @@ class Sniper:
             # The venue refuses a marketable BUY under $1, so under 10c the
             # 10-share clip becomes $1 - the smallest order live could place.
             amount = max(self.s.shares * ask, MIN_ORDER_USD)
-        rd = self.rounds.get(end)
-        if rd is None:
-            # A new round: rounds that ended over an hour ago go (one entry per
-            # market otherwise accumulates for the life of the process). An order
-            # still settling holds its own round dict in its plan.
-            for old in [e for e in self.rounds if e < float(end) - 3600]:
-                del self.rounds[old]
-            rd = self.rounds[end]
-            for s_, tok in (("UP", up), ("DOWN", down)):
-                shares, fills = self.round_baseline.get(str(tok), (0.0, 0))
-                rd[s_] += shares
-                rd["fills"] += fills
         # The other side may have an order in flight in this round: it holds a
         # fill slot until its outcome is known, so two sides together never
         # pass the round's fill cap.
@@ -2452,6 +2503,7 @@ class Sniper:
                 self.n["filled"] += 1
                 rd["fills"] += 1
                 rd[side] += float(fill.get("shares") or 0)
+                rd[side + "_notional"] += float(fill.get("shares") or 0) * float(fill.get("average_price") or 0)
                 self._note_over_target(row, plan, fill.get("shares"))
                 self._settle_carry(plan, side, fill.get("shares"))
                 if plan.get("target") is not None:

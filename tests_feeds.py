@@ -1486,7 +1486,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # ack checked, out-of-order tickers dropped, starvation/silence reconnect) and a
     # freshness gate on each ticker's match time (cb_fresh). Same rule, gates and sizing;
     # Binance/Kraken still selectable. A Binance tick moves no rule unless Binance is the trigger.
-    "sniper_mode.py": "836c763bac17a8c5cfcbb9c7bcc18f9b4013101f65c539efbc957f0ad7c6a0cb",
+    # Re-approved 2026-10-11 (the operator's rule, SNIPER_AVG_DOWN): after a side's first fill
+    # in a market its next buy only below that side's average - the limit is the highest tick
+    # under the average, an ask not under it is skipped; rounds track each side's notional
+    # (and seed_rounds the ledger lots' prices after a restart); an unknown average skips.
+    "sniper_mode.py": "c04e0409345bef9b3dd49a759780cf79ca8d4f447023c59b8e8b2a411e695566",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
