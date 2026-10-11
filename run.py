@@ -1406,7 +1406,16 @@ class JournalTail:
         return {"time": stamp, "side": row.get("side"), "bp": row.get("bp"), "ask": row.get("ask_seen"),
                 "cap": row.get("cap"), "result": result, "shares": row.get("shares"), "price": row.get("price"),
                 "order_id": row.get("order_id"), "detail": detail,
-                "window_ms": row.get("window_ms"), "fill_confirmed_ms": confirmed}
+                "window_ms": row.get("window_ms"), "fill_confirmed_ms": confirmed,
+                "round_end": row.get("round_end")}
+
+    @staticmethod
+    def same_market(row: dict, round_end) -> bool:
+        """The order belongs to the market ending at round_end (epoch seconds)."""
+        try:
+            return abs(float(row.get("round_end")) - float(round_end)) < 0.5
+        except (TypeError, ValueError):
+            return False
 
 
 def _num_or(v):
@@ -1734,6 +1743,7 @@ class DashView:
             trig["btc_start"] = getattr(self, "_btc_start", None)
         end = hub.window_end
         market = {"slug": f"btc-updown-5m-{hub.window_start}" if hub.window_start and hub.up_token else None,
+                  "end": end,
                   "btc_now": trig.get("mid"), "btc_start": getattr(self, "_btc_start", None),
                   "seconds_left": (float(end) - now_wall) if end else None,
                   "book_status": (health.get("book") or {}).get("status")}
@@ -1857,8 +1867,13 @@ class DashView:
             return "STALE"
         return "LIVE" if time.monotonic() * 1000.0 - q[-1][0] < 10_000 else "STALE"
 
-    def orders(self) -> list[dict]:
-        return self.tail.read()
+    def orders(self, round_end=None) -> list[dict]:
+        """The ORDERS table. With round_end: only that market's orders, so the
+        table starts empty when a new market starts (the journal keeps them all)."""
+        rows = self.tail.read()
+        if round_end is None:
+            return rows
+        return [r for r in rows if JournalTail.same_market(r, round_end)]
 
 
 def status_text(snap: dict) -> str:
@@ -1922,7 +1937,8 @@ async def _dashboard(rt: Runtime) -> None:
                     renderer.cols, renderer.rows = renderer.size()
 
                     def frame(snap=snap):
-                        snap["orders"] = view.orders()
+                        # this market's orders only: the table clears when a new market starts
+                        snap["orders"] = view.orders(round_end=(snap.get("market") or {}).get("end"))
                         return renderer.draw(build(snap, renderer.cols, renderer.rows, g))
 
                     await asyncio.to_thread(frame)

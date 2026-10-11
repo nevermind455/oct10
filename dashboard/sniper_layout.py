@@ -301,7 +301,7 @@ def _orders_body(orders: list, w: int, h: int) -> list[Row]:
     out = [_runs([(fit(t, n) + " ", Style("dim", bold=True)) for t, n in zip(head_txt, widths)]
                  + ([(fit("DETAIL", detail_w), Style("dim", bold=True))] if detail_w else []), w)]
     if not orders:
-        out.append(_runs([("  no orders yet this session", FAINT)], w))
+        out.append(_runs([("  no orders yet in this market", FAINT)], w))
     for o in list(orders)[-max(0, h - 1):][::-1]:          # newest first
         side = _text(o.get("side"))
         result = str(o.get("result") or MISSING).lower()

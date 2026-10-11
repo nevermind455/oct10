@@ -475,6 +475,24 @@ class JournalTailTests(unittest.TestCase):
             self.assertEqual(last["detail"], "confirmed 186ms")
             self.assertEqual((got[2]["result"], got[2]["shares"], got[2]["price"]), ("filled", 4.2, 0.5))
 
+    def test_the_orders_table_shows_only_the_current_market(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "j.jsonl"
+            rows = [{"wall": 1.0, "side": "UP", "bp": 1.0, "result": "filled", "round_end": 1_791_374_100},
+                    {"wall": 2.0, "side": "DOWN", "bp": -1.0, "result": "refused", "round_end": 1_791_374_100,
+                     "reason": "FAK no-fill"},
+                    {"wall": 3.0, "side": "UP", "bp": 0.7, "result": "filled", "round_end": 1_791_374_400},
+                    {"wall": 4.0, "side": "UP", "result": "error", "reason": "no round"}]       # no market: never shown
+            path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+            view = run.DashView.__new__(run.DashView)
+            view.tail = run.JournalTail(path)
+            self.assertEqual(len(view.orders()), 4)                                    # unfiltered: every row
+            old = view.orders(round_end=1_791_374_100)
+            self.assertEqual([(r["side"], r["result"]) for r in old], [("UP", "filled"), ("DOWN", "missed")])
+            new = view.orders(round_end=1_791_374_400.0)                               # the next market began
+            self.assertEqual([(r["side"], r["bp"]) for r in new], [("UP", 0.7)])
+            self.assertEqual(view.orders(round_end=1_791_374_700), [])                 # a market with none yet
+
     def test_a_big_journal_is_read_from_its_tail_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "j.jsonl"
