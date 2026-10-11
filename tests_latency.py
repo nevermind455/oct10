@@ -53,7 +53,7 @@ def move_mid(ref: float, bp: float) -> float:
 
 # =========================================================================== trigger
 class TriggerBoundaries(unittest.TestCase):
-    K = float(dict((a, v) for a, _n, v, _l, _f in X.FROZEN_SPEC)["k_bp"])   # 0.3bp since 2026-10-11 (0.5 before)
+    K = float(dict((a, v) for a, _n, v, _l, _f in X.FROZEN_SPEC)["k_bp"])   # 0.5bp (0.3 for part of 2026-10-11)
 
     def fire(self, bp: float, age_ms: float = 260.0, k: float | None = None):
         t = S.Trigger(self.K if k is None else k, 250)
@@ -62,7 +62,7 @@ class TriggerBoundaries(unittest.TestCase):
 
     def test_just_under_at_and_over_the_spec_threshold_both_ways(self):
         K = self.K
-        self.assertEqual(K, 0.3)
+        self.assertEqual(K, 0.5)
         for bp, want in ((K - 0.01, None), (K, 1), (K + 0.01, 1), (-(K - 0.01), None), (-K, -1), (-(K + 0.01), -1),
                          (0.5, 1), (-0.5, -1), (1.00, 1), (-1.00, -1)):     # the previous specs fire too
             self.assertEqual(self.fire(bp), want, bp)
@@ -130,7 +130,7 @@ class CooldownBoundary(unittest.TestCase):
 
 # =========================================================================== config fail-fast
 class FrozenSpec(unittest.TestCase):
-    FROZEN = {"SNIPER_ONLY": "1", "SNIPER_LIVE_CANARY": "1", "SNIPER_PRIMARY_FEED": "coinbase", "SNIPER_K_BP": "0.3",
+    FROZEN = {"SNIPER_ONLY": "1", "SNIPER_LIVE_CANARY": "1", "SNIPER_PRIMARY_FEED": "coinbase", "SNIPER_K_BP": "0.5",
               "SNIPER_WINDOW_MS": "250", "SNIPER_ORDER_TYPE": "FAK", "SNIPER_SLIP": "0.05",
               "SNIPER_COOLDOWN_MS": "300", "SNIPER_SHARES": "10", "SNIPER_MAX_TARGET_SHARES": "20",
               "SNIPER_CANARY_MAX_SHARES": "25"}
@@ -165,11 +165,11 @@ class FrozenSpec(unittest.TestCase):
             self.assertIn(var, str(ctx.exception))
 
     def test_a_missing_trigger_or_slip_falls_back_to_the_spec(self):
-        # the code defaults ARE the spec: 0.3bp, ask + $0.05 (the slip default was $0.02)
+        # the code defaults ARE the spec: 0.5bp, ask + $0.05 (the slip default was $0.02)
         self.assertTrue(self.gate(SNIPER_K_BP=None, SNIPER_SLIP=None))
         with patch.dict(os.environ, {"SNIPER_ONLY": "1"}, clear=True):
             s = S.Settings()
-        self.assertEqual((s.k_bp, s.slip), (0.3, 0.05))
+        self.assertEqual((s.k_bp, s.slip), (0.5, 0.05))
 
     def test_a_missing_value_falling_back_to_a_non_spec_default_is_named(self):
         with patch.dict(os.environ, {}, clear=True):                  # without SNIPER_ONLY the default is FOK
@@ -192,7 +192,7 @@ class FrozenSpec(unittest.TestCase):
         text = "\n".join(lines)
         self.assertIn("trigger", text)
         self.assertIn("1.00 bp", text)
-        self.assertIn("<- frozen spec 0.30 bp", text)
+        self.assertIn("<- frozen spec 0.50 bp", text)
         self.assertNotIn("ab" * 32, text)
         self.assertNotIn("cd" * 20, text)
         self.assertEqual(len(bad), 1)

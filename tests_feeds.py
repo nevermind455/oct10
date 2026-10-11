@@ -1493,7 +1493,9 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # SNIPER_FAIR_MARGIN, the limit capped there - fair UP = Phi(ln(S/S0) / (sigma sqrt tau)),
     # S0 the trigger feed's price at the round's first instant, sigma its 5-minute 1s
     # volatility; unknown inputs skip ("fair value unknown"). The feeds feed the model.
-    "sniper_mode.py": "d6d111ef12d5fc7ec49554c93c8589e6e0aaadec3375ad50c182fe746931862e",
+    # Re-approved 2026-10-11 (later, the operator's change): the SNIPER_K_BP default is the
+    # frozen spec's 0.5bp again (0.3bp for part of the day); nothing else changed.
+    "sniper_mode.py": "86a976feca84701cb4e46d2508b278009d787854ea2a00c11a9655bbbe292525",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.

@@ -183,7 +183,7 @@ class HandlerTests(unittest.TestCase):
         self.assertAlmostEqual(sn.last_mid, 59_994.0)
 
     def test_the_spec_threshold_is_the_rule(self):
-        k = dict((a, v) for a, _n, v, _l, _f in X.FROZEN_SPEC)["k_bp"]       # 0.3bp since 2026-10-11
+        k = dict((a, v) for a, _n, v, _l, _f in X.FROZEN_SPEC)["k_bp"]       # the frozen spec's trigger
         sn, fired = make()
         sn.on_coinbase(ticker(60_000.0, spread=0.002))
         age(sn, 260)
