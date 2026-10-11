@@ -114,7 +114,7 @@ class Config(unittest.TestCase):
             lim = L.limits_from_env({})
         got = (s.k_bp, s.window_ms, s.order_type, s.slip, s.cooldown_ms, s.shares, s.max_target_shares,
                lim.max_order_shares)
-        self.assertEqual(got[:7], (0.5, 250.0, "FAK", 0.05, 300.0, 10.0, 20.0))
+        self.assertEqual(got[:7], (0.3, 250.0, "FAK", 0.05, 300.0, 10.0, 20.0))      # 0.3bp since 2026-10-11
         self.assertGreaterEqual(lim.max_order_shares, 20.0)                    # canary cap >= max target
         self.assertEqual(exec_latency.spec_violations(s, lim.max_order_shares), [])
 
@@ -321,7 +321,8 @@ class Trigger(unittest.TestCase):
         with env(SPEC):
             s = S.Settings()
         # 2026-10-10: the trigger feed is Coinbase's BTC-USD ticker (the operator's change)
-        self.assertEqual((s.primary_feed, s.k_bp, s.window_ms), ("coinbase", 0.5, 250.0))
+        # 2026-10-11: Coinbase's ticker, a 0.3bp move (the operator's changes)
+        self.assertEqual((s.primary_feed, s.k_bp, s.window_ms), ("coinbase", 0.3, 250.0))
 
 
 # =========================================================================== BOOK

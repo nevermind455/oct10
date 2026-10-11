@@ -2615,7 +2615,7 @@ def t_sniper_only_mode_switches_and_live_refusal():
             check("LIVE with SNIPER_ONLY (no canary flag) refuses to start, before touching anything",
                   "refusing to start LIVE" in str(exc) and "SNIPER_LIVE_CANARY" in str(exc), str(exc))
         os.environ["SNIPER_LIVE_CANARY"] = "1"
-        frozen = {"SNIPER_K_BP": "0.5", "SNIPER_WINDOW_MS": "250", "SNIPER_ORDER_TYPE": "FAK", "SNIPER_SLIP": "0.05", "SNIPER_COOLDOWN_MS": "300", "SNIPER_SHARES": "10", "SNIPER_MAX_TARGET_SHARES": "20", "SNIPER_CANARY_MAX_SHARES": "25"}                       # --live also needs the frozen spec (exec_latency)
+        frozen = {"SNIPER_K_BP": "0.3", "SNIPER_WINDOW_MS": "250", "SNIPER_ORDER_TYPE": "FAK", "SNIPER_SLIP": "0.05", "SNIPER_COOLDOWN_MS": "300", "SNIPER_SHARES": "10", "SNIPER_MAX_TARGET_SHARES": "20", "SNIPER_CANARY_MAX_SHARES": "25"}                       # --live also needs the frozen spec (exec_latency)
         before = {k: os.environ.get(k) for k in frozen}
         os.environ.update(frozen)
         try:

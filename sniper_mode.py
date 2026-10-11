@@ -38,7 +38,7 @@ untouched:
                                 LIVE refuses it unless SNIPER_LIVE_CANARY=1
     SNIPER_LIVE_CANARY=1        LIVE only, with SNIPER_ONLY: real orders under the
                                 SNIPER_CANARY_* limits (see sniper_live.limits_from_env)
-    SNIPER_K_BP=0.5             SNIPER_WINDOW_MS=250
+    SNIPER_K_BP=0.3             SNIPER_WINDOW_MS=250
     SNIPER_SHARES=10            SNIPER_SLIP=0.05
     SNIPER_LATENCY_MS=(unset)   SNIPER_COOLDOWN_MS=300 (per side, from the order's submission)
     SNIPER_MIN_LEFT_S=10        SNIPER_MAX_FILLS_ROUND=20
@@ -690,8 +690,9 @@ def live_delays(path) -> tuple[list[float], float]:
 
 class Settings:
     def __init__(self) -> None:
-        # the frozen spec's trigger (exec_latency.FROZEN_SPEC): a 0.5bp move
-        self.k_bp = _env_float("SNIPER_K_BP", 0.5)
+        # the frozen spec's trigger (exec_latency.FROZEN_SPEC): a 0.3bp move
+        # (0.5bp until 2026-10-11)
+        self.k_bp = _env_float("SNIPER_K_BP", 0.3)
         self.window_ms = _env_float("SNIPER_WINDOW_MS", 250)
         self.shares = _env_float("SNIPER_SHARES", 10)
         # the frozen spec's limit (exec_latency.FROZEN_SPEC): the ask seen + $0.05 at most

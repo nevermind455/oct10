@@ -53,18 +53,34 @@ def move_mid(ref: float, bp: float) -> float:
 
 # =========================================================================== trigger
 class TriggerBoundaries(unittest.TestCase):
-    K = float(dict((a, v) for a, _n, v, _l, _f in X.FROZEN_SPEC)["k_bp"])   # 0.5bp
+    K = float(dict((a, v) for a, _n, v, _l, _f in X.FROZEN_SPEC)["k_bp"])   # 0.3bp since 2026-10-11 (0.5 before)
 
-    def fire(self, bp: float, age_ms: float = 260.0):
-        t = S.Trigger(self.K, 250)
+    def fire(self, bp: float, age_ms: float = 260.0, k: float | None = None):
+        t = S.Trigger(self.K if k is None else k, 250)
         t.update(0.0, 60_000.0)
         return t.update(age_ms, move_mid(60_000.0, bp))[0]
 
-    def test_049_no_050_and_051_trigger_both_ways(self):
-        self.assertEqual(self.K, 0.5)
-        for bp, want in ((0.49, None), (0.50, 1), (0.51, 1), (-0.49, None), (-0.50, -1), (-0.51, -1),
-                         (1.00, 1), (-1.00, -1)):                           # 1bp (the previous spec) fires too
+    def test_just_under_at_and_over_the_spec_threshold_both_ways(self):
+        K = self.K
+        self.assertEqual(K, 0.3)
+        for bp, want in ((K - 0.01, None), (K, 1), (K + 0.01, 1), (-(K - 0.01), None), (-K, -1), (-(K + 0.01), -1),
+                         (0.5, 1), (-0.5, -1), (1.00, 1), (-1.00, -1)):     # the previous specs fire too
             self.assertEqual(self.fire(bp), want, bp)
+        self.assertIsNone(self.fire(0.29))                                  # 0.29bp: no signal
+
+    def test_an_exact_spec_threshold_move_triggers(self):
+        """Exactly K bp up and down from references where K lands on the 0.001 grid."""
+        from decimal import Decimal as D
+        k, n = D(str(self.K)) / D(10_000), 0
+        for ref in (D("30000"), D("45000"), D("60000"), D("90000"), D("120000")):
+            up, down = ref + ref * k, ref - ref * k
+            self.assertEqual(up, up.quantize(D("0.001")))
+            n += 1
+            for sign, mid in ((1, up), (-1, down)):
+                t = S.Trigger(self.K, 250)
+                t.update(0.0, float(ref))
+                self.assertEqual(t.update(260.0, float(mid))[0], sign, (str(ref), sign))
+        self.assertEqual(n, 5)
 
     def test_an_exact_half_bp_move_always_triggers(self):
         from decimal import Decimal as D
@@ -76,7 +92,7 @@ class TriggerBoundaries(unittest.TestCase):
                 continue
             n += 1
             for sign in (1, -1):
-                t = S.Trigger(self.K, 250)
+                t = S.Trigger(0.5, 250)            # the float tolerance at an exact threshold, on the 0.5bp grid
                 t.update(0.0, float(ref))
                 m = float(mid) if sign > 0 else float(ref - ref * D("0.00005"))
                 if t.update(260.0, m)[0] != sign:
@@ -114,7 +130,7 @@ class CooldownBoundary(unittest.TestCase):
 
 # =========================================================================== config fail-fast
 class FrozenSpec(unittest.TestCase):
-    FROZEN = {"SNIPER_ONLY": "1", "SNIPER_LIVE_CANARY": "1", "SNIPER_PRIMARY_FEED": "coinbase", "SNIPER_K_BP": "0.5",
+    FROZEN = {"SNIPER_ONLY": "1", "SNIPER_LIVE_CANARY": "1", "SNIPER_PRIMARY_FEED": "coinbase", "SNIPER_K_BP": "0.3",
               "SNIPER_WINDOW_MS": "250", "SNIPER_ORDER_TYPE": "FAK", "SNIPER_SLIP": "0.05",
               "SNIPER_COOLDOWN_MS": "300", "SNIPER_SHARES": "10", "SNIPER_MAX_TARGET_SHARES": "20",
               "SNIPER_CANARY_MAX_SHARES": "25"}
@@ -149,11 +165,11 @@ class FrozenSpec(unittest.TestCase):
             self.assertIn(var, str(ctx.exception))
 
     def test_a_missing_trigger_or_slip_falls_back_to_the_spec(self):
-        # the code defaults ARE the spec: 0.5bp, ask + $0.05 (the slip default was $0.02)
+        # the code defaults ARE the spec: 0.3bp, ask + $0.05 (the slip default was $0.02)
         self.assertTrue(self.gate(SNIPER_K_BP=None, SNIPER_SLIP=None))
         with patch.dict(os.environ, {"SNIPER_ONLY": "1"}, clear=True):
             s = S.Settings()
-        self.assertEqual((s.k_bp, s.slip), (0.5, 0.05))
+        self.assertEqual((s.k_bp, s.slip), (0.3, 0.05))
 
     def test_a_missing_value_falling_back_to_a_non_spec_default_is_named(self):
         with patch.dict(os.environ, {}, clear=True):                  # without SNIPER_ONLY the default is FOK
@@ -176,7 +192,7 @@ class FrozenSpec(unittest.TestCase):
         text = "\n".join(lines)
         self.assertIn("trigger", text)
         self.assertIn("1.00 bp", text)
-        self.assertIn("<- frozen spec 0.50 bp", text)
+        self.assertIn("<- frozen spec 0.30 bp", text)
         self.assertNotIn("ab" * 32, text)
         self.assertNotIn("cd" * 20, text)
         self.assertEqual(len(bad), 1)

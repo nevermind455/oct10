@@ -249,7 +249,7 @@ class KrakenSignalTests(unittest.TestCase):
         self.assertEqual(fired, [("DOWN", -1.67, "kraken")])
 
     def test_a_move_under_the_threshold_is_no_signal(self):
-        sn, fired = self.run_ticks([(0, 3000.0), (100, 3000.0), (200, 3000.12)])         # +0.40bp
+        sn, fired = self.run_ticks([(0, 3000.0), (100, 3000.0), (200, 3000.06)])         # +0.20bp (spec: 0.3)
         self.assertEqual(fired, [])
         self.assertEqual(sn.n["signals"], 0)
 
@@ -521,13 +521,13 @@ class SettingsTests(unittest.TestCase):
             st = S.Settings()
         self.assertEqual(st.primary_feed, "coinbase")
         self.assertTrue(st.lines()[0].startswith(
-            "SNIPER paper-only [triggered by Coinbase BTC-USD ticker]: spot mid >= 0.5bp within 250ms"), st.lines()[0])
+            "SNIPER paper-only [triggered by Coinbase BTC-USD ticker]: spot mid >= 0.3bp within 250ms"), st.lines()[0])
 
     def test_the_binance_start_line_is_unchanged(self):
         with env(**BTC):
             st = S.Settings()
         self.assertEqual(st.primary_feed, "binance")
-        self.assertTrue(st.lines()[0].startswith("SNIPER paper-only: spot mid >= 0.5bp within 250ms"), st.lines()[0])
+        self.assertTrue(st.lines()[0].startswith("SNIPER paper-only: spot mid >= 0.3bp within 250ms"), st.lines()[0])
         self.assertNotIn("Kraken", st.lines()[0])
 
     def test_the_kraken_start_line_names_the_trigger(self):
@@ -535,7 +535,7 @@ class SettingsTests(unittest.TestCase):
             st = S.Settings()
         self.assertEqual((st.primary_feed, st.kraken_url), ("kraken", "wss://ws.kraken.com/v2"))
         self.assertTrue(st.lines()[0].startswith(
-            "SNIPER paper-only [triggered by Kraken BTC/USD ticker (bbo), not Binance]: spot mid >= 0.5bp"),
+            "SNIPER paper-only [triggered by Kraken BTC/USD ticker (bbo), not Binance]: spot mid >= 0.3bp"),
             st.lines()[0])
 
     def test_only_coinbase_binance_or_kraken(self):

@@ -43,13 +43,15 @@ import os
 # 0.5bp / 250ms rule on Coinbase Exchange's BTC-USD ticker (best bid/ask as of
 # each match; heartbeats for liveness; its own freshness gate). Binance and
 # Kraken stay selectable in paper.
+# 2026-10-11: trigger 0.50bp -> 0.30bp (the operator's change): the same 250ms
+# window on the Coinbase mid, a smaller move.
 # 2026-10-11: after a side's first fill in a market, its next buy only below
 # that side's average price (the operator's rule): the limit is the highest
 # tick under the average, a signal whose ask is not under it is skipped.
 FROZEN_SPEC = (
     # (Settings attribute, environment variable, frozen value, label, format)
     ("primary_feed", "SNIPER_PRIMARY_FEED", "coinbase", "trigger feed", "{}"),
-    ("k_bp", "SNIPER_K_BP", 0.5, "trigger", "{:.2f} bp"),
+    ("k_bp", "SNIPER_K_BP", 0.3, "trigger", "{:.2f} bp"),
     ("window_ms", "SNIPER_WINDOW_MS", 250.0, "window", "{:.0f} ms"),
     ("order_type", "SNIPER_ORDER_TYPE", "FAK", "execution", "{}"),
     ("slip", "SNIPER_SLIP", 0.05, "slip", "${:.2f}"),

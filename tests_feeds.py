@@ -1490,7 +1490,9 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # in a market its next buy only below that side's average - the limit is the highest tick
     # under the average, an ask not under it is skipped; rounds track each side's notional
     # (and seed_rounds the ledger lots' prices after a restart); an unknown average skips.
-    "sniper_mode.py": "c04e0409345bef9b3dd49a759780cf79ca8d4f447023c59b8e8b2a411e695566",
+    # Re-approved 2026-10-11 (the operator's change): the SNIPER_K_BP default is the frozen
+    # spec's 0.3bp (was 0.5bp); nothing else changed.
+    "sniper_mode.py": "a2e246720b8ef5526fd714183d2637f0387cd7292f5b83a80af7c8a25db3ac92",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.

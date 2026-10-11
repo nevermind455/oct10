@@ -13,7 +13,7 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
 
 ## The strategy
 
-- **Trigger.** The BTC mid moves at least `SNIPER_K_BP` (0.5bp) within `SNIPER_WINDOW_MS` (250ms).
+- **Trigger.** The BTC mid moves at least `SNIPER_K_BP` (0.3bp since 2026-10-11; 0.5bp before) within `SNIPER_WINDOW_MS` (250ms).
   The mid comes from **Coinbase Exchange's BTC-USD ticker** by default (the frozen
   spec's feed since 2026-10-10), or Binance BTCUSDT bookTicker, or Kraken BTC/USD.
   The move is measured against the last price at or before the lookback, and
@@ -91,10 +91,11 @@ is left of trigger -> ACK is outside the process:
   end-of-round cutoff 0.1s later, which is why it is your choice, not a default.
 
 **The frozen spec.** `--live` refuses to start unless the resolved settings are
-exactly the frozen spec (`exec_latency.FROZEN_SPEC`: Binance, 0.50bp in 250ms, FAK,
-ask+$0.05, 300ms per side, 10 shares, carry to 20) and `SNIPER_CANARY_MAX_SHARES`
-admits the 20-share carried target. A missing `.env` value falls back to a code
-default; for the trigger and the limit those are the spec (0.5bp, ask+$0.05). Every
+exactly the frozen spec (`exec_latency.FROZEN_SPEC`: Coinbase, 0.30bp in 250ms, FAK,
+ask+$0.05, 300ms per side, 10 shares, carry to 20, add-on buys only below the side's
+average) and `SNIPER_CANARY_MAX_SHARES` admits the 20-share carried target. A missing
+`.env` value falls back to a code default; for the trigger and the limit those are the
+spec (0.3bp, ask+$0.05). Every
 start prints the resolved configuration and which ECDSA backend signs (install
 `coincurve`: ~0.1ms per order against ~1.4ms in pure Python).
 
@@ -276,7 +277,7 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | `SNIPER_PRIMARY_FEED` | coinbase | trigger feed: `coinbase` (the frozen spec; LIVE refuses any other), `binance` or `kraken` |
 | `SNIPER_COINBASE_FRESHNESS` | 1 (unset) | skip a Coinbase signal unless the feed is shown current: `_STALE_MS` 1000 (match age above its 5-min best), `_BACKLOG_MAX` 20, `_UNKNOWN_MS` 5000 |
 | `SNIPER_COINBASE_SILENT_S` | 5 (unset) | no Coinbase message (heartbeats included) this long: reconnect |
-| `SNIPER_K_BP` / `SNIPER_WINDOW_MS` | 0.5 / 250 | trigger: a move of >= 0.5bp within 250ms |
+| `SNIPER_K_BP` / `SNIPER_WINDOW_MS` | 0.3 / 250 | trigger: a move of >= 0.3bp within 250ms |
 | `SNIPER_SHARES` | 10 | base target shares per order (at least $1) |
 | `SNIPER_MAX_TARGET_SHARES` | 20 | cap on base + same-side unfilled carry |
 | `SNIPER_ORDER_TYPE` | FAK | IOC limit: partial fills kept, the rest cancelled; FOK is all-or-nothing |

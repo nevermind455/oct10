@@ -182,16 +182,17 @@ class HandlerTests(unittest.TestCase):
         self.assertEqual(sn.summary()["fired_by_feed"], {"coinbase": 2})
         self.assertAlmostEqual(sn.last_mid, 59_994.0)
 
-    def test_the_half_bp_threshold_is_the_frozen_rule(self):
+    def test_the_spec_threshold_is_the_rule(self):
+        k = dict((a, v) for a, _n, v, _l, _f in X.FROZEN_SPEC)["k_bp"]       # 0.3bp since 2026-10-11
         sn, fired = make()
         sn.on_coinbase(ticker(60_000.0, spread=0.002))
         age(sn, 260)
-        sn.on_coinbase(ticker(60_002.94, spread=0.0))                       # 0.49bp: no signal
+        sn.on_coinbase(ticker(round(60_000.0 * (1 + (k - 0.01) / 1e4), 2), spread=0.0))   # 0.01bp under: no signal
         self.assertEqual(fired, [])
         sn.trigger.q.clear()
         sn.on_coinbase(ticker(60_000.0, spread=0.0))
         age(sn, 260)
-        sn.on_coinbase(ticker(60_003.0, spread=0.0))                        # exactly 0.5bp
+        sn.on_coinbase(ticker(round(60_000.0 * (1 + k / 1e4), 2), spread=0.0))           # exactly k
         self.assertEqual([f[0] for f in fired], ["UP"])
 
     def test_a_heartbeat_does_not_carry_the_price_forward(self):

@@ -30,7 +30,7 @@ Measured, per endpoint:
              (a gap over 2s restarts the rule), and this box's clock offset to
              Coinbase (GET /time on one kept-alive connection) to correct it
   race       Coinbase and Binance at once, each through the sniper's own rule
-             (sniper_mode.Trigger, the frozen spec's 0.5bp / 250ms) on this
+             (sniper_mode.Trigger, the frozen spec's k_bp / 250ms) on this
              box's receipt clock: which feed signals a move first, by how much
   budget     BTC match on Coinbase -> our order matched at Polymarket: feed
              delay + in-process (~0.4ms, bench_execution.py) + one-way to the

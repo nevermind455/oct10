@@ -11,7 +11,7 @@ What runs (all in this process, on one event loop, as in the bot):
                    of the trigger feed (the frozen spec's: Coinbase BTC-USD
                    tickers through Sniper.on_coinbase; also Binance bookTicker
                    through Sniper.on_tick) that do not trigger: parse + the
-                   250ms / 0.5bp rule.
+                   250ms / k_bp rule (the frozen spec's).
   2. live orders   M triggers through the LIVE path end to end:
                    trigger-feed message -> its handler -> Trigger -> per-side
                    gates -> book -> IOC sizing -> LiveExecution.prepare ->
@@ -58,7 +58,8 @@ import sniper_mode as S  # noqa: E402
 import tests_sniper_live as T  # noqa: E402  (FakeH2Clob, live_book, rules_fetch, paper_rules, UP/DN/COND)
 
 SPEC_FEED = str(dict((a, v) for a, _n, v, _l, _f in X.FROZEN_SPEC)["primary_feed"])
-BENCH_ENV = {"SNIPER_ONLY": "1", "SNIPER_K_BP": "0.5", "SNIPER_WINDOW_MS": "250", "SNIPER_ORDER_TYPE": "FAK",
+BENCH_ENV = {"SNIPER_ONLY": "1", "SNIPER_K_BP": str(dict((a, v) for a, _n, v, _l, _f in X.FROZEN_SPEC)["k_bp"]),
+             "SNIPER_WINDOW_MS": "250", "SNIPER_ORDER_TYPE": "FAK",
              "SNIPER_SLIP": "0.05", "SNIPER_SHARES": "10", "SNIPER_MAX_TARGET_SHARES": "20",
              "SNIPER_COOLDOWN_MS": "300", "SNIPER_SHADOW_MS": "", "SNIPER_STALL_MS": "0",
              "SNIPER_PRIMARY_FEED": SPEC_FEED, "SNIPER_EXTRA_FEEDS": "",
@@ -268,7 +269,7 @@ async def bench_live(m: int, matched_every: int = 5, with_pm: bool = False, pm_s
         sn.trigger.q.clear()
         ref = 60_000.0
         sn.trigger.q.append((now - 300.0, ref))
-        mid = ref * (1 + (0.6 if side == "UP" else -0.6) / 1e4)        # past the 0.5bp trigger
+        mid = ref * (1 + (0.6 if side == "UP" else -0.6) / 1e4)        # past the trigger (0.6bp)
         feed_tick(sn, tick_raw(sn.s.primary_feed, mid))
         return oid, tid, n_order % matched_every == 0
 
