@@ -54,13 +54,14 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
     same-side signal. It is never retried. A zero fill is not a fill.
   - **Carry.** UP and DOWN carries are kept apart, and both are cleared when the
     market changes.
-  - **Only below the average (2026-10-11).** After a side's first fill in a market,
-    its next buy must lower that side's average: the limit becomes the highest tick
-    under the average (UP held at 0.789 -> limit 0.78), and a signal whose ask is not
-    under it is skipped ("not below this side's average"). The other side's first buy
-    is not limited. A restart rebuilds the average from the ledger; shares with no
-    known price skip ("side average unknown"). `SNIPER_AVG_DOWN=0` turns it off
-    (paper only: it is in the frozen spec).
+  - **Fair value (2026-10-11).** Every buy, first or add-on, must be at or under what
+    the share is worth now, less the taker fee and `SNIPER_FAIR_MARGIN` ($0.01):
+    fair UP = Φ(ln(BTC now / BTC at the round's start) / (σ·√seconds left)), DOWN =
+    1 − UP, with σ the trigger feed's own volatility over the last 5 minutes. The
+    limit is capped at that price too. The start price is the trigger feed's price at
+    the round's first instant (Polymarket settles on Chainlink's, usually a few dollars
+    off). A bot that joined mid-round, or has under a minute of history, does not buy
+    ("fair value unknown"). The dashboard's trigger panel shows fair UP / DOWN.
   - **FOK.** `SNIPER_ORDER_TYPE=FOK` keeps the old all-or-nothing order with no carry.
 - **Paper fills.** Paper fills against Polymarket's book at the modelled match
   instant. With `SNIPER_DELAY_SOURCE=live`, each order's delay is drawn from real
@@ -92,8 +93,8 @@ is left of trigger -> ACK is outside the process:
 
 **The frozen spec.** `--live` refuses to start unless the resolved settings are
 exactly the frozen spec (`exec_latency.FROZEN_SPEC`: Coinbase, 0.30bp in 250ms, FAK,
-ask+$0.05, 300ms per side, 10 shares, carry to 20, add-on buys only below the side's
-average) and `SNIPER_CANARY_MAX_SHARES` admits the 20-share carried target. A missing
+ask+$0.05, 300ms per side, 10 shares, carry to 20, every buy at or under fair value
+− fee − $0.01) and `SNIPER_CANARY_MAX_SHARES` admits the 20-share carried target. A missing
 `.env` value falls back to a code default; for the trigger and the limit those are the
 spec (0.3bp, ask+$0.05). Every
 start prints the resolved configuration and which ECDSA backend signs (install
@@ -282,7 +283,8 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | `SNIPER_MAX_TARGET_SHARES` | 20 | cap on base + same-side unfilled carry |
 | `SNIPER_ORDER_TYPE` | FAK | IOC limit: partial fills kept, the rest cancelled; FOK is all-or-nothing |
 | `SNIPER_SLIP` | 0.05 | limit = the ask seen + 0.05, clipped at `MAX_BUY_PRICE`: never pays more |
-| `SNIPER_AVG_DOWN` | 1 | after a side's first fill in a market, its next buy only below that side's average (limit = the tick under it) |
+| `SNIPER_FAIR` / `SNIPER_FAIR_MARGIN` | 1 / 0.01 | every buy at or under fair value − fee − margin (the limit capped there) |
+| `SNIPER_FAIR_VOL_S` / `SNIPER_FAIR_FEE_RATE` | 300 / 0.07 | the volatility window (s) and the taker fee rate the fair limit uses |
 | `SNIPER_COOLDOWN_MS` | 300 | per side: an order starts a pause on ITS side only, from its submission |
 | `SNIPER_MIN_LEFT_S` | 10 | no order with fewer seconds left in the round |
 | `SNIPER_MAX_FILLS_ROUND` / `SNIPER_MAX_SIDE_SHARES` | 20 / 200 | per-round caps |

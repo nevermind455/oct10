@@ -1486,13 +1486,14 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # ack checked, out-of-order tickers dropped, starvation/silence reconnect) and a
     # freshness gate on each ticker's match time (cb_fresh). Same rule, gates and sizing;
     # Binance/Kraken still selectable. A Binance tick moves no rule unless Binance is the trigger.
-    # Re-approved 2026-10-11 (the operator's rule, SNIPER_AVG_DOWN): after a side's first fill
-    # in a market its next buy only below that side's average - the limit is the highest tick
-    # under the average, an ask not under it is skipped; rounds track each side's notional
-    # (and seed_rounds the ledger lots' prices after a restart); an unknown average skips.
     # Re-approved 2026-10-11 (the operator's change): the SNIPER_K_BP default is the frozen
-    # spec's 0.3bp (was 0.5bp); nothing else changed.
-    "sniper_mode.py": "a2e246720b8ef5526fd714183d2637f0387cd7292f5b83a80af7c8a25db3ac92",
+    # spec's 0.3bp (was 0.5bp).
+    # Re-approved 2026-10-11 (the operator's rule, SNIPER_FAIR): the below-average rule is
+    # removed; every buy only at or under FairValue's fair price less the taker fee and
+    # SNIPER_FAIR_MARGIN, the limit capped there - fair UP = Phi(ln(S/S0) / (sigma sqrt tau)),
+    # S0 the trigger feed's price at the round's first instant, sigma its 5-minute 1s
+    # volatility; unknown inputs skip ("fair value unknown"). The feeds feed the model.
+    "sniper_mode.py": "d6d111ef12d5fc7ec49554c93c8589e6e0aaadec3375ad50c182fe746931862e",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.

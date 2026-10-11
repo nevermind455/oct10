@@ -1323,7 +1323,7 @@ class EventLoopWork(unittest.TestCase):
             self.assertEqual(len(calls), 4)
 
     def test_old_rounds_and_finished_manager_orders_are_dropped(self):
-        with env(SPEC):
+        with env(SPEC, SNIPER_FAIR="0"):         # round pruning, not the fair-value gate (no price history here)
             sn = S.Sniper(types.SimpleNamespace(up_token=None, down_token=None, condition_id=None, window_end=None),
                           types.SimpleNamespace(), settings=S.Settings())
         for end in (1_000, 2_000, 5_000, 8_000):                             # earlier rounds' entries

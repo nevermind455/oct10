@@ -1727,6 +1727,14 @@ class DashView:
                     "in_flight": "+".join(s for s, v in getattr(sn, "inflight", {}).items() if v) or None,
                     "last_signal_bp": last[1] if last else None,
                     "last_signal_age_s": now_wall - last[0] if last else None}
+            fm = getattr(sn, "fair_model", None)
+            if getattr(s, "fair", False) and fm is not None and hub.window_end:
+                # what UP is worth now by the sniper's own fair model (SNIPER_FAIR), or why unknown
+                cur = fm.last_mid
+                p_up, info = fm.fair_up(float(cur), now_wall, hub.window_end) if cur else (None, "no BTC price")
+                trig["fair"] = {"up": p_up, "why": None if p_up is not None else info,
+                                "vol_bp": info.get("vol_bp") if p_up is not None else None,
+                                "start": fm.starts.get(int(round(float(hub.window_end))) - 300)}
             skips = sorted(((k[6:], v) for k, v in sn.n.items() if k.startswith("skip: ") and v),
                            key=lambda kv: -kv[1])
             snap["skips"] = skips[:6]

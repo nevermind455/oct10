@@ -168,6 +168,7 @@ def _trigger_body(t: dict, w: int) -> list[Row]:
     rate = _num(t.get("signals_per_min"))
     fr = _num(t.get("fill_rate"))
     window = _num(t.get("window_ms"))
+    fair = t.get("fair") if isinstance(t.get("fair"), dict) else None
     rows = [
         _runs([(fit("feed", 9), DIM), (" ", PAPER), (f"{feed} ", Style("ink", bold=True)),
                (status, state_fg(status)),
@@ -179,13 +180,27 @@ def _trigger_body(t: dict, w: int) -> list[Row]:
                # the market's strike is Chainlink's price); N/A after joining mid-round
                ((f"  start ~{_num(t['btc_start']):,.0f}" if _num(t.get("btc_start")) is not None
                  else "  start N/A") if "btc_start" in t else "", FAINT)], w),
+    ]
+    if fair is not None:
+        # the fair-value gate (SNIPER_FAIR): what each side is worth now, or why it is unknown
+        up = _num(fair.get("up"))
+        rows.append(_runs([(fit("fair", 9), DIM), (" ", PAPER)]
+                          + ([(f"UP {up:.2f}", Style("green", bold=True)), ("  ", PAPER),
+                              (f"DN {1 - up:.2f}", Style("red", bold=True)),
+                              (f"  vol {_num(fair.get('vol_bp')):.2f}bp" if _num(fair.get("vol_bp")) is not None
+                               else "", FAINT)]
+                             if up is not None else
+                             [(f"unknown: {_text(fair.get('why'))} - no buys", Style("amber"))]), w))
+    rows += [
         _runs([(fit("move", 9), DIM), (" ", PAPER), (bp(move), Style("red", bold=True) if hot else Style("ink")),
                (f" /{window:.0f}ms" if window is not None else "", DIM),
                (f" k{k:g}" if k is not None else "", FAINT)], w),
-        _runs([(fit("last sig", 9), DIM), (" ", PAPER), (bp(t.get("last_signal_bp")), Style("ink")),
-               (f"  {age:.0f}s ago" if age is not None else "", DIM)], w),
+        # signals, their rate and the last one on one line (frees a line for the fair value)
         _runs([(fit("signals", 9), DIM), (" ", PAPER), (count(t.get("signals")), Style("ink", bold=True)),
-               (f"  {rate:.1f}/min" if rate is not None else "", DIM)], w),
+               (f"  {rate:.1f}/min" if rate is not None else "", DIM),
+               ("  last ", DIM) if t.get("last_signal_bp") is not None else ("", DIM),
+               (bp(t.get("last_signal_bp")) if t.get("last_signal_bp") is not None else "", Style("ink")),
+               (f" {age:.0f}s ago" if age is not None and t.get("last_signal_bp") is not None else "", DIM)], w),
         _runs([(fit("orders", 9), DIM), (" ", PAPER), (count(t.get("orders")), Style("ink", bold=True)),
                ("  fill ", DIM), (count(t.get("filled")), Style("green", bold=True)),
                ("  miss ", DIM), (count(t.get("refused")), Style("amber")),

@@ -45,9 +45,10 @@ import os
 # Kraken stay selectable in paper.
 # 2026-10-11: trigger 0.50bp -> 0.30bp (the operator's change): the same 250ms
 # window on the Coinbase mid, a smaller move.
-# 2026-10-11: after a side's first fill in a market, its next buy only below
-# that side's average price (the operator's rule): the limit is the highest
-# tick under the average, a signal whose ask is not under it is skipped.
+# 2026-10-11: every buy only at or under the share's fair value (sniper_mode.
+# FairValue: BTC against its round-start price, 5-minute volatility, time left)
+# less the taker fee and a $0.01 margin (the operator's rule); the limit is
+# capped there too.
 FROZEN_SPEC = (
     # (Settings attribute, environment variable, frozen value, label, format)
     ("primary_feed", "SNIPER_PRIMARY_FEED", "coinbase", "trigger feed", "{}"),
@@ -58,7 +59,8 @@ FROZEN_SPEC = (
     ("cooldown_ms", "SNIPER_COOLDOWN_MS", 300.0, "cooldown", "{:.0f} ms / side"),
     ("shares", "SNIPER_SHARES", 10.0, "base_target", "{:g}"),
     ("max_target_shares", "SNIPER_MAX_TARGET_SHARES", 20.0, "max_target", "{:g}"),
-    ("avg_down", "SNIPER_AVG_DOWN", True, "add-on buys", "{}"),
+    ("fair", "SNIPER_FAIR", True, "fair value", "{}"),
+    ("fair_margin", "SNIPER_FAIR_MARGIN", 0.01, "fair margin", "${:.2f}"),
 )
 
 

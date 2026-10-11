@@ -44,10 +44,7 @@ import tests_sniper_live as T  # noqa: E402  (FakeClob, make_canary, live_book, 
 
 AUDIT_ENV = {"SNIPER_ONLY": "1", "SNIPER_K_BP": "0.5", "SNIPER_WINDOW_MS": "250", "SNIPER_ORDER_TYPE": "FAK",
              "SNIPER_SLIP": "0.05", "SNIPER_SHARES": "10", "SNIPER_MAX_TARGET_SHARES": "20",
-             "SNIPER_COOLDOWN_MS": "300", "SNIPER_SHADOW_MS": "", "SNIPER_STALL_MS": "0",
-             # the live-path checks rebuy a side at the same or a higher ask; the
-             # below-average rule (SNIPER_AVG_DOWN) has its own tests with it on
-             "SNIPER_AVG_DOWN": "0"}
+             "SNIPER_COOLDOWN_MS": "300", "SNIPER_SHADOW_MS": "", "SNIPER_STALL_MS": "0"}
 
 
 def say(msg: str) -> None:

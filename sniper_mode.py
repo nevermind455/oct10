@@ -479,10 +479,117 @@ def _env_bool(name: str, default: bool) -> bool:
     raise ValueError(f"invalid {name}={raw!r}: 1 or 0")
 
 
-def below_average(avg: float, tick: float) -> float:
-    """The highest price on the tick grid strictly below avg: the limit of a
-    buy that must lower its side's average (avg 0.789 -> 0.78, 0.78 -> 0.77)."""
-    return round(math.floor((float(avg) - 1e-9) / float(tick)) * float(tick), 4)
+# ---------------------------------------------------------------- fair value
+ROUND_S = 300                 # btc-updown-5m: a round starts every 5 minutes on the epoch grid
+FAIR_MIN_SAMPLES = 60         # 1s volatility samples before a fair value is trusted (a minute)
+FAIR_MIN_VOL_BP = 0.2         # volatility floor, bp per sqrt(second): a dead-calm minute is not zero risk
+FAIR_START_STALE_S = 30.0     # a price older than this at the round's first instant does not set its start
+
+
+def norm_cdf(z: float) -> float:
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def taker_fee(price: float, rate: float) -> float:
+    """The venue's taker fee per share at this price: rate * p * (1 - p)."""
+    return rate * price * (1.0 - price)
+
+
+def fair_limit(fair: float, margin: float, tick: float, fee_rate: float) -> float:
+    """The highest tick price p that still leaves the margin after its fee:
+    p + fee(p) + margin <= fair. 0.0 when none does."""
+    p = math.floor((fair - margin) / tick + 1e-9) * tick
+    while p > 0 and p + taker_fee(p, fee_rate) + margin > fair + 1e-12:
+        p -= tick
+    return round(max(p, 0.0), 4)
+
+
+class FairValue:
+    """What a btc-updown-5m share is worth now, from the trigger feed alone.
+
+    A market pays UP when BTC at the round's end is at or above BTC at its
+    start. With BTC a driftless random walk over the seconds left:
+
+        P(UP) = Phi( ln(S / S0) / (sigma * sqrt(tau)) )       P(DOWN) = 1 - P(UP)
+
+    S: the trigger feed's mid now. S0: its mid standing at the round's first
+    instant (Polymarket settles on Chainlink's price; the feed's is an
+    approximation, usually a few dollars off). sigma: the feed's realized
+    volatility per sqrt(second) over the last vol_window_s, from one sample a
+    second (floored). tau: the seconds left.
+
+    None whenever an input is unknown: a start price the bot did not see (it
+    joined mid-round) or too few volatility samples. Never guessed."""
+
+    def __init__(self, vol_window_s: float = 300.0, min_samples: int = FAIR_MIN_SAMPLES,
+                 min_vol_bp: float = FAIR_MIN_VOL_BP) -> None:
+        self.vol_window_s, self.min_samples, self.min_vol = float(vol_window_s), int(min_samples), min_vol_bp / 1e4
+        self.starts: dict = {}                      # round start (epoch s) -> S0, or None (unknown)
+        self.last_mid: float | None = None
+        self._prev: tuple[float, float] | None = None       # (wall, mid) of the previous tick
+        self._last: tuple[float, float] | None = None       # (mono, ln mid) of the last 1s sample
+        self._incs: collections.deque = collections.deque()  # (mono, dx^2, dt) per sample step
+        self._sq = self._dt = 0.0
+        self._steps = 0
+
+    def observe(self, wall: float, mono: float, mid: float) -> None:
+        """One trigger-feed price. Cheap: called on every tick, before the rule."""
+        if isinstance(mid, bool) or not isinstance(mid, (int, float)) or not (math.isfinite(mid) and mid > 0):
+            return
+        mid = float(mid)
+        rs = int(wall // ROUND_S) * ROUND_S
+        if rs not in self.starts:
+            prev = self._prev
+            if prev is not None and prev[0] <= rs and rs - prev[0] <= FAIR_START_STALE_S:
+                self.starts[rs] = prev[1]           # the price standing at the round's first instant
+            elif wall - rs <= 5.0:
+                self.starts[rs] = mid               # the round's first tick, within its first 5s
+            else:
+                self.starts[rs] = None              # joined mid-round: unknown, never guessed
+            while len(self.starts) > 4:
+                self.starts.pop(min(self.starts))
+        self._prev = (wall, mid)
+        self.last_mid = mid
+        last = self._last
+        if last is not None and mono - last[0] < 1.0:
+            return
+        x = math.log(mid)
+        if last is not None:
+            dx2, dt = (x - last[1]) ** 2, mono - last[0]
+            self._incs.append((mono, dx2, dt))
+            self._sq += dx2
+            self._dt += dt
+            self._steps += 1
+            cut = mono - self.vol_window_s
+            while self._incs and self._incs[0][0] < cut:
+                _m, a, b = self._incs.popleft()
+                self._sq -= a
+                self._dt -= b
+            if self._steps % 600 == 0:              # re-add exactly now and then: no float drift
+                self._sq = sum(i[1] for i in self._incs)
+                self._dt = sum(i[2] for i in self._incs)
+        self._last = (mono, x)
+
+    def vol(self) -> float | None:
+        """sigma per sqrt(second), or None with fewer than min_samples steps."""
+        if len(self._incs) < self.min_samples or self._dt <= 0:
+            return None
+        return max(math.sqrt(max(self._sq, 0.0) / self._dt), self.min_vol)
+
+    def fair_up(self, mid: float, now_wall: float, round_end: float):
+        """(P(UP), detail) for the round ending at round_end, or (None, why)."""
+        start = int(round(float(round_end))) - ROUND_S
+        s0 = self.starts.get(start)
+        if s0 is None:
+            return None, "no start price"
+        sigma = self.vol()
+        if sigma is None:
+            return None, "volatility warming up"
+        tau = float(round_end) - now_wall
+        if tau <= 0:
+            return None, "round over"
+        z = math.log(mid / s0) / (sigma * math.sqrt(tau))
+        return norm_cdf(z), {"start_px": s0, "vol_bp": sigma * 1e4, "tau_s": tau, "z": z}
 
 
 def signing_price(cap: float, tick: str) -> float:
@@ -731,12 +838,15 @@ class Settings:
         # FAK (IOC) only: what an order did not fill is added to the next
         # same-side order in the same market, the target never above this.
         self.max_target_shares = _env_float("SNIPER_MAX_TARGET_SHARES", 20)
-        # After a side's first fill in a market, its next buy only BELOW that
-        # side's average price (the frozen spec since 2026-10-11, the operator's
-        # rule): the limit is the highest tick under the average, and a signal
-        # whose ask is not under it is skipped - every add-on buy lowers the
-        # side's average. The other side's first buy is not limited.
-        self.avg_down = _env_bool("SNIPER_AVG_DOWN", True)
+        # Fair value (the frozen spec since 2026-10-11, the operator's rule): every buy
+        # only at or under the share's fair value (FairValue: BTC against its price at
+        # the round's start, its 5-minute volatility, the seconds left) less the taker
+        # fee and SNIPER_FAIR_MARGIN; the limit is capped there too. Unknown fair value
+        # (no start price seen, volatility warming up) skips: never guessed.
+        self.fair = _env_bool("SNIPER_FAIR", True)
+        self.fair_margin = _env_float("SNIPER_FAIR_MARGIN", 0.01)
+        self.fair_vol_s = _env_float("SNIPER_FAIR_VOL_S", 300)
+        self.fair_fee_rate = _env_float("SNIPER_FAIR_FEE_RATE", 0.07)
         self.stale_ms = _env_float("SNIPER_STALE_MS", 2000)
         # Which book a paper order fills against. "exchange": the book as it
         # stood at the modelled match instant on the venue's own clock (the
@@ -823,7 +933,10 @@ class Settings:
              "SNIPER_BINANCE_STALE_MS / _UNKNOWN_MS / _SILENT_S must be > 0, _BACKLOG_MAX >= 0"),
             (self.coinbase_stale_ms > 0 and self.coinbase_unknown_ms > 0 and self.coinbase_backlog_max >= 0
              and self.coinbase_silent_s > 0,
-             "SNIPER_COINBASE_STALE_MS / _UNKNOWN_MS / _SILENT_S must be > 0, _BACKLOG_MAX >= 0")) if not ok]
+             "SNIPER_COINBASE_STALE_MS / _UNKNOWN_MS / _SILENT_S must be > 0, _BACKLOG_MAX >= 0"),
+            (0 <= self.fair_margin < 0.5, f"SNIPER_FAIR_MARGIN={self.fair_margin:g} (must be 0 to 0.49)"),
+            (self.fair_vol_s >= 60, f"SNIPER_FAIR_VOL_S={self.fair_vol_s:g} (must be >= 60)"),
+            (0 <= self.fair_fee_rate < 0.25, f"SNIPER_FAIR_FEE_RATE={self.fair_fee_rate:g} (must be 0 to 0.25)")) if not ok]
         if bad:
             raise ValueError("invalid SNIPER_* settings: " + "; ".join(bad))
 
@@ -847,15 +960,16 @@ class Settings:
         return (f" (+ same-side unfilled carry, <= {self.max_target_shares:g} sh)"
                 if self.order_type == "FAK" else "")
 
-    def avg_text(self) -> str:
-        return "; after a side's first fill in a market, it buys only below its average" if self.avg_down else ""
+    def fair_text(self) -> str:
+        return (f"; every buy at or under fair value - fee - ${self.fair_margin:.2f} (BTC vs its round-start "
+                f"price, {self.fair_vol_s:.0f}s volatility, time left)" if self.fair else "")
 
     def lines(self, live: bool = False) -> list[str]:
         if live:
             return [f"SNIPER LIVE CANARY{self.lead_text()}: spot mid >= {self.k_bp}bp within {self.window_ms:.0f}ms -> real {self.order_type} "
                     f"{self.shares:.0f} sh{self.carry_text()} at ask+{self.slip:.2f}, cooldown {self.cooldown_ms:.0f}ms per side, "
                     f">= {self.min_left_s:.0f}s left, <= {self.max_fills_round} fills and "
-                    f"{self.max_side_shares:.0f} sh/side per round" + self.avg_text()
+                    f"{self.max_side_shares:.0f} sh/side per round" + self.fair_text()
                     + (f"; shadow fills at {','.join(map(str, self.shadow_ms))}ms (arithmetic only)"
                        if self.shadow_ms else "") + self.feeds_text()]
         return [f"SNIPER paper-only{self.lead_text()}: spot mid >= {self.k_bp}bp within {self.window_ms:.0f}ms -> {self.order_type} "
@@ -866,7 +980,7 @@ class Settings:
                    f"+ {self.server_ms:.0f}ms server allowance; ")
                 + f"cooldown {self.cooldown_ms:.0f}ms per side, >= {self.min_left_s:.0f}s left, "
                 f"<= {self.max_fills_round} fills and {self.max_side_shares:.0f} sh/side per round"
-                + self.avg_text()
+                + self.fair_text()
                 + (f"; shadow fills at {','.join(map(str, self.shadow_ms))}ms (arithmetic only)"
                    if self.shadow_ms else "")
                 + ("" if self.fixed_latency else
@@ -1135,6 +1249,8 @@ class Sniper:
         # Coinbase: its freshness gate (enabled by _coinbase_loop only, like Binance's
         # by run()), the last ticker sequence used (an older one is out of order) and
         # feed-quality figures for the summary rows.
+        # What a share is worth now (SNIPER_FAIR): fed every trigger-feed price.
+        self.fair_model = FairValue(vol_window_s=self.s.fair_vol_s)
         self.cb_fresh = BinanceFreshness(self.s.coinbase_stale_ms, self.s.coinbase_unknown_ms,
                                          self.s.coinbase_backlog_max, name="coinbase")
         self._coinbase_seq: int | None = None
@@ -1148,10 +1264,7 @@ class Sniper:
         # order waiting for its venue answer holds UP only; DOWN may trade -
         # its fills are told apart by order id (live) / per-order result (paper).
         self.inflight = {"UP": None, "DOWN": None}
-        # per round: fills, shares per side, and each side's notional (shares x
-        # price paid, fees apart) - its average price is notional / shares
-        self.rounds = collections.defaultdict(lambda: {"fills": 0, "UP": 0.0, "DOWN": 0.0,
-                                                       "UP_notional": 0.0, "DOWN_notional": 0.0})
+        self.rounds = collections.defaultdict(lambda: {"fills": 0, "UP": 0.0, "DOWN": 0.0})
         # signals per round by side, and how many each gate stopped (journalled as
         # a round_summary row once the round has ended; no decision reads it)
         self.round_signals = collections.defaultdict(collections.Counter)
@@ -1204,10 +1317,8 @@ class Sniper:
             for pos in ledger.positions.values():
                 if pos.settled or pos.shares <= 0:
                     continue
-                buys = [lot for lot in pos.lots if str(lot.side or "").upper() == "BUY"]
-                # the notional its average price comes from (fees apart), for SNIPER_AVG_DOWN
-                notional = sum(float(lot.shares) * float(lot.price) for lot in buys)
-                base[str(pos.token_id)] = (float(pos.shares), len(buys), notional)
+                fills = sum(1 for lot in pos.lots if str(lot.side or "").upper() == "BUY")
+                base[str(pos.token_id)] = (float(pos.shares), int(fills))
         self.round_baseline = base
         return len(base)
 
@@ -1385,6 +1496,7 @@ class Sniper:
         if self.s.primary_feed != "binance":
             self.n["binance ticks ignored (not the trigger)"] += 1
             return
+        self.fair_model.observe(time.time(), t / 1000.0, mid)
         self._signal("binance", self.trigger, mid, t, t_pc)
 
     def on_coinbase(self, raw) -> str:
@@ -1437,13 +1549,15 @@ class Sniper:
             self._coinbase_seq = seq
         primary = self.s.primary_feed == "coinbase"
         trig = self.trigger if primary else self.triggers.get("coinbase")
+        wall = time.time()
         # (no match time -> note_trade counts "trade without E"; the gate then says "age unknown")
-        self.cb_fresh.note_trade(_exchange_ms(d.get("time")), time.time() * 1000.0, t / 1000.0)
+        self.cb_fresh.note_trade(_exchange_ms(d.get("time")), wall * 1000.0, t / 1000.0)
         self.n["coinbase ticks"] += 1
         if trig is None:
             return "tick"
         if primary:
             self.last_mid = mid
+            self.fair_model.observe(wall, t / 1000.0, mid)
         q = trig.q
         reset = bool(q) and t - q[-1][0] > trig.max_gap_ms      # no match for that long: the rule restarts
         self._signal("coinbase", trig, mid, t, t_pc)
@@ -1510,6 +1624,7 @@ class Sniper:
         self.last_mid = mid
         q = self.trigger.q
         reset = bool(q) and t - q[-1][0] > self.trigger.max_gap_ms     # no tick and no heartbeat for that long
+        self.fair_model.observe(time.time(), t / 1000.0, mid)
         self._signal("kraken", self.trigger, mid, t, t_pc)
         # Feed quality, measured after the decision so it costs the decision nothing:
         # gaps between updates (one longer than the max gap resets the rule) and how
@@ -2216,7 +2331,6 @@ class Sniper:
                 shares = float(fill.get("shares") or est.get("shares") or p.amount / p.price)
                 rd["fills"] += 1
                 rd[side] += shares
-                rd[side + "_notional"] += shares * float(fill.get("price") or est.get("price") or p.price)
             if kind == MATCHED:
                 self.n["filled"] += 1
                 fill = res.get("fill")
@@ -2296,7 +2410,6 @@ class Sniper:
                                  "ORDER_STATUS" if fill.get("source") == "terminal order status" else "PRIVATE_WS")
         if shares > 0:
             rd[side] += shares
-            rd[side + "_notional"] += shares * float(fill.get("price") or 0.0)
             self._note_over_target(row, plan, shares)
             self.n["filled"] += 1
             row.update(result="filled", outcome="FILLED")
@@ -2399,36 +2512,26 @@ class Sniper:
         if not lo <= ask <= hi:
             row.update(ask_seen=ask)
             return self._skip("ask outside price band", row)
-        rd = self.rounds.get(end)
-        if rd is None:
-            # A new round: rounds that ended over an hour ago go (one entry per
-            # market otherwise accumulates for the life of the process). An order
-            # still settling holds its own round dict in its plan.
-            for old in [e for e in self.rounds if e < float(end) - 3600]:
-                del self.rounds[old]
-            rd = self.rounds[end]
-            for s_, tok in (("UP", up), ("DOWN", down)):
-                shares, fills, *notional = self.round_baseline.get(str(tok), (0.0, 0, 0.0))
-                rd[s_] += shares
-                rd["fills"] += fills
-                rd[s_ + "_notional"] += float(notional[0]) if notional else 0.0
         # The price ceiling is fixed here, once, from the ask this decision saw:
         # never recomputed from a later ask, so it cannot chase the book.
         cap = min(0.99, round(ask + self.s.slip, 4))
-        if self.s.avg_down and rd[side] > 1e-9:
-            # This side already holds shares in this market: buy only below their
-            # average, so every add-on buy lowers it (SNIPER_AVG_DOWN).
-            held, notional = float(rd[side]), float(rd.get(side + "_notional") or 0.0)
-            if notional <= 0.0:
-                return self._skip("side average unknown", row)          # cannot enforce it: never guess
-            avg = notional / held
+        if self.s.fair:
+            # Buy only at or under what the share is worth now, less the fee and the
+            # margin (SNIPER_FAIR): first buys and add-ons alike.
+            mid = row.get("signal_mid") or self.fair_model.last_mid
+            p_up, info = (self.fair_model.fair_up(float(mid), time.time(), end) if mid
+                          else (None, "no BTC price"))
+            if p_up is None:
+                return self._skip(f"fair value unknown: {info}", row)
+            fair = p_up if side == "UP" else 1.0 - p_up
             tick = getattr(view, "tick_size", None)
-            below = below_average(avg, float(tick) if tick else 0.01)
-            row.update(side_avg=round(avg, 4), side_shares=round(held, 4))
-            if ask > below + 1e-9:
+            limit = fair_limit(fair, self.s.fair_margin, float(tick) if tick else 0.01, self.s.fair_fee_rate)
+            row.update(fair=round(fair, 4), fair_limit=limit, start_px=info["start_px"],
+                       vol_bp=round(info["vol_bp"], 3), tau_s=round(info["tau_s"], 1))
+            if ask > limit + 1e-9:
                 row.update(ask_seen=ask)
-                return self._skip("not below this side's average", row)
-            cap = min(cap, below)
+                return self._skip("ask not below fair value", row)
+            cap = min(cap, limit)
         target = carry = None
         if self.s.order_type == "FAK":
             # IOC: a share target - the base clip plus what this side's last
@@ -2442,6 +2545,18 @@ class Sniper:
             # The venue refuses a marketable BUY under $1, so under 10c the
             # 10-share clip becomes $1 - the smallest order live could place.
             amount = max(self.s.shares * ask, MIN_ORDER_USD)
+        rd = self.rounds.get(end)
+        if rd is None:
+            # A new round: rounds that ended over an hour ago go (one entry per
+            # market otherwise accumulates for the life of the process). An order
+            # still settling holds its own round dict in its plan.
+            for old in [e for e in self.rounds if e < float(end) - 3600]:
+                del self.rounds[old]
+            rd = self.rounds[end]
+            for s_, tok in (("UP", up), ("DOWN", down)):
+                shares, fills = self.round_baseline.get(str(tok), (0.0, 0))
+                rd[s_] += shares
+                rd["fills"] += fills
         # The other side may have an order in flight in this round: it holds a
         # fill slot until its outcome is known, so two sides together never
         # pass the round's fill cap.
@@ -2504,7 +2619,6 @@ class Sniper:
                 self.n["filled"] += 1
                 rd["fills"] += 1
                 rd[side] += float(fill.get("shares") or 0)
-                rd[side + "_notional"] += float(fill.get("shares") or 0) * float(fill.get("average_price") or 0)
                 self._note_over_target(row, plan, fill.get("shares"))
                 self._settle_carry(plan, side, fill.get("shares"))
                 if plan.get("target") is not None:
@@ -2753,6 +2867,10 @@ class Sniper:
                                  "gap_ms_max": round(self.coinbase_gap_max, 1)}}
                    if self.s.primary_feed == "coinbase" else {}),
                 **({"carry": self.carry_view()} if self.s.order_type == "FAK" else {}),
+                **({"fair": {"vol_bp": (round(v * 1e4, 3) if (v := self.fair_model.vol()) is not None else None),
+                             "samples": len(self.fair_model._incs),
+                             "starts": {str(k): v for k, v in sorted(self.fair_model.starts.items())}}}
+                   if self.s.fair else {}),
                 "errors": self.n["errors"], "shadow_errors": self.n["shadow errors"],
                 "latency_ms": round(self.latency_plan()[0], 1),       # paper's MODELLED flight, not a measurement
                 "exec_latency": self.latency.summary(), "exec_quality": self.quality.summary(),

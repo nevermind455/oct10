@@ -249,15 +249,14 @@ class FAKTests(unittest.IsolatedAsyncioTestCase):
         pending = next(r for r in self.rows if r.get("result") == "pending")
         self.assertIsNone(pending["shares"])
         rd = sniper.rounds[sniper.hub.window_end]
-        self.assertEqual(rd, {"fills": 1, "UP": 0, "DOWN": 0, "UP_notional": 0, "DOWN_notional": 0})
+        self.assertEqual(rd, {"fills": 1, "UP": 0, "DOWN": 0})
         self.assertIsNone(sniper._decide("UP", {}, time.monotonic() * 1000))
         self.assertEqual(len(self.fake.orders), 1)
         self.trade()
         # A 3-share partial + a new requested 10 would exceed this 12-share cap.
         self.assertIsNone(sniper._decide("UP", {}, time.monotonic() * 1000))
         sniper._sync_live_fak()
-        # 3 shares at 0.51: the side's average (SNIPER_AVG_DOWN) comes from the actual fill
-        self.assertEqual(rd, {"fills": 1, "UP": 3, "DOWN": 0, "UP_notional": 1.53, "DOWN_notional": 0})
+        self.assertEqual(rd, {"fills": 1, "UP": 3, "DOWN": 0})
         self.assertEqual(sniper.n["filled"], 1)
         self.assertEqual(len(sniper.trade_rows), 1)
         self.assertEqual(sniper.trade_rows[0]["result"], "filled")
@@ -271,7 +270,7 @@ class FAKTests(unittest.IsolatedAsyncioTestCase):
         await sniper._fire("UP", 2, time.monotonic() * 1000)
         self.assertEqual(sniper.n["errors"], 0)
         rd = sniper.rounds[sniper.hub.window_end]
-        self.assertEqual(rd, {"fills": 1, "UP": 3, "DOWN": 0, "UP_notional": 1.53, "DOWN_notional": 0})
+        self.assertEqual(rd, {"fills": 1, "UP": 3, "DOWN": 0})
         row = next(r for r in self.rows if r.get("result") == "filled")
         self.assertEqual(row["shares"], 3)
         self.assertEqual(row["order_type"], "FAK")
@@ -287,8 +286,7 @@ class FAKTests(unittest.IsolatedAsyncioTestCase):
         self.ex.order_status = lambda oid: self.terminal(0)
         self.ex.reconcile_once()
         sniper._sync_live_fak()
-        self.assertEqual(sniper.rounds[sniper.hub.window_end],
-                         {"fills": 0, "UP": 0, "DOWN": 0, "UP_notional": 0, "DOWN_notional": 0})
+        self.assertEqual(sniper.rounds[sniper.hub.window_end], {"fills": 0, "UP": 0, "DOWN": 0})
         self.assertEqual(sniper.n["filled"], 0)
         self.assertEqual(len(sniper.trade_rows), 1)
         self.assertEqual(sniper.trade_rows[0]["result"], "missed")
