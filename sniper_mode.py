@@ -903,6 +903,10 @@ class Settings:
         self.coinbase_unknown_ms = _env_float("SNIPER_COINBASE_UNKNOWN_MS", 5000)
         self.coinbase_backlog_max = int(_env_float("SNIPER_COINBASE_BACKLOG_MAX", 20))
         self.coinbase_silent_s = _env_float("SNIPER_COINBASE_SILENT_S", 5)
+        # Coinbase sockets carrying the same ticker at once (the trigger feed only):
+        # each ticker is used from whichever delivers it first (by sequence), so a
+        # stalled or dropped socket costs nothing while another is up.
+        self.coinbase_conns = int(_env_float("SNIPER_COINBASE_CONNS", 2))
         raw = os.environ.get("SNIPER_EXTRA_FEEDS", "")
         self.extra_feeds = tuple(dict.fromkeys(x.strip().lower() for x in raw.split(",") if x.strip()))
         unknown = [x for x in self.extra_feeds if x not in EXTRA_FEEDS]
@@ -935,6 +939,7 @@ class Settings:
             (self.coinbase_stale_ms > 0 and self.coinbase_unknown_ms > 0 and self.coinbase_backlog_max >= 0
              and self.coinbase_silent_s > 0,
              "SNIPER_COINBASE_STALE_MS / _UNKNOWN_MS / _SILENT_S must be > 0, _BACKLOG_MAX >= 0"),
+            (1 <= self.coinbase_conns <= 4, f"SNIPER_COINBASE_CONNS={self.coinbase_conns} (1 to 4)"),
             (0 <= self.fair_margin < 0.5, f"SNIPER_FAIR_MARGIN={self.fair_margin:g} (must be 0 to 0.49)"),
             (self.fair_vol_s >= 60, f"SNIPER_FAIR_VOL_S={self.fair_vol_s:g} (must be >= 60)"),
             (0 <= self.fair_fee_rate < 0.25, f"SNIPER_FAIR_FEE_RATE={self.fair_fee_rate:g} (must be 0 to 0.25)"),
@@ -1262,11 +1267,18 @@ class Sniper:
         # (the paper broker sums every ledger position for it) - see _bankroll_now.
         self._bankroll: float | None = None
         self._bankroll_at = -1e18
+        self._spends: list = []                     # paper: (mono, $) of orders sent - see _set_bankroll
         self.last_fair: dict | None = None          # the last fair-value decision (the dashboard)
         self.cb_fresh = BinanceFreshness(self.s.coinbase_stale_ms, self.s.coinbase_unknown_ms,
                                          self.s.coinbase_backlog_max, name="coinbase")
         self._coinbase_seq: int | None = None
         self._coinbase_prev_t: float | None = None  # None after a (re)connect: an outage is not a market gap
+        # SNIPER_COINBASE_CONNS > 1: the sockets up now, when each recent sequence was
+        # first heard, and how far behind the other socket(s) delivered the same ticker.
+        self._cb_up: set = set()
+        self._cb_first: dict = {}
+        self._cb_late_seq: int | None = None
+        self.cb_behind: collections.deque = collections.deque(maxlen=5000)
         self.coinbase_gap_max = 0.0
         self.journal = Path(journal_path) if journal_path else None
         # When each side's last order was submitted (monotonic ms, the ticks'
@@ -1464,15 +1476,19 @@ class Sniper:
             return float(rd[side])
         return float(self.round_baseline.get(str(token), (0.0, 0))[0])
 
-    BANKROLL_EVERY_S = 5.0     # the cash Kelly sizes from is re-read this often, off the order path
+    BANKROLL_EVERY_S = 5.0     # paper: the broker's cash is re-read this often, off the order path
     BANKROLL_STALE_S = 30.0    # older than this (no refresher running): read it on the spot
+    BANKROLL_SETTLE_S = 2.0    # paper: an order sent this long before a reading may not be in it yet
 
     def _read_bankroll(self) -> float | None:
-        """The account's cash: live, the canary's collateral reading; paper, the
-        broker's cash (which sums every ledger position - never per tick)."""
+        """The account's cash: live, the canary's collateral reading less what its
+        orders in flight reserve (plain attributes - nothing on the wire); paper,
+        the broker's cash (which sums every ledger position - never per tick)."""
         try:
             if self.live is not None:
                 v = getattr(self.live, "balance", None)
+                if v is not None:
+                    v = float(v) - float(getattr(self.live, "reserved", 0.0) or 0.0)
             else:
                 read = getattr(self.broker, "cash_balance", None)
                 v = read() if callable(read) else None
@@ -1482,14 +1498,39 @@ class Sniper:
         return v if v is not None and math.isfinite(v) else None
 
     def _bankroll_now(self) -> float | None:
+        if self.live is not None:
+            # The sender debits its collateral itself (in flight: reserved; then
+            # spent): read on every decision, so two orders seconds apart never
+            # both size from cash only one of them still has.
+            return self._read_bankroll()
         if self._bankroll is None or time.monotonic() - self._bankroll_at > self.BANKROLL_STALE_S:
-            self._bankroll, self._bankroll_at = self._read_bankroll(), time.monotonic()
+            self._set_bankroll(self._read_bankroll(), time.monotonic())
         return self._bankroll
+
+    def _set_bankroll(self, v, read_at: float) -> None:
+        """Paper: a cash reading taken at read_at, less what orders sent from
+        BANKROLL_SETTLE_S before it may not have booked yet (no fill, or a fill
+        the reading already holds, only makes the next order smaller until the
+        reading after)."""
+        cut = read_at - self.BANKROLL_SETTLE_S
+        self._spends = [s for s in self._spends if s[0] >= cut]
+        self._bankroll = None if v is None else v - sum(a for _t, a in self._spends)
+        self._bankroll_at = read_at
+
+    def _bankroll_spent(self, amount: float) -> None:
+        """Paper: an order went out - its spend leaves the cash Kelly sizes from
+        at once, not at the next reading (up to 5s later: the next order on the
+        other side, or this side's after its cooldown, sized from the same cash
+        and the two together bet more than Kelly)."""
+        self._spends.append((time.monotonic(), float(amount)))
+        if self._bankroll is not None:
+            self._bankroll -= float(amount)
 
     async def _bankroll_loop(self) -> None:
         while True:
+            t0 = time.monotonic()
             v = await asyncio.to_thread(self._read_bankroll)
-            self._bankroll, self._bankroll_at = v, time.monotonic()
+            self._set_bankroll(v, t0)
             await asyncio.sleep(self.BANKROLL_EVERY_S)
 
     async def _round_watch(self) -> None:
@@ -1590,11 +1631,18 @@ class Sniper:
             self.n["coinbase malformed"] += 1
             return "malformed"
         seq = d.get("sequence")
+        many = self.s.coinbase_conns > 1 and self.s.primary_feed == "coinbase"
         if isinstance(seq, int) and not isinstance(seq, bool):
             if self._coinbase_seq is not None and seq <= self._coinbase_seq:
-                self.n["coinbase out of order"] += 1         # older than a ticker already used
+                # older than a ticker already used - with several sockets, almost
+                # always the same ticker arriving second on another one
+                self._cb_late_seq = seq
+                self.n["coinbase already heard" if many else "coinbase out of order"] += 1
                 return "late"
             self._coinbase_seq = seq
+        elif many:
+            self.n["coinbase malformed"] += 1                # no sequence: its copy on the other socket would count twice
+            return "malformed"
         primary = self.s.primary_feed == "coinbase"
         trig = self.trigger if primary else self.triggers.get("coinbase")
         wall = time.time()
@@ -2289,6 +2337,7 @@ class Sniper:
             else:
                 st["handoff_pc"] = time.perf_counter_ns()
                 fut = loop.run_in_executor(None, self._match, plan, sign_ms, st)
+                self._bankroll_spent(plan["amount"])
             if self.s.shadow_ms:
                 # After the send: the shadow sleeps until absolute times anyway.
                 self._spawn(self._shadow(row, plan["token"], plan["other"], plan["cond"],
@@ -2518,6 +2567,27 @@ class Sniper:
         except Exception:  # noqa: BLE001 - diagnostics only
             pass
 
+    def _fair_anchor(self, token: str, view, row: dict, t_ms: float):
+        """(market mid, which) the fair value is anchored to: the side's book as
+        it stood when the move BEGAN (the trigger's reference, window_ms before
+        the tick), never higher than its mid now. The book on our side reacts
+        to BTC within the same 250ms, and the model adds the whole move: a mid
+        read after it had already moved part of the way counted that part
+        twice and bid above fair. "before move" / "now" (lower, or no history)."""
+        now = getattr(view, "mid", None)
+        book = getattr(self.hub, "book", None)
+        win = row.get("window_ms")
+        if now is None or win is None or not hasattr(book, "view_at_mono"):
+            return now, "now"
+        try:
+            then = getattr(book.view_at_mono(token, (float(t_ms) - float(win)) / 1000.0), "mid", None)
+        except Exception:  # noqa: BLE001 - no history: the mid now, as before
+            then = None
+        if then is None:
+            return now, "now"
+        row["market_mid_now"] = round(float(now), 4)
+        return (then, "before move") if then <= now else (now, "now")
+
     def _decide(self, side: str, row: dict, t_ms: float):
         """Every check and every field of the order; None (skip journalled) if it must not trade."""
         self._sync_live_fak()
@@ -2569,7 +2639,7 @@ class Sniper:
             # anchored to the market's own price for it (anchored_fair), less the fee
             # and the margin (SNIPER_FAIR): first buys and add-ons alike.
             sigma = self.vol_model.vol()
-            mkt = getattr(view, "mid", None)
+            mkt, anchor = self._fair_anchor(str(token), view, row, t_ms)
             tau = float(end) - time.time()
             move = abs(float(row.get("bp") or 0.0))
             why = ("volatility warming up" if sigma is None else "no market price" if mkt is None
@@ -2579,9 +2649,9 @@ class Sniper:
             fair = anchored_fair(float(mkt), move, sigma, tau)
             tick = getattr(view, "tick_size", None)
             limit = fair_limit(fair, self.s.fair_margin, float(tick) if tick else 0.01, self.s.fair_fee_rate)
-            row.update(market_mid=round(float(mkt), 4), fair=round(fair, 4), fair_limit=limit,
+            row.update(market_mid=round(float(mkt), 4), fair_anchor=anchor, fair=round(fair, 4), fair_limit=limit,
                        vol_bp=round(sigma * 1e4, 3), tau_s=round(tau, 1))
-            self.last_fair = {"side": side, "market_mid": round(float(mkt), 4), "fair": round(fair, 4),
+            self.last_fair = {"side": side, "market_mid": round(float(mkt), 4), "anchor": anchor, "fair": round(fair, 4),
                               "limit": limit, "ask": ask, "wall": time.time()}
             if ask > limit + 1e-9:
                 row.update(ask_seen=ask)
@@ -2944,11 +3014,18 @@ class Sniper:
                                  "malformed": self.n["coinbase malformed"],
                                  "out_of_order": self.n["coinbase out of order"], "reconnects": self.n["reconnects"],
                                  "gaps_over_max_gap": self.n["coinbase gaps over max gap"],
-                                 "gap_ms_max": round(self.coinbase_gap_max, 1)}}
+                                 "gap_ms_max": round(self.coinbase_gap_max, 1),
+                                 **({"sockets": self.s.coinbase_conns, "sockets_up": len(self._cb_up),
+                                     "already_heard": self.n["coinbase already heard"],
+                                     "first_by_socket": [self.n[f"coinbase first on conn {j + 1}"]
+                                                         for j in range(self.s.coinbase_conns)],
+                                     "copy_behind_ms": BinanceFreshness._q(self.cb_behind)}
+                                    if self.s.coinbase_conns > 1 else {})}}
                    if self.s.primary_feed == "coinbase" else {}),
                 **({"carry": self.carry_view()} if self.s.order_type == "FAK" else {}),
                 **({"fair": {"vol_bp": (round(v * 1e4, 3) if (v := self.vol_model.vol()) is not None else None),
-                             "samples": len(self.vol_model._incs), "bankroll": self._bankroll,
+                             "samples": len(self.vol_model._incs),
+                             "bankroll": self._bankroll if self.live is None else self._read_bankroll(),
                              "last": self.last_fair}}
                    if self.s.fair else {}),
                 "errors": self.n["errors"], "shadow_errors": self.n["shadow errors"],
@@ -3005,8 +3082,8 @@ class Sniper:
             self._spawn(self._extra_feed(name))
         self._spawn(self._loop_lag_probe())
         self._spawn(self._gc_schedule())
-        if self.s.fair and self.s.kelly:
-            self._spawn(self._bankroll_loop())
+        if self.s.fair and self.s.kelly and self.live is None:
+            self._spawn(self._bankroll_loop())          # live reads the sender's own figures each time
         stall_ms = _env_float("SNIPER_STALL_MS", 50)
         if stall_ms > 0 and self.journal is not None:
             self.stallwatch = StallWatch(asyncio.get_running_loop(), self._write, threshold_ms=stall_ms).start()
@@ -3076,25 +3153,56 @@ class Sniper:
             attempt += 1
 
     async def _coinbase_loop(self) -> None:
-        """The trigger's socket when SNIPER_PRIMARY_FEED=coinbase (the default):
-        Coinbase Exchange's public BTC-USD ticker + heartbeat channels. Every
-        (re)connect starts the rule afresh - a price from before a gap is no
-        reference for "moved within 250ms" - and retries come fast and jittered
-        (0.25s .. 8s), the ladder resetting only after a connection has held
-        30s, so a connect/drop loop cannot spin. Heartbeats arrive every second
-        whatever the market does, so SNIPER_COINBASE_SILENT_S of silence is a
-        dead socket, and heartbeats with no BTC-USD ticker for
+        """The trigger's sockets when SNIPER_PRIMARY_FEED=coinbase (the default):
+        Coinbase Exchange's public BTC-USD ticker + heartbeat channels, on
+        SNIPER_COINBASE_CONNS sockets at once (default 2). Each ticker is used
+        from whichever socket delivers it first - the venue's sequence numbers
+        it - and its copy on another socket is dropped, so one socket stalling,
+        dropping or falling behind costs nothing while another is up.
+
+        Each socket reconnects on its own, fast and jittered (0.25s .. 8s), the
+        ladder resetting only after a connection has held 30s, so a
+        connect/drop loop cannot spin. When NO socket was up, the first one
+        back starts the rule afresh - a price from before a gap is no reference
+        for "moved within 250ms". Heartbeats arrive every second whatever the
+        market does, so SNIPER_COINBASE_SILENT_S of silence is a dead socket,
+        and heartbeats with no BTC-USD ticker (first-heard or a copy) for
         COINBASE_STARVED_S are a lost subscription. The freshness gate
-        (cb_fresh) is on for this socket only. No permessage-deflate: inflating
-        every message is CPU the 1-vCPU VPS spends before the tick can be read."""
-        from feeds.supervisor import backoff_delay
-        from feeds.tls import ws_ssl
+        (cb_fresh) is on for these sockets only. No permessage-deflate:
+        inflating every message is CPU the 1-vCPU VPS spends before the tick
+        can be read."""
         fresh = self.cb_fresh
         fresh.enabled = self.s.coinbase_freshness
         if not fresh.enabled:
             self.on_event("sniper", "SNIPER_COINBASE_FRESHNESS=0: Coinbase ticks are NOT checked for age", "warn")
-        url = self.s.coinbase_url
-        report_at = time.monotonic() + 300
+        self._cb_report_at = time.monotonic() + 300
+        n = self.s.coinbase_conns
+        if n == 1:
+            await self._coinbase_conn(0)
+            return
+        await asyncio.gather(*(self._coinbase_conn(i) for i in range(n)))
+
+    def _cb_race(self, i: int, kind: str, now: float) -> None:
+        """Several sockets: which one heard each ticker first, and how far behind
+        the copy came on the other(s)."""
+        if kind == "tick":
+            self.n[f"coinbase first on conn {i + 1}"] += 1
+            if self._coinbase_seq is not None:
+                first = self._cb_first
+                first[self._coinbase_seq] = now
+                if len(first) > 512:
+                    del first[next(iter(first))]
+        else:
+            t0 = self._cb_first.get(self._cb_late_seq)
+            if t0 is not None:
+                self.cb_behind.append((now - t0) * 1000.0)
+
+    async def _coinbase_conn(self, i: int) -> None:
+        """One of the trigger's Coinbase sockets (see _coinbase_loop)."""
+        from feeds.supervisor import backoff_delay
+        from feeds.tls import ws_ssl
+        fresh, url, n = self.cb_fresh, self.s.coinbase_url, self.s.coinbase_conns
+        tag = f" [socket {i + 1}/{n}]" if n > 1 else ""
         attempt = 0
         while True:
             opened = None
@@ -3102,11 +3210,15 @@ class Sniper:
                 async with websockets.connect(url, ssl=ws_ssl(url), ping_interval=20, ping_timeout=20,
                                               open_timeout=10, compression=None) as ws:
                     opened = time.monotonic()
-                    self.trigger = Trigger(self.s.k_bp, self.s.window_ms)
-                    self.triggers["coinbase"] = self.trigger
-                    self.last_mid = None
-                    self._coinbase_seq = self._coinbase_prev_t = None
-                    fresh.on_connect()
+                    if not self._cb_up:
+                        # no socket was up: nothing heard before vouches for this one
+                        self.trigger = Trigger(self.s.k_bp, self.s.window_ms)
+                        self.triggers["coinbase"] = self.trigger
+                        self.last_mid = None
+                        self._coinbase_seq = self._coinbase_prev_t = None
+                        self._cb_first.clear()
+                        fresh.on_connect()
+                    self._cb_up.add(i)
                     await ws.send(json.dumps(COINBASE_SUBSCRIBE))
                     ticked = False
                     last_tick = time.monotonic()
@@ -3115,17 +3227,19 @@ class Sniper:
                         now = time.monotonic()
                         fresh.note_message(now, rx_backlog(ws))
                         kind = self.on_coinbase(raw.decode() if isinstance(raw, bytes) else raw)
-                        if kind == "tick":
+                        if kind == "tick" or kind == "late":
                             last_tick = now
+                            if n > 1:
+                                self._cb_race(i, kind, now)
                             if not ticked:
                                 ticked = True
                                 self.on_event("sniper", f"Coinbase {COINBASE_PRODUCT} ticker connected"
-                                              + (" (freshness gate on)" if fresh.enabled else ""), "good")
+                                              + (" (freshness gate on)" if fresh.enabled else "") + tag, "good")
                         elif now - last_tick >= COINBASE_STARVED_S:
                             raise CoinbaseFeedError(f"no {COINBASE_PRODUCT} ticker for {COINBASE_STARVED_S:.0f}s "
                                                     f"(heartbeats only): subscription lost")
-                        if now >= report_at:
-                            report_at = now + 300
+                        if now >= self._cb_report_at:
+                            self._cb_report_at = now + 300
                             s = self.summary()
                             c = s.get("coinbase") or {}
                             ex = c.get("excess_ms") or {}
@@ -3133,18 +3247,25 @@ class Sniper:
                                                     f"refused {s['refused']} markout 5s {s['markout_5s_c']}c; "
                                                     f"coinbase {c.get('status')} {c.get('ticks')} tickers, excess "
                                                     f"p50/p99 {ex.get('p50')}/{ex.get('p99')}ms, longest gap "
-                                                    f"{c.get('gap_ms_max')}ms", "info")
+                                                    f"{c.get('gap_ms_max')}ms"
+                                                    + (f", sockets up {len(self._cb_up)}/{n}" if n > 1 else ""),
+                                          "info")
                             self._write({"wall": time.time(), "result": "summary", **s})
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - reconnect; the bot keeps running
                 self.n["reconnects"] += 1
+                left = len(self._cb_up - {i})
                 self.on_event("sniper", f"Coinbase ticker {type(exc).__name__}"
                                         f"{': ' + str(exc)[:100] if isinstance(exc, CoinbaseFeedError) else ''}"
                                         f"{' (silent ' + format(self.s.coinbase_silent_s, 'g') + 's)' if isinstance(exc, asyncio.TimeoutError) else ''}"
-                                        f"; reconnecting", "warn")
+                                        f"; reconnecting{tag}"
+                                        + (f" ({left} other socket{'s' if left > 1 else ''} still up)" if left else ""),
+                              "info" if left else "warn")
             finally:
-                fresh.on_disconnect()
+                self._cb_up.discard(i)
+                if not self._cb_up:
+                    fresh.on_disconnect()                    # the last socket down: no signal until one is back
             if opened is not None and time.monotonic() - opened >= 30:
                 attempt = 0
             await asyncio.sleep(backoff_delay(attempt))

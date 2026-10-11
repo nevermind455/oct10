@@ -21,12 +21,17 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
   forward; Coinbase heartbeats do not (its ticker speaks on matches, so the book
   can move between messages unseen). A move up buys **UP**; a move down buys
   **DOWN**, in the current round.
-  - **Coinbase.** One socket to `wss://ws-feed.exchange.coinbase.com`, channels
-    `ticker` + `heartbeat` for BTC-USD. The ack must cover both; an `error` or a
-    wrong ack reconnects. A ticker older (by sequence) than one already used is
-    dropped. No message for `SNIPER_COINBASE_SILENT_S` (5s; heartbeats come every
-    second), or heartbeats with no ticker for 60s, reconnect (0.25s..8s,
-    jittered); every reconnect starts the rule afresh.
+  - **Coinbase.** `SNIPER_COINBASE_CONNS` sockets (2) to `wss://ws-feed.exchange.coinbase.com`,
+    channels `ticker` + `heartbeat` for BTC-USD, all carrying the same tickers. Each
+    ticker is used once, from whichever socket delivers it first (by the venue's
+    sequence); its copy on the other socket, or any ticker older than one already
+    used, is dropped. So a socket that stalls, drops or falls behind costs nothing
+    while the other is up. The ack must cover both channels; an `error` or a wrong
+    ack reconnects that socket. No message for `SNIPER_COINBASE_SILENT_S` (5s;
+    heartbeats come every second), or heartbeats with no ticker (first or copy) for
+    60s, reconnect it (0.25s..8s, jittered). Only when every socket was down does
+    the first one back start the rule afresh. The summary shows which socket heard
+    each ticker first and how far behind the copies came.
   - Measured from the PC on 2026-10-10 (45s, a quiet Saturday): 103 tickers,
     match -> receipt 64ms min / 104ms median, but gaps between tickers up to
     10.7s, 4 of them over 2s. In quiet spells the rule restarts more often than on
@@ -59,13 +64,19 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
     ($0.01): fair = Φ(Φ⁻¹(the market's mid for the side) + |move| / (σ·√seconds left)),
     σ the trigger feed's volatility over the last 5 minutes. The market sets the level
     (where BTC stands against the strike, momentum, Chainlink); the model adds only what
-    the move should do to it. The limit is capped there too. Under a minute of price
+    the move should do to it. The market's mid is the side's book as it stood when the
+    move BEGAN (the trigger's reference, ≥250ms before the tick), never above its mid
+    now: the book reacts within the same 250ms, and a mid that already held part of
+    the move counted that part twice (journal: `fair_anchor` "before move" / "now",
+    `market_mid_now`). The limit is capped there too. Under a minute of price
     history, or no market mid, there are no buys ("fair value unknown"). A first version
     priced from Coinbase against the round's start price disagreed with the market by
     10-30c and bought the losing side; it was replaced the same day.
   - **Kelly size (2026-10-11).** Each FAK order buys `SNIPER_KELLY_FRACTION` (1: full Kelly; ¼ before) of the
     Kelly bet on that fair value: f* = (fair − p) / (1 − p), p the ask plus its fee,
-    times the account's cash (re-read every 5s, off the order path), in whole shares,
+    times the account's cash (live: the sender's balance less what its orders in flight
+    reserve, read on every decision; paper: re-read every 5s off the order path, each
+    sent order's spend taken off at once), in whole shares,
     from 5 with no per-order cap - only what is left of `SNIPER_MAX_SIDE_SHARES` (200)
     for the side in the round, and live the canary's per-order cap; under 5 it skips. Each order is sized fresh:
     no carry. The dashboard's "fair" line shows the volatility and the last decision
@@ -286,6 +297,7 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | `SNIPER_PRIMARY_FEED` | coinbase | trigger feed: `coinbase` (the frozen spec; LIVE refuses any other), `binance` or `kraken` |
 | `SNIPER_COINBASE_FRESHNESS` | 1 (unset) | skip a Coinbase signal unless the feed is shown current: `_STALE_MS` 1000 (match age above its 5-min best), `_BACKLOG_MAX` 20, `_UNKNOWN_MS` 5000 |
 | `SNIPER_COINBASE_SILENT_S` | 5 (unset) | no Coinbase message (heartbeats included) this long: reconnect |
+| `SNIPER_COINBASE_CONNS` | 2 (unset) | Coinbase sockets carrying the same ticker (1 to 4); each ticker used once, from the first to deliver it |
 | `SNIPER_K_BP` / `SNIPER_WINDOW_MS` | 0.5 / 250 | trigger: a move of >= 0.5bp within 250ms |
 | `SNIPER_SHARES` | 10 | base target shares per order (at least $1) |
 | `SNIPER_MAX_TARGET_SHARES` | 20 | cap on base + same-side unfilled carry |

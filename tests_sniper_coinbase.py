@@ -39,7 +39,8 @@ TICKER_FIELDS = ("best_ask", "best_ask_size", "best_bid", "best_bid_size", "high
                  "volume_30d")
 ACK = {"type": "subscriptions", "channels": [{"name": "ticker", "product_ids": ["BTC-USD"], "account_ids": None},
                                              {"name": "heartbeat", "product_ids": ["BTC-USD"], "account_ids": None}]}
-CB = {"SNIPER_LATENCY_MS": "200"}                 # a fixed latency: no order signing; the feed is the default
+CB = {"SNIPER_LATENCY_MS": "200",                 # a fixed latency: no order signing; the feed is the default
+      "SNIPER_COINBASE_CONNS": "1"}               # one socket (DualSocketTests: the default two)
 _SEQ = itertools.count(1_000)
 
 
@@ -359,6 +360,8 @@ class SettingsTests(unittest.TestCase):
                          (S.COINBASE_WS_URL, True, 1000.0, 5000.0, 20, 5.0))
         with env(SNIPER_ONLY="1"):
             self.assertFalse(any("trigger feed" in v for v in X.spec_violations(S.Settings(), 25)))
+        with env(SNIPER_LATENCY_MS="200"):
+            self.assertEqual(S.Settings().coinbase_conns, 2)                # two sockets unless told otherwise
 
     def test_the_primary_is_never_its_own_second_trigger(self):
         with env(**CB, SNIPER_EXTRA_FEEDS="coinbase"):
@@ -374,6 +377,9 @@ class SettingsTests(unittest.TestCase):
                 S.Settings()
         with env(**CB, SNIPER_COINBASE_BACKLOG_MAX="-1"), self.assertRaisesRegex(ValueError, "SNIPER_COINBASE"):
             S.Settings()
+        for n in ("0", "5"):
+            with self.subTest(conns=n), env(**{**CB, "SNIPER_COINBASE_CONNS": n}),                     self.assertRaisesRegex(ValueError, "SNIPER_COINBASE_CONNS"):
+                S.Settings()
         with env(**CB, SNIPER_COINBASE_URL="wss://evil.example.com"), self.assertRaisesRegex(ValueError, "SNIPER_COINBASE_URL"):
             S.Settings()
         with env(**CB, SNIPER_COINBASE_FRESHNESS="0"):
@@ -599,6 +605,94 @@ class CoinbaseSocketTests(unittest.IsolatedAsyncioTestCase):
         await self.until(lambda: any("ticker connected" in e[1] for e in self.events))
         self.assertTrue(any("NOT checked for age" in e[1] and e[2] == "warn" for e in self.events), self.events)
         self.assertFalse(self.sn.cb_fresh.enabled)
+
+
+# =========================================================================== two sockets (the default)
+DUAL = {"SNIPER_COINBASE_CONNS": "2"}
+
+
+class DualSocketTests(unittest.IsolatedAsyncioTestCase):
+    """SNIPER_COINBASE_CONNS=2: the same ticker on two sockets, each used once,
+    from whichever socket delivered it first; one socket down costs nothing."""
+
+    asyncSetUp, asyncTearDown = CoinbaseSocketTests.asyncSetUp, CoinbaseSocketTests.asyncTearDown
+    start, until = CoinbaseSocketTests.start, CoinbaseSocketTests.until
+
+    async def test_each_ticker_is_used_once_from_the_first_socket(self):
+        async def script(n, ws):
+            await ws.send(json.dumps(ACK))
+            await asyncio.sleep(0.05 * n)                                   # socket 2 trails by 50ms
+            await ws.send(ticker(60_000.0, seq=1))
+            await asyncio.sleep(0.3)
+            await ws.send(ticker(60_012.0, seq=2))                          # +2bp
+            await asyncio.sleep(1.0)
+        await self.start(script, DUAL)
+        await self.until(lambda: self.sn.n["coinbase already heard"] >= 2)
+        self.assertEqual([(f[0], f[1]) for f in self.fired], [("UP", 2.0)])     # one signal, not two
+        self.assertEqual((self.sn.n["coinbase ticks"], self.conns), (2, 2))
+        c = self.sn.summary()["coinbase"]
+        self.assertEqual((c["sockets"], c["sockets_up"], sum(c["first_by_socket"]), c["already_heard"]), (2, 2, 2, 2))
+        self.assertEqual(c["copy_behind_ms"]["n"], 2)
+        self.assertEqual(self.sn.n["coinbase out of order"], 0)
+        self.assertEqual(sum(1 for e in self.events if "ticker connected" in e[1]), 2)
+        self.assertTrue(any("[socket 2/2]" in e[1] for e in self.events), self.events)
+
+    async def test_one_socket_dropping_keeps_the_rule_and_the_gate(self):
+        async def script(n, ws):
+            if n == 0:
+                await ws.send(ticker(60_000.0, seq=10))
+                await asyncio.sleep(0.1)
+                await ws.close()                                            # socket 1 drops ...
+            elif n == 1:
+                await ws.send(ticker(60_000.0, seq=10))
+                await asyncio.sleep(0.35)
+                await ws.send(ticker(60_012.0, seq=11))                     # ... the move comes on socket 2
+                await asyncio.sleep(1.0)
+            else:
+                await asyncio.sleep(2.0)                                    # socket 1 back, quiet
+        await self.start(script, DUAL)
+        await self.until(lambda: self.sn.n["coinbase ticks"] >= 1)
+        rule = self.sn.trigger
+        await self.until(lambda: self.fired)
+        self.assertEqual([(f[0], f[1]) for f in self.fired], [("UP", 2.0)])     # the price before the drop held
+        self.assertIs(self.sn.trigger, rule)                               # never restarted: a socket stayed up
+        self.assertTrue(self.sn.cb_fresh.connected)
+        self.assertGreaterEqual(self.sn.n["reconnects"], 1)
+        self.assertTrue(any("other socket still up" in e[1] and e[2] == "info" for e in self.events), self.events)
+
+    async def test_with_every_socket_down_the_first_back_restarts_the_rule(self):
+        async def script(n, ws):
+            if n < 2:
+                await ws.send(ticker(60_000.0, seq=20))
+                await asyncio.sleep(0.05)
+                await ws.close()                                            # both drop
+            else:
+                await asyncio.sleep(0.3)
+                await ws.send(ticker(60_060.0, seq=21))                     # +10bp against the price before the outage
+                await asyncio.sleep(1.0)
+        await self.start(script, DUAL)
+        await self.until(lambda: self.sn.last_mid == 60_060.0)
+        await asyncio.sleep(0.1)
+        self.assertEqual(self.fired, [])
+        self.assertEqual(self.sn.n["signals"], 0)
+
+    async def test_copies_keep_the_slower_socket_alive(self):
+        async def script(n, ws):
+            await ws.send(json.dumps(ACK))
+            for i in range(20):
+                await asyncio.sleep(0.05 + 0.01 * n)
+                await ws.send(ticker(60_000.0, seq=100 + i))
+        with patch.object(S, "COINBASE_STARVED_S", 0.3):
+            await self.start(script, DUAL)
+            await self.until(lambda: self.sn.n["coinbase ticks"] >= 15)
+        self.assertEqual((self.sn.n["reconnects"], self.conns), (0, 2))   # all copies, still not "subscription lost"
+
+    def test_a_ticker_without_a_sequence_cannot_be_deduplicated(self):
+        sn, fired = make(DUAL)
+        self.assertEqual(sn.on_coinbase(ticker(60_000.0, sequence=None)), "malformed")
+        self.assertEqual(sn.on_coinbase(ticker(60_000.0, seq=7)), "tick")
+        self.assertEqual(sn.on_coinbase(ticker(60_000.0, seq=7)), "late")
+        self.assertEqual((sn.n["coinbase already heard"], sn.n["coinbase out of order"]), (1, 0))
 
 
 # =========================================================================== bench_network: the race and the budget

@@ -252,6 +252,54 @@ class Gate(I.PaperIOCBase):
         self.assertIsNotNone(plan)
         self.assertLessEqual(plan["target"], 25.0)
 
+    def anchored_order(self, then, now, move_bp=5.0, ask=0.41):
+        """An UP order whose book stood at mid `then` when the move began
+        (window_ms before the tick) and stands at `now` when it signals."""
+        token = self.m.up_token
+        t_ms = time.monotonic() * 1000.0
+        seen = []
+
+        def view_at_mono(tok, mono):
+            seen.append((tok, mono))
+            v = I.View(self.m.decision[str(tok)])
+            v.mid = then
+            return v
+        self.m.book.view_at_mono = view_at_mono
+        self.sn.trigger.ref = (t_ms - 300.0, 60_000.0)                  # the move's reference, 300ms back
+        self.mids[token] = now
+        self.m.set(token, [(ask, 200)])
+        self.sn.last_fire_by_side["UP"] = -1e18
+        before = len(self.rows)
+        asyncio.run(self.sn._fire("UP", move_bp, t_ms))
+        rows = [r for r in self.rows[before:] if r.get("result") in ("filled", "refused", "skipped", "error")]
+        self.assertEqual(len(rows), 1, self.rows[before:])
+        self.assertEqual(seen[-1], (str(token), (t_ms - 300.0) / 1000.0))
+        return rows[0]
+
+    def test_the_anchor_is_the_book_from_before_the_move(self):
+        """The book had already moved .40 -> .44 by the tick: anchoring on .44
+        added the move to a price that partly held it already."""
+        r = self.anchored_order(then=0.40, now=0.44)
+        self.assertEqual((r["fair_anchor"], r["market_mid"], r["market_mid_now"]), ("before move", 0.40, 0.44))
+        self.check_fair(r, 0.40, 5.0)
+        self.assertLess(r["fair"], oracle_fair(0.44, 5.0, self.V, r["tau_s"]))
+
+    def test_the_anchor_is_never_above_the_mid_now(self):
+        r = self.anchored_order(then=0.45, now=0.40)                    # the book fell meanwhile: the lower one
+        self.assertEqual((r["fair_anchor"], r["market_mid"]), ("now", 0.40))
+        self.check_fair(r, 0.40, 5.0)
+
+    def test_no_book_history_anchors_on_the_mid_now(self):
+        r = self.anchored_order(then=None, now=0.40)
+        self.assertEqual((r["fair_anchor"], r["market_mid"]), ("now", 0.40))
+        self.assertNotIn("market_mid_now", r)
+
+    def test_back_to_back_orders_size_from_the_cash_left(self):
+        r1 = self.order("UP", [(0.41, 1000)], mid=0.40, move_bp=5.0)
+        r2 = self.order("DOWN", [(0.41, 1000)], mid=0.40, move_bp=-5.0)   # before the next cash reading
+        self.assertEqual(r1["bankroll"], 1000.0)
+        self.assertAlmostEqual(r2["bankroll"], 1000.0 - r1["amount"], places=2)
+
     def test_kelly_orders_carry_nothing(self):
         r = self.order("UP", [(0.41, 3)], mid=0.40, move_bp=5.0)        # only 3 shares at the ask, then nothing
         self.assertIn(r["result"], ("filled", "refused"))
@@ -293,6 +341,25 @@ class Bankroll(unittest.TestCase):
         with patch.dict(os.environ, {"SNIPER_FAIR": "1", "SNIPER_KELLY": "1"}):
             sn2 = S.Sniper(None, None, settings=S.Settings(), live=live)
         self.assertEqual(sn2._bankroll_now(), 77.0)              # live: the canary's collateral reading
+        live.reserved = 30.0                                     # an order in flight holds $30 of it
+        self.assertEqual(sn2._bankroll_now(), 47.0)
+        live.balance, live.reserved = 50.0, 0.0                  # the sender booked it: read on every decision
+        self.assertEqual(sn2._bankroll_now(), 50.0)
+
+    def test_paper_spends_leave_the_cash_at_once_until_a_reading_holds_them(self):
+        with patch.dict(os.environ, {"SNIPER_FAIR": "1", "SNIPER_KELLY": "1", "SNIPER_LATENCY_MS": "200"}):
+            sn = S.Sniper(None, type("B", (), {"cash_balance": lambda self: 1000.0})(), settings=S.Settings())
+        self.assertEqual(sn._bankroll_now(), 1000.0)
+        sn._bankroll_spent(60.0)
+        self.assertEqual(sn._bankroll_now(), 940.0)                 # at once, not at the next reading
+        now = time.monotonic()
+        sn._set_bankroll(1000.0, now)                            # a reading the fill had not reached yet
+        self.assertEqual(sn._bankroll, 940.0)
+        sn._set_bankroll(940.0, now + S.Sniper.BANKROLL_SETTLE_S + 0.1)   # a later one that holds it
+        self.assertEqual(sn._bankroll, 940.0)
+        self.assertEqual(sn._spends, [])
+        sn._set_bankroll(None, now + 10)
+        self.assertIsNone(sn._bankroll)                          # no reading: Kelly skips, never guesses
 
 
 class Feed(unittest.TestCase):

@@ -1505,7 +1505,14 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # to the frozen spec's 1.0 (full Kelly; was 0.25), and a Kelly order has no per-order cap -
     # only what is left of SNIPER_MAX_SIDE_SHARES for the side in the round (_side_held) and,
     # live, the canary's max_order_shares.
-    "sniper_mode.py": "9f4cf0719e3825e7b6c2cdfa17563356e3dd33705c27b5372abc2bbe487884b0",
+    # Re-approved 2026-10-11 (review): the fair value anchors on the side's book as it stood
+    # when the move began (_fair_anchor; never above the mid now) - a mid read after the
+    # book had partly reacted counted that part of the move twice. Kelly's cash: live reads
+    # the sender's balance less its in-flight reserve on every decision; paper takes each
+    # sent order's spend off at once (_bankroll_spent / _set_bankroll). The Coinbase trigger
+    # runs on SNIPER_COINBASE_CONNS sockets (default 2), each ticker used once by sequence
+    # from the first socket to deliver it (_coinbase_conn / _cb_race).
+    "sniper_mode.py": "f86383c7f11c4d37cec05d09c99ee5f31a4c305dfef0ce8f413e00063250a947",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.

@@ -1817,8 +1817,9 @@ class DashView:
             c = summary.get("coinbase") or {}
             ex = c.get("excess_ms") or {}
             behind = "--" if ex.get("p50") is None else f"{ex['p50']}ms"
+            socks = f"sockets {c['sockets_up']}/{c['sockets']} " if c.get("sockets") else ""
             rows.append(("COINBASE", str(c.get("status") or "--"),
-                         f"behind p50 {behind} gap max {c.get('gap_ms_max')}ms backlog max {c.get('backlog_max')} "
+                         f"{socks}behind p50 {behind} gap max {c.get('gap_ms_max')}ms backlog max {c.get('backlog_max')} "
                          f"rc {c.get('reconnects')}"))
         elif primary == "kraken":
             k = summary.get("kraken") or {}
