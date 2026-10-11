@@ -12,6 +12,8 @@ STOP_LIVE
 # Balances, positions, order ids and P&L - never in git.
 *.json
 *.jsonl
+# ...except the shipped order delays: reply times only, no ids, prices or addresses
+!data/live_delays_*.jsonl
 *.csv
 *.lock
 *.journal

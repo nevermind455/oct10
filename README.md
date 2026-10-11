@@ -290,7 +290,7 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | `SNIPER_MAX_FILLS_ROUND` / `SNIPER_MAX_SIDE_SHARES` | 20 / 200 | per-round caps |
 | `MIN_BUY_PRICE` / `MAX_BUY_PRICE` | 0.05 / 0.95 | the asks the bot may buy |
 | `TRADE_LAST_SECONDS` / `MIN_SECONDS_TO_EXPIRY` | 300 / 10 | the whole round, down to 10s left |
-| `SNIPER_DELAY_SOURCE` | live | paper delays drawn from >= 30 real live orders in `live_sniper.jsonl` |
+| `SNIPER_DELAY_SOURCE` / `SNIPER_DELAY_JOURNAL` | live / `data/live_delays_2026-10-04.jsonl` | paper delays drawn from >= 30 real live orders: the shipped copy of 238 canary orders (reply times only, no ids, prices or addresses) |
 | `SNIPER_LIVE_CANARY` | 1 | `--live` sends real orders (with `SNIPER_ONLY=1`) |
 | `ASSUMED_MATCH_DELAY_SECONDS` | 5 | Polymarket's taker delay; live refuses to start without it |
 | `USER_WS` / `RECONCILE` | on / auto | live fills come from the private channel, with REST as backup |
@@ -364,7 +364,7 @@ LAB_DATA=/opt/lab_data nice -n 19 .venv/bin/python sniper_dynexec.py
 Paper runs fine on a PC; live belongs on the VPS (a home link is slow to the CLOB, and some ISPs hijack polymarket.com's DNS).
 
 1. Make `.env` from `.env.example`, with three changes:
-   - `SNIPER_DELAY_SOURCE=model`, unless you copied `live_sniper.jsonl` from the VPS.
+   - Nothing for the delays: `SNIPER_DELAY_SOURCE=live` reads the shipped `data/live_delays_2026-10-04.jsonl`.
    - `SNIPER_LIVE_CANARY=0`.
    - `PAPER_LEDGER_PATH`, `PAPER_ACCOUNT_PATH`, `PAPER_AUDIT_PATH` and `BOT_LOCK_PATH` pointing to a folder outside OneDrive. Its sync can lock a file at the moment the ledger replaces it.
 2. Double-click `run_paper.cmd`, or run `python run.py --paper --dash` in Windows Terminal. Ctrl+C stops it.
