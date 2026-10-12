@@ -95,6 +95,12 @@ def refusal_kind(reason) -> str:
         return "book at the modelled arrival not seen yet (paper measurement gap, not a price move)"
     if "execution interval" in r or "cutoff" in r or "time remaining" in r:
         return "outside trade window (skipped instead since f8bbb2e)"
+    if "order price cap" in r and "floor" in r:
+        return "price cap at the price floor (skipped instead since 2026-10-12)"
+    if "best ask" in r and "min_buy_price" in r:
+        # the decision already skips an ask outside the band (6ab06b6): this one
+        # fell under MIN_BUY_PRICE during the order's flight
+        return "the ask fell under MIN_BUY_PRICE by arrival (normal)"
     if "floor" in r or "min_buy_price" in r or "maximum buy price" in r:
         return "outside price band (skipped instead since 6ab06b6)"
     if "order signing failed" in r:

@@ -349,6 +349,17 @@ class Gate(I.PaperIOCBase):
         self.assertEqual(r1["bankroll"], 1000.0)
         self.assertAlmostEqual(r2["bankroll"], 1000.0 - r1["amount"], places=2)
 
+    def test_a_cap_at_the_price_floor_is_skipped_not_sent(self):
+        """10-12 VPS run: 14 orders with ask 0.05 = MIN_BUY_PRICE and cap 0.05
+        were refused by the broker ("order price cap 0.05 is at or below the
+        floor 0.05"); live would have bought at the floor."""
+        self.make(SNIPER_FAIR="0", SNIPER_SLIP="0")
+        self.broker.min_buy_price = 0.05
+        r = self.order("UP", [(0.05, 200)], mid=0.05, move_bp=5.0)
+        self.assertEqual((r["result"], r["reason"], r["cap"]), ("skipped", "price cap at the price floor", 0.05))
+        r = self.order("UP", [(0.06, 200)], mid=0.06, move_bp=5.0)
+        self.assertEqual(r["result"], "filled")
+
     def test_kelly_orders_carry_nothing(self):
         r = self.order("UP", [(0.41, 3)], mid=0.40, move_bp=5.0)        # only 3 shares at the ask, then nothing
         self.assertIn(r["result"], ("filled", "refused"))

@@ -1526,7 +1526,9 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved 2026-10-11 (operator's audit): hardened parsing of feed prices and
     # timestamps, order tasks drained on stop(), Kelly stakes trimmed to the side's round
     # room at the cap (skip "kelly room under venue minimum at price cap").
-    "sniper_mode.py": "2fd97aed3769fd95793bd8dd0143d1bbae46077ec951cfdba813a66275edf708",
+    # Re-approved 2026-10-12: a price cap at or below MIN_BUY_PRICE is skipped at the
+    # decision ("price cap at the price floor") - the paper broker refused it, live would buy.
+    "sniper_mode.py": "6ba6f269cb50b8179c26043da706490d7ead86ce2ac2d00e20745c138fa6df94",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.

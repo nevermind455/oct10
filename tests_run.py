@@ -601,6 +601,12 @@ class SniperCheckToolTests(unittest.TestCase):
         self.assertIn("measurement gap",
                       sc.refusal_kind("unknown book state at the modelled arrival: the feed has not yet passed"))
 
+    def test_price_band_refusals_split_by_when_they_happen(self):
+        import sniper_check as sc
+        self.assertEqual(sc.refusal_kind("best ask 0.04 is below MIN_BUY_PRICE 0.05"),
+                         "the ask fell under MIN_BUY_PRICE by arrival (normal)")
+        self.assertIn("skipped instead", sc.refusal_kind("order price cap 0.05 is at or below the floor 0.05"))
+
     def test_the_cap_is_read_from_the_orders(self):
         import sniper_check as sc
         rows = [{"cap": 0.52, "ask_seen": 0.47}, {"cap": 0.60, "ask_seen": 0.55}, {"cap": 0.95, "ask_seen": 0.93}]

@@ -2701,6 +2701,12 @@ class Sniper:
                 row.update(ask_seen=ask)
                 return self._skip("ask not below fair value", row)
             cap = min(cap, limit)
+        if lo > 0 and cap <= lo + 1e-9:
+            # An ask at MIN_BUY_PRICE whose ceiling is that same price: the paper
+            # broker refuses a cap at or below the floor ("order price cap ... is at
+            # or below the floor") while live would buy there. Neither should send it.
+            row.update(ask_seen=ask, cap=cap)
+            return self._skip("price cap at the price floor", row)
         target = carry = None
         kelly = False
         if self.s.order_type == "FAK":
