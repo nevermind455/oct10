@@ -885,7 +885,7 @@ class Settings:
         # SNIPER_MAX_SIDE_SHARES in the round (live: also the canary's per-order cap);
         # under the venue's 5-share minimum it skips. Replaces the fixed SNIPER_SHARES + carry.
         self.kelly = _env_bool("SNIPER_KELLY", True)
-        self.kelly_fraction = _env_float("SNIPER_KELLY_FRACTION", 1.0)       # full Kelly (0.25 earlier on 2026-10-11)
+        self.kelly_fraction = _env_float("SNIPER_KELLY_FRACTION", 0.5)       # half Kelly since 2026-10-13 (full before; 0.25 earlier on 10-11)
         self.stale_ms = _env_float("SNIPER_STALE_MS", 2000)
         # Which book a paper order fills against. "exchange": the book as it
         # stood at the modelled match instant on the venue's own clock (the

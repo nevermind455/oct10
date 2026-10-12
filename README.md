@@ -74,7 +74,7 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
     rules used by execution, including its exponent. A first version
     priced from Coinbase against the round's start price disagreed with the market by
     10-30c and bought the losing side; it was replaced the same day.
-  - **Kelly size (2026-10-11).** Each FAK order buys `SNIPER_KELLY_FRACTION` (1: full Kelly; ¼ before) of the
+  - **Kelly size (2026-10-11).** Each FAK order buys `SNIPER_KELLY_FRACTION` (0.5: half Kelly since 2026-10-13; full before, ¼ at first) of the
     Kelly bet on that fair value: f* = (fair − p) / (1 − p), p the ask plus its fee,
     times the account's cash (live: the sender's balance less what its orders in flight
     reserve, read on every decision; paper: re-read every 5s off the order path, each
@@ -323,7 +323,7 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | `SNIPER_ORDER_TYPE` | FAK | IOC limit: partial fills kept, the rest cancelled; FOK is all-or-nothing |
 | `SNIPER_SLIP` | 0.05 | limit = the ask seen + 0.05, clipped at `MAX_BUY_PRICE`: never pays more |
 | `SNIPER_FAIR` / `SNIPER_FAIR_MARGIN` | 1 / 0.01 | every buy at or under the market-anchored fair value − fee − margin (the limit capped there) |
-| `SNIPER_KELLY` / `SNIPER_KELLY_FRACTION` | 1 / 1 | FAK size: full Kelly on the fair value from the account's cash, from 5 shares, no per-order cap (side cap 200 per round) |
+| `SNIPER_KELLY` / `SNIPER_KELLY_FRACTION` | 1 / 0.5 | FAK size: half Kelly on the fair value from the account's cash, from 5 shares, no per-order cap (side cap 200 per round) |
 | `SNIPER_FAIR_VOL_S` / `SNIPER_FAIR_FEE_RATE` | 300 / 0.07 | the volatility window (s) and the taker fee rate the fair limit uses |
 | `SNIPER_COOLDOWN_MS` | 300 | per side: an order starts a pause on ITS side only, from its submission |
 | `SNIPER_MIN_LEFT_S` | 10 | no order with fewer seconds left in the round |

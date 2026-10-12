@@ -69,7 +69,9 @@ FROZEN_SPEC = (
     ("fair", "SNIPER_FAIR", True, "fair value", "{}"),
     ("fair_margin", "SNIPER_FAIR_MARGIN", 0.01, "fair margin", "${:.2f}"),
     ("kelly", "SNIPER_KELLY", True, "kelly size", "{}"),
-    ("kelly_fraction", "SNIPER_KELLY_FRACTION", 1.0, "kelly fraction", "{:g}"),
+    # 2026-10-13, the operator's choice: half Kelly (was 1.0) - about 3/4 of full Kelly's
+    # long-run growth for about half its swings while the fair value is still unproven.
+    ("kelly_fraction", "SNIPER_KELLY_FRACTION", 0.5, "kelly fraction", "{:g}"),
 )
 
 

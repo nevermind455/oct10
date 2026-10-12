@@ -499,17 +499,17 @@ class Settings(unittest.TestCase):
             s = S.Settings()
             self.assertEqual(X.spec_violations(s, 25), [])
         self.assertEqual((s.fair, s.fair_margin, s.kelly, s.kelly_fraction, s.max_target_shares),
-                         (True, 0.01, True, 1.0, 20.0))
+                         (True, 0.01, True, 0.5, 20.0))
         spec = dict((a, v) for a, _n, v, _l, _f in X.FROZEN_SPEC)
         self.assertEqual((spec["fair"], spec["fair_margin"], spec["kelly"], spec["kelly_fraction"]),
-                         (True, 0.01, True, 1.0))
+                         (True, 0.01, True, 0.5))
         for line in (s.lines()[0], s.lines(live=True)[0]):
             self.assertIn("market-anchored fair value - fee - $0.01", line)
-            self.assertIn("size 1 Kelly from 5 sh, no per-order cap (<= 200 sh/side per round)", line)
+            self.assertIn("size 0.5 Kelly from 5 sh, no per-order cap (<= 200 sh/side per round)", line)
 
     def test_live_refuses_them_off_or_changed(self):
         for kw, word in (({"SNIPER_FAIR": "0"}, "fair value"), ({"SNIPER_FAIR_MARGIN": "0.02"}, "fair margin"),
-                         ({"SNIPER_KELLY": "0"}, "kelly size"), ({"SNIPER_KELLY_FRACTION": "0.5"}, "kelly fraction")):
+                         ({"SNIPER_KELLY": "0"}, "kelly size"), ({"SNIPER_KELLY_FRACTION": "1"}, "kelly fraction")):
             with self.subTest(kw), self.env(SNIPER_ONLY="1", **kw):
                 bad = X.spec_violations(S.Settings(), 25)
             self.assertTrue(any(word in v for v in bad), bad)
