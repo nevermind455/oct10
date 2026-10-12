@@ -714,6 +714,70 @@ class DualSocketTests(unittest.IsolatedAsyncioTestCase):
 
 
 # =========================================================================== bench_network: the race and the budget
+class FeedRaceTests(unittest.TestCase):
+    """bench_network's feed race: each candidate feed's parser, and the report."""
+
+    def test_iso_times_with_nanoseconds(self):
+        import bench_network as N
+        self.assertAlmostEqual(N.iso_ms("2026-10-12T20:32:50.714964855Z"), 1791837170714.965, places=2)
+        self.assertAlmostEqual(N.iso_ms("2026-10-12T20:32:50Z"), 1791837170000.0)
+        self.assertIsNone(N.iso_ms("yesterday"))
+
+    def test_coinbase_level2_keeps_the_best_bid_and_ask(self):
+        import bench_network as N
+        b = N.CoinbaseL2()
+        snap = {"channel": "l2_data", "timestamp": "2026-10-12T20:32:50.000Z", "events": [
+            {"type": "snapshot", "product_id": "BTC-USD", "updates": [
+                {"side": "bid", "price_level": "60000.00", "new_quantity": "1"},
+                {"side": "bid", "price_level": "59999.00", "new_quantity": "2"},
+                {"side": "offer", "price_level": "60001.00", "new_quantity": "1"},
+                {"side": "offer", "price_level": "60002.00", "new_quantity": "3"}]}]}
+        mid, ex = b.parse(snap)
+        self.assertEqual((mid, ex), (60000.5, N.iso_ms("2026-10-12T20:32:50.000Z")))
+        upd = lambda *u: {"channel": "l2_data", "timestamp": "2026-10-12T20:32:51Z", "events": [
+            {"type": "update", "product_id": "BTC-USD",
+             "updates": [{"side": s, "price_level": p, "new_quantity": q} for s, p, q in u]}]}
+        self.assertEqual(b.parse(upd(("offer", "60001.00", "0")))[0], 60001.0)        # best ask gone: next level
+        self.assertEqual(b.parse(upd(("bid", "60000.50", "4")))[0], 60001.25)         # a better bid, no trade
+        self.assertIsNone(b.parse({"channel": "heartbeats"}))
+        self.assertIsNone(N.CoinbaseL2().parse(upd(("bid", "60000.00", "1"))))     # one side only: no mid
+
+    def test_binance_and_chainlink_messages(self):
+        import bench_network as N
+        self.assertEqual(N.parse_binance_book({"e": "bookTicker", "b": "60000.0", "a": "60002.0", "E": 1791837170714}),
+                         (60001.0, 1791837170714.0))
+        self.assertEqual(N.parse_binance_book({"b": "60000.0", "a": "60002.0"}), (60001.0, None))   # spot: no E
+        self.assertIsNone(N.parse_binance_book({"result": None, "id": 1}))
+        msg = {"topic": "crypto_prices_chainlink", "type": "update", "timestamp": 1791837170800,
+               "payload": {"symbol": "btc/usd", "timestamp": 1791837170714, "value": 60001.25}}
+        self.assertEqual(N.parse_chainlink(msg), (60001.25, 1791837170714.0))
+        dump = {"topic": "crypto_prices_chainlink", "type": "update",
+                "payload": {"symbol": "btc/usd", "data": [{"timestamp": 1, "value": 2}]}}
+        self.assertIsNone(N.parse_chainlink(dump))                                # the history dump on connect
+        self.assertIsNone(N.parse_chainlink({**msg, "payload": {**msg["payload"], "symbol": "eth/usd"}}))
+        self.assertIsNone(N.parse_chainlink({**msg, "topic": "crypto_prices"}))
+        self.assertEqual(json.loads(N.RTDS_SUBSCRIBE["subscriptions"][0]["filters"]), {"symbol": "btc/usd"})
+
+    def test_the_report_compares_every_feed_with_the_ticker(self):
+        import bench_network as N
+        sig = {"coinbase": [(1_000, 1), (5_000, -1)], "binance_fut": [(940, 1), (5_030, -1), (9_000, 1)],
+               "chainlink": [(1_400, 1)]}
+        r = N.race_summary(60.0, {"coinbase": 200, "binance_fut": 4000, "chainlink": 60},
+                           {"binance_fut": [100.0, 120.0]}, sig, {"cb_level2": "SSLError: blocked"},
+                           0.5, 250.0, 300.0)
+        bf, cl = r["feeds"]["binance_fut"], r["feeds"]["chainlink"]
+        self.assertEqual((bf["same_move"], bf["first"], bf["later"], bf["only_this"]), (2, 1, 1, 1))
+        self.assertEqual((bf["ahead_ms"]["p50"], bf["behind_ms"]["p50"]), (60.0, 30.0))
+        self.assertEqual((cl["same_move"], cl["first"], cl["later"]), (1, 0, 1))
+        text = "\n".join(N.feed_race_table(r))
+        for part in ("Binance futures BTCUSDT", "FIRST 1 (ahead p50 60ms)", "later 1 (behind p50 30ms)",
+                     "Coinbase full book (level2)", "FAILED: SSLError: blocked", "Chainlink BTC/USD"):
+            self.assertIn(part, text)
+        only = N.table({"host": "vps", "when": "now", "feed_race": r})
+        self.assertIn("feed race (60s", only)
+        self.assertNotIn("latency budget", only)                                  # --feed-race-only: the race alone
+
+
 class BenchNetworkTests(unittest.TestCase):
     def test_one_move_is_one_episode_per_side(self):
         import bench_network as N

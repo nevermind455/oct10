@@ -332,6 +332,233 @@ async def race(seconds: float) -> dict:
             "coinbase_lead_ms": m["a_lead_ms"], "binance_lead_ms": m["b_lead_ms"]}
 
 
+# ------------------------------------------------------------- the feed race
+# Candidate BTC feeds raced against today's trigger (the Coinbase ticker), all
+# public, no keys: which shows a move first on this box? Measurement only -
+# nothing here is wired to the bot.
+COINBASE_AT_WS = "wss://advanced-trade-ws.coinbase.com"          # Advanced Trade: level2 is public
+BINANCE_FUT_WS = "wss://fstream.binance.com/ws/btcusdt@bookTicker"  # USD-M perpetual: futures lead spot
+RTDS_WS = "wss://ws-live-data.polymarket.com"                     # Polymarket's real-time data socket
+RTDS_PING_S = 5.0                                                 # its client sends the text "ping" this often
+RTDS_SUBSCRIBE = {"action": "subscribe", "subscriptions": [
+    {"topic": "crypto_prices_chainlink", "type": "*",
+     "filters": json.dumps({"symbol": "btc/usd"}, separators=(",", ":"))}]}
+CB_L2_SUBSCRIBE = [{"type": "subscribe", "product_ids": ["BTC-USD"], "channel": "level2"},
+                   {"type": "subscribe", "product_ids": ["BTC-USD"], "channel": "heartbeats"}]
+RACE_FEEDS = ("coinbase", "cb_level2", "binance_fut", "binance", "chainlink")
+RACE_LABEL = {"coinbase": "Coinbase ticker (today's trigger)", "cb_level2": "Coinbase full book (level2)",
+              "binance_fut": "Binance futures BTCUSDT", "binance": "Binance spot BTCUSDT",
+              "chainlink": "Chainlink BTC/USD (Polymarket's settlement price)"}
+
+
+def iso_ms(ts) -> float | None:
+    """An ISO-8601 UTC time with any number of fractional digits (Coinbase
+    sends nanoseconds) as epoch ms, or None."""
+    if not isinstance(ts, str) or not ts:
+        return None
+    import re
+    from datetime import datetime
+    m = re.fullmatch(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)?", ts.strip())
+    if not m:
+        return None
+    frac = (m.group(2) or "0")[:6].ljust(6, "0")
+    zone = m.group(3) or "Z"
+    try:
+        dt = datetime.fromisoformat(f"{m.group(1)}.{frac}{'+00:00' if zone == 'Z' else zone}")
+    except ValueError:
+        return None
+    return dt.timestamp() * 1000.0
+
+
+class CoinbaseL2:
+    """Coinbase Advanced Trade level2 for BTC-USD: the whole book from its
+    snapshot, then every change - so the mid moves on quote changes too, not
+    only on trades (the ticker's blind spot). parse() -> (mid, exchange ms)."""
+
+    def __init__(self) -> None:
+        self.bids: dict = {}
+        self.asks: dict = {}
+        self.bb = self.ba = None
+
+    def parse(self, d):
+        if not isinstance(d, dict) or d.get("channel") != "l2_data":
+            return None
+        full = False
+        for ev in d.get("events") or ():
+            if not isinstance(ev, dict) or ev.get("product_id", "BTC-USD") != "BTC-USD":
+                continue
+            if ev.get("type") == "snapshot":
+                self.bids, self.asks, full = {}, {}, True
+            for u in ev.get("updates") or ():
+                try:
+                    px, qty = float(u["price_level"]), float(u["new_quantity"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                side = u.get("side")
+                book = self.bids if side == "bid" else self.asks if side in ("offer", "ask") else None
+                if book is None:
+                    continue
+                if qty > 0:
+                    book[px] = qty
+                    if not full:
+                        if book is self.bids and (self.bb is None or px > self.bb):
+                            self.bb = px
+                        elif book is self.asks and (self.ba is None or px < self.ba):
+                            self.ba = px
+                else:
+                    book.pop(px, None)
+                    if not full and px == self.bb:
+                        self.bb = max(self.bids) if self.bids else None
+                    elif not full and px == self.ba:
+                        self.ba = min(self.asks) if self.asks else None
+        if full:
+            self.bb = max(self.bids) if self.bids else None
+            self.ba = min(self.asks) if self.asks else None
+        if self.bb is None or self.ba is None or self.bb >= self.ba:
+            return None
+        return (self.bb + self.ba) / 2.0, iso_ms(d.get("timestamp"))
+
+
+def parse_binance_book(d):
+    """Binance bookTicker (spot or futures) -> (mid, event ms or None)."""
+    try:
+        mid = (float(d["b"]) + float(d["a"])) / 2.0
+    except (KeyError, TypeError, ValueError):
+        return None
+    e = d.get("E")
+    return mid, (float(e) if isinstance(e, (int, float)) and not isinstance(e, bool) else None)
+
+
+def parse_chainlink(d):
+    """Polymarket RTDS crypto_prices_chainlink -> (BTC/USD value, its ms).
+    The initial history dump (payload.data) and anything else -> None."""
+    if not isinstance(d, dict) or d.get("topic") != "crypto_prices_chainlink":
+        return None
+    p = d.get("payload")
+    if not isinstance(p, dict) or str(p.get("symbol", "")).lower() != "btc/usd":
+        return None
+    v = p.get("value")
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not (v > 0):
+        return None
+    ts = p.get("timestamp")
+    return float(v), (float(ts) if isinstance(ts, (int, float)) and not isinstance(ts, bool) else None)
+
+
+def parse_coinbase_ticker(d):
+    import sniper_mode as S
+    if not isinstance(d, dict) or d.get("type") != "ticker":
+        return None
+    mid = S.coinbase_mid(d)
+    return None if mid is None else (mid, iso_ms(d.get("time")))
+
+
+def race_summary(seconds, ticks, lags, sig, errors, k, window, cooldown, baseline="coinbase") -> dict:
+    """Each feed's activity, and each candidate against the baseline: the same
+    move on both (episodes paired within 1s), who showed it first, by how much."""
+    eps = {n: episodes(sig.get(n, []), cooldown) for n in RACE_FEEDS}
+    feeds = {}
+    for n in RACE_FEEDS:
+        f = {"ticks": ticks.get(n, 0), "per_s": round(ticks.get(n, 0) / seconds, 2) if seconds else None,
+             "exchange_to_receipt_ms": stats(lags.get(n, [])), "moves": len(eps[n])}
+        if n in errors:
+            f["error"] = errors[n]
+        if n != baseline:
+            m = match_episodes(eps[n], eps[baseline])
+            f.update(same_move=m["matched"], first=m["a_first"], later=m["b_first"], tie=m["tie"],
+                     only_this=m["only_a"], only_baseline=m["only_b"],
+                     ahead_ms=m["a_lead_ms"], behind_ms=m["b_lead_ms"])
+        feeds[n] = f
+    return {"seconds": seconds, "k_bp": k, "window_ms": window, "baseline": baseline, "feeds": feeds}
+
+
+async def feed_race(seconds: float) -> dict:
+    """Every RACE_FEEDS feed at once for `seconds`, each through the sniper's
+    own rule (the frozen spec's k_bp / window) on this box's receipt clock.
+    A feed that cannot connect is reported, the others carry on."""
+    import websockets
+    import exec_latency
+    import sniper_mode as S
+    spec = {a: v for a, _n, v, _l, _f in exec_latency.FROZEN_SPEC}
+    k, window, cooldown = float(spec["k_bp"]), float(spec["window_ms"]), float(spec["cooldown_ms"])
+    trig = {n: S.Trigger(k, window) for n in RACE_FEEDS}
+    sig = {n: [] for n in RACE_FEEDS}
+    lags = {n: [] for n in RACE_FEEDS}
+    ticks, errors = collections.Counter(), {}
+    end = time.perf_counter() + seconds
+    l2 = CoinbaseL2()
+
+    async def pump(name, url, subs, parse, ping_s=None):
+        try:
+            async with websockets.connect(url, open_timeout=10, compression=None, max_size=None) as ws:
+                for sub in subs:
+                    await ws.send(json.dumps(sub))
+                pinger = None
+                if ping_s:
+                    async def ping():
+                        while True:
+                            await asyncio.sleep(ping_s)
+                            await ws.send("ping")
+                    pinger = asyncio.create_task(ping())
+                try:
+                    while time.perf_counter() < end:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), max(0.05, end - time.perf_counter()))
+                        except asyncio.TimeoutError:
+                            break
+                        t_ms, wall_ms = time.monotonic() * 1000.0, time.time() * 1000.0
+                        try:
+                            d = json.loads(raw)
+                        except ValueError:
+                            continue                        # "pong" and other text frames
+                        got = parse(d)
+                        if got is None:
+                            continue
+                        mid, ex = got
+                        ticks[name] += 1
+                        if ex is not None:
+                            lags[name].append(wall_ms - ex)
+                        direction, _r = trig[name].update(t_ms, mid)
+                        if direction is not None:
+                            sig[name].append((t_ms, direction))
+                finally:
+                    if pinger is not None:
+                        pinger.cancel()
+        except Exception as exc:  # noqa: BLE001 - one feed down: reported, the race goes on
+            errors[name] = f"{type(exc).__name__}: {exc}"[:160]
+
+    await asyncio.gather(
+        pump("coinbase", S.COINBASE_WS_URL, [S.COINBASE_SUBSCRIBE], parse_coinbase_ticker),
+        pump("cb_level2", COINBASE_AT_WS, CB_L2_SUBSCRIBE, l2.parse),
+        pump("binance_fut", BINANCE_FUT_WS, [], parse_binance_book),
+        pump("binance", BINANCE_BOOK_WS, [], parse_binance_book),
+        pump("chainlink", RTDS_WS, [RTDS_SUBSCRIBE], parse_chainlink, ping_s=RTDS_PING_S))
+    return race_summary(seconds, ticks, lags, sig, errors, k, window, cooldown)
+
+
+def feed_race_table(r: dict) -> list[str]:
+    f = lambda v: "--" if v is None else f"{v:.0f}"  # noqa: E731
+    out = [f"feed race ({r['seconds']:g}s, {r['k_bp']:g}bp / {r['window_ms']:g}ms on every feed, this box's clock):"
+           f" which feed shows a BTC move first, against the Coinbase ticker the bot trades on today"]
+    for n in RACE_FEEDS:
+        x = r["feeds"].get(n) or {}
+        head = f"  {RACE_LABEL[n]:48s}"
+        if x.get("error") and not x.get("ticks"):
+            out.append(f"{head} FAILED: {x['error']}")
+            continue
+        lag = (x.get("exchange_to_receipt_ms") or {}).get("p50")
+        out.append(f"{head} {x['per_s']:>6} updates/s  exchange->here p50 {f(lag)}ms  moves {x['moves']}"
+                   + (f"  (stopped: {x['error']})" if x.get("error") else ""))
+        if n == r["baseline"]:
+            continue
+        ahead, behind = x.get("ahead_ms") or {}, x.get("behind_ms") or {}
+        out.append(f"      same move as the ticker {x['same_move']}: FIRST {x['first']}"
+                   f" (ahead p50 {f(ahead.get('p50'))}ms)  later {x['later']} (behind p50 {f(behind.get('p50'))}ms)"
+                   f"  tie {x['tie']}; only here {x['only_this']}, only on the ticker {x['only_baseline']}")
+    out.append("  A feed worth adding is FIRST on most shared moves, by tens of ms, and also catches moves the "
+               "ticker misses (only here). exchange->here includes this box's clock offset to each venue.")
+    return out
+
+
 def budget(res: dict, hold_ms: float = VENUE_HOLD_MS, server_ms: float = 25.0, in_process_ms: float = 0.4) -> dict | None:
     """BTC match on Coinbase -> our order matched at Polymarket, from the
     measured parts (p50s). None when a part is missing."""
@@ -348,8 +575,13 @@ def budget(res: dict, hold_ms: float = VENUE_HOLD_MS, server_ms: float = 25.0, i
             "btc_to_match_ms": feed_true + in_process_ms + one_way + hold_ms + server_ms}
 
 
-async def main_async(n: int, feed_s: float = 60.0, race_s: float = 120.0) -> dict:
+async def main_async(n: int, feed_s: float = 60.0, race_s: float = 120.0, feed_race_s: float = 0.0,
+                     feed_race_only: bool = False) -> dict:
     res = {"when": time.strftime("%Y-%m-%d %H:%M:%S %z"), "host": socket.gethostname()}
+    if feed_race_only:
+        progress(f"feed race: {', '.join(RACE_FEEDS)} ({feed_race_s:g}s)")
+        res["feed_race"] = await feed_race(feed_race_s)
+        return res
     progress("handshakes")
     for name, host in (("clob", "clob.polymarket.com"), ("poly_ws", "ws-subscriptions-clob.polymarket.com"),
                        ("binance", "stream.binance.com"), ("coinbase", "ws-feed.exchange.coinbase.com")):
@@ -373,6 +605,12 @@ async def main_async(n: int, feed_s: float = 60.0, race_s: float = 120.0) -> dic
             res["race"] = await race(race_s)
         except Exception as exc:  # noqa: BLE001
             res["race"] = {"error": f"{type(exc).__name__}: {exc}"}
+    if feed_race_s > 0:
+        progress(f"feed race: {', '.join(RACE_FEEDS)} ({feed_race_s:g}s)")
+        try:
+            res["feed_race"] = await feed_race(feed_race_s)
+        except Exception as exc:  # noqa: BLE001
+            res["feed_race"] = {"error": f"{type(exc).__name__}: {exc}"}
     res["budget"] = budget(res)
     return res
 
@@ -380,6 +618,9 @@ async def main_async(n: int, feed_s: float = 60.0, race_s: float = 120.0) -> dic
 def table(res: dict) -> str:
     f = lambda v: "--" if v is None else f"{v:.1f}"  # noqa: E731
     out = [f"network from {res['host']} at {res['when']}"]
+    fr = res.get("feed_race")
+    if fr is not None and "budget" not in res:                  # --feed-race-only
+        return "\n".join(out + ([f"feed race: {fr['error']}"] if "error" in fr else feed_race_table(fr)))
     for name in ("clob", "poly_ws", "binance", "coinbase"):
         h = res.get(f"{name}_handshake") or {}
         out.append(f"  {name:8s} dns {f(h.get('dns_ms'))}ms  tcp {f(h.get('tcp_ms'))}ms  tls {f(h.get('tls_ms'))}ms"
@@ -436,6 +677,9 @@ def table(res: dict) -> str:
                    f"{r['binance_first']}, tie {r['tie']}; only Coinbase {r['only_coinbase']}, only Binance {r['only_binance']}")
         line("  Coinbase ahead by", r.get("coinbase_lead_ms"))
         line("  Binance ahead by", r.get("binance_lead_ms"))
+    fr = res.get("feed_race")
+    if fr is not None:
+        out.extend([f"feed race: {fr['error']}"] if "error" in fr else feed_race_table(fr))
     bu = res.get("budget")
     if bu:
         out.append("latency budget (p50s): BTC match on Coinbase -> our order matched at Polymarket")
@@ -454,9 +698,15 @@ def main(argv=None) -> int:
     ap.add_argument("--n", type=int, default=50)
     ap.add_argument("--feed-s", type=float, default=60.0, help="seconds of the Coinbase feed to measure")
     ap.add_argument("--race-s", type=float, default=120.0, help="seconds of the Coinbase vs Binance race (0 = skip)")
+    ap.add_argument("--feed-race-s", type=float, default=0.0,
+                    help="seconds racing the Coinbase ticker against its full book, Binance futures/spot and "
+                         "Polymarket's Chainlink price (0 = skip)")
+    ap.add_argument("--feed-race-only", action="store_true", help="run only the feed race")
     ap.add_argument("--json", default=None)
     args = ap.parse_args(argv)
-    res = asyncio.run(main_async(args.n, args.feed_s, args.race_s))
+    if args.feed_race_only and args.feed_race_s <= 0:
+        ap.error("--feed-race-only needs --feed-race-s > 0")
+    res = asyncio.run(main_async(args.n, args.feed_s, args.race_s, args.feed_race_s, args.feed_race_only))
     print(table(res))
     if args.json:
         pathlib.Path(args.json).write_text(json.dumps(res, indent=1, default=str), encoding="utf-8")
