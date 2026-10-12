@@ -366,12 +366,17 @@ def t_book_history_reads_the_book_as_it_stood_at_a_venue_time():
     b.apply_price_changes([{"asset_id": "up", "price": 0.50, "size": 0, "side": "SELL"}], ts_ms=T + 100,
                           require_exchange_ts=False)
     asks = lambda t: (lambda v: v[0].asks if v[0] is not None else v[1]["why"])(b.view_at("up", t))
-    check("before the change: the snapshot's book; at/after it: the changed book",
-          asks(T + 50) == ((0.50, 10.0), (0.53, 50.0)) and asks(T + 100) == ((0.53, 50.0),), f"{asks(T + 50)} {asks(T + 100)}")
+    check("before the change: the snapshot's book", asks(T + 50) == ((0.50, 10.0), (0.53, 50.0)), str(asks(T + 50)))
+    # 10-12 audit: messages can share a millisecond stamp, so the newest stamp
+    # itself is final only once the feed carries something stamped after it.
+    check("the change's own instant is unknown until the feed passes it",
+          "not yet passed" in str(asks(T + 100)), str(asks(T + 100)))
     check("a time the feed has not yet passed is not answered (a later change could still arrive)",
           "not yet passed" in str(asks(T + 150)), str(asks(T + 150)))
     b.note_exchange_ts(T + 200)                                   # e.g. a trade message on the same feed
     check("...once anything stamped later arrives, it is", asks(T + 150) == ((0.53, 50.0),), str(asks(T + 150)))
+    check("...and so is the change's own instant: the changed book", asks(T + 100) == ((0.53, 50.0),),
+          str(asks(T + 100)))
     check("before the history starts: unknown", "does not reach back" in str(asks(T - 10)), str(asks(T - 10)))
     first = b.view_at("up", T + 50)[0]
     b.apply_price_changes([{"asset_id": "up", "price": 0.53, "size": 1, "side": "SELL"}], ts_ms=T + 300,
@@ -379,6 +384,7 @@ def t_book_history_reads_the_book_as_it_stood_at_a_venue_time():
     check("later updates never alter an earlier state", b.view_at("up", T + 50)[0].asks == first.asks,
           str(b.view_at("up", T + 50)[0].asks))
     b.desync_all("disconnect")                                    # gap stamped at the newest time seen (T+300)
+    b.note_exchange_ts(T + 305)                                   # a later message passes the gap's instant
     check("a feed gap makes the time after it unknown", "gap" in str(asks(T + 300)), str(asks(T + 300)))
     check("...but the time before it is still known", asks(T + 250) == ((0.53, 50.0),), str(asks(T + 250)))
     check("resync refuses a snapshot predating the newest observed venue update",

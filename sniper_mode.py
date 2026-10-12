@@ -1635,11 +1635,33 @@ class Sniper:
             return None
         task = asyncio.get_running_loop().create_task(coro)
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(self._task_done)
         if order:
             self._order_tasks.add(task)
             task.add_done_callback(self._order_tasks.discard)
         return task
+
+    def _task_done(self, task) -> None:
+        self._tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        self.n["task errors"] += 1
+        # An order worker that escaped its own error handling has an uncertain
+        # outcome. Keep existing reservations and prevent another decision.
+        if task in self._order_tasks:
+            self._closing = True
+            kill = getattr(self.live, "kill", None)
+            if kill is not None:
+                kill.trip("order task failed: reconcile before trading")
+        detail = f"{task.get_name()}: {type(exc).__name__}: {exc}"[:240]
+        self._write({"wall": time.time(), "result": "task_error", "reason": detail})
+        try:
+            self.on_event("sniper", detail, "bad")
+        except Exception:
+            self.n["event errors"] += 1
 
     async def stop(self) -> None:
         """Stop auxiliary feeds first, then finish orders before ledger teardown.
@@ -1877,6 +1899,8 @@ class Sniper:
         feeds (the same side) is one order - fired by whichever saw it first.
         Binance's counters keep their old names; a second feed's are suffixed
         with its name."""
+        if self._closing:
+            return
         direction, r = trigger.update(t, mid)
         if direction is None:
             return
@@ -2388,6 +2412,9 @@ class Sniper:
         median) before any of this started. Returns the task that records the
         outcome, or None when the signal was skipped.
         """
+        if self._closing:
+            self._release(side)
+            return None
         start_pc = time.perf_counter_ns()
         t_pc = start_pc if t_pc is None else t_pc
         feed = feed or self.s.primary_feed                              # None: the trigger feed
@@ -2468,6 +2495,9 @@ class Sniper:
         The reply is awaited in the task spawned below. A refusal or
         a halted canary is journalled as a skip: nothing was sent."""
         from sniper_live import Halted, Refused
+        feed = row.get("feed", self.s.primary_feed)
+        gate = self.fresh if feed == "binance" else self.cb_fresh if feed == "coinbase" else None
+        excess = gate.last_excess if gate is not None else None
         try:
             p = self.live.prepare(plan, decided_pc=plan["decided_pc"])
         except (Refused, Halted) as exc:
@@ -2476,6 +2506,12 @@ class Sniper:
             self._skip("live halted" if isinstance(exc, Halted) else "live refused", row)
             self._release(side)
             return None
+        previous_guard = getattr(p, "send_guard", None)
+        def send_guard():
+            if previous_guard is not None:
+                previous_guard()
+            self._check_dispatch_age(plan, gate, excess)
+        p.send_guard = send_guard
         # The bytes go out here, still inside the BTC tick's own step: no
         # event-loop turn between the decision and the wire (None: no warm
         # HTTP/2 connection - the task below then connects and sends).
@@ -2485,6 +2521,32 @@ class Sniper:
             self._spawn(self._shadow(row, plan["token"], plan["other"], plan["cond"],
                                      plan["amount"], plan["cap"], plan["t0"]))
         return task
+
+    def _check_dispatch_age(self, plan, gate, original_excess) -> None:
+        """Recheck the original decision at the transport's write boundary.
+
+        A cold reconnect or durable intent write can take seconds. New book
+        updates and BTC ticks must not make that old signed decision fresh.
+        Reuse the configured freshness limits; never reprice or resize it.
+        """
+        from sniper_live import Refused
+        if self._closing:
+            raise Refused("sniper is shutting down before dispatch")
+        now = time.monotonic()
+        updated = getattr(plan["view"], "updated_mono", None)
+        if updated is not None:
+            age = (now - float(updated)) * 1000.0
+            if not math.isfinite(age) or age < 0 or age > self.s.stale_ms:
+                raise Refused("decision book became stale before dispatch")
+        if gate is not None and gate.enabled:
+            why = gate.why_not(now)
+            if why is not None:
+                raise Refused(why + " before dispatch")
+            elapsed = now * 1000.0 - float(plan["t_ms"])
+            excess = float(original_excess or 0.0)
+            if (not math.isfinite(elapsed) or elapsed < 0
+                    or elapsed > gate.unknown_ms or excess + elapsed > gate.stale_ms):
+                raise Refused("trigger signal became stale before dispatch")
 
     async def _finish_live(self, side, r_bp, row, plan, p, t_pc, started=None) -> None:
         """Send, then journal the venue's answer. Fills count towards the

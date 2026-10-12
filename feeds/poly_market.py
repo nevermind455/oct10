@@ -325,27 +325,39 @@ class PolyMarketFeed(SupervisedFeed):
                 self._request_resync()
         elif et == "tick_size_change":
             tok = str(m.get("asset_id"))
-            self.book.set_tick_size(tok, m.get("new_tick_size"))
-            self.event(f"tick {m.get('old_tick_size')} -> {m.get('new_tick_size')} "
-                       f"on {tok[-6:]}", "warn")
+            if self.book.set_tick_size(tok, m.get("new_tick_size"),
+                                       ts_ms=m.get("timestamp"),
+                                       require_exchange_ts=m.get("timestamp") is not None):
+                self.event(f"tick {m.get('old_tick_size')} -> {m.get('new_tick_size')} "
+                           f"on {tok[-6:]}", "warn")
+            else:
+                self.invalid_messages += 1
+                self.health.detail = "rejected invalid/stale tick-size event"
         elif et == "last_trade_price":
             token = str(m.get("asset_id") or "")
             if token not in self.book.active:
                 self.book.note_inactive_drop()
                 return
             try:
+                if isinstance(m.get("price"), bool) or isinstance(m.get("timestamp"), bool):
+                    raise ValueError("boolean last-trade value")
                 price = float(m.get("price"))
-                timestamp = int(m.get("timestamp")) if m.get("timestamp") is not None else None
+                timestamp = int(m.get("timestamp"))
             except (TypeError, ValueError, OverflowError):
                 self.invalid_messages += 1
                 self.health.detail = "rejected invalid last-trade price"
                 return
-            if not math.isfinite(price) or not 0 < price < 1:
+            if (not math.isfinite(price) or not 0 < price < 1
+                    or not self.book._fresh_exchange_ts(timestamp)):
                 self.invalid_messages += 1
-                self.health.detail = "rejected out-of-range last-trade price"
+                self.health.detail = "rejected out-of-range/stale last-trade price"
                 return
             self.book.note_exchange_ts(timestamp)
             with self._sub_lock:
+                # Discovery can rotate tokens between parsing and assignment.
+                if token not in self._want:
+                    self.book.note_inactive_drop()
+                    return
                 previous = self.last_trade_ts.get(token)
                 if timestamp is not None and previous is not None and timestamp < previous:
                     self.invalid_messages += 1

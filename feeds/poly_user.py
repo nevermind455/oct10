@@ -122,6 +122,7 @@ class FillStore:
         self.late_status = 0
         self.invalid_updates = 0
         self.identity_conflicts = 0
+        self._summary_cache: dict | None = None
 
     def record_trade(self, trade_id, *, order_id=None, asset_id=None, market=None, side=None,
                      price=None, size=None, status="", source="ws",
@@ -144,6 +145,7 @@ class FillStore:
         legs = taker_legs(incoming["asset_id"], maker_orders, incoming["size"])
         paid = _legs_paid(legs)
         with self._lock:
+            self._summary_cache = None
             rec = self.fills.get(tid)
             if rec is None:
                 self.fills[tid] = Fill(
@@ -230,6 +232,7 @@ class FillStore:
             return
         oid = str(order_id).strip()
         with self._lock:
+            self._summary_cache = None
             rec = self.orders.get(oid)
             if rec is None:
                 rec = self.orders[oid] = OrderRec(order_id=oid)
@@ -271,8 +274,10 @@ class FillStore:
     # ------------------------------------------------------------- reads
     def summary(self) -> dict:
         with self._lock:
+            if self._summary_cache is not None:
+                return dict(self._summary_cache)
             counted = [f for f in self.fills.values() if f.counts]
-            return {
+            self._summary_cache = {
                 "fills": len(counted),
                 "seen": len(self.fills),
                 "duplicates_suppressed": self.duplicates,
@@ -287,6 +292,7 @@ class FillStore:
                 "invalid_updates": self.invalid_updates,
                 "identity_conflicts": self.identity_conflicts,
             }
+            return dict(self._summary_cache)
 
     def recent(self, n: int = 20) -> list[Fill]:
         with self._lock:
@@ -300,6 +306,7 @@ class FillStore:
     def note_invalid(self) -> None:
         with self._lock:
             self.invalid_updates += 1
+            self._summary_cache = None
 
 
 class PolyUserFeed(SupervisedFeed):

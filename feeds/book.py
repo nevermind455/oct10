@@ -184,7 +184,7 @@ class BookState:
         token = str(token)
         with self._lock:
             info = {"hwm_ms": self.ts_hwm}
-            if self.ts_hwm is None or self.ts_hwm < venue_ms:
+            if self.ts_hwm is None or self.ts_hwm <= venue_ms:
                 info["why"] = "the feed has not yet passed that time"
                 return None, info
             h = self._hist.get(token)
@@ -199,6 +199,11 @@ class BookState:
                 return None, info
             if e[4] is None:
                 info["why"] = "feed gap (disconnect or resync) at that time"
+                return None, info
+            if e[3] is None:
+                # A REST tuple has receipt time but no exchange timestamp.
+                # It cannot certify the book at an earlier venue instant.
+                info["why"] = "snapshot has no exchange timestamp"
                 return None, info
             info.update(book_ts=e[3], applied_wall=e[2])
             return self._entry_view(token, e), info
@@ -417,7 +422,9 @@ class BookState:
             if require_exchange_ts and not self._fresh_exchange_ts(incoming_ts):
                 self._desync_locked((token,), "delta timestamp refused")
                 return False
-            previous_ts = m.get("ts")
+            # Anonymous REST tuples must not erase the observed venue
+            # watermark; an older WS delta still cannot rewind this book.
+            previous_ts = m.get("seen_ts") or m.get("ts")
             if (incoming_ts is not None and previous_ts is not None
                     and incoming_ts < previous_ts):
                 return False
@@ -488,7 +495,7 @@ class BookState:
                     # discard deltas for a token that is already live.
                     skipped_pending = True
                     continue
-                previous_ts = meta.get("ts")
+                previous_ts = meta.get("seen_ts") or meta.get("ts")
                 if (incoming_ts is not None and previous_ts is not None
                         and incoming_ts < previous_ts):
                     continue
@@ -540,23 +547,37 @@ class BookState:
                 self._record(token, incoming_ts, mono=now_mono, wall=now_wall)
             return bool(touched) or skipped_pending
 
-    def set_tick_size(self, token: str, tick) -> None:
+    def set_tick_size(self, token: str, tick, *, ts_ms=None,
+                      require_exchange_ts: bool = False) -> bool:
         with self._lock:
             if token in self._meta:
+                timestamp = _int(ts_ms)
+                if require_exchange_ts and not self._fresh_exchange_ts(timestamp):
+                    return False
+                meta = self._meta[token]
+                previous = meta.get("tick_ts") or meta.get("seen_ts") or meta.get("ts")
+                if timestamp is not None and previous is not None and timestamp < previous:
+                    return False
                 try:
                     if isinstance(tick, bool):
                         raise ValueError("boolean tick")
                     parsed = float(tick)
                 except (TypeError, ValueError, OverflowError):
-                    return
+                    return False
                 if not math.isfinite(parsed) or parsed <= 0 or parsed >= 1:
-                    return
-                self._meta[token]["tick"] = parsed
+                    return False
+                self._observe_locked((token,))
+                meta["tick"] = parsed
+                if timestamp is not None:
+                    meta["tick_ts"] = timestamp
+                    self._note_ts(timestamp)
                 # Must invalidate: view() is cached on this counter, and a
                 # stale tick size gets orders rejected by the venue.
                 self._dirty[token] = self._dirty.get(token, 0) + 1
                 if self._meta[token].get("synced"):
-                    self._record(token, None)
+                    self._record(token, timestamp if timestamp is not None else meta.get("ts"))
+                return True
+            return False
 
     # --------------------------------------------------------------- reads
     def view(self, token: str) -> BookView:

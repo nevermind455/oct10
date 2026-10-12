@@ -613,6 +613,7 @@ class Runtime:
     trade_rows: list = dataclasses.field(default_factory=list)
     tasks: list = dataclasses.field(default_factory=list)
     sniper_task: asyncio.Task | None = None
+    task_failure: BaseException | None = None
     clock_detail: str = "not checked"
     clock_ok: bool | None = None
     started: float = dataclasses.field(default_factory=time.time)
@@ -1031,6 +1032,10 @@ async def run_runtime(rt: Runtime, *, dash: bool = False, paper_balance: float |
         else:
             rt.tasks.append(asyncio.create_task(_status_loop(rt), name="status"))
 
+        for task in rt.tasks:
+            if task.get_name() not in ("dashboard", "status"):
+                task.add_done_callback(lambda done: _critical_task_done(rt, done))
+
         # Pre-open the venue connections (DNS + TCP + TLS can take seconds).
         import http_pool
         import market_discovery
@@ -1053,22 +1058,42 @@ async def run_runtime(rt: Runtime, *, dash: bool = False, paper_balance: float |
             rt.tasks.append(dash_task)
         await shutdown(rt)
     if failure is not None:
-        raise RuntimeError(f"sniper task stopped: {type(failure).__name__}: {failure}") from failure
+        raise RuntimeError(f"critical bot task stopped: {type(failure).__name__}: {failure}") from failure
+
+
+def _critical_task_done(rt: Runtime, task: asyncio.Task) -> None:
+    if rt.stop.is_set():
+        return
+    exc = RuntimeError(f"{task.get_name()} task cancelled unexpectedly") if task.cancelled() else task.exception()
+    if exc is None:
+        exc = RuntimeError(f"{task.get_name()} task returned unexpectedly")
+    if getattr(rt, "task_failure", None) is None:
+        rt.task_failure = exc
+        if getattr(rt, "sniper", None) is not None:
+            rt.sniper._closing = True
+        if getattr(rt, "live_exec", None) is not None:
+            rt.live_exec.kill.trip(f"critical service {task.get_name()} stopped")
+        on_event("bot", f"critical service {task.get_name()} ended: {exc!r}", "bad")
 
 
 async def _wait_until_stopped(rt: Runtime) -> BaseException | None:
-    """Until stop is set or the sniper task ends. A sniper that died leaves a
+    """Until stop is set or a critical service ends. A service that died leaves a
     bot that only looks alive, so that is a failed run, not a quiet idle.
 
     A file at rt.stop_request (``<BOT_LOCK_PATH>.stop``) asks for the same clean
     shutdown as SIGTERM: on Windows a bot started in the background has no
     console that CTRL_BREAK could reach. The file is removed when honoured."""
     while not rt.stop.is_set():
-        task = rt.sniper_task
-        if task is not None and task.done():
-            exc = None if task.cancelled() else task.exception()
-            on_event("sniper", f"sniper task ended: {exc!r}", "bad")
-            return exc or RuntimeError("the sniper task returned")
+        if getattr(rt, "task_failure", None) is not None:
+            return rt.task_failure
+        critical = {task for task in getattr(rt, "tasks", ())
+                    if task.get_name() not in ("dashboard", "status")}
+        if rt.sniper_task is not None:
+            critical.add(rt.sniper_task)
+        for task in critical:
+            if task.done():
+                _critical_task_done(rt, task)
+                return getattr(rt, "task_failure", None)
         req = getattr(rt, "stop_request", None)
         if req is not None and req.exists():
             try:
@@ -1078,7 +1103,10 @@ async def _wait_until_stopped(rt: Runtime) -> BaseException | None:
             on_event("shutdown", f"clean stop requested ({req.name})", "warn")
             print(f"{TAG} clean stop requested by {req}", flush=True)
             return None
-        await asyncio.sleep(0.5)
+        if critical:
+            await asyncio.wait(critical, timeout=0.5, return_when=asyncio.FIRST_COMPLETED)
+        else:
+            await asyncio.sleep(0.5)
     return None
 
 

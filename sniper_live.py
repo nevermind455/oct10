@@ -222,10 +222,20 @@ class ServerClock:
         self.samples: collections.deque = collections.deque(maxlen=keep)   # (mono, offset_s, rtt_ms)
         self.offset: float | None = None
         self.at: float | None = None
+        self._server_at: float | None = None
         self.rejected = 0
 
     def add_sample(self, server_s: float, sent_wall: float, recv_wall: float, rtt_ms: float) -> bool:
-        if not rtt_ms <= self.max_rtt_ms:
+        values = (server_s, sent_wall, recv_wall, rtt_ms)
+        try:
+            valid = (not any(isinstance(v, bool) for v in values)
+                     and all(math.isfinite(float(v)) for v in values)
+                     and float(server_s) > 0 and 0 <= float(rtt_ms) <= self.max_rtt_ms
+                     and float(recv_wall) >= float(sent_wall)
+                     and abs((float(recv_wall) - float(sent_wall)) * 1000 - float(rtt_ms)) <= 1000)
+        except (TypeError, ValueError, OverflowError):
+            valid = False
+        if not valid:
             self.rejected += 1
             return False
         # A whole-second reply means the server was somewhere in [s, s+1):
@@ -234,6 +244,9 @@ class ServerClock:
         self.samples.append((self.mono(), mid - (sent_wall + recv_wall) / 2.0, rtt_ms))
         self.offset = statistics.median(s[1] for s in list(self.samples)[-5:])
         self.at = self.mono()
+        # Advance authentication time on the monotonic clock. A local NTP or
+        # manual wall-clock step must not invalidate every order's HMAC.
+        self._server_at = float(recv_wall) + self.offset
         return True
 
     def now_s(self) -> int:
@@ -241,9 +254,9 @@ class ServerClock:
         if self.offset is None or self.at is None:
             raise Halted("server clock never synced")
         age = self.mono() - self.at
-        if age > self.max_age_s:
+        if age < 0 or age > self.max_age_s:
             raise Halted(f"server clock stale ({age:.0f}s > {self.max_age_s:.0f}s)")
-        return int(self.wall() + self.offset)
+        return int(self._server_at + age)
 
     async def refresh(self, http, url: str) -> bool:
         sent = self.wall()
@@ -251,6 +264,9 @@ class ServerClock:
         r = await http.get(url)
         rtt = (time.perf_counter() - t) * 1000.0
         recv = self.wall()
+        if r.status_code != 200:
+            self.rejected += 1
+            return False
         try:
             data = r.json()
         except ValueError:
@@ -277,15 +293,20 @@ class RoundRules:
         self._rules: dict = {}
         self.fetches = 0
         self._generation: dict = {}
+        self._refresh_generation: dict = {}
         self.on_invalidate = None
 
     async def prefetch(self, condition: str, up: str, down: str) -> dict:
         key = str(condition)
         generation = self._generation.get(key, 0)
+        refresh = self._refresh_generation.get(key, 0) + 1
+        self._refresh_generation[key] = refresh
         rules = await asyncio.to_thread(self.fetch, condition, up, down)
         self.fetches += 1
         if generation != self._generation.get(key, 0):
             raise Refused("rules invalidated during refresh; waiting for a new fetch")
+        if refresh != self._refresh_generation.get(key):
+            raise Refused("a newer market-rules refresh superseded this fetch")
         self._rules[key] = (dict(rules, up_token=str(up), down_token=str(down)), self.mono())
         return rules
 
@@ -720,6 +741,29 @@ class Prepared:
     order_type: str = "FOK"     # FOK (fill-or-kill) or FAK (fill-and-kill: keep what fills, cancel the rest)
 
 
+async def _once(p: Prepared, attribute: str, action, *args):
+    """One outcome per prepared intent; repeated waiters share it.
+
+    These calls run on the sender's event loop, with no yield between checking
+    and claiming the future. Await the first action inline so dispatch incurs
+    no additional scheduling turn. Cancelling a duplicate waiter cannot cancel
+    the original order, its reconciliation or its accounting.
+    """
+    existing = getattr(p, attribute, None)
+    if existing is not None:
+        return await asyncio.shield(existing)
+    outcome = asyncio.get_running_loop().create_future()
+    setattr(p, attribute, outcome)
+    try:
+        result = await action(*args)
+    except BaseException as exc:
+        outcome.set_exception(exc)
+        outcome.exception()
+        raise
+    outcome.set_result(result)
+    return result
+
+
 class LeanSender:
     """Prepare (sync, on the event loop) and send (async) one sniper order."""
 
@@ -830,6 +874,12 @@ class LeanSender:
         (fast_h2.FastH2.post_now). Returns the in-flight stream for send(), or
         None when it cannot (httpx, or no live connection): send() then goes
         the async way, which connects first. Nothing is written on None."""
+        # Repeated start/send calls must never write the same signed order or
+        # release its cash/fill reservation twice, including after an ACK.
+        if hasattr(p, "_dispatch_stream"):
+            return p._dispatch_stream
+        if getattr(p, "_sender_outcome", None) is not None:
+            return None
         post_now = getattr(self.http, "post_now", None)
         if post_now is None or not getattr(self.http, "connected", False):
             return None
@@ -850,12 +900,19 @@ class LeanSender:
                 stream.future.exception()
                 if not isinstance(exc, (Halted, Refused, NotProcessed)):
                     self._record_send(p)
+                p._dispatch_stream = stream
                 return stream
             return None
+        p._dispatch_stream = stream
         return stream
 
     # ------------------------------------------------------------ the send, async
     async def send(self, p: Prepared, started=None) -> dict:
+        return await _once(p, "_sender_outcome", self._send_once, p, started)
+
+    async def _send_once(self, p: Prepared, started=None) -> dict:
+        if hasattr(p, "_dispatch_stream"):
+            started = p._dispatch_stream
         row = {"client_order_id": p.client_order_id, "side": p.side, "token": p.token,
                "condition": p.condition, "round_end": p.end, "cap": p.cap, "price": p.price, "tick": p.tick, "amount": p.amount,
                "order_type": p.order_type}
@@ -980,6 +1037,10 @@ class LeanSender:
             if timed_out:
                 return REJECTED, f"{error} (rejected before the book)"
             return REJECTED, str(error or "post_only_mode")
+        if (isinstance(resp, dict) and self._has_acceptance_evidence(resp, status)
+                and (status >= 400 or resp.get("success") is False or resp.get("ok") is False
+                     or str(resp.get("status") or "").strip().lower() in pt._FAILED_ORDER_STATUSES)):
+            return AMBIGUOUS, "conflicting rejection and acceptance evidence"
         if status == 429:
             return REJECTED, "rate limited (429)"
         if status >= 500:
@@ -1899,6 +1960,9 @@ class LiveExecution:
         return self.sender.start(p)
 
     async def send(self, p: Prepared, started=None) -> dict:
+        return await _once(p, "_execution_outcome", self._send_once, p, started)
+
+    async def _send_once(self, p: Prepared, started=None) -> dict:
         reserve = getattr(p, "reserve", p.amount)
         try:
             row = await self.sender.send(p, started)

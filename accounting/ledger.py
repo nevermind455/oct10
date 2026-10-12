@@ -664,8 +664,19 @@ class Ledger:
         tid = str(trade_id or "")
         with self._save_lock:
             with self._lock:
-                previous = copy.deepcopy(self.positions.get(token))
-                had_position = token in self.positions
+                position = self.positions.get(token)
+                # A BUY changes scalar fields and appends one lot; it never
+                # changes earlier lots. Deep-copying the entire history here
+                # made each journal append O(history), holding the ledger and
+                # the GIL for tens of milliseconds. Keep an exact undo record
+                # instead. SELL additionally changes FIFO consumption, which
+                # is restored separately if the durable write fails.
+                previous = None if position is None else position.__dict__.copy()
+                previous_length = 0 if position is None else len(position.lots)
+                consumed = []
+                if position is not None and str(kwargs.get("side", "BUY")).upper() == "SELL":
+                    consumed = [(lot, lot.consumed) for lot in position.lots
+                                if str(lot.side or "").upper() == "BUY" and lot.open_shares > 0]
                 inserted = self.record_fill(trade_id, token_id, **kwargs)
                 if not inserted:
                     return False
@@ -677,8 +688,11 @@ class Ledger:
                         "source": lot.source, "order_id": lot.order_id,
                         "reported_price": lot.reported_price}):
                     return True
-                if had_position:
-                    self.positions[token] = previous
+                if previous is not None:
+                    del position.lots[previous_length:]
+                    for old_lot, old_consumed in consumed:
+                        old_lot.consumed = old_consumed
+                    position.__dict__.update(previous)
                 else:
                     self.positions.pop(token, None)
                 self.seen.discard(tid)

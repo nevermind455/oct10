@@ -440,6 +440,12 @@ def _definitive_rejection(resp) -> bool:
     if not isinstance(resp, dict):
         return False
     status = str(resp.get("status") or "").strip().lower()
+    # Conflicting venue evidence is an unknown outcome. Releasing exposure or
+    # retrying a no-match message alongside trade evidence can buy twice.
+    if (resp.get("success") is True or resp.get("ok") is True
+            or status in ("matched", "delayed", "live")
+            or any(resp.get(k) for k in ("tradeIDs", "trade_ids", "transactionsHashes", "transaction_hashes"))):
+        return False
     return (resp.get("success") is False or resp.get("ok") is False
             or status in _FAILED_ORDER_STATUSES)
 

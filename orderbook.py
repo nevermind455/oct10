@@ -20,8 +20,10 @@ _TS_LOG = (os.environ.get("ORDERBOOK_TS_LOG", "") or "").strip().lower() in (
 
 def _number(name, value, *, minimum=None, maximum=None, inclusive_min=False):
     try:
+        if isinstance(value, bool):
+            raise ValueError("boolean numeric value")
         parsed = float(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{name} must be numeric") from exc
     if not math.isfinite(parsed):
         raise ValueError(f"{name} must be finite")
@@ -52,6 +54,8 @@ def _level(raw, side):
 
 def _levels(raw_levels, side):
     """Aggregate duplicate price rows so malformed depth cannot be double-counted."""
+    if not isinstance(raw_levels, (list, tuple)):
+        raise ValueError(f"invalid {side} level collection")
     aggregated: dict[Decimal, Decimal] = {}
     for raw in raw_levels or ():
         price, size = _level(raw, side)
@@ -254,6 +258,10 @@ def validate_buy_liquidity(token_id, amount, max_price, max_spread, min_price=0.
     if min_price >= max_price:
         raise ValueError("min_price must be below max_price")
     bids, asks = get_orderbook(token_id) if book is None else book
+    # Cached reads must satisfy the same safeguards as public REST reads.
+    # Sorting also prevents an unsorted caller's first row hiding the real
+    # best price. No second network request is needed for validation.
+    bids, asks = _levels(bids, "bid"), _levels(asks, "ask")
     if not asks:
         raise ValueError("selected token has no asks")
     best_ask = float(asks[0]["price"])
@@ -264,6 +272,8 @@ def validate_buy_liquidity(token_id, amount, max_price, max_spread, min_price=0.
     if not bids:
         raise ValueError("selected token has no bids; spread cannot be validated")
     spread = best_ask - float(bids[0]["price"])
+    if spread <= 0:
+        raise ValueError("selected token book is crossed or locked")
     if spread > max_spread:
         raise ValueError(f"spread {spread:.6f} exceeds limit {max_spread:.6f}")
     available = sum(

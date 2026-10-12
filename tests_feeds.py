@@ -1529,7 +1529,9 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved 2026-10-12: a price cap at or below MIN_BUY_PRICE is skipped at the
     # decision ("price cap at the price floor") - the paper broker refused it, live would buy.
     # Reviewed 2026-10-12: user-requested recovery, accounting and portfolio safety fixes.
-    "sniper_mode.py": "232da5a7e6b82512f78c431c0b8c048eaacd7a553b2a12cd38b5d881b13f5b88",
+    # Re-approved 2026-10-12 (audit 20261012): order-task failures stop new decisions; a last
+    # freshness check of book and signal at the wire
+    "sniper_mode.py": "e3418d5e72ff62f9426f73ac5fa717993a14803fa7637f66787675742fdc8387",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
@@ -1538,7 +1540,9 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved (F3): CanarySession - the canary's counters, halts and loss window survive
     # restarts, reconciled with the ledger's authorizations; unreadable state fails closed.
     # Reviewed 2026-10-12: user-requested recovery, accounting and portfolio safety fixes.
-    "sniper_live.py": "b9d1671255668b1781f7794f4eeceaea7d2e01d2c3e2fd4399ef36746803970b",
+    # Re-approved 2026-10-12 (audit 20261012): one outcome per prepared order; monotonic server
+    # clock; conflicting venue evidence is AMBIGUOUS
+    "sniper_live.py": "243293f7890f40a5f204f4594fa027592c750d973273018b3c2b01017ffca442",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads
@@ -1553,9 +1557,15 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # (both grew by a few entries per market for the life of the process).
     # Re-approved (paper attribution): a paper fill's ledger source carries its tag
     # (paper_live_book/sniper, /manager) - per-source P/L from actual fills.
-    "paper_trade.py": "57df2739a670cf5fb125304747ed83bbace45384c80ec064b3f7ee12fc4458b5",
-    "polymarket_trade.py": "1f9d29896d39e9d83005fbb4d95f3de1cda3fc1cd8cbbc5d5998c6287fdba88b",
-    "orderbook.py": "fe3decc44a8f1061c2788c1f2ae85739ade137910033031eac3138f11b22f090",
+    # Re-approved 2026-10-12 (audit 20261012): a failing event observer cannot change a committed
+    # paper fill or rejection
+    "paper_trade.py": "042cd08f2334b0c617bfbf36acdf7638df4f760126b7eafc93f2ddc77018698a",
+    # Re-approved 2026-10-12 (audit 20261012): a rejection that also carries acceptance evidence
+    # is not definitive
+    "polymarket_trade.py": "6dd32d0a02b3d34b82f1195988afe16d949ded8fe6a157b9603a301018ff9b9f",
+    # Re-approved 2026-10-12 (audit 20261012): supplied/cached books pass the same level
+    # validation; crossed books refused
+    "orderbook.py": "da71e154a518bebbad1eb95f2a4259f5d228ee51b0f26ccffd9071bcc5a2f8b3",
     "market_discovery.py": "ca15ccc4c1b0da18248abc91143604d15fe00b1638d727bf5209d6f9ff059dc1",
     "timer.py": "3ca35cc64539d45f7e4b982cbe9b6153138f87ee1be79adfae0c8eaccc875d50",
     "config.py": "4a1584c419e24d805c691d3bf8d7885f998c00aba2e2195f647e963154fda45d",
@@ -1564,7 +1574,9 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # records the entry it includes; load replays newer ones, validated, torn tail dropped,
     # gaps/corruption refused); snapshots every 500 entries and on save(). current_payload().
     # Reviewed 2026-10-12: user-requested recovery, accounting and portfolio safety fixes.
-    "accounting/ledger.py": "6936873433f2da0053b85835c8d2ad76ee78f3e042c78abc994b826964504028",
+    # Re-approved 2026-10-12 (audit 20261012): durable-fill rollback keeps an undo record instead
+    # of deep-copying the position history
+    "accounting/ledger.py": "792f8b5bd1bedb01570326ef603bdc163e78ada188b864a77ba47a1ff4450e3c",
     "accounting/fees.py": "44e45be00c7c3b330ef0ff11950fa42944029ba83a61ec8066af3494c0956dc7",
     # Re-approved (settlement audit): one record per market (condition id), checked from
     # expiry, concurrently, on the worker's own pool; explicit lifecycle events and a journal;
@@ -1585,9 +1597,13 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved 2026-10-11 (operator's audit): malformed updates and invalid
     # exchange timestamps fail closed; REST snapshots cannot overwrite newer socket data.
     # Reviewed 2026-10-12: user-requested recovery, accounting and portfolio safety fixes.
-    "feeds/book.py": "76840192de204eea390333f1c943158bc695313f756a94b7894f14b142b73150",
+    # Re-approved 2026-10-12 (audit 20261012): deltas fenced by the newest observed exchange time,
+    # so a REST snapshot cannot rewind them; timestamped tick changes; REST tuples cannot certify
+    # a past venue instant
+    "feeds/book.py": "75c6eb40bc9c86399c55a74d4804f92334e859315098a8d1d329652633f0599c",
     # Reviewed 2026-10-12: user-requested recovery, accounting and portfolio safety fixes.
-    "feeds/poly_user.py": "f9d5d11f00923f0aea83e6935bf803e01f45f06f9e5aa20bc83571482e5baf66",
+    # Re-approved 2026-10-12 (audit 20261012): FillStore summary cached until the next mutation
+    "feeds/poly_user.py": "5b13a011bc1cfd7c5445ea17013100728ed02134ba75e4049a37d96c26699660",
     # Reviewed 2026-10-12: receive fencing and ordered public-token snapshot recovery.
     "feeds/hub.py": "45b61d911502da1eaf424d154ca33d0e9226d727f9b076acf74eff7ca8d2c22a",
     "feeds/poly_market.py": "a1bb16261905e0b2f39b63afa25c6e50c25140d1ee3fd931b15134065a7ad6f4",

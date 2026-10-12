@@ -250,6 +250,10 @@ async def bench_live(m: int, matched_every: int = 5, with_pm: bool = False, pm_s
         now = time.monotonic()
         for i in range(301):
             sn.vol_model.observe(now - 300 + i, 60_000.0)
+        # The fair value anchors on the book as it stood when the move began
+        # (300ms before each tick here); without that history every order is
+        # skipped ("no pre-move market history"). A real round's book has it.
+        await asyncio.sleep(0.35)
     pm = None
     if with_pm:
         import position_manager as PMM

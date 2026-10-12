@@ -83,7 +83,8 @@ class FeedHub:
     def __init__(self, *, creds: dict | None = None, on_event=None,
                  btc_stale_after: float = 3.0, book_stale_after: float = 8.0,
                  rest_book_fetch=None, urls: dict | None = None,
-                 book_refresh_after: float | None = None) -> None:
+                 book_refresh_after: float | None = None,
+                 rest_book_timeout: float = 10.0) -> None:
         urls = urls or {}
         self._lock = threading.RLock()
         self._on_event = on_event
@@ -100,6 +101,9 @@ class FeedHub:
             raise ValueError("book refresh age must be finite and positive")
         self.book_refresh_after = book_refresh_after
         self._book_refresh_check_s = min(0.25, book_refresh_after / 4.0)
+        if not math.isfinite(rest_book_timeout) or rest_book_timeout <= 0:
+            raise ValueError("REST book timeout must be finite and positive")
+        self.rest_book_timeout = float(rest_book_timeout)
         self.fill_store = FillStore()
 
         kw = {"on_event": on_event}
@@ -125,6 +129,10 @@ class FeedHub:
         self._resync_wanted: set[str] = set()
         self._next_book_fetch_at: dict[str, tuple[int, float]] = {}
         self._next_ws_snapshot_at: dict[str, tuple[int, float]] = {}
+        # One background recovery per token, and one physical HTTP worker
+        # per token even if an async waiter times out or the hub restarts.
+        self._book_recovery_tasks: dict[str, asyncio.Task] = {}
+        self._book_fetches: dict[str, tuple[asyncio.Task, BookView]] = {}
         self._tasks: list[asyncio.Task] = []
         self._stop = asyncio.Event()
         self._resync_event = asyncio.Event()
@@ -318,36 +326,60 @@ class FeedHub:
         """
         self._resync_loop_owner = asyncio.get_running_loop()
         limiter = asyncio.Semaphore(4)
-        while not self._stop.is_set():
-            try:
-                self._resync_event.clear()
-                with self._lock:
-                    need = set(self.book.needs_resync(include_stale=True)) | set(self._resync_wanted)
-                for token, view in self.book.views().items():
-                    age = view.book_age_ms()
-                    if age is not None and age >= self.book_refresh_after * 1000.0:
-                        need.add(token)
-                need &= set(self.book.active)
-                active = set(self.book.active)
-                self._next_book_fetch_at = {token: deadline
-                                           for token, deadline in self._next_book_fetch_at.items()
-                                           if token in active}
-                self._next_ws_snapshot_at = {token: deadline
-                                            for token, deadline in self._next_ws_snapshot_at.items()
-                                            if token in active}
-                if self._rest_book_fetch is not None and need:
-                    await asyncio.gather(*(self._resync_token(token, limiter)
-                                           for token in sorted(need)))
+        try:
+            while not self._stop.is_set():
                 try:
-                    await asyncio.wait_for(self._resync_event.wait(), timeout=self._book_refresh_check_s)
-                except asyncio.TimeoutError:
-                    pass
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.market.health.mark_error(exc)
-                self._event("resync", f"loop error: {type(exc).__name__}: {exc}", "warn")
-                await asyncio.sleep(1.0)
+                    self._resync_event.clear()
+                    for token, task in tuple(self._book_recovery_tasks.items()):
+                        if task.done():
+                            self._book_recovery_tasks.pop(token, None)
+                            if not task.cancelled() and task.exception() is not None:
+                                self.market.health.mark_error(task.exception())
+                    with self._lock:
+                        need = set(self.book.needs_resync(include_stale=True)) | set(self._resync_wanted)
+                    for token, view in self.book.views().items():
+                        age = view.book_age_ms()
+                        if age is not None and age >= self.book_refresh_after * 1000.0:
+                            need.add(token)
+                    active = set(self.book.active)
+                    need &= active
+                    for token, (fetch_task, _view) in tuple(self._book_fetches.items()):
+                        if token not in self._book_recovery_tasks and fetch_task.done():
+                            # A timed-out request may finish after WS recovery
+                            # or rotation. Consume its exception and discard;
+                            # it has no authority to update a newer book.
+                            if token not in need:
+                                if not fetch_task.cancelled():
+                                    fetch_task.exception()
+                                self._book_fetches.pop(token, None)
+                    self._next_book_fetch_at = {token: deadline
+                                               for token, deadline in self._next_book_fetch_at.items()
+                                               if token in active}
+                    self._next_ws_snapshot_at = {token: deadline
+                                                for token, deadline in self._next_ws_snapshot_at.items()
+                                                if token in active}
+                    if self._rest_book_fetch is not None:
+                        for token in sorted(need):
+                            if token not in self._book_recovery_tasks:
+                                task = asyncio.create_task(self._resync_token(token, limiter),
+                                                           name=f"feed:resync:{token[-6:]}")
+                                self._book_recovery_tasks[token] = task
+                    try:
+                        await asyncio.wait_for(self._resync_event.wait(), timeout=self._book_refresh_check_s)
+                    except asyncio.TimeoutError:
+                        pass
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.market.health.mark_error(exc)
+                    self._event("resync", f"loop error: {type(exc).__name__}: {exc}", "warn")
+                    await asyncio.sleep(1.0)
+        finally:
+            pending = list(self._book_recovery_tasks.values())
+            self._book_recovery_tasks.clear()
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def _resync_token(self, token: str, limiter: asyncio.Semaphore) -> None:
         async with limiter:
@@ -369,8 +401,32 @@ class FeedHub:
             # must not turn the background deadline check into an API hot loop.
             self._next_book_fetch_at[token] = (view.generation, now + max(0.25, self.book_refresh_after))
             try:
-                bids, asks = await asyncio.to_thread(self._rest_book_fetch, token)
+                pending = self._book_fetches.get(token)
+                if pending is None:
+                    fetch_task = asyncio.create_task(asyncio.to_thread(self._rest_book_fetch, token),
+                                                     name=f"feed:book-http:{token[-6:]}")
+                    self._book_fetches[token] = (fetch_task, view)
+                else:
+                    fetch_task, view = pending
+                bids, asks = await asyncio.wait_for(asyncio.shield(fetch_task),
+                                                  timeout=self.rest_book_timeout)
+                self._book_fetches.pop(token, None)
+            except asyncio.TimeoutError as exc:
+                # A Python worker cannot be killed. Keep its handle so no
+                # replacement HTTP call accumulates behind a hung request.
+                # A timeout raised BY a completed HTTP worker is different:
+                # it can be discarded and retried after the rate-limit gate.
+                if fetch_task.done():
+                    self._book_fetches.pop(token, None)
+                self.market.health.mark_error("REST book snapshot timed out")
+                self._event("resync", f"REST snapshot timed out for {token[-6:]}", "warn")
+                current = self.book.view(token)
+                self._request_ws_snapshot(token, current)
+                return
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
+                self._book_fetches.pop(token, None)
                 self.market.health.mark_error(exc)
                 self._event("resync", f"REST snapshot failed for {token[-6:]}: "
                             f"{type(exc).__name__}: {exc}", "warn")
@@ -392,15 +448,21 @@ class FeedHub:
                 # Ignored UNSYNCED deltas now fence REST. On a busy market
                 # every HTTP response can race; use a stream-ordered snapshot
                 # instead of waiting indefinitely for a quiet fetch interval.
-                prior = self._next_ws_snapshot_at.get(token)
-                now = time.monotonic()
                 if (current.status == UNSYNCED and current.generation == view.generation
-                        and current.receive_revision != view.receive_revision
-                        and (prior is None or prior[0] != current.generation or now >= prior[1])
-                        and self.market.request_snapshot(token, expected_generation=current.generation)):
-                    self._next_ws_snapshot_at[token] = (
-                        current.generation, now + max(1.0, self.book_refresh_after))
-                    self._event("resync", f"WS snapshot requested {token[-6:]} after raced REST", "info")
+                        and current.receive_revision != view.receive_revision):
+                    self._request_ws_snapshot(token, current)
+
+    def _request_ws_snapshot(self, token: str, view: BookView) -> bool:
+        prior = self._next_ws_snapshot_at.get(token)
+        now = time.monotonic()
+        if (view.status == UNSYNCED
+                and (prior is None or prior[0] != view.generation or now >= prior[1])
+                and self.market.request_snapshot(token, expected_generation=view.generation)):
+            self._next_ws_snapshot_at[token] = (
+                view.generation, now + max(1.0, self.book_refresh_after))
+            self._event("resync", f"WS snapshot requested {token[-6:]} after REST recovery delay", "info")
+            return True
+        return False
 
     def _wake_resync(self) -> None:
         loop = self._resync_loop_owner

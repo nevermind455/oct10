@@ -21,6 +21,7 @@ real matcher acknowledgement cannot be recreated without placing an order.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import tempfile
@@ -768,6 +769,8 @@ class PaperBroker:
         self._rules_cache: dict[str, tuple] = {}
         self._rules_cache_ttl = 300.0
         self.last_error: str | None = None
+        self.last_callback_error: str | None = None
+        self.callback_errors = 0
         self.last_fill: dict | None = None
         self.filled_orders = 0
         self.rejected_orders = 0
@@ -1459,9 +1462,8 @@ class PaperBroker:
                 f"{side} ${float(quote.notional):.2f} | "
                 f"{float(quote.shares):.6f} shares @ {float(quote.average_price):.6f} | "
                 f"fee ${float(quote.fee):.5f} | cash ${self.cash_balance():.2f}")
-            if self.on_event:
-                self.on_event("paper", f"FILL {side} {float(quote.shares):.4f} @ "
-                              f"{float(quote.average_price):.4f}", "good")
+            self._emit(f"FILL {side} {float(quote.shares):.4f} @ "
+                       f"{float(quote.average_price):.4f}", "good")
             return True
         except PaperRejected as exc:
             return self._reject(side, amount, str(exc))
@@ -1706,9 +1708,20 @@ class PaperBroker:
             })
         self._publish_error(reason)
         print(f"[PAPER] FOK rejected: {reason}")
-        if self.on_event:
-            self.on_event("paper", f"REJECT {reason}", "warn")
+        self._emit(f"REJECT {reason}", "warn")
         return False
+
+    def _emit(self, message: str, level: str) -> None:
+        """An observer cannot change an already committed execution outcome."""
+        if self.on_event is None:
+            return
+        try:
+            self.on_event("paper", message, level)
+            self.last_callback_error = None
+        except Exception as exc:
+            self.callback_errors += 1
+            self.last_callback_error = f"paper event callback failed: {type(exc).__name__}: {exc}"[:200]
+            logging.getLogger(__name__).exception(self.last_callback_error)
 
     @staticmethod
     def _publish_error(reason: str | None) -> None:
@@ -1747,6 +1760,8 @@ class PaperBroker:
             "total_pnl": None if equity is None else equity - self.start_balance,
             "filled_orders_session": self.filled_orders,
             "rejected_orders_session": self.rejected_orders,
+            "callback_errors": self.callback_errors,
+            "last_callback_error": self.last_callback_error,
             "ledger_path": str(Path(self.ledger.path).resolve()),
             "audit_path": str(self.audit_path.resolve()),
             **ledger,

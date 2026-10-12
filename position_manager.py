@@ -71,6 +71,7 @@ import collections
 import concurrent.futures
 import functools
 import json
+import logging
 import math
 import os
 import queue
@@ -785,6 +786,7 @@ class PositionManager:
         import uuid
         self.run_id = uuid.uuid4().hex[:12]           # this process: reservation ids restart at 1 in each
         self.last_error: str | None = None
+        self.last_callback_error: str | None = None
         self._task = None
         self._closing = False
         self._executor = None
@@ -1078,8 +1080,20 @@ class PositionManager:
         self.journal.write({"wall": self.wall(), "event": f"POSITION_MANAGER BUY {d.side}",
                             "condition": cond, "seq": self._seq, "market_id": o.market_id, "run_id": self.run_id,
                             "token_id": o.token_id, "reservation_id": o.reservation_id, **d.row()})
-        self.on_event("manager", f"BUY {d.side} {d.fill.qty:.2f} @<= {d.limit:.2f} ({d.classification})", "info")
+        self._emit(f"BUY {d.side} {d.fill.qty:.2f} @<= {d.limit:.2f} ({d.classification})", "info")
         return o
+
+    def _emit(self, message: str, level: str) -> None:
+        # reserve() has already committed exposure before this observer runs.
+        # Propagating its exception would prevent dispatch and leave a phantom
+        # in-flight reservation with neither a worker nor an outcome timer.
+        try:
+            self.on_event("manager", message, level)
+            self.last_callback_error = None
+        except Exception as exc:
+            self.n["callback errors"] += 1
+            self.last_callback_error = f"manager event callback failed: {type(exc).__name__}: {exc}"[:200]
+            logging.getLogger(__name__).exception(self.last_callback_error)
 
     def _book(self, o: ManagerOrder, *, ok: bool, fill: dict | None, error: str | None) -> bool:
         """The order's actual outcome (never its request), applied to the order
@@ -1254,7 +1268,18 @@ class PositionManager:
             if t:
                 v = hub.book.view(str(t))
                 vs.append((getattr(v, "updated_mono", None), v.best_ask))
-        return (hub.condition_id, tuple(vs), len(getattr(self.ledger, "seen", ())), self._seq, self._epoch, self._gen)
+        # These gates can change while a healthy public book is quiet. An
+        # unchanged book must not hide an expired cooldown or sniper quiet
+        # period, a new expiry tier, or a settlement crediting available cash.
+        now = self.mono()
+        left = float(hub.window_end or 0) - self.wall()
+        timed = (self.engine.multiplier(left), left >= self.cfg.min_left_s,
+                 tuple(now - self.hist.sides[s].last_done_mono < self.cfg.cooldown_ms / 1000.0
+                       for s in SIDES), self._sniper_busy(),
+                 tuple(self._book_ok(str(t)) for t in (hub.up_token, hub.down_token) if t))
+        return (hub.condition_id, hub.up_token, hub.down_token, hub.window_end, tuple(vs),
+                len(getattr(self.ledger, "seen", ())), getattr(self.ledger, "journal_seq", 0),
+                self._seq, self._epoch, self._gen, timed)
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -1301,7 +1326,7 @@ class PositionManager:
             except Exception as exc:  # noqa: BLE001 - the manager never stops the bot; it says why
                 self.n["errors"] += 1
                 self.last_error = f"{type(exc).__name__}: {exc}"[:200]
-                self.on_event("manager", f"error: {self.last_error}", "bad")
+                self._emit(f"error: {self.last_error}", "bad")
 
     def _dispatch(self, d: Decision, loop) -> ManagerOrder | None:
         """Send one decided order - synchronously, on the event loop: nothing (a
@@ -1311,13 +1336,15 @@ class PositionManager:
         reserved (FILLED + PENDING) and the order handed to a worker."""
         if self._closing:
             return None
+        # The sniper's activity is now part of the state version too: check it
+        # first so its refusal keeps its own, more useful reason.
+        if self._sniper_busy():
+            d.action, d.reason = "BLOCKED", "SNIPER_PRIORITY"
+            self._log_skip(d)
+            return None
         if self._state_version() != self._snap_version:
             d.action, d.reason = "BLOCKED", "STATE_CHANGED"
             self._version = None
-            self._log_skip(d)
-            return None
-        if self._sniper_busy():
-            d.action, d.reason = "BLOCKED", "SNIPER_PRIORITY"
             self._log_skip(d)
             return None
         hub = self.hub
@@ -1375,8 +1402,8 @@ class PositionManager:
                             "token_id": o.token_id, "reservation_id": o.reservation_id,
                             "reserved_usd": o.reserved_usd, "requested_qty": o.requested_qty,
                             "timeout_s": self.cfg.order_timeout_s})
-        self.on_event("manager", f"order {o.reservation_id} {o.side}: no outcome after {self.cfg.order_timeout_s:g}s "
-                                 f"- UNKNOWN, reservation kept until it is known", "warn")
+        self._emit(f"order {o.reservation_id} {o.side}: no outcome after {self.cfg.order_timeout_s:g}s "
+                   f"- UNKNOWN, reservation kept until it is known", "warn")
 
     def _done(self, o: ManagerOrder, fut) -> None:
         if fut.cancelled():
@@ -1474,6 +1501,7 @@ class PositionManager:
         xs = sorted(self.eval_us)
         sl = sorted(self.slice_us)
         return {"enabled": self.cfg.enabled, "shadow": self.shadow, "counts": dict(self.n),
+                "last_callback_error": self.last_callback_error,
                 "eval_us": None if not xs else {"p50": xs[len(xs) // 2], "p99": xs[int(len(xs) * 0.99)],
                                                 "max": xs[-1], "n": len(xs)},
                 "slice_us": None if not sl else {"p50": sl[len(sl) // 2], "p99": sl[int(len(sl) * 0.99)],
