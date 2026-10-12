@@ -24,6 +24,7 @@ import os
 import pathlib
 import sys
 import time
+from decimal import Decimal
 import unittest
 from unittest.mock import patch
 
@@ -161,7 +162,13 @@ class Gate(I.PaperIOCBase):
             v = I.View(market.decision[str(token)])
             v.mid = test.mids.get(str(token), v.mid)
             return v
-        self.m.book = type("Book", (), {"view": staticmethod(view)})()
+        self.m.book = type("Book", (), {"view": staticmethod(view),
+                                        "view_at_mono": staticmethod(lambda token, mono: view(token))})()
+        from paper_trade import MarketRules
+        self.broker._rules_fetch = lambda cid: MarketRules(
+            cid, Decimal(str(RATE)), 1, min_order_size=Decimal("5"), tick_size=Decimal("0.01"),
+            up_token_id=self.m.up_token, down_token_id=self.m.down_token)
+        self.broker._rules(self.m.condition_id)  # production warms rules before evaluating a signal
         self.make()
 
     def make(self, **env):
@@ -176,7 +183,9 @@ class Gate(I.PaperIOCBase):
         self.m.set(token, ask_levels)
         self.sn.last_fire_by_side[side] = -1e18
         before = len(self.rows)
-        asyncio.run(self.sn._fire(side, move_bp, time.monotonic() * 1000.0))
+        tick_ms = time.monotonic() * 1000.0
+        self.sn.trigger.ref = (tick_ms - 250.0, 60_000.0)
+        asyncio.run(self.sn._fire(side, move_bp, tick_ms))
         rows = [r for r in self.rows[before:] if r.get("result") in ("filled", "refused", "skipped", "error")]
         self.assertEqual(len(rows), 1, self.rows[before:])
         return rows[0]
@@ -248,7 +257,7 @@ class Gate(I.PaperIOCBase):
             limits=types.SimpleNamespace(max_order_shares=25.0)))
         self.mids[self.m.up_token] = 0.40
         self.m.set(self.m.up_token, [(0.41, 1000)])
-        plan = self.sn._decide("UP", {"bp": 5.0}, time.monotonic() * 1000.0)
+        plan = self.sn._decide("UP", {"bp": 5.0, "window_ms": 250.0}, time.monotonic() * 1000.0)
         self.assertIsNotNone(plan)
         self.assertLessEqual(plan["target"], 25.0)
 
@@ -296,7 +305,7 @@ class Gate(I.PaperIOCBase):
             limits=types.SimpleNamespace(max_order_shares=20.0)))
         self.mids[self.m.up_token] = 0.40
         self.m.set(self.m.up_token, [(0.41, 1), (0.43, 1000)])
-        plan = self.sn._decide("UP", {"bp": 5.0}, time.monotonic() * 1000.0)
+        plan = self.sn._decide("UP", {"bp": 5.0, "window_ms": 250.0}, time.monotonic() * 1000.0)
         self.assertIsNotNone(plan)
         self.assertEqual((plan["target"], plan["amount"]), (20.0, 8.20))
         self.assertLessEqual(plan["amount"] / plan["view"].best_ask, 20.0)
@@ -338,9 +347,11 @@ class Gate(I.PaperIOCBase):
         self.assertEqual((r["fair_anchor"], r["market_mid"]), ("now", 0.40))
         self.check_fair(r, 0.40, 5.0)
 
-    def test_no_book_history_anchors_on_the_mid_now(self):
+    def test_no_book_history_refuses_to_guess_a_pre_move_price(self):
         r = self.anchored_order(then=None, now=0.40)
-        self.assertEqual((r["fair_anchor"], r["market_mid"]), ("now", 0.40))
+        self.assertEqual((r["result"], r["reason"]),
+                         ("skipped", "fair value unknown: no pre-move market history"))
+        self.assertNotIn("fair", r)
         self.assertNotIn("market_mid_now", r)
 
     def test_back_to_back_orders_size_from_the_cash_left(self):
@@ -359,6 +370,29 @@ class Gate(I.PaperIOCBase):
         self.assertEqual((r["result"], r["reason"], r["cap"]), ("skipped", "price cap at the price floor", 0.05))
         r = self.order("UP", [(0.06, 200)], mid=0.06, move_bp=5.0)
         self.assertEqual(r["result"], "filled")
+
+    def test_a_repeat_signal_does_not_repeat_the_same_outcome_kelly_bet(self):
+        self.m.window_end = time.time() + 100.0
+        self.sn._read_bankroll = lambda: 100.0
+        first = self.order("UP", [(0.50, 1000)], mid=0.49, move_bp=3.0)
+        self.assertEqual(first["result"], "filled")
+        second = self.order("UP", [(0.50, 1000)], mid=0.49, move_bp=3.0)
+        self.assertEqual((second["result"], second["reason"]),
+                         ("skipped", "kelly size under the 5-share minimum"))
+        self.assertAlmostEqual(second["kelly_held_shares"], first["shares"], places=3)
+        self.assertEqual(self.broker.filled_orders, 1)
+
+    def test_market_fees_override_an_understated_environment_fee(self):
+        from paper_trade import MarketRules
+        self.m.window_end = time.time() + 100.0
+        self.sn.s.fair_fee_rate = 0.0
+        self.broker._rules_cache[self.m.condition_id] = (MarketRules(
+            self.m.condition_id, Decimal(".14"), 1, min_order_size=Decimal("5"),
+            tick_size=Decimal(".01"), up_token_id=self.m.up_token, down_token_id=self.m.down_token), time.time())
+        row = self.order("UP", [(0.58, 1000)], mid=0.49, move_bp=3.0)
+        self.assertEqual((row["result"], row["reason"]), ("skipped", "ask not below fair value"))
+        self.assertEqual((row["fee_rate"], row["fee_exponent"]), (.14, 1))
+        self.assertEqual(self.broker.filled_orders, 0)
 
     def test_kelly_orders_carry_nothing(self):
         r = self.order("UP", [(0.41, 3)], mid=0.40, move_bp=5.0)        # only 3 shares at the ask, then nothing

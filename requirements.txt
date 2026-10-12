@@ -22,3 +22,5 @@ socksio>=1.0.0,<2
 web3>=7.0.0,<8
 # sniper_rescore.py / sniper_dynexec.py (research, read-only) and their tests.
 numpy>=1.26,<3
+# Resource/lifecycle regressions and process measurements.
+psutil>=5.9,<8

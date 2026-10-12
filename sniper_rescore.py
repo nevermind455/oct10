@@ -29,6 +29,9 @@ for 2s) over every recorded round, and prices each order both ways - the old
 rule (the book in our hands at send + flight) and the venue-time book - so the
 size of the old paper's optimism is measured on the recordings themselves.
 Settlement there uses the round's last recorded mid (>=0.90 won, <=0.10 lost).
+This is the historical Binance/fixed-size strategy with a shared cooldown;
+it omits today's Coinbase, fair-value and portfolio Kelly gates. Its research
+outputs cannot validate the current canary. Use replay_ab.py for that path.
 
 Read-only: the journal, the paper ledger (for each token's payout) and the
 lab files. Round books it rebuilds are cached in LAB_DATA/_rounds (shared
@@ -1262,6 +1265,9 @@ def main() -> int:
                     help="--simulate: also price fill-and-kill / 5 shares / wider caps on the same decisions "
                          "at the first --holds value")
     args = ap.parse_args()
+    if args.simulate:
+        print("HISTORICAL STRATEGY RESEARCH: Binance, fixed sizing, shared cooldown; "
+              "no current fair-value/portfolio Kelly gates. Not current-canary validation.", file=sys.stderr)
     holds = [float(x) for x in args.holds.split(",")]
     if args.live_orders:
         return live_orders_main(args)

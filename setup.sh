@@ -13,7 +13,7 @@ set -euo pipefail
 
 OLD="${OLD_DIR:-/opt/btcbot}"
 APP="${APP_DIR:-/opt/sniperbtc}"
-BRANCH="${BRANCH:-sniperbtc}"
+BRANCH="${BRANCH:-main}"
 WITH_LEDGER=0
 for arg in "$@"; do
     case "$arg" in
@@ -70,7 +70,7 @@ else
     if [ -z "$url" ] && [ -d "$OLD/.git" ]; then
         url="$(git -C "$OLD" remote get-url "$(git -C "$OLD" remote | head -n 1)")"
     fi
-    [ -n "$url" ] || die "no repository URL: set REPO_URL=<the spe24 URL> and run again"
+    [ -n "$url" ] || die "no repository URL: set REPO_URL=<the oct10 URL> and run again"
     git clone --quiet --branch "$BRANCH" --single-branch "$url" "$APP"
     ok "cloned $(git -C "$APP" rev-parse --short HEAD)"
 fi
@@ -85,8 +85,10 @@ PY="${PYTHON:-python3}"
 "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' || die "$PY is older than 3.11"
 [ -x .venv/bin/python ] || "$PY" -m venv .venv
 .venv/bin/python -m pip install --quiet --upgrade pip
-.venv/bin/python -m pip install --quiet -r requirements.txt
-ok "$(.venv/bin/python --version) + requirements.txt"
+requirements_file="requirements.txt"
+[ ! -f requirements.lock.txt ] || requirements_file="requirements.lock.txt"
+.venv/bin/python -m pip install --quiet -r "$requirements_file"
+ok "$(.venv/bin/python --version) + $requirements_file"
 
 # Paths are not secrets: resolve a state path the way run.py does (KEY from
 # an .env file, else the default; relative to the install it belongs to).

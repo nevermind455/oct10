@@ -12,8 +12,10 @@ the REAL position_manager.PositionManager, both on a virtual clock driven by
 recorded messages (latency_lab recorder: the trigger feed - Coinbase BTC-USD
 ticker by default, the frozen spec's; --feed binance replays Binance spot
 bookTicker - and Polymarket books). Every round in the recordings is used -
-none picked or dropped - and settles on its authoritative venue result
-(accounting.resolution, cached).
+none picked or dropped - and is scored on its authoritative venue result
+(accounting.resolution, cached). During trading, settlement defaults to 60s
+after expiry and redemption to another 600s; payouts cannot be reused before
+then. These are configurable assumptions, not measured venue timings.
 
 How an order fills: it reaches the venue latency_ms after the decision (the
 modelled taker hold + network) and is matched against the recorded book at
@@ -47,6 +49,7 @@ import threading
 import time
 import types
 from dataclasses import replace
+from datetime import datetime, timezone
 from decimal import Decimal
 from unittest.mock import patch
 
@@ -64,6 +67,8 @@ from paper_trade import MarketRules  # noqa: E402
 
 FEE_RATE, FEE_EXP = 0.07, 1
 OWN_FILL_TTL_S = 2.0
+SETTLEMENT_DELAY_S = 60.0
+REDEMPTION_DELAY_S = 600.0
 
 
 # =========================================================================== recordings
@@ -78,10 +83,12 @@ REPLAY_FEEDS = ("coinbase", "binance")
 COINBASE_CODE = XF.CODE["coinbase"]
 
 
-def events(paths, feed: str = "coinbase"):
+def events(paths, feed: str = "coinbase", diagnostics=None):
     """("round", wall, info) / ("aid", wall, asset, idx, side) / ("btc", wall, bid, ask) /
     ("pm", wall, {asset: (bids, asks)}) in recording order. Books rebuilt per
-    asset from snapshots and level changes (latency_lab.load.Book). "btc" is
+    asset from snapshots and level changes (latency_lab.load.Book). Coinbase
+    "btc" events also carry sequence/exchange-time metadata in slot 4.
+    "btc" is
     the trigger feed's best bid/ask: Coinbase's ticker ("xb" rows of its code)
     or Binance's bookTicker ("bsb" rows) - only that one feed, so a replay on
     one feed is not timed by the other's messages."""
@@ -89,20 +96,52 @@ def events(paths, feed: str = "coinbase"):
         raise ValueError(f"replay feed {feed!r}: {' or '.join(REPLAY_FEEDS)}")
     books = collections.defaultdict(Book)
     idx_asset: dict = {}
+    sequence = 0
+    diagnostics = diagnostics if diagnostics is not None else collections.Counter()
     for path in paths:
         for line in _lines(path):
             try:
                 r = json.loads(line)
-            except ValueError:
+                if not isinstance(r, list) or len(r) < 3:
+                    raise ValueError("not a recording row")
+                k = r[0]
+                wall = float(r[2]) / 1e9
+                if not math.isfinite(wall):
+                    raise ValueError("nonfinite receive time")
+            except (ValueError, TypeError):
+                diagnostics["malformed_rows"] += 1
                 continue
-            k = r[0]
-            wall = r[2] / 1e9
-            if k == "bsb":
-                if feed == "binance":
-                    yield ("btc", wall, float(r[4]), float(r[6]))
-            elif k == "xb":
-                if feed == "coinbase" and r[3] == COINBASE_CODE:
-                    yield ("btc", wall, float(r[5]), float(r[6]))
+            if k == "bsb" or k == "xb":
+                try:
+                    selected = ((k == "bsb" and feed == "binance") or
+                                (k == "xb" and feed == "coinbase" and r[3] == COINBASE_CODE))
+                    if not selected:
+                        continue
+                    bid, ask = float(r[4 if k == "bsb" else 5]), float(r[6])
+                    if not (math.isfinite(bid) and math.isfinite(ask) and 0 < bid <= ask):
+                        raise ValueError("invalid best bid/ask")
+                    if k == "bsb":
+                        yield ("btc", wall, bid, ask)
+                        continue
+                    # Legacy compact xb rows discarded Coinbase's sequence. Give
+                    # them increasing, run-local identities; newer rows may retain
+                    # it in an optional trailing integer. Preserve duplicates so
+                    # the production multi-socket deduplicator still handles them.
+                    recorded_seq = r[7] if len(r) > 7 else None
+                    has_seq = isinstance(recorded_seq, int) and not isinstance(recorded_seq, bool)
+                    if len(r) > 7 and not has_seq:
+                        raise ValueError("invalid recorded sequence")
+                    seq = recorded_seq if has_seq else sequence + 1
+                    sequence = max(sequence, seq)
+                    ex = float(r[4]) if r[4] is not None else wall * 1000.0
+                    if not math.isfinite(ex):
+                        raise ValueError("nonfinite exchange time")
+                    yield ("btc", wall, bid, ask, {"sequence": seq, "exchange_ms": ex,
+                           "sequence_source": "recorded" if has_seq else "synthetic",
+                           "exchange_time_source": "recorded" if r[4] is not None else "receive_time_model"})
+                except (IndexError, ValueError, TypeError):
+                    diagnostics["malformed_trigger_rows"] += 1
+                    continue
             elif k == "round":
                 yield ("round", wall, r[3])
             elif k == "aid":
@@ -139,7 +178,8 @@ def scan_rounds(paths, feed: str = "coinbase") -> dict:
     asset_round = {}
     last = 0.0
     ticks = 0
-    for ev in events(paths, feed):
+    diagnostics = collections.Counter()
+    for ev in events(paths, feed, diagnostics):
         last = max(last, ev[1])
         if ev[0] == "btc":
             ticks += 1
@@ -156,6 +196,7 @@ def scan_rounds(paths, feed: str = "coinbase") -> dict:
     out = {w: dict(info, book_updates=counts[w]) for w, info in rounds.items()}
     out["__until__"] = last
     out["__btc_ticks__"] = ticks
+    out["__input_diagnostics__"] = dict(diagnostics)
     return out
 
 
@@ -208,13 +249,15 @@ class ReplayBroker:
 
     def __init__(self, ledger: Ledger, clock: Clock, book, *, start_cash: float, latency_ms: float,
                  window_s: float = 300.0, min_left_s: float = 10.0, min_price: float = 0.05,
-                 max_price: float = 0.95) -> None:
+                 max_price: float = 0.95, redemption_delay_s: float = REDEMPTION_DELAY_S) -> None:
         self.ledger, self.clock, self.book = ledger, clock, book
         self.start_balance = start_cash
         self.latency_s = latency_ms / 1000.0
         self.trade_window_seconds, self.min_seconds_to_expiry = window_s, min_left_s
         self.min_buy_price, self.max_buy_price = min_price, max_price
         self._rules_cache: dict = {}
+        self.redemption_delay_s = redemption_delay_s
+        self.redemption_at: dict[str, float] = {}
         self.pending: list = []
         self.received = 0
         self.lock = threading.Lock()
@@ -265,8 +308,12 @@ class ReplayBroker:
     def cash_balance(self) -> float:
         with self.ledger._lock:
             spent = sum(p.cost for p in self.ledger.positions.values())
-            payouts = sum(p.shares * float(p.payout_per_share or 0) for p in self.ledger.positions.values() if p.settled)
+            payouts = sum(p.shares * float(p.payout_per_share or 0) for p in self.ledger.positions.values()
+                          if p.settled and self.redemption_at.get(p.condition_id, math.inf) <= self.clock.now)
         return self.start_balance - spent + payouts
+
+    def mark_settled(self, condition_id: str, settled_at: float) -> None:
+        self.redemption_at[str(condition_id)] = settled_at + self.redemption_delay_s
 
     def _asks_now(self, token):
         view = self.book.view(token)
@@ -291,8 +338,13 @@ class ReplayBroker:
         with self.lock:
             due = [o for o in self.pending if o["arrival"] <= now]
             self.pending = [o for o in self.pending if o["arrival"] > now]
-        for o in due:
+        for o in sorted(due, key=lambda o: o["arrival"]):
+            # No recorded event between arrival and now changed the book. Match
+            # at arrival, including the cutoff and own-depth TTL, rather than
+            # rejecting a valid order because the next message arrived late.
+            self.clock.now = o["arrival"]
             self._fill(o)
+        self.clock.now = now
         return due
 
     def _fill(self, o) -> None:
@@ -320,6 +372,8 @@ class ReplayBroker:
             elif o["fok"] and spend > 1e-6:
                 # FOK: all of it at or under the cap, or nothing
                 err = f"FOK no-fill: only ${o['amount'] - spend:.6f} available at or below {cap}"
+            elif notional + fee > self.cash_balance() + 1e-9:
+                err = "insufficient available collateral including fees"
         if err is not None:
             slot.update(ok=False, error=err, fill=None)
         else:
@@ -344,7 +398,8 @@ class ReplayBroker:
 # =========================================================================== one variant
 SNIPER_ENV = {k: v for k, v in (
     ("SNIPER_ONLY", "1"), ("SNIPER_SHADOW_MS", ""), ("SNIPER_STALL_MS", "0"), ("SNIPER_MIN_LEFT_S", "10"),
-    ("SNIPER_MAX_FILLS_ROUND", "20"), ("SNIPER_MAX_SIDE_SHARES", "200"), ("SNIPER_BINANCE_FRESHNESS", "0"))}
+    ("SNIPER_MAX_FILLS_ROUND", "20"), ("SNIPER_MAX_SIDE_SHARES", "200"), ("SNIPER_BINANCE_FRESHNESS", "0"),
+    ("SNIPER_COINBASE_CONNS", "2"))}
 for _attr, _var, _val, _l, _f in exec_latency.FROZEN_SPEC:
     SNIPER_ENV[_var] = str(_val)
 SPEC_FEED = SNIPER_ENV["SNIPER_PRIMARY_FEED"]
@@ -353,16 +408,24 @@ SPEC_FEED = SNIPER_ENV["SNIPER_PRIMARY_FEED"]
 SNIPER_ENV["SNIPER_EXTRA_FEEDS"] = ""
 
 
-def btc_message(feed: str, bid: float, ask: float) -> str:
+def btc_message(feed: str, bid: float, ask: float, *, sequence: int = 1, exchange_ms: float = 0.0) -> str:
     """One recorded best bid/ask as the trigger feed's own message."""
     if feed == "coinbase":
         return json.dumps({"type": "ticker", "product_id": S.COINBASE_PRODUCT, "best_bid": repr(bid),
-                           "best_ask": repr(ask)})
+                           "best_ask": repr(ask), "sequence": sequence,
+                           "time": datetime.fromtimestamp(exchange_ms / 1000.0, timezone.utc).isoformat()})
+    if feed != "binance":
+        raise ValueError(f"unsupported replay feed {feed!r}")
     return json.dumps({"b": f"{bid:.2f}", "a": f"{ask:.2f}"})
 
 
 async def run_variant(paths, rounds, results, *, with_pm: bool, pm_cfg: PMM.PMConfig, latency_ms: float,
-                      start_cash: float, label: str, feed: str = SPEC_FEED) -> dict:
+                      start_cash: float, label: str, feed: str = SPEC_FEED,
+                      settlement_delay_s: float = SETTLEMENT_DELAY_S,
+                      redemption_delay_s: float = REDEMPTION_DELAY_S) -> dict:
+    for name, value in (("settlement_delay_s", settlement_delay_s), ("redemption_delay_s", redemption_delay_s)):
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be finite and nonnegative")
     until = rounds.get("__until__", math.inf)
     rounds = {w: i for w, i in rounds.items() if not str(w).startswith("__")}
     clock = Clock()
@@ -372,9 +435,12 @@ async def run_variant(paths, rounds, results, *, with_pm: bool, pm_cfg: PMM.PMCo
     book.connected = True
     hub = types.SimpleNamespace(up_token=None, down_token=None, condition_id=None, window_start=None,
                                 window_end=None, book=book)
-    broker = ReplayBroker(ledger, clock, book, start_cash=start_cash, latency_ms=latency_ms)
+    broker = ReplayBroker(ledger, clock, book, start_cash=start_cash, latency_ms=latency_ms,
+                          redemption_delay_s=redemption_delay_s)
     env = dict(SNIPER_ENV, SNIPER_LATENCY_MS=str(latency_ms), SNIPER_PRIMARY_FEED=feed)
     metrics = {"label": label, "max_open_cost": 0.0, "max_worst_loss": 0.0, "max_one_side": 0.0}
+    input_diagnostics = collections.Counter()
+    trigger_status = collections.Counter()
     asset_side = {}
     latest = {}                                            # asset -> (bids, asks) latest recorded ladder
     settled_rounds, pm_last = set(), -1e9
@@ -444,17 +510,19 @@ async def run_variant(paths, rounds, results, *, with_pm: bool, pm_cfg: PMM.PMCo
         def settle_due(now):
             for w, info in rounds.items():
                 cid = info["condition_id"]
-                if w + 300 + 1 <= now and w not in settled_rounds and cid in results:
+                settled_at = w + 300 + settlement_delay_s
+                if settled_at <= now and w not in settled_rounds and cid in results:
                     from accounting.resolution import RESOLVED, Resolution
                     r = results[cid]
                     done = ledger.settle(Resolution(cid, RESOLVED, {k: float(v) for k, v in r["payouts"].items()},
                                                     winning_label=r.get("winner")))
                     settled_rounds.add(w)
+                    broker.mark_settled(cid, settled_at)
                     if done:
                         equity_curve.append(sum(float(p.realized or 0) for p in ledger.positions.values()
                                                 if p.settled))
 
-        for ev in events(paths, feed):
+        for ev in events(paths, feed, input_diagnostics):
             kind, now = ev[0], ev[1]
             if now > until:
                 break                                       # identical input for A and B
@@ -486,20 +554,36 @@ async def run_variant(paths, rounds, results, *, with_pm: bool, pm_cfg: PMM.PMCo
                                                                                             error=err))
             elif kind == "btc":
                 before, received = sn.n["orders"], broker.received      # both counted BEFORE the tick
-                on_btc(btc_message(feed, ev[2], ev[3]))
+                metadata = ev[4] if len(ev) > 4 else {}
+                for key in ("sequence_source", "exchange_time_source"):
+                    if key in metadata:
+                        input_diagnostics[f"{key}:{metadata[key]}"] += 1
+                trigger_status[on_btc(btc_message(feed, ev[2], ev[3],
+                                sequence=metadata.get("sequence", 1),
+                                exchange_ms=metadata.get("exchange_ms", now * 1000.0))) or "tick"] += 1
                 if sn.n["orders"] > before:
                     await drain(expect_orders=received + (sn.n["orders"] - before))
-        # the end: whatever is in flight, then every round that has a result
-        clock.now += 1000.0
+        # Finish orders already dispatched, without granting future payouts.
+        if broker.pending:
+            clock.now = max(clock.now, max(o["arrival"] for o in broker.pending))
         due = broker.resolve_due()
         await drain(sides={o["side"] for o in due if o["tag"] == "sniper"})
-        settle_due(clock.now + 10_000)
+        settle_due(clock.now)
         for task in list(sn._tasks):
             task.cancel()
         await asyncio.gather(*sn._tasks, return_exceptions=True)
         if pm is not None:
             pm.journal.close()
-    return collect(label, ledger, broker, sn, pm, metrics, equity_curve, asset_side, rounds, results, tmp)
+    out = collect(label, ledger, broker, sn, pm, metrics, equity_curve, asset_side, rounds, results, tmp)
+    out["input_diagnostics"] = dict(input_diagnostics)
+    out["trigger_status"] = dict(trigger_status)
+    out["sniper_counters"] = dict(sn.n)
+    out["settlement_delay_s"] = settlement_delay_s
+    out["redemption_delay_s"] = redemption_delay_s
+    out["replay_end_wall"] = clock.now
+    out["freshness_enabled"] = False
+    out["warnings"] = replay_warnings(out)
+    return out
 
 
 def collect(label, ledger, broker, sn, pm, m, curve, asset_side, rounds, results, tmp) -> dict:
@@ -513,8 +597,10 @@ def collect(label, ledger, broker, sn, pm, m, curve, asset_side, rounds, results
         rec["fees"] += lot.fee
         rec["shares"] += lot.shares
         rec["orders"].add(lot.trade_id)
-        if p.settled and p.payout_per_share is not None:
-            rec["pnl"] += lot.shares * float(p.payout_per_share) - lot.cost
+        payout = (p.payout_per_share if p.settled else
+                  results.get(p.condition_id, {}).get("payouts", {}).get(str(p.token_id)))
+        if payout is not None:
+            rec["pnl"] += lot.shares * float(payout) - lot.cost
         st = side_tot[asset_side.get(str(p.token_id), "UP")]
         st[0] += lot.cost
         st[1] += lot.shares
@@ -540,13 +626,22 @@ def collect(label, ledger, broker, sn, pm, m, curve, asset_side, rounds, results
             if o["fill"] and o["ref_ask"] is not None]
     realized = sum(float(p.realized or 0) for p in ledger.positions.values() if p.settled)
     unsettled = sum(p.cost for p in ledger.positions.values() if not p.settled and p.shares > 0)
+    known_unsettled_pnl = 0.0
+    for p in ledger.positions.values():
+        payout = results.get(p.condition_id, {}).get("payouts", {}).get(str(p.token_id))
+        if not p.settled and payout is not None:
+            known_unsettled_pnl += p.shares * float(payout) - p.cost
+    pending_redemption = sum(p.shares * float(p.payout_per_share or 0) for p in ledger.positions.values()
+                             if p.settled and broker.redemption_at.get(p.condition_id, math.inf) > broker.clock.now)
     rows = [json.loads(x) for x in (tmp / "sniper.jsonl").read_text(encoding="utf-8").splitlines()] \
         if (tmp / "sniper.jsonl").exists() else []
     sniper_orders = [r for r in rows if r.get("result") in ("filled", "refused", "error")]
     n_markets = len({r["condition_id"] for r in sniper_orders if r.get("condition_id")}) or 0
     out = {
         "label": label, "rounds_with_result": sum(1 for i in rounds.values() if i["condition_id"] in results),
-        "total_pnl": realized, "realized_pnl": realized, "unsettled_cost": unsettled,
+        "total_pnl": realized + known_unsettled_pnl, "realized_pnl": realized, "unsettled_cost": unsettled,
+        "known_outcome_unsettled_pnl": known_unsettled_pnl,
+        "end_available_cash": broker.cash_balance(), "pending_redemption_payout": pending_redemption,
         "fees": sum(r["fees"] for r in by_src.values()),
         "capital_deployed": sum(r["cost"] for r in by_src.values()),
         "max_exposure": m["max_open_cost"], "max_worst_case_loss": m["max_worst_loss"],
@@ -560,7 +655,9 @@ def collect(label, ledger, broker, sn, pm, m, curve, asset_side, rounds, results
         "slippage_c_avg": sum(x for x, _ in slip) / len(slip) if slip else None,
         "by_source": {k: {kk: (len(vv) if isinstance(vv, set) else vv) for kk, vv in v.items()} for k, v in by_src.items()},
         "sniper_rows": [{k: r.get(k) for k in ("wall", "side", "result", "reason", "ask_seen", "cap", "amount",
-                                               "shares", "price", "target_shares", "carry_in")} for r in sniper_orders],
+                                               "shares", "price", "target_shares", "carry_in", "fair", "fair_anchor",
+                                               "kelly_held_shares", "kelly_opposite_shares", "fee_rate",
+                                               "fee_exponent")} for r in sniper_orders],
         "manager": None if pm is None else {
             "orders": len(pm.orders),
             "by_class": dict(collections.Counter(o.classification for o in pm.orders.values())),
@@ -578,6 +675,25 @@ def collect(label, ledger, broker, sn, pm, m, curve, asset_side, rounds, results
     return out
 
 
+def replay_warnings(out: dict) -> list[str]:
+    """Zero activity has different meanings; expose its inputs and gates."""
+    warnings = []
+    malformed = sum(v for k, v in out.get("input_diagnostics", {}).items() if k.startswith("malformed"))
+    malformed += out.get("trigger_status", {}).get("malformed", 0)
+    if malformed:
+        warnings.append(f"{malformed} malformed input rows/messages; inspect input_diagnostics and trigger_status")
+    accepted = out.get("trigger_status", {}).get("tick", 0)
+    if not accepted:
+        warnings.append("no trigger ticks accepted; this run cannot validate strategy behavior")
+    elif not out.get("sniper_counters", {}).get("signals", 0):
+        warnings.append("no signals on accepted ticks; no trading decisions were exercised")
+    elif not out.get("sniper_orders", 0):
+        warnings.append("signals produced no orders; inspect sniper_counters for the rejecting gates")
+    elif not out.get("sniper_fills", 0):
+        warnings.append("orders produced no fills; this run did not exercise fill accounting or settlement")
+    return warnings
+
+
 def compare_sniper(a: dict, b: dict) -> dict:
     """Every sniper decision of A against B, matched by time and side."""
     ka = {(round(r["wall"], 3), r["side"]): r for r in a["sniper_rows"]}
@@ -593,7 +709,10 @@ def compare_sniper(a: dict, b: dict) -> dict:
 
 def report(a: dict, b: dict, cmp: dict) -> str:
     f = lambda v, n=2: "--" if v is None else f"{v:,.{n}f}"  # noqa: E731
-    rows = [("total P/L $", "total_pnl", 2), ("realized P/L $", "realized_pnl", 2), ("fees $", "fees", 2),
+    rows = [("known-outcome P/L $", "total_pnl", 2), ("settled P/L $", "realized_pnl", 2), ("fees $", "fees", 2),
+            ("end available cash $", "end_available_cash", 2),
+            ("pending redemption payout $", "pending_redemption_payout", 2),
+            ("unsettled cost $", "unsettled_cost", 2),
             ("avg slippage c/share", "slippage_c_avg", 2), ("capital deployed $", "capital_deployed", 2),
             ("max exposure (open cost) $", "max_exposure", 2), ("max one-side exposure $", "max_one_sided_exposure", 2),
             ("max worst-case loss $", "max_worst_case_loss", 2),
@@ -612,6 +731,13 @@ def report(a: dict, b: dict, cmp: dict) -> str:
     extra_cap = b["capital_deployed"] - a["capital_deployed"]
     dpl = b["total_pnl"] - a["total_pnl"]
     out += ["", f"rounds with a venue result: {a['rounds_with_result']}",
+            f"cash model: settlement {a.get('settlement_delay_s', SETTLEMENT_DELAY_S):g}s after expiry, "
+            f"redemption {a.get('redemption_delay_s', REDEMPTION_DELAY_S):g}s after settlement; "
+            "known-outcome P/L uses cached final results and does not imply spendable cash",
+            "feed freshness gates disabled for compact recordings; recorded timestamps retained, "
+            "missing sequences/times synthesized and counted",
+            f"A trigger status {a.get('trigger_status')} input diagnostics {a.get('input_diagnostics')}",
+            f"B trigger status {b.get('trigger_status')} input diagnostics {b.get('input_diagnostics')}",
             f"manager orders {mg.get('orders')} by class {mg.get('by_class')} by status {mg.get('by_status')}",
             f"manager orders creating pairs above the pair threshold: {mg.get('bad_pairs')}",
             f"manager capital ${f(src.get('cost', 0.0))}  manager fees ${f(src.get('fees', 0.0))}  "
@@ -627,6 +753,8 @@ def report(a: dict, b: dict, cmp: dict) -> str:
             f"sniper decisions: A {cmp['sniper_orders_A']} B {cmp['sniper_orders_B']}; missed in B "
             f"{cmp['missed_in_B']}, extra in B {cmp['extra_in_B']}, different outcome {cmp['different_outcome']}",
             f"manager skips (sampled): {mg.get('skips')}", f"manager evaluation us: {mg.get('eval_us')}"]
+    for variant in (a, b):
+        out.extend(f"WARNING {variant['label']}: {warning}" for warning in variant.get("warnings", ()))
     return "\n".join(out)
 
 
@@ -635,10 +763,16 @@ def main(argv=None) -> int:
     ap.add_argument("--data", action="append", default=None, help="a recordings folder (repeatable)")
     ap.add_argument("--latency-ms", type=float, default=170.0, help="decision -> venue match (150ms hold + network)")
     ap.add_argument("--cash", type=float, default=1000.0)
+    ap.add_argument("--settlement-delay-s", type=float, default=SETTLEMENT_DELAY_S,
+                    help="assumed resolution delay after expiry (default: 60s)")
+    ap.add_argument("--redemption-delay-s", type=float, default=REDEMPTION_DELAY_S,
+                    help="additional delay before settled payouts become collateral (default: 600s)")
     ap.add_argument("--json", default=None)
     ap.add_argument("--feed", choices=REPLAY_FEEDS, default=SPEC_FEED,
                     help=f"the trigger feed to replay (default: the frozen spec's, {SPEC_FEED})")
     args = ap.parse_args(argv)
+    if any(not math.isfinite(v) or v < 0 for v in (args.settlement_delay_s, args.redemption_delay_s)):
+        ap.error("settlement and redemption delays must be finite and nonnegative")
     dirs = args.data or [os.environ.get("LAB_DATA", str(ROOT / "latency_lab" / "data"))]
     paths = recording_files(dirs)
     if not paths:
@@ -647,18 +781,22 @@ def main(argv=None) -> int:
     rounds = scan_rounds(paths, args.feed)
     until = rounds.pop("__until__")
     ticks = rounds.pop("__btc_ticks__")
+    diagnostics = rounds.pop("__input_diagnostics__")
     if not ticks:
         print(f"the recordings hold no {args.feed} ticks: nothing to trigger on (recorded with --feeds none? "
               f"try --feed {'binance' if args.feed == 'coinbase' else 'coinbase'})")
+        print("input diagnostics:", diagnostics)
         return 1
     res = outcomes(rounds, pathlib.Path(dirs[-1]) / "replay_outcomes.json")
     rounds["__until__"] = until
     pm_cfg = PMM.PMConfig.from_env({}, global_max_buy_price=0.95, global_max_side_shares=200)
     t0 = time.time()
     a = asyncio.run(run_variant(paths, rounds, res, with_pm=False, pm_cfg=pm_cfg, latency_ms=args.latency_ms,
-                                start_cash=args.cash, label="A", feed=args.feed))
+                                start_cash=args.cash, label="A", feed=args.feed,
+                                settlement_delay_s=args.settlement_delay_s, redemption_delay_s=args.redemption_delay_s))
     b = asyncio.run(run_variant(paths, rounds, res, with_pm=True, pm_cfg=pm_cfg, latency_ms=args.latency_ms,
-                                start_cash=args.cash, label="B", feed=args.feed))
+                                start_cash=args.cash, label="B", feed=args.feed,
+                                settlement_delay_s=args.settlement_delay_s, redemption_delay_s=args.redemption_delay_s))
     cmp = compare_sniper(a, b)
     rounds.pop("__until__", None)
     print(f"{len(paths)} recordings, {len(rounds)} rounds ({sum(1 for i in rounds.values() if i['condition_id'] in res)}"
@@ -669,7 +807,7 @@ def main(argv=None) -> int:
                                                        "latency_ms": args.latency_ms, "feed": args.feed},
                                                       indent=1, default=str),
                                            encoding="utf-8")
-    return 0
+    return 0 if all(v["trigger_status"].get("tick", 0) for v in (a, b)) else 2
 
 
 if __name__ == "__main__":

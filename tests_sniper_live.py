@@ -546,7 +546,8 @@ def t_repeated_slow_replies_hard_halt():
         fake = await FakeClob().start()
         with tempfile.TemporaryDirectory() as tmp:
             ex, *_ = await make_canary(fake, tmp, limits=L.CanaryLimits(max_orders=100, max_fills=100,
-                                                                        max_exposure_usd=1e6))
+                                                                        max_exposure_usd=1e6,
+                                                                        max_daily_loss_usd=1e6))
             ex.sender.guard.slow_ms = 100.0
             ex.hub = types.SimpleNamespace(condition_id=COND, up_token=UP, down_token=DN)
             b = live_book()
@@ -617,7 +618,8 @@ def t_normal_venue_orders_flow_with_no_guard_transition():
         fake = await FakeClob().start()
         with tempfile.TemporaryDirectory() as tmp:
             ex, *_ = await make_canary(fake, tmp, limits=L.CanaryLimits(max_orders=100, max_fills=100,
-                                                                        max_exposure_usd=1e6))
+                                                                        max_exposure_usd=1e6,
+                                                                        max_daily_loss_usd=1e6))
             journal = []
             ex.sender.guard.journal = journal.append
             b = live_book()
@@ -992,7 +994,7 @@ def t_canary_reconciler_grace_baseline_and_confirmation():
             ledger.ingest_fill_store(store)
             ex.baseline_unexplained = ex._unexplained_now()
             # our fill arrives a moment before its order is authorized (the race)
-            store.record_trade("t-1", order_id="0xorder1", asset_id=UP, market=COND, side="BUY",
+            store.record_trade("trade-1", order_id="0xorder1", asset_id=UP, market=COND, side="BUY",
                                price=0.5, size=10, status="CONFIRMED")
             ledger.ingest_fill_store(store)
             ex.reconcile_once()

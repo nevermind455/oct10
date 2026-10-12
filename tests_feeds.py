@@ -1528,7 +1528,8 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # room at the cap (skip "kelly room under venue minimum at price cap").
     # Re-approved 2026-10-12: a price cap at or below MIN_BUY_PRICE is skipped at the
     # decision ("price cap at the price floor") - the paper broker refused it, live would buy.
-    "sniper_mode.py": "6ba6f269cb50b8179c26043da706490d7ead86ce2ac2d00e20745c138fa6df94",
+    # Reviewed 2026-10-12: user-requested recovery, accounting and portfolio safety fixes.
+    "sniper_mode.py": "232da5a7e6b82512f78c431c0b8c048eaacd7a553b2a12cd38b5d881b13f5b88",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
@@ -1536,7 +1537,8 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # numbers for counts) or the start is refused - "nan" used to switch a cap off.
     # Re-approved (F3): CanarySession - the canary's counters, halts and loss window survive
     # restarts, reconciled with the ledger's authorizations; unreadable state fails closed.
-    "sniper_live.py": "64aa14526c291c8dbfee6b9cf3dcac746d4c88c68d4cd41adff86b5a6c06a37e",
+    # Reviewed 2026-10-12: user-requested recovery, accounting and portfolio safety fixes.
+    "sniper_live.py": "b9d1671255668b1781f7794f4eeceaea7d2e01d2c3e2fd4399ef36746803970b",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads
@@ -1561,13 +1563,15 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved (F2): fills and settlements append one fsynced journal line (the snapshot
     # records the entry it includes; load replays newer ones, validated, torn tail dropped,
     # gaps/corruption refused); snapshots every 500 entries and on save(). current_payload().
-    "accounting/ledger.py": "a76729c0e98607acbbc9990e40751f4bea06b906fd884f38a07ca74689645572",
+    # Reviewed 2026-10-12: user-requested recovery, accounting and portfolio safety fixes.
+    "accounting/ledger.py": "6936873433f2da0053b85835c8d2ad76ee78f3e042c78abc994b826964504028",
     "accounting/fees.py": "44e45be00c7c3b330ef0ff11950fa42944029ba83a61ec8066af3494c0956dc7",
     # Re-approved (settlement audit): one record per market (condition id), checked from
     # expiry, concurrently, on the worker's own pool; explicit lifecycle events and a journal;
     # REDEEM PENDING / REDEEMED tracked apart from SETTLED. Ledger.settle is unchanged.
     # Re-approved (F5): a RESULT_MISMATCH detail raises the RESULT_MISMATCH event (never settled).
-    "accounting/settlement.py": "66bbd90695e971aa7d164edd46eafd4534d5b2dd870bebb051551301f3a72ae6",
+    # Reviewed 2026-10-12: user-requested recovery, accounting and portfolio safety fixes.
+    "accounting/settlement.py": "2eadbbd30ebaa53fc88846d0cba148dbaf8f9ebfa83573229c5b3e6492499080",
     # Re-approved: Resolver - the chain's payout vector first, the market's outcome order read
     # once per market, the CLOB + Gamma mirrors only when the chain cannot answer. fetch() is
     # unchanged but for its chain=False switch.
@@ -1580,8 +1584,13 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # instead of leaving a LIVE book that silently missed a change.
     # Re-approved 2026-10-11 (operator's audit): malformed updates and invalid
     # exchange timestamps fail closed; REST snapshots cannot overwrite newer socket data.
-    "feeds/book.py": "098272dd3343ba59eee56bb7435b5cb46c1f5c901d8d2f830277ac9867269b4a",
-    "feeds/poly_user.py": "a6d8c60e2feb6088dd5c68babb5d74b0a0cbea3ae4d54493946959255ed91436",
+    # Reviewed 2026-10-12: user-requested recovery, accounting and portfolio safety fixes.
+    "feeds/book.py": "76840192de204eea390333f1c943158bc695313f756a94b7894f14b142b73150",
+    # Reviewed 2026-10-12: user-requested recovery, accounting and portfolio safety fixes.
+    "feeds/poly_user.py": "f9d5d11f00923f0aea83e6935bf803e01f45f06f9e5aa20bc83571482e5baf66",
+    # Reviewed 2026-10-12: receive fencing and ordered public-token snapshot recovery.
+    "feeds/hub.py": "45b61d911502da1eaf424d154ca33d0e9226d727f9b076acf74eff7ca8d2c22a",
+    "feeds/poly_market.py": "a1bb16261905e0b2f39b63afa25c6e50c25140d1ee3fd931b15134065a7ad6f4",
     "feeds/reconcile.py": "71dea5e832fb970e5cfac1880686cf5eff477a34c48c9b91ba961f77b3e9cb6f",
 }
 SIDES = (None, "UP", "DOWN")

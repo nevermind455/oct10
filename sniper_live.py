@@ -8,9 +8,10 @@ client's own OrderBuilder (signer, signature type, funder) and API creds, so
 an order is signed and authenticated exactly as the audited live path does -
 without that path's per-order network calls.
 
-Hot path, signal -> network send, and nothing else:
+Hot path, signal -> network send:
     exact price (sniper_mode.signing_price) -> sign (the client's builder) ->
     order JSON + L2 HMAC headers stamped with a CACHED server time ->
+    durable local intent/reservation -> recheck dispatch guards ->
     POST /order on an already-open HTTP/2 connection.
 No GET /time, no market metadata, no balance read, no book fetch, no retry.
 
@@ -379,59 +380,70 @@ class CanaryLimits:
     max_daily_loss_usd: float = 15.0
     orders: int = 0
     fills: int = 0
+    pending_fills: int = 0                  # every dispatched order may fill
     exposure_usd: float = 0.0
     rounds: set = field(default_factory=set)
 
+    def __post_init__(self):
+        import threading
+        self._lock = threading.RLock()
+
     def check(self, amount: float, shares: float, condition: str, kill: KillSwitch, realized_loss_usd=None):
+        with self._lock:
+            orders, potential_fills = self.orders, self.fills + self.pending_fills
+            rounds, exposure = set(self.rounds), self.exposure_usd
         if shares > self.max_order_shares + 1e-9:
             raise Refused(f"order of {shares:.2f} shares exceeds the canary cap {self.max_order_shares}")
-        if self.orders >= self.max_orders:
+        if orders >= self.max_orders:
             kill.trip(f"canary order cap reached ({self.max_orders})")
-        if self.fills >= self.max_fills:
+        if potential_fills >= self.max_fills:
             kill.trip(f"canary fill cap reached ({self.max_fills})")
-        if condition not in self.rounds and len(self.rounds) >= self.max_rounds:
+        if condition not in rounds and len(rounds) >= self.max_rounds:
             kill.trip(f"canary round cap reached ({self.max_rounds})")
-        if self.exposure_usd + amount > self.max_exposure_usd + 1e-9:
+        if exposure + amount > self.max_exposure_usd + 1e-9:
             kill.trip(f"canary exposure cap ${self.max_exposure_usd:.2f} would be exceeded")
         if realized_loss_usd is not None and realized_loss_usd >= self.max_daily_loss_usd:
             kill.trip(f"canary daily loss ${realized_loss_usd:.2f} >= ${self.max_daily_loss_usd:.2f}")
         kill.check()
 
     def record_send(self, amount: float, condition: str) -> None:
-        self.orders += 1
-        self.rounds.add(condition)
-        self.exposure_usd += amount           # counted at send: an unknown order is exposure
+        with self._lock:
+            self.orders += 1
+            self.pending_fills += 1
+            self.rounds.add(condition)
+            self.exposure_usd += amount       # counted at send: an unknown order is exposure
 
     def record_outcome(self, kind: str, amount: float) -> None:
-        if kind in (MATCHED, PENDING):
-            self.fills += kind == MATCHED
-        elif kind in (NO_MATCH, REJECTED, NOT_SENT):
-            self.exposure_usd = max(0.0, self.exposure_usd - amount)   # definitely not spent
+        with self._lock:
+            if kind in (MATCHED, PENDING):
+                self.pending_fills = max(0, self.pending_fills - 1)
+                self.fills += 1
+            elif kind in (NO_MATCH, REJECTED, NOT_SENT):
+                self.pending_fills = max(0, self.pending_fills - 1)
+                if kind == NOT_SENT:
+                    self.orders = max(0, self.orders - 1)
+                self.exposure_usd = max(0.0, self.exposure_usd - amount)   # definitely not spent
         # AMBIGUOUS keeps its exposure until reconciled
+
+    def resolve_accepted(self, unused: float, *, zero_fill: bool = False) -> None:
+        """Serialize worker reconciliation with event-loop send counters."""
+        with self._lock:
+            self.exposure_usd = max(0.0, self.exposure_usd - unused)
+            if zero_fill:
+                self.fills = max(0, self.fills - 1)
 
 
 class CanarySession:
-    """The canary's session budget, durable across restarts (audit F3).
+    """Durable send intents and session budgets.
 
-    CanaryLimits counts orders, fills, rounds and spend in memory, and the
-    session's realized loss is counted from session_start - all of which a
-    restart used to reset, re-arming the whole budget (a crash-restart loop
-    would re-arm it each time). This persists them, and the halt reasons, in
-    one small JSON file next to the live ledger:
-
-    - written atomically (temp file, fsync, rename) off the order path: the
-      sender updates its counters on the event loop, a worker persists a
-      change within persist_every_s;
-    - on start every counter is the LARGER of the file and what the live
-      ledger's durable order authorizations prove for this session (orders
-      in rounds ending after it began, their notional, their markets), so a
-      crash inside that window can only over-count, never reset;
-    - fails closed: an unreadable file, another wallet's file, or no file
-      while the ledger shows live orders in the last day, refuses to start.
-      A new budget is a deliberate act (new_session=True / --new-canary-session),
-      which keeps the old file as a .bak.
+    A signed order's intent and reservation are fsynced BEFORE its first
+    possible socket write. A crash with an unresolved intent halts the next
+    run; neither a restart nor a new budget silently retries that order.
+    Definitive no-fill replies and complete ledger confirmations resolve
+    intents atomically. Periodic saves also retain halt reasons.
     """
-    VERSION = 1
+    VERSION = 2
+    UNRESOLVED = {"DISPATCHING", "ACCEPTED", "AMBIGUOUS"}
     RECENT_S = 86_400.0
     TRANSIENT = ("shutting down",)          # halts that are not about the session's risk
 
@@ -444,7 +456,8 @@ class CanarySession:
         self._last: tuple | None = None
         self.last_error: str | None = None
         self.restored: dict = {}
-        self._save_lock = threading.Lock()
+        self.intents: dict = {}
+        self._save_lock = threading.RLock()
 
     @staticmethod
     def wallet_key_for(address: str) -> str:
@@ -456,7 +469,7 @@ class CanarySession:
         if not self.path.exists():
             return None
         data = json.loads(self.path.read_text(encoding="utf-8"), parse_constant=lambda c: float("nan"))
-        ok = (isinstance(data, dict) and data.get("version") == self.VERSION
+        ok = (isinstance(data, dict) and data.get("version") in (1, self.VERSION)
               and isinstance(data.get("session_id"), str) and data["session_id"]
               and isinstance(data.get("wallet"), str)
               and isinstance(data.get("rounds"), list) and isinstance(data.get("kill_reasons"), list))
@@ -465,20 +478,46 @@ class CanarySession:
                 v = data.get(k)
                 if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
                     ok = False
+                elif k in ("orders", "fills") and v != int(v):
+                    ok = False
         if not ok:
             raise ValueError("malformed canary session state")
+        pending = data.get("pending_fills", 0)
+        intents = data.get("intents", {})
+        if data["version"] == self.VERSION and ("pending_fills" not in data or "intents" not in data):
+            raise ValueError("missing durable canary reservations")
+        if (isinstance(pending, bool) or not isinstance(pending, int) or pending < 0
+                or not isinstance(intents, dict)):
+            raise ValueError("malformed canary send reservations")
+        for key, intent in intents.items():
+            if (not isinstance(key, str) or not key or not isinstance(intent, dict)
+                    or intent.get("status") not in self.UNRESOLVED | {NO_MATCH, REJECTED, NOT_SENT, "CONFIRMED"}
+                    or not isinstance(intent.get("condition"), str) or not intent["condition"]
+                    or not isinstance(intent.get("token"), str) or not intent["token"]):
+                raise ValueError("malformed canary send intent")
+            for field_name in ("amount", "reserve", "wall", "end"):
+                value = intent.get(field_name)
+                if (isinstance(value, bool) or not isinstance(value, (int, float))
+                        or not math.isfinite(value) or value < 0):
+                    raise ValueError("malformed canary intent reservation")
+            if intent["reserve"] < intent["amount"]:
+                raise ValueError("canary intent reserve below notional")
+            spent = intent.get("spent")
+            if spent is not None and (isinstance(spent, bool) or not isinstance(spent, (int, float))
+                                      or not math.isfinite(spent) or not 0 <= spent <= intent["amount"] + 1e-6):
+                raise ValueError("invalid resolved canary spend")
         return data
 
     @staticmethod
-    def _ledger_view(ledger, since_wall: float) -> dict:
+    def _ledger_view(ledger, since_wall: float, intents: dict | None = None) -> dict:
         """What the live ledger's durable authorizations prove since since_wall."""
         orders, spend, rounds, filled = 0, 0.0, set(), set()
+        by_order = {intent.get("order_id"): intent for intent in (intents or {}).values() if intent.get("order_id")}
         with ledger._lock:
             for oid, meta in ledger.authorized_orders.items():
                 if not isinstance(meta, dict) or float(meta.get("window_end") or 0) < since_wall:
                     continue
                 orders += 1
-                spend += float(meta.get("requested_notional") or 0.0)
                 if meta.get("condition_id"):
                     rounds.add(str(meta["condition_id"]))
             ids = {oid for oid, meta in ledger.authorized_orders.items()
@@ -487,7 +526,19 @@ class CanarySession:
                 for lot in pos.lots:
                     if lot.order_id in ids:
                         filled.add(lot.order_id)
-        return {"orders": orders, "spend": spend, "rounds": rounds, "fills": len(filled)}
+            no_fill = {oid for oid in ids if by_order.get(oid, {}).get("status") in (NO_MATCH, REJECTED, NOT_SENT)} - filled
+            for oid in ids - no_fill:
+                meta, intent = ledger.authorized_orders[oid], by_order.get(oid, {})
+                if intent.get("status") == "CONFIRMED" and intent.get("spent") is not None:
+                    spend += float(intent["spent"])
+                else:
+                    spend += float(meta.get("requested_notional") or 0.0)
+            ids -= no_fill
+            complete = {oid for oid in filled
+                        if not ledger.authorized_orders[oid].get("trade_ids")
+                        or set(ledger.authorized_orders[oid]["trade_ids"]) <= set(ledger.seen)}
+        return {"orders": orders, "spend": spend, "rounds": rounds, "fills": len(filled),
+                "confirmed": complete, "unconfirmed": ids - complete}
 
     def open(self, limits: "CanaryLimits", kill: KillSwitch, ledger, *, new_session: bool = False,
              now: float | None = None) -> str:
@@ -502,6 +553,12 @@ class CanarySession:
                                f"restore it, or start a NEW budget deliberately with --new-canary-session") from None
         if data is not None and data["wallet"] != self.wallet_key:
             raise RuntimeError(f"canary session state {self.path} belongs to another wallet: refusing to start")
+        if data is not None:
+            # A single booked lot cannot prove an accepted FAK's complete
+            # quantity. Only an explicitly persisted terminal resolution can
+            # clear its intent; an interrupted reconciliation stays halted.
+            if new_session and any(i["status"] in self.UNRESOLVED for i in data.get("intents", {}).values()):
+                raise RuntimeError("unresolved live send intent: reconcile the venue before starting a new canary budget")
         if new_session and data is not None:
             self.path.replace(self.path.with_name(f"{self.path.name}.{int(now)}.bak"))
             data = None
@@ -518,14 +575,24 @@ class CanarySession:
         else:
             how = "canary session restored"
         self.session_id, self.started_wall = data["session_id"], float(data["started_wall"])
-        proof = self._ledger_view(ledger, self.started_wall)
+        self.intents = copy.deepcopy(data.get("intents", {}))
+        proof = self._ledger_view(ledger, self.started_wall, self.intents)
         limits.orders = max(int(data["orders"]), proof["orders"])
         limits.fills = max(int(data["fills"]), proof["fills"])
+        accepted_ids = {i.get("order_id") for i in self.intents.values() if i.get("kind") in (MATCHED, PENDING)}
+        limits.pending_fills = max(int(data.get("pending_fills", 0)),
+                                   len(proof["unconfirmed"] - accepted_ids),
+                                   sum(i["status"] in self.UNRESOLVED and i.get("kind") not in (MATCHED, PENDING)
+                                       for i in self.intents.values()))
         limits.exposure_usd = max(float(data["exposure_usd"]), proof["spend"])
         limits.rounds = set(map(str, data["rounds"])) | proof["rounds"]
         for reason in data["kill_reasons"]:
             if not str(reason).startswith(self.TRANSIENT):
                 kill.trip(str(reason))
+        unresolved = [key for key, intent in self.intents.items() if intent["status"] in self.UNRESOLVED]
+        if unresolved or proof["unconfirmed"]:
+            kill.trip(f"unresolved live orders from a previous run ({len(unresolved)} send intents, "
+                      f"{len(proof['unconfirmed'])} unconfirmed authorizations): reconcile before trading")
         self.restored = {"orders": limits.orders, "fills": limits.fills, "spend": round(limits.exposure_usd, 4),
                          "rounds": len(limits.rounds), "halts": list(kill.reasons)}
         self._last = None
@@ -537,10 +604,56 @@ class CanarySession:
                 f"{len(limits.rounds)} rounds" + (f"; HALTED: {'; '.join(kill.reasons)}" if kill.reasons else ""))
 
     def state(self, limits: "CanaryLimits", kill: KillSwitch) -> dict:
-        return {"version": self.VERSION, "session_id": self.session_id, "wallet": self.wallet_key,
-                "started_wall": self.started_wall, "orders": int(limits.orders), "fills": int(limits.fills),
-                "exposure_usd": float(limits.exposure_usd), "rounds": sorted(map(str, limits.rounds)),
-                "kill_reasons": [r for r in kill.reasons if not str(r).startswith(self.TRANSIENT)]}
+        with limits._lock:
+            return {"version": self.VERSION, "session_id": self.session_id, "wallet": self.wallet_key,
+                    "started_wall": self.started_wall, "orders": int(limits.orders), "fills": int(limits.fills),
+                    "exposure_usd": float(limits.exposure_usd), "rounds": sorted(map(str, limits.rounds)),
+                    "pending_fills": int(limits.pending_fills), "intents": copy.deepcopy(self.intents),
+                    "kill_reasons": [r for r in kill.reasons if not str(r).startswith(self.TRANSIENT)]}
+
+    def before_send(self, p: "Prepared", limits: "CanaryLimits", kill: KillSwitch) -> None:
+        """Persist risk and signed identity before the transport may write."""
+        import hashlib
+        with self._save_lock:
+            key = p.client_order_id
+            if key in self.intents:
+                kill.trip("duplicate durable live send intent")
+                raise Halted("duplicate durable live send intent")
+            payload = json.loads(p.body)
+            limits.record_send(p.amount, p.condition)
+            p.stamps["budget_recorded"] = True
+            self.intents[key] = {"status": "DISPATCHING", "wall": time.time(), "end": p.end,
+                                 "condition": p.condition, "token": p.token, "side": p.side,
+                                 "amount": p.amount, "reserve": float(getattr(p, "reserve", p.amount)),
+                                 "order_type": p.order_type, "price": p.price,
+                                 "body_sha256": hashlib.sha256(p.body.encode()).hexdigest(),
+                                 "signed_order": payload.get("order"), "order_id": None}
+            if not self._save_unlocked(limits, kill):
+                kill.trip(f"live send intent cannot be persisted ({self.last_error})")
+                raise Halted("live send intent cannot be persisted; order not sent")
+
+    def outcome(self, p: "Prepared", row: dict, limits: "CanaryLimits", kill: KillSwitch) -> None:
+        with self._save_lock:
+            intent = self.intents.get(p.client_order_id)
+            if intent is None:
+                return
+            kind = row["kind"]
+            intent.update(status="ACCEPTED" if kind in (MATCHED, PENDING) else kind,
+                          kind=kind, order_id=row.get("order_id"))
+            if not self._save_unlocked(limits, kill):
+                kill.trip(f"live send outcome cannot be persisted ({self.last_error})")
+
+    def resolve(self, client_order_id: str | None, status: str, limits: "CanaryLimits", kill: KillSwitch,
+                *, spent: float | None = None) -> None:
+        with self._save_lock:
+            intent = self.intents.get(client_order_id)
+            if intent is None:
+                return
+            intent["status"] = status
+            if spent is not None:
+                intent["spent"] = float(spent)
+            if not self._save_unlocked(limits, kill):
+                kill.trip(f"live send reconciliation cannot be persisted ({self.last_error})")
 
     def save(self, limits: "CanaryLimits", kill: KillSwitch) -> bool:
         """Atomic write when something changed (worker thread). True when the
@@ -568,6 +681,15 @@ class CanarySession:
             from durable_io import replace_atomic
             replace_atomic(tmp, self.path)
             tmp = None
+            if os.name != "nt":
+                # The file flush alone cannot make its new directory entry
+                # survive a host failure. Any POSIX directory-flush failure
+                # must prevent the subsequent order write.
+                directory = os.open(str(self.path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
             self._last, self.last_error = key, None
             return True
         except Exception as exc:  # noqa: BLE001 - reported; the caller halts on repeated failure
@@ -624,6 +746,7 @@ class LeanSender:
         self.guard = guard or VenueGuard(kill, slow_ms=latency_halt_ms, extreme_ms=latency_extreme_ms)
         self.max_consecutive_errors, self.consecutive_errors = max_consecutive_errors, 0
         self.realized_loss = realized_loss
+        self.session: CanarySession | None = None
         self._lib = dict(CreateOrderOptions=CreateOrderOptions, MarketOrderArgsV2=MarketOrderArgsV2,
                          FOK=OrderType.FOK, FAK=OrderType.FAK, RequestArgs=RequestArgs, POST_ORDER=POST_ORDER,
                          l2=create_level_2_headers, BUY=BUY, to_json=order_to_json_v2)
@@ -688,11 +811,16 @@ class LeanSender:
         check = getattr(p, "send_guard", None)
         if check is not None:
             check()
-        if budget:
+        if budget and not p.stamps.get("budget_recorded"):
             self.limits.check(p.amount, p.amount / p.price, p.condition, self.kill,
                               self.realized_loss() if self.realized_loss else None)
 
     def _record_send(self, p: Prepared) -> None:
+        if p.stamps.get("budget_recorded"):
+            return
+        if self.session is not None:
+            self.session.before_send(p, self.limits, self.kill)
+            return
         self.limits.record_send(p.amount, p.condition)
         p.stamps["budget_recorded"] = True
 
@@ -708,6 +836,8 @@ class LeanSender:
         p.stamps["post_call_pc"] = time.perf_counter_ns()
         try:
             self._check_send(p)
+            self._record_send(p)               # durable intent before the first possible write
+            self._check_send(p, budget=False)  # disk flush may have outlived the signal/rules/expiry
             stream = post_now(self.url, p.body.encode("utf-8"), p.headers)
         except Exception as exc:
             from fast_h2 import NotConnected, Stream
@@ -722,7 +852,6 @@ class LeanSender:
                     self._record_send(p)
                 return stream
             return None
-        self._record_send(p)
         return stream
 
     # ------------------------------------------------------------ the send, async
@@ -794,7 +923,8 @@ class LeanSender:
                 st["response_pc"] = t
         new_conn = any("connect_tcp" in n or "start_tls" in n for n, _ in events)
         row.update(kind=kind, http_status=status, error=err, new_connection=new_conn,
-                   order_id=(resp or {}).get("orderID") if isinstance(resp, dict) else None,
+                   order_id=((resp or {}).get("orderID") or (resp or {}).get("order_id"))
+                   if isinstance(resp, dict) else None,
                    venue_status=(resp or {}).get("status") if isinstance(resp, dict) else None,
                    response=resp if isinstance(resp, dict) else None)
         self._after(p, row, st)
@@ -926,6 +1056,8 @@ class LeanSender:
         row["ts_us"] = {k[:-3]: round((v - base) / 1000) for k, v in st.items()
                         if k.endswith("_pc") and isinstance(v, int)}
         row["wall"] = time.time()
+        if self.session is not None:
+            self.session.outcome(p, row, self.limits, self.kill)
         self.journal(row)
 
 
@@ -1079,6 +1211,9 @@ class LiveExecution:
         self.balance: float | None = None
         self.balance_at: float | None = None
         self.reserved = 0.0
+        import threading
+        self._risk_lock = threading.RLock()
+        self._risk_orders: dict = {}        # client id -> full all-in reservation until fully reconciled
         self._balance_revision = 0
         self.awaiting: dict = {}            # order id -> what we expect the ledger to confirm
         self.fak_orders: dict = {}          # retained metadata for validating partial-fill updates
@@ -1116,7 +1251,7 @@ class LiveExecution:
         lim = self.sender.limits
         return (f"SNIPER LIVE CANARY limits: <= {lim.max_order_shares:g} sh/order, {lim.max_orders} orders, "
                 f"{lim.max_fills} fills, {lim.max_rounds} rounds, ${lim.max_exposure_usd:g} total spend, "
-                f"${lim.max_daily_loss_usd:g} realized loss; stop file {self.kill.stop_file}")
+                f"${lim.max_daily_loss_usd:g} worst-case loss incl. open orders; stop file {self.kill.stop_file}")
 
     # ------------------------------------------------------------ start / stop / background
     async def start(self, hub) -> None:
@@ -1129,9 +1264,11 @@ class LiveExecution:
         await self._read_balance()
         if self.balance is None:
             raise RuntimeError("could not read the collateral balance/allowance")
-        # Fills this wallet already had that no order explains are the
-        # operator's to know about, not a reason to halt this session.
-        self.baseline_unexplained = await asyncio.to_thread(self._unexplained_now)
+        # Recovery cannot distinguish a manual trade from an orphaned bot
+        # write. Never silently exempt recovered unexplained fills.
+        self.baseline_unexplained = set()
+        if await asyncio.to_thread(self._unexplained_now):
+            self._trip("unexplained recovered wallet fills: reconcile before trading")
         self.hub = hub
         loop = asyncio.get_running_loop()
         self._tasks = [loop.create_task(keep_warm(self.sender.http, self.sender.clock, self.clock_url,
@@ -1348,10 +1485,79 @@ class LiveExecution:
             return sum(float(getattr(p, "realized", 0) or 0) for p in led.positions.values()
                        if getattr(p, "settled", False) and float(getattr(p, "settled_wall", 0) or 0) >= self.session_start)
 
+    def _risk_budget_used(self) -> float:
+        """Loss already realized plus conservative open and uncertain basis.
+
+        Unconfirmed quantities never earn a hedge credit. A partially booked
+        order retains its unused full reservation until its complete trade
+        set is confirmed, without counting booked basis twice.
+        """
+        with self._risk_lock:
+            reservations = [dict(a) for a in self._risk_orders.values()]
+        with self.ledger._lock:
+            positions = list(self.ledger.positions.values())
+            realized = sum(float(getattr(p, "realized", 0) or 0) for p in positions
+                           if getattr(p, "settled", False)
+                           and float(getattr(p, "settled_wall", 0) or 0) >= self.session_start)
+            open_basis = sum(float(p.cost) for p in positions if not p.settled and p.shares > 0)
+            booked = collections.defaultdict(float)
+            for pos in positions:
+                for lot in pos.lots:
+                    if not getattr(lot, "order_id", None) or str(lot.side).upper() != "BUY":
+                        continue
+                    booked[lot.order_id] += float(lot.cost)
+        # Settlement of a partially booked position is not proof that the
+        # unresolved remainder never executed. Retain that remaining risk.
+        uncertain = sum(max(0.0, a["reserve"] - booked.get(a.get("order_id"), 0.0)) for a in reservations)
+        value = max(0.0, -realized) + open_basis + uncertain
+        if not math.isfinite(value) or value < 0:
+            self._trip("invalid live worst-case loss reservation")
+            self.kill.check()
+        return value
+
+    def _check_loss_budget(self, additional: float = 0.0) -> None:
+        self._check_accounting_integrity()
+        risk = self._risk_budget_used() + additional
+        cap = self.sender.limits.max_daily_loss_usd
+        if risk > cap + 1e-9:
+            raise Refused(f"worst-case loss ${risk:.6f} incl. fees exceeds the canary loss budget ${cap:.2f}")
+
+    def _check_accounting_integrity(self) -> None:
+        error = getattr(self.ledger, "integrity_error", None)
+        if error:
+            self._trip(f"durable fill execution evidence conflicts with the ledger: {error}")
+            self.kill.check()
+
+    def own_risk_shares(self, token: str, condition: str) -> float:
+        """Booked plus uncertain own-side inventory; never hedge credit."""
+        with self._risk_lock:
+            reservations = [dict(a) for a in self._risk_orders.values()
+                            if a["token"] == str(token) and a["condition"] == str(condition)]
+        with self.ledger._lock:
+            positions = [p for p in self.ledger.positions.values()
+                         if str(p.token_id) == str(token) and str(p.condition_id) == str(condition) and not p.settled]
+            held = sum(float(p.shares) for p in positions)
+            booked = collections.defaultdict(float)
+            for pos in positions:
+                for lot in pos.lots:
+                    if str(lot.side).upper() == "BUY" and getattr(lot, "order_id", None):
+                        booked[lot.order_id] += float(lot.open_shares)
+        return held + sum(max(0.0, a["shares"] - booked.get(a.get("order_id"), 0.0)) for a in reservations)
+
+    def _resolve_risk(self, a: dict, *, filled: bool, spent: float | None = None) -> None:
+        key = a.get("client_order_id")
+        with self._risk_lock:
+            self._risk_orders.pop(key, None)
+        session = self.session
+        if session is not None:
+            session.resolve(key, "CONFIRMED" if filled else NO_MATCH, self.sender.limits, self.kill,
+                            spent=spent if filled else 0.0)
+
     def reconcile_once(self) -> None:
         """Every accepted order must turn up CONFIRMED in the ledger; no fill
         may stay unexplained past a short grace; the session's realized loss
         feeds the loss cap. Runs on a worker thread."""
+        self._check_accounting_integrity()
         now = time.time()
         unexplained = self._unexplained_now() - self.baseline_unexplained
         for tid in [t for t in self._unexplained_since if t not in unexplained]:
@@ -1363,27 +1569,49 @@ class LiveExecution:
                            f"(trade ...{str(tid)[-10:]}): reconcile by hand")
         confirmed = self._confirmed_orders()
         for oid, a in list(self.awaiting.items()):
+            if a.get("authorized") is False:
+                if now - a["wall"] > self.confirm_within_s:
+                    self._trip(f"order {oid} authorization incomplete: reconcile")
+                continue
             if a.get("order_type") == "FAK":
                 self._reconcile_fak(oid, a, now)
                 continue
             if oid in confirmed:
-                self.awaiting.pop(oid, None)
-                self.n["confirmed in ledger"] += 1
-                continue
+                with self.ledger._lock:
+                    complete = not a.get("trade_ids") or set(a["trade_ids"]) <= set(self.ledger.seen)
+                if complete:
+                    self._resolve_risk(a, filled=True)
+                    self.awaiting.pop(oid, None)
+                    self.n["confirmed in ledger"] += 1
+                    continue
             age = now - a["wall"]
             if (self.order_status is not None and age > 30 and not a.get("venue_matched")
                     and now - a.get("checked_at", 0.0) > 15):
                 a["checked_at"] = now
                 try:
-                    status = str((self.order_status(oid) or {}).get("status") or "").lower()
+                    order = self.order_status(oid) or {}
+                    status = str(order.get("status") or "").lower()
                 except Exception:  # noqa: BLE001 - counted; the deadline below still applies
-                    status = ""
+                    status, order = "", {}
                     self.n["order status errors"] += 1
                 a["venue_status"] = status
                 if status in ("canceled", "cancelled", "unmatched", "killed", "expired"):
-                    # A delayed FOK the venue then killed: no fill will come.
+                    # Cancellation alone cannot release collateral: require
+                    # this exact order's authoritative zero execution evidence.
+                    try:
+                        zero = (str(order.get("id")) == str(oid) and str(order.get("asset_id")) == a["token"]
+                                and str(order.get("market")) == a["condition"] and order.get("side") == "BUY"
+                                and Decimal(str(order.get("size_matched"))) == 0
+                                and order.get("associate_trades") == [])
+                    except (ArithmeticError, TypeError, ValueError):
+                        zero = False
+                    if not zero:
+                        if age > self.confirm_within_s:
+                            self._trip(f"FOK order {oid} canceled without complete zero-fill proof: reconcile")
+                        continue
                     self.awaiting.pop(oid, None)
-                    self.sender.limits.exposure_usd = max(0.0, self.sender.limits.exposure_usd - a["amount"])
+                    self.sender.limits.resolve_accepted(a["amount"], zero_fill=True)
+                    self._resolve_risk(a, filled=False)
                     self.n["accepted but never filled"] += 1
                     continue
                 a["venue_matched"] = status == "matched"
@@ -1429,8 +1657,8 @@ class LiveExecution:
         fill = self.fill_for(oid)
         if fill is not None:
             if fill["shares"] == 0:
-                self.sender.limits.exposure_usd = max(0.0, self.sender.limits.exposure_usd - a["amount"])
-                self.sender.limits.fills -= 1     # release this accepted FAK's reserved fill slot
+                self.sender.limits.resolve_accepted(a["amount"], zero_fill=True)
+                self._resolve_risk(a, filled=False)
                 self.awaiting.pop(oid, None)
                 self.n["accepted but never filled"] += 1
                 return
@@ -1439,7 +1667,8 @@ class LiveExecution:
             if fill["statuses"] == ["CONFIRMED"] and booked:
                 # Only the proven unused notional is returned to the session cap.
                 unused = max(0.0, a["amount"] - fill["cost"])
-                self.sender.limits.exposure_usd = max(0.0, self.sender.limits.exposure_usd - unused)
+                self.sender.limits.resolve_accepted(unused)
+                self._resolve_risk(a, filled=True, spent=fill["cost"])
                 self.awaiting.pop(oid, None)
                 self.n["confirmed in ledger"] += 1
                 return
@@ -1514,8 +1743,24 @@ class LiveExecution:
                 return None
             shares += qty
             paid = getattr(f, "paid", None)
-            cost += Decimal(str(paid)) if paid is not None else qty * px
-            fee += curve_fee(qty, px, rules)
+            trade_cost = Decimal(str(paid)) if paid is not None else qty * px
+            legs = getattr(f, "maker_legs", None)
+            if legs is not None:
+                try:
+                    parsed_legs = [(Decimal(str(q)), Decimal(str(price))) for q, price in legs]
+                    if (not parsed_legs or any(not q.is_finite() or not price.is_finite() or q <= 0
+                                              or not 0 < price <= Decimal(str(a["cap"]))
+                                              for q, price in parsed_legs)
+                            or abs(sum(q for q, _ in parsed_legs) - qty) > Decimal("0.000001")
+                            or abs(sum(q * price for q, price in parsed_legs) - trade_cost) > Decimal("0.000001")):
+                        raise ValueError("invalid maker execution legs")
+                except (ArithmeticError, TypeError, ValueError):
+                    self._trip(f"FAK order {oid} has invalid maker execution legs: reconcile")
+                    return None
+                fee += sum(curve_fee(q, price, rules) for q, price in parsed_legs)
+            else:
+                fee += curve_fee(qty, trade_cost / qty, rules)
+            cost += trade_cost
         if cost > Decimal(str(a["amount"])) + Decimal("0.000001"):
             self._trip(f"FAK order {oid} filled above its budget: reconcile")
             return None
@@ -1567,6 +1812,12 @@ class LiveExecution:
         if rules is None:
             raise Refused("market rules not loaded for this round yet")
         order_rules = self.sender.rules.get(cond, str(up), str(down))
+        if plan.get("fair_fee_rate") is not None:
+            if (Decimal(str(plan["fair_fee_rate"])) != rules.fee_rate
+                    or int(plan.get("fair_fee_exponent", 1)) != rules.fee_exponent
+                    or Decimal(str(order_rules["fee_rate"])) != rules.fee_rate
+                    or int(order_rules["fee_exponent"]) != rules.fee_exponent):
+                raise Refused("fee rules changed after the fair-value decision")
         if order_rules.get("taker_delay") and end - time.time() <= self.assumed_delay_s:
             raise Refused(f"inside the venue's assumed {self.assumed_delay_s:g}s matching-delay window")
         # As paper: an order's cap may tighten the account ceiling, never loosen it.
@@ -1601,15 +1852,17 @@ class LiveExecution:
         spend, fee = float(spend), float(quote.fee)
         # More liquidity can arrive after our snapshot. Reserve for the whole
         # signed spend and an upper fee bound, not just the visible partial.
-        reserve_fee = max(fee, spend * float(rules.fee_rate)) if order_type == "FAK" else fee
+        reserve_fee = max(fee, spend * float(rules.fee_rate))
         free = (self.balance or 0.0) - self.reserved
         if spend + reserve_fee > free + 1e-9:
             raise Refused(f"collateral ${free:.2f} is below the order ${spend + reserve_fee:.2f} incl. fee")
+        self._check_loss_budget(spend + reserve_fee)
         p = self.sender.prepare(side=side, token=token, up=str(up), down=str(down), condition=cond, end=end,
                                 amount=spend, cap=cap, decided_pc=decided_pc, order_type=order_type)
         p.reserve = spend + reserve_fee
         p.estimate = {"shares": float(quote.shares), "price": float(quote.average_price), "fee": fee}
         def send_guard():
+            self._check_loss_budget()
             if self.balance_at is None or time.monotonic() - self.balance_at > self.balance_max_age_s:
                 raise Refused("collateral balance became stale before dispatch")
             if self.balance is None or self.reserved > self.balance + 1e-9:
@@ -1633,6 +1886,10 @@ class LiveExecution:
                 if latest.status != LIVE or age is None or not math.isfinite(age) or age < 0 or age > max_age:
                     raise Refused("book became stale before dispatch")
         p.send_guard = send_guard
+        with self._risk_lock:
+            self._risk_orders[p.client_order_id] = {"condition": str(cond), "token": str(token),
+                                                   "reserve": p.reserve, "order_id": None,
+                                                   "shares": max(float(quote.shares), spend / float(book.asks[0][0]))}
         self.reserved += p.reserve
         self._balance_revision += 1
         return p
@@ -1656,6 +1913,9 @@ class LiveExecution:
             self.reserved = max(0.0, self.reserved - reserve)
             self._balance_revision += 1
         kind = row["kind"]
+        if kind in (NO_MATCH, REJECTED, NOT_SENT):
+            with self._risk_lock:
+                self._risk_orders.pop(p.client_order_id, None)
         if kind in (MATCHED, PENDING, AMBIGUOUS) and self.balance is not None:
             self.balance -= reserve                         # spent, or may be; the next read corrects it
         if kind in (MATCHED, PENDING) and row.get("order_id"):
@@ -1705,22 +1965,23 @@ class LiveExecution:
             window_end=p.end, amount=p.amount, estimated_fee=float(est.get("fee") or 0.0),
             fee_rate=float(rules.get("fee_rate") or 0), fee_exponent=int(rules.get("fee_exponent") or 1),
             validation="MATCHED_WITH_TRADE_EVIDENCE" if row["kind"] == MATCHED else (row.get("error") or "PENDING"))
+        resp = row.get("response") or {}
+        a = {"wall": time.time(), "condition": p.condition, "token": p.token, "amount": p.amount,
+             "kind": row["kind"], "client_order_id": p.client_order_id, "authorized": False,
+             "trade_ids": set(resp.get("tradeIDs") or resp.get("trade_ids") or [])}
+        self.awaiting[oid] = a
+        with self._risk_lock:
+            if p.client_order_id in self._risk_orders:
+                self._risk_orders[p.client_order_id]["order_id"] = oid
+        if p.order_type == "FAK":
+            a.update(order_type="FAK", cap=p.price, fee_rate=float(rules.get("fee_rate") or 0),
+                     fee_exponent=int(rules.get("fee_exponent") or 1))
+            self.fak_orders[oid] = a
         try:
             ok = self.receipt_sink(receipt)
         except Exception as exc:  # noqa: BLE001
             ok, row["authorize_error"] = False, f"{type(exc).__name__}: {exc}"[:160]
-        self.awaiting[oid] = {"wall": time.time(), "condition": p.condition, "token": p.token,
-                              "amount": p.amount, "kind": row["kind"]}
-        if p.order_type == "FAK":
-            resp = row.get("response") or {}
-            tids = resp.get("tradeIDs") or resp.get("trade_ids") or []
-            a = self.awaiting[oid]
-            a.update(order_type="FAK", cap=p.price, fee_rate=float(rules.get("fee_rate") or 0),
-                     fee_exponent=int(rules.get("fee_exponent") or 1),
-                     trade_ids=set(tids) if row["kind"] == MATCHED else set())
-            self.fak_orders[oid] = a
-            if row["kind"] == PENDING:
-                self.sender.limits.fills += 1     # pending FAK also reserves a session fill slot
+        a["authorized"] = bool(ok)
         if not ok:
             row.setdefault("authorize_error", getattr(self.ledger, "last_persistence_error", None)
                            or "receipt sink refused authorization")
@@ -1729,7 +1990,8 @@ class LiveExecution:
     def status(self) -> dict:
         lim = self.sender.limits
         return {"halted": list(self.kill.reasons), "balance": None if self.balance is None else round(self.balance, 2),
-                "orders": lim.orders, "fills": lim.fills, "spend_usd": round(lim.exposure_usd, 2),
+                "orders": lim.orders, "fills": lim.fills, "potential_fills": lim.pending_fills,
+                "spend_usd": round(lim.exposure_usd, 2), "worst_case_loss_usd": round(self._risk_budget_used(), 6),
                 "rounds": len(lim.rounds), "awaiting_confirmation": len(self.awaiting),
                 "session_loss_usd": round(self.session_loss, 2), "clock": self.sender.clock.status(),
                 "rules_ready": bool(self.rules_ready), "guard": self.sender.guard.status(), "counts": dict(self.n)}
@@ -1780,6 +2042,7 @@ def build_live_execution(*, ledger, on_event=None, user_ready=None, fills=None, 
     state_path = env.get("SNIPER_CANARY_STATE_PATH") or str(Path(ledger.path).with_name("live_canary_state.json"))
     ex.session = CanarySession(state_path, CanarySession.wallet_key_for(holder))
     line = ex.session.open(sender.limits, sender.kill, ledger, new_session=new_session)
+    sender.session = ex.session
     ex.session_start = ex.session.started_wall
     (on_event or (lambda *a: None))("sniper", f"LIVE CANARY {line}", "warn")
     return ex

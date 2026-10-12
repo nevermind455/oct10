@@ -508,6 +508,29 @@ class JournalTailTests(unittest.TestCase):
 
 
 class DashViewTests(unittest.TestCase):
+    def test_live_equity_uses_observed_remaining_tokens_and_keeps_unknown_unknown(self):
+        now = time.time()
+        hub = types.SimpleNamespace(up_token=None, down_token=None, condition_id=None,
+                                    window_start=None, window_end=None,
+                                    health=lambda: {}, book=types.SimpleNamespace(),
+                                    fill_store=types.SimpleNamespace(summary=lambda: {"fills": 0}))
+        rt = types.SimpleNamespace(mode="LIVE", paper=False, hub=hub, sniper=None,
+                                   ledger=None, broker=None, live_exec=None,
+                                   reconciler=None, settler=None, journal_path=None,
+                                   clock_ok=True, clock_detail="fixture", started=now)
+        view = run.DashView(rt)
+        view._refresh_slow = lambda: None
+        view._acct = {"kind": "LIVE", "balance": 100.0, "position_value": 5.0,
+                      "equity": 115.0}
+        for remaining, expected in ((9.0, 114.0), (0.0, 105.0), (None, None)):
+            with self.subTest(remaining=remaining):
+                view._settlement = lambda remaining=remaining: {
+                    "redeem_pending": remaining, "redeem_unverified": 1.0}
+                acct = view.snapshot()["account"]
+                self.assertEqual(acct["redeemable"], remaining)
+                self.assertEqual(acct["equity"], expected)
+                self.assertEqual(acct["redemption_unverified"], 1.0)
+
     def test_snapshot_from_a_real_sniper_and_fake_hub(self):
         from dashboard import build, glyphs
         now = time.time()

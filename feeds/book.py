@@ -43,6 +43,9 @@ class BookView:
     tick_size: float | None = None
     hash: str | None = None
     updates: int = 0
+    # Includes refused/ignored venue messages, unlike `updates` which counts
+    # installed book states. REST recovery must race against both.
+    receive_revision: int = 0
 
     @property
     def best_bid(self) -> float | None:
@@ -246,7 +249,8 @@ class BookState:
                 self._bids[t] = {}
                 self._asks[t] = {}
                 self._meta[t] = {"synced": False, "updated": None, "ts": None,
-                                 "tick": None, "hash": None, "updates": 0}
+                                 "tick": None, "hash": None, "updates": 0,
+                                 "receive_revision": 0, "seen_ts": None}
                 self._dirty[t] = 0
             self._active = new
             return added, removed
@@ -292,10 +296,38 @@ class BookState:
             self.rejected_updates += 1
 
     # -------------------------------------------------------------- writes
+    def _observe_locked(self, tokens, ts=None) -> None:
+        """Fence in-flight REST even when a venue update cannot be applied.
+
+        Do not add a history state or change the applied-update count: while
+        UNSYNCED the levels still are unknown. Caller holds the book lock.
+        """
+        for token in set(tokens) & self._active:
+            m = self._meta[token]
+            m["receive_revision"] = m.get("receive_revision", 0) + 1
+            if ts is not None and (m.get("seen_ts") is None or ts > m["seen_ts"]):
+                m["seen_ts"] = ts
+            self._dirty[token] = self._dirty.get(token, 0) + 1
+
+    def subscription_gap(self, token: str, *, expected_generation: int) -> int | None:
+        """Invalidate a token after unsubscribe, before requesting its snapshot.
+
+        A previously queued WS snapshot can recover it while the unsubscribe
+        send yields. Fence REST and mark that state unknown through the gap;
+        the next subscription's full snapshot will recover it again.
+        """
+        with self._lock:
+            if token not in self._active or self._generation.get(token) != expected_generation:
+                return None
+            self._observe_locked((token,))
+            self._desync_locked((token,), "snapshot resubscription")
+            return self._generation[token]
+
     def apply_snapshot(self, token: str, bids, asks, *, ts_ms=None, hash_=None,
                        tick=None, only_if_unsynced: bool = False,
                        expected_generation: int | None = None,
                        expected_updates: int | None = None,
+                       expected_receive_revision: int | None = None,
                        refresh_if_older_than: float | None = None,
                        require_exchange_ts: bool = False) -> bool:
         """Full replace. Returns False if the token is not active."""
@@ -308,6 +340,14 @@ class BookState:
                 return False
             if expected_updates is not None and m.get("updates", 0) != expected_updates:
                 return False
+            if (expected_receive_revision is not None
+                    and m.get("receive_revision", 0) != expected_receive_revision):
+                return False
+            incoming_ts = _int(ts_ms)
+            # A REST recovery is guarded by its request's receive revision;
+            # it is not itself an observed venue event.
+            if expected_receive_revision is None:
+                self._observe_locked((token,), incoming_ts if self._fresh_exchange_ts(incoming_ts) else None)
             if only_if_unsynced and m.get("synced") and self._status(token) != STALE:
                 # A quiet but connected book may hit a consumer's shorter
                 # freshness budget before the feed's own stale threshold.
@@ -318,12 +358,14 @@ class BookState:
                         or expected_updates is None or updated is None
                         or time.monotonic() - updated < refresh_if_older_than):
                     return False
-            incoming_ts = _int(ts_ms)
             if require_exchange_ts and not self._fresh_exchange_ts(incoming_ts):
                 self._desync_locked((token,), "snapshot timestamp refused")
                 return False
             previous_ts = m.get("ts")
-            if (m.get("synced") and incoming_ts is not None and previous_ts is not None
+            seen_ts = m.get("seen_ts")
+            if seen_ts is not None and (previous_ts is None or seen_ts > previous_ts):
+                previous_ts = seen_ts
+            if (incoming_ts is not None and previous_ts is not None
                     and incoming_ts < previous_ts):
                 return False
             new_bids, valid_bids = _to_map(bids)
@@ -353,6 +395,8 @@ class BookState:
                 self.dropped_inactive += 1
                 return False
             m = self._meta[token]
+            incoming_ts = _int(ts_ms)
+            self._observe_locked((token,), incoming_ts if self._fresh_exchange_ts(incoming_ts) else None)
             if not m.get("synced"):
                 # A delta on an unsynced book cannot be trusted: we do not
                 # know what it is being applied to. Wait for the snapshot.
@@ -370,7 +414,6 @@ class BookState:
                     or not 0 < p < 1 or s < 0):
                 self._desync_locked((token,), "invalid delta")
                 return False
-            incoming_ts = _int(ts_ms)
             if require_exchange_ts and not self._fresh_exchange_ts(incoming_ts):
                 self._desync_locked((token,), "delta timestamp refused")
                 return False
@@ -412,9 +455,18 @@ class BookState:
         incoming_ts = _int(ts_ms)
         with self._lock:
             if not isinstance(changes, (list, tuple)):
+                self._observe_locked(self._active)
                 self._desync_locked(self._active, "malformed price-change collection")
                 return False
             named = [str(c.get("asset_id") or "") for c in (changes or ()) if isinstance(c, dict)]
+            # An unidentifiable row might belong to any active token. Refuse
+            # it conservatively, including on books already awaiting recovery.
+            malformed = any(not isinstance(c, dict) or not c.get("asset_id") for c in changes)
+            observed = self._active if malformed else named
+            self._observe_locked(observed, incoming_ts if self._fresh_exchange_ts(incoming_ts) else None)
+            if malformed:
+                self._desync_locked(observed, "malformed event")
+                return False
             if require_exchange_ts and not self._fresh_exchange_ts(incoming_ts):
                 self._desync_locked(named, "event timestamp refused")
                 return False
@@ -527,7 +579,8 @@ class BookState:
             v = BookView(token=token, generation=gen, status=self._status(token),
                          bids=bids, asks=asks, updated_mono=m.get("updated"),
                          exchange_ts_ms=m.get("ts"), tick_size=m.get("tick"),
-                         hash=m.get("hash"), updates=m.get("updates", 0))
+                         hash=m.get("hash"), updates=m.get("updates", 0),
+                         receive_revision=m.get("receive_revision", 0))
             self._cache[token] = (dirty, v)
             return v
 
@@ -633,7 +686,8 @@ def _replace_status(self: BookView, status: str) -> BookView:
     return BookView(token=self.token, generation=self.generation, status=status,
                     bids=self.bids, asks=self.asks, updated_mono=self.updated_mono,
                     exchange_ts_ms=self.exchange_ts_ms, tick_size=self.tick_size,
-                    hash=self.hash, updates=self.updates)
+                    hash=self.hash, updates=self.updates,
+                    receive_revision=self.receive_revision)
 
 
 BookView._replace_status = _replace_status

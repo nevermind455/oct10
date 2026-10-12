@@ -547,10 +547,16 @@ class Bot:
             counts["crashes"] += self.pm.n["errors"]
             self.pm.n["errors"] = 0
 
-    def close(self):
-        self.stop.set()
-        self.pump.join(2)
-        self.pm.journal.close()
+    async def close(self):
+        # Exercise the real component lifecycle, including manager-owned
+        # executors and order waiters, before closing the harness clock.
+        try:
+            await self.sn.stop()
+            await self.pm.stop()
+            await self.settler.stop()
+        finally:
+            self.stop.set()
+            self.pump.join(2)
 
 
 class FullSystem(unittest.TestCase):
@@ -580,9 +586,8 @@ class FullSystem(unittest.TestCase):
                                 counts["deadlocks"] += 1
                             bot.check()
                             done += 1
-                        await bot.settler.stop()
                     finally:
-                        bot.close()
+                        await bot.close()
                         stats["fills"] += sum(len(p.lots) for p in bot.ledger.positions.values())
                         stats["settled_positions"] += sum(1 for p in bot.ledger.positions.values() if p.settled)
                         stats["manager_orders"] += len(bot.pm.orders)
@@ -652,59 +657,131 @@ class Resources(unittest.TestCase):
             counts = collections.Counter()
             with tempfile.TemporaryDirectory() as tmp:
                 bot = Bot(pathlib.Path(tmp), rng, counts)
-                bot.new_market()
-                loop = asyncio.get_running_loop()
+                try:
+                    bot.new_market()
+                    loop = asyncio.get_running_loop()
 
-                async def rotate(n):
-                    for _ in range(n):
-                        for _ in range(6):
-                            bot.signal(rng.choice(("UP", "DOWN")))
-                            bot.manager(loop)
-                            bot.delta(rng.choice((bot.hub.up_token, bot.hub.down_token)))
-                            await asyncio.sleep(0.002)
+                    def executor_pools():
+                        pools = {}
+                        if loop._default_executor is not None:
+                            pools["sniper"] = loop._default_executor
+                        if bot.pm._executor is not None:
+                            pools["manager"] = bot.pm._executor
+                        pools.update({f"settle-{name}": pool for name, pool in bot.settler._pools.items()})
+                        return pools
+
+                    async def warm_pool(pool):
+                        # ThreadPoolExecutor starts workers lazily. Twenty rotations
+                        # need not use every slot, so comparing cold thread counts
+                        # confuses later bounded allocation with a resource leak.
+                        # Hold one job per configured slot until every worker exists;
+                        # all trading/settlement methods remain the real methods.
+                        ready = asyncio.Event()
+                        release = threading.Event()
+                        lock = threading.Lock()
+                        started = 0
+
+                        def occupy():
+                            nonlocal started
+                            with lock:
+                                started += 1
+                                if started == pool._max_workers:
+                                    loop.call_soon_threadsafe(ready.set)
+                            release.wait()
+
+                        futures = []
+                        try:
+                            for _ in range(pool._max_workers):
+                                futures.append(pool.submit(occupy))
+                            await asyncio.wait_for(ready.wait(), timeout=10.0)
+                            self.assertEqual(len(pool._threads), pool._max_workers)
+                        finally:
+                            release.set()
+                            await asyncio.gather(*(asyncio.wrap_future(f) for f in futures))
+
+                    async def rotate(n):
+                        for _ in range(n):
+                            for _ in range(6):
+                                bot.signal(rng.choice(("UP", "DOWN")))
+                                bot.manager(loop)
+                                bot.delta(rng.choice((bot.hub.up_token, bot.hub.down_token)))
+                                await asyncio.sleep(0.002)
+                            await bot.quiesce()
+                            bot.resolve_old()
+                            await bot.settler.tick()
+                            bot.new_market()
                         await bot.quiesce()
-                        bot.resolve_old()
-                        await bot.settler.tick()
-                        bot.new_market()
-                    await bot.quiesce()
-                await rotate(20)                                             # warm up
-                await asyncio.sleep(5.5)          # markout tasks live 5s by design: not a leak, let them end
-                gc.collect()
-                tracemalloc.start()
-                m0 = tracemalloc.take_snapshot()
-                before = {"threads": threading.active_count(), "tasks": len(asyncio.all_tasks()),
-                          "handles": proc.num_handles() if hasattr(proc, "num_handles") else proc.num_fds(),
-                          "settle_records": len(bot.settler.records), "pm_histories": len(bot.pm.histories),
-                          "book_tokens": len(bot.hub.book._meta), "book_history": len(bot.hub.book._hist),
-                          "exec_locks": len(bot.broker._execution_locks), "own_fills": len(bot.broker._own_fills),
-                          "rules_cache": len(bot.broker._rules_cache), "sniper_rounds": len(bot.sn.rounds),
-                          "pm_orders": len(bot.pm.orders)}
-                t_rot = time.monotonic()
-                await rotate(rotations)
-                self.elapsed = time.monotonic() - t_rot
-                await asyncio.sleep(5.5)
-                gc.collect()
-                m1 = tracemalloc.take_snapshot()
-                grown = sum(s.size_diff for s in m1.compare_to(m0, "filename"))
-                tracemalloc.stop()
-                after = {"threads": threading.active_count(), "tasks": len(asyncio.all_tasks()),
-                         "handles": proc.num_handles() if hasattr(proc, "num_handles") else proc.num_fds(),
-                         "settle_records": len(bot.settler.records), "pm_histories": len(bot.pm.histories),
-                         "book_tokens": len(bot.hub.book._meta), "book_history": len(bot.hub.book._hist),
-                         "exec_locks": len(bot.broker._execution_locks), "own_fills": len(bot.broker._own_fills),
-                         "rules_cache": len(bot.broker._rules_cache), "sniper_rounds": len(bot.sn.rounds),
-                         "pm_orders": len(bot.pm.orders)}
-                await bot.settler.stop()
-                bot.close()
-                return before, after, grown, counts
+                    await rotate(20)                                             # warm up
+                    for pool in executor_pools().values():
+                        await warm_pool(pool)
+                    await asyncio.sleep(5.5)          # markout tasks live 5s by design: not a leak, let them end
+                    gc.collect()
+                    before_pools = executor_pools()
+                    before_threads = set(threading.enumerate())
+                    tracemalloc.start()
+                    m0 = tracemalloc.take_snapshot()
+                    before = {"threads": threading.active_count(), "tasks": len(asyncio.all_tasks()),
+                              "handles": proc.num_handles() if hasattr(proc, "num_handles") else proc.num_fds(),
+                              "settle_records": len(bot.settler.records), "pm_histories": len(bot.pm.histories),
+                              "book_tokens": len(bot.hub.book._meta), "book_history": len(bot.hub.book._hist),
+                              "exec_locks": len(bot.broker._execution_locks), "own_fills": len(bot.broker._own_fills),
+                              "rules_cache": len(bot.broker._rules_cache), "sniper_rounds": len(bot.sn.rounds),
+                              "pm_orders": len(bot.pm.orders)}
+                    t_rot = time.monotonic()
+                    await rotate(rotations)
+                    self.elapsed = time.monotonic() - t_rot
+                    await asyncio.sleep(5.5)
+                    gc.collect()
+                    m1 = tracemalloc.take_snapshot()
+                    grown = sum(s.size_diff for s in m1.compare_to(m0, "filename"))
+                    tracemalloc.stop()
+                    after = {"threads": threading.active_count(), "tasks": len(asyncio.all_tasks()),
+                             "handles": proc.num_handles() if hasattr(proc, "num_handles") else proc.num_fds(),
+                             "settle_records": len(bot.settler.records), "pm_histories": len(bot.pm.histories),
+                             "book_tokens": len(bot.hub.book._meta), "book_history": len(bot.hub.book._hist),
+                             "exec_locks": len(bot.broker._execution_locks), "own_fills": len(bot.broker._own_fills),
+                             "rules_cache": len(bot.broker._rules_cache), "sniper_rounds": len(bot.sn.rounds),
+                             "pm_orders": len(bot.pm.orders)}
+                    after_pools = executor_pools()
+                    after_threads = set(threading.enumerate())
+                    owned_threads = {bot.pump} | {thread for pool in after_pools.values() for thread in pool._threads}
+                    # A manager executor may only be needed after the measured
+                    # rotations start; every such new pool still has its explicit
+                    # configured bound. Existing warmed pools must be reused.
+                    expected_limits = {"manager": 2, "settle-net": bot.settler.workers, "settle-io": 2}
+                    new_capacity = 0
+                    for name, pool in after_pools.items():
+                        self.assertLessEqual(len(pool._threads), pool._max_workers, name)
+                        if name in before_pools:
+                            self.assertIs(pool, before_pools[name], name)
+                        else:
+                            self.assertIn(name, expected_limits)
+                            self.assertEqual(pool._max_workers, expected_limits[name], name)
+                            new_capacity += pool._max_workers
+                    self.assertEqual(set(before_pools) - set(after_pools), set())
+                    self.assertFalse(after_threads - before_threads - owned_threads,
+                                     "rotation spawned threads outside the bot's bounded executors")
+                    self.assertLessEqual(after["threads"], before["threads"] + new_capacity)
+                    return before, after, grown, counts, owned_threads
+                finally:
+                    if tracemalloc.is_tracing():
+                        tracemalloc.stop()
+                    await bot.close()
 
         with patch("sys.stdout", QUIET):
-            before, after, grown, counts = asyncio.run(main())
+            before, after, grown, counts, owned_threads = asyncio.run(main())
+        # asyncio.run has also shut down the sniper's default executor. The
+        # settlement shutdown is non-blocking, so give any final already-running
+        # local worker a bounded opportunity to exit and verify ownership ends.
+        deadline = time.monotonic() + 2.0
+        for thread in owned_threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        self.assertFalse([thread.name for thread in owned_threads if thread.is_alive()],
+                         "bot-owned workers survived shutdown")
         print(f"\n  C. resources over {rotations} market rotations: memory {grown / 1024:+.0f} KiB")
         for k in before:
             print(f"     {k:16s} {before[k]:>7} -> {after[k]:>7}")
         self.assertEqual({k: v for k, v in counts.items() if v}, {})
-        self.assertLessEqual(after["threads"], before["threads"] + 2)
         self.assertLessEqual(after["tasks"], before["tasks"] + 5)
         self.assertLessEqual(after["handles"], before["handles"] + 20)
         for bounded in ("settle_records", "pm_histories", "book_tokens", "rules_cache", "own_fills", "exec_locks",

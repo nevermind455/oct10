@@ -386,6 +386,17 @@ def test_settlement_states_are_spelled_out() -> None:
     check("LIVE shows REDEEMABLE apart from collateral", "REDEEMABLE" in text and "$4.37" in text, text)
     check("LIVE shows REDEEM PENDING with its amount",
           any("REDEEM" in ln and "PENDING $4.37" in ln for ln in text.splitlines()), text)
+    live["settlement"]["subject"].update(redeem_remaining_amount=3.37,
+                                        redeem_unverified_amount=1.0)
+    partial = _text(build(live, 120, 40, UNICODE))
+    check("partial redemption shows only the remaining wallet-held payout",
+          any("REDEEM" in ln and "PENDING $3.37" in ln for ln in partial.splitlines()), partial)
+    live["settlement"]["subject"].update(redeem="REDEMPTION UNVERIFIED",
+                                        redeem_remaining_amount=0.0)
+    unverified = _text(build(live, 120, 40, UNICODE))
+    check("token disappearance is shown as unverified collateral",
+          any("UNVERIFIED" in ln and "$1.00" in ln and "collateral" in ln
+              for ln in unverified.splitlines()), unverified)
 
 
 def test_execution_latency_and_quality_are_visible() -> None:

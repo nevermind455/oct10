@@ -30,7 +30,8 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field, fields
-from decimal import DecimalException
+from decimal import Decimal, DecimalException
+from types import SimpleNamespace
 
 from . import fees as fee_mod
 from durable_io import replace_atomic
@@ -78,6 +79,9 @@ class Lot:
     # is never mutated away or removed: `lots` stays an append-only journal of
     # what actually happened, and FIFO basis is derived from what is left open.
     consumed: float = 0.0
+    # The venue's headline price identifies a trade across WS/REST replays.
+    # `price` is its cash-weighted execution price and drives inventory basis.
+    reported_price: float | None = None
 
     @property
     def open_shares(self) -> float:
@@ -126,6 +130,7 @@ class Ledger:
                  fee_resolver=None, allow_sells: bool = False) -> None:
         self._lock = threading.RLock()
         self._save_lock = threading.Lock()
+        self._ingest_lock = threading.Lock()
         self.path = path or os.environ.get("LEDGER_PATH", "ledger.json")
         self.category = category
         self.fee_resolver = fee_resolver
@@ -165,6 +170,7 @@ class Ledger:
         self.balance_marks: list = []        # (wall, balance) from the venue
         self.last_persistence_error: str | None = None
         self.last_ingest_error: str | None = None
+        self.integrity_error: str | None = None
         self.last_mark_error: str | None = None
         # Append-only journal beside the snapshot (audit F2). A fill or a
         # settlement appends one fsynced line instead of rewriting every
@@ -445,6 +451,7 @@ class Ledger:
             lot = next((candidate for position in self.positions.values()
                         for candidate in position.lots
                         if candidate.trade_id == trade_id), None)
+            authorization = copy.deepcopy(self.authorized_orders.get(lot.order_id, {})) if lot else {}
         if lot is None:
             return False
 
@@ -469,30 +476,39 @@ class Ledger:
         if status.endswith("FAILED") or status.endswith("CONFLICT"):
             conflicts.append("terminal status")
         for label, raw, expected in (
-                ("price", row.get("price"), lot.price),
+                ("price", row.get("price"),
+                 lot.price if lot.reported_price is None else lot.reported_price),
                 ("size", row.get("size"), lot.shares)):
             if raw in (None, ""):
                 continue
             try:
                 value = float(raw)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 conflicts.append(label)
                 continue
             if (not math.isfinite(value)
                     or not math.isclose(value, float(expected),
                                         rel_tol=1e-9, abs_tol=1e-9)):
                 conflicts.append(label)
+        try:
+            conflicts.extend(_replay_execution_conflicts(row, lot, authorization, self.category))
+        except (TypeError, ValueError, OverflowError, DecimalException) as exc:
+            conflicts.append(f"invalid execution evidence: {exc}")
         if conflicts:
-            raise RuntimeError(
-                f"REST replay conflicts with durable fill {trade_id[-12:]} "
-                f"({', '.join(conflicts)})")
+            message = (f"REST replay conflicts with durable fill {trade_id[-12:]} "
+                       f"({', '.join(conflicts)})")[:1000]
+            with self._lock:
+                # Successful later reads cannot erase an unresolved discrepancy.
+                self.integrity_error = self.integrity_error or message
+            raise RuntimeError(message)
         return True
 
     # -------------------------------------------------------------- ingest
     def record_fill(self, trade_id, token_id, *, shares, price, side="BUY",
                     condition_id=None, status="CONFIRMED", theta=None,
                     source="user_ws", fee=None, fee_exponent: int = 1,
-                    order_id=None, wall: float | None = None) -> bool:
+                    order_id=None, wall: float | None = None,
+                    reported_price: float | None = None) -> bool:
         """Idempotent. Returns True only if this trade id was new. `wall` is
         the lot's time; only a journal replay passes it (the original one)."""
         try:
@@ -536,6 +552,14 @@ class Ledger:
             except (TypeError, ValueError, OverflowError, DecimalException):
                 return False
             if not math.isfinite(sh) or not math.isfinite(px) or sh <= 0 or not (0.0 < px <= 1.0):
+                return False
+            try:
+                headline = None if reported_price is None else float(reported_price)
+            except (TypeError, ValueError, OverflowError):
+                return False
+            if (isinstance(reported_price, bool)
+                    or (headline is not None
+                        and (not math.isfinite(headline) or not 0 < headline <= 1))):
                 return False
             try:
                 if fee is None and (type(fee_exponent) is not int or not 1 <= fee_exponent <= 8):
@@ -597,7 +621,7 @@ class Ledger:
                 proceeds = sh * px - f
                 pos.lots.append(Lot(tid, token, condition, order_side,
                                     sh, px, f, st, lot_wall, source_text,
-                                    order_text))
+                                    order_text, reported_price=headline))
                 pos.shares -= sh
                 pos.cost -= basis
                 pos.fees -= fee_basis
@@ -619,7 +643,7 @@ class Ledger:
                 return True
             pos.lots.append(Lot(tid, token, condition, order_side,
                                 sh, px, f, st, lot_wall, source_text,
-                                order_text))
+                                order_text, reported_price=headline))
             pos.shares += sh
             pos.fees += f
             pos.cost += sh * px + f
@@ -650,7 +674,8 @@ class Ledger:
                         "op": "fill", "trade_id": lot.trade_id, "token_id": lot.token_id,
                         "condition_id": lot.condition_id, "side": lot.side, "shares": lot.shares,
                         "price": lot.price, "fee": lot.fee, "status": lot.status, "wall": lot.wall,
-                        "source": lot.source, "order_id": lot.order_id}):
+                        "source": lot.source, "order_id": lot.order_id,
+                        "reported_price": lot.reported_price}):
                     return True
                 if had_position:
                     self.positions[token] = previous
@@ -662,6 +687,12 @@ class Ledger:
 
     def ingest_fill_store(self, store) -> int:
         """Pull everything from the feeds FillStore. Safe to call repeatedly."""
+        # Cumulative order limits and the subsequent durable fill must observe
+        # one ingestion at a time, including concurrent reconciliation callers.
+        with self._ingest_lock:
+            return self._ingest_fill_store(store)
+
+    def _ingest_fill_store(self, store) -> int:
         n = 0
         store_lock = getattr(store, "_lock", None)
         if store_lock is None:
@@ -672,12 +703,24 @@ class Ledger:
                 # lifecycle objects in place during reconnect/reconcile.
                 fills = [copy.deepcopy(fill) for fill in store.fills.values()]
         for fill in fills:
-            # Do not turn ordinary pending lifecycle updates into a growing
-            # skipped-status counter on every ingest pass.
-            if str(fill.status or "").upper() not in COUNTED_STATUSES:
-                continue
             trade_id = str(getattr(fill, "trade_id", None) or "")
             order_id = str(getattr(fill, "order_id", None) or "")
+            if self.has_seen_trade(trade_id):
+                # Verify identity before suppressing a durable replay. Adding
+                # the same fill to cumulative authorization a second time used
+                # to falsely reject every fully filled order on the next poll.
+                self.rest_trade_is_booked({
+                    "id": trade_id, "taker_order_id": order_id,
+                    "asset_id": fill.asset_id, "market": fill.market,
+                    "side": fill.side, "price": fill.price,
+                    "size": fill.size, "status": fill.status,
+                    "paid": getattr(fill, "paid", None),
+                    "maker_legs": getattr(fill, "maker_legs", None)})
+                continue
+            # Pending new trades do not count. A durable trade is checked
+            # above even if a later feed copy has become FAILED or CONFLICT.
+            if str(fill.status or "").upper() not in COUNTED_STATUSES:
+                continue
             with self._lock:
                 authorization = copy.deepcopy(self.authorized_orders.get(order_id))
             if not order_id or authorization is None:
@@ -712,11 +755,13 @@ class Ledger:
                     self.last_ingest_error = (
                         f"fee resolver failed for token {str(fill.asset_id)[-12:]}: "
                         f"{type(exc).__name__}: {exc}")[:300]
+            price, actual_fee = _fill_execution_values(
+                fill, live_theta, self.category, fee_exponent)
             if self.record_fill_durable(
                     fill.trade_id, fill.asset_id, shares=fill.size,
-                    price=fill.price, side=fill.side,
+                    price=price, reported_price=fill.price, side=fill.side,
                     condition_id=fill.market, status=fill.status,
-                    theta=live_theta, fee_exponent=fee_exponent,
+                    fee=actual_fee, theta=live_theta, fee_exponent=fee_exponent,
                     order_id=order_id,
                     source="+".join(sorted(fill.sources)) or "user_ws"):
                 n += 1
@@ -742,7 +787,7 @@ class Ledger:
             # $1.00 buy of 10.322 shares as $1.0322 and refused our own fill.
             paid = getattr(fill, "paid", None)
             candidate = float(paid) if paid is not None else float(fill.size) * float(fill.price)
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError, OverflowError):
             return False
         with self._lock:
             already = sum(
@@ -904,7 +949,7 @@ class Ledger:
                 if not self.record_fill(e["trade_id"], e["token_id"], shares=e["shares"], price=e["price"],
                                         side=e["side"], condition_id=e["condition_id"], status=e["status"],
                                         source=e["source"], fee=e["fee"], order_id=e["order_id"],
-                                        wall=e["wall"]):
+                                        wall=e["wall"], reported_price=e.get("reported_price")):
                     raise ValueError(f"ledger journal fill {e['seq']} does not apply")
             else:
                 targets = [p for p in self.positions.values()
@@ -980,6 +1025,7 @@ class Ledger:
                 "skipped_authorization_mismatch": self.skipped_authorization_mismatch,
                 "persistence_error": self.last_persistence_error,
                 "ingest_error": self.last_ingest_error,
+                "integrity_error": self.integrity_error,
                 "open_position_details": [
                     {
                         "token_id": p.token_id,
@@ -1097,6 +1143,7 @@ class Ledger:
             "skipped_side": self.skipped_side,
             "skipped_unauthorized": self.skipped_unauthorized,
             "skipped_authorization_mismatch": self.skipped_authorization_mismatch,
+            "integrity_error": self.integrity_error,
             "reported_unauthorized": sorted(self.reported_unauthorized),
             "reported_mismatch": sorted(self.reported_mismatch),
             # Nested authorization dicts used to remain shared with live
@@ -1211,6 +1258,11 @@ class Ledger:
                 # the file atomically to V4.
                 ledger_id = self.ledger_id
             opened_wall = float(data.get("opened_wall", self.opened_wall))
+            integrity_error = data.get("integrity_error")
+            if (integrity_error is not None
+                    and (not isinstance(integrity_error, str) or not integrity_error
+                         or len(integrity_error) > 1024 or not integrity_error.isprintable())):
+                raise ValueError("invalid ledger integrity error")
             category = data.get("category", self.category)
             if (not math.isfinite(opened_wall) or opened_wall <= 0
                     or not isinstance(category, str) or not category.strip()
@@ -1347,6 +1399,7 @@ class Ledger:
                 self.journal_replayed = self._replay_journal(journal_seq)
                 self._journal_since = self.journal_replayed
                 self.last_persistence_error = None
+                self.integrity_error = self.integrity_error or integrity_error
             return True
         except Exception as exc:
             self.last_persistence_error = (
@@ -1373,6 +1426,9 @@ def _journal_entry(e) -> dict:
     if not isinstance(e, dict) or e.get("op") not in ("fill", "settle"):
         raise ValueError("invalid ledger journal entry")
     shape = _JOURNAL_FILL if e["op"] == "fill" else _JOURNAL_SETTLE
+    if e["op"] == "fill" and "reported_price" in e:
+        # Old journals predate a separate headline price and remain readable.
+        shape = {**shape, "reported_price": (int, float, type(None))}
     if set(e) != set(shape):
         raise ValueError("ledger journal entry has unexpected fields")
     for k, t in shape.items():
@@ -1472,6 +1528,94 @@ _LOT_FIELDS = tuple(f.name for f in fields(Lot))
 
 def _s(v):
     return None if v is None else str(v)
+
+
+def _fill_execution_values(fill, theta, category, exponent) -> tuple[float, float]:
+    """Cash-weighted basis and fees at each actual execution price.
+
+    Some lifecycle copies omit maker legs. Actual paid cash still proves the
+    average basis when available; otherwise the headline is the only evidence.
+    """
+    if type(exponent) is not int or not 1 <= exponent <= 8:
+        raise ValueError("invalid fill fee exponent")
+    shares, headline = float(fill.size), float(fill.price)
+    paid_raw = getattr(fill, "paid", None)
+    paid = shares * headline if paid_raw is None else float(paid_raw)
+    if (isinstance(fill.size, bool) or isinstance(fill.price, bool)
+            or isinstance(paid_raw, bool)
+            or not all(math.isfinite(value) for value in (shares, headline, paid))
+            or shares <= 0 or paid <= 0 or not 0 < headline <= 1):
+        raise ValueError("invalid fill execution amounts")
+    price = paid / shares
+    if not math.isfinite(price) or not 0 < price <= 1:
+        raise ValueError("invalid fill execution price")
+    legs = getattr(fill, "maker_legs", None)
+    if legs is None:
+        return price, fee_mod.taker_fee(shares, price, theta, category, exponent=exponent)
+    if not isinstance(legs, (list, tuple)) or not legs:
+        raise ValueError("invalid fill maker legs")
+    quantities, cash, fees = [], [], []
+    for leg in legs:
+        if (not isinstance(leg, (list, tuple)) or len(leg) != 2
+                or any(isinstance(value, bool) for value in leg)):
+            raise ValueError("invalid fill maker leg")
+        quantity, leg_price = map(float, leg)
+        if (not math.isfinite(quantity) or quantity <= 0
+                or not math.isfinite(leg_price) or not 0 < leg_price < 1):
+            raise ValueError("invalid fill maker leg")
+        quantities.append(quantity)
+        cash.append(quantity * leg_price)
+        fees.append(Decimal(str(fee_mod.taker_fee(
+            quantity, leg_price, theta, category, exponent=exponent))))
+    if (not math.isclose(math.fsum(quantities), shares, rel_tol=1e-6, abs_tol=1e-6)
+            or not math.isclose(math.fsum(cash), paid, rel_tol=1e-6, abs_tol=1e-6)):
+        raise ValueError("fill maker legs do not match its shares/cash")
+    return price, float(sum(fees))
+
+
+def _replay_execution_conflicts(row, lot, authorization, category) -> list[str]:
+    """Available execution evidence must agree before a booked ID is suppressed."""
+    paid, legs = row.get("paid"), row.get("maker_legs")
+    maker_orders = row.get("maker_orders")
+    if maker_orders is not None:
+        from feeds.poly_user import taker_legs, taker_paid
+        parsed_legs = taker_legs(lot.token_id, maker_orders, lot.shares)
+        parsed_paid = taker_paid(lot.token_id, maker_orders, lot.shares)
+        if parsed_legs is None or parsed_paid is None:
+            raise ValueError("malformed supplied maker orders")
+        if (paid is not None and (isinstance(paid, bool)
+                or not math.isclose(float(paid), parsed_paid, rel_tol=1e-9, abs_tol=1e-6))):
+            raise ValueError("maker orders disagree with paid cash")
+        if legs is not None and legs != parsed_legs:
+            raise ValueError("maker execution surfaces disagree")
+        paid, legs = parsed_paid, parsed_legs
+    conflicts = []
+    if paid is not None:
+        value = float(paid)
+        if isinstance(paid, bool) or not math.isfinite(value) or value <= 0:
+            raise ValueError("invalid paid cash")
+        if not math.isclose(value, lot.notional, rel_tol=1e-9, abs_tol=1e-6):
+            conflicts.append("paid cash")
+    if legs is not None:
+        evidence = SimpleNamespace(
+            size=lot.shares,
+            price=lot.price if lot.reported_price is None else lot.reported_price,
+            paid=paid, maker_legs=legs)
+        # Missing paid cash is reconstructed from the supplied executions;
+        # the headline cannot prove the average price of a multi-level match.
+        if paid is None:
+            if not isinstance(legs, (list, tuple)) or not legs:
+                raise ValueError("invalid supplied maker legs")
+            evidence.paid = math.fsum(float(qty) * float(price) for qty, price in legs)
+        price, fee = _fill_execution_values(
+            evidence, authorization.get("fee_rate"), category,
+            authorization.get("fee_exponent") or 1)
+        if not math.isclose(price * lot.shares, lot.notional, rel_tol=1e-9, abs_tol=1e-6):
+            if "paid cash" not in conflicts:
+                conflicts.append("paid cash")
+        if not math.isclose(fee, lot.fee, rel_tol=1e-9, abs_tol=1e-9):
+            conflicts.append("maker-leg fee")
+    return conflicts
 
 
 def _safe_identifier(value, *, max_length: int = 256) -> bool:
@@ -1737,6 +1881,12 @@ def _validate_loaded_position(key: str, position: Position) -> None:
                 or lot.fee < 0 or lot.wall <= 0
                 or lot.consumed < 0 or lot.consumed > lot.shares + 1e-9):
             raise ValueError("invalid persisted lot amount")
+        if (lot.reported_price is not None
+                and (isinstance(lot.reported_price, bool)
+                     or not isinstance(lot.reported_price, (int, float))
+                     or not math.isfinite(lot.reported_price)
+                     or not 0 < lot.reported_price <= 1)):
+            raise ValueError("invalid persisted headline price")
         if lot_side == "SELL":
             # A sale is journalled but holds nothing: its PnL was banked into
             # realized_from_sales when it happened, and the BUY lots it

@@ -68,7 +68,7 @@ def check_settings(config) -> None:
     lim = sniper_live.limits_from_env()
     mark("INFO", "canary limits", f"{lim.max_order_shares:g} sh/order, {lim.max_orders} orders, {lim.max_fills} fills, "
                                   f"{lim.max_rounds} rounds, ${lim.max_exposure_usd:g} total spend, "
-                                  f"${lim.max_daily_loss_usd:g} realized loss")
+                                  f"${lim.max_daily_loss_usd:g} worst-case loss incl. open orders and fees")
     stop = os.environ.get("SNIPER_CANARY_STOP_FILE") or os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                                        "STOP_LIVE")
     if os.path.exists(stop):

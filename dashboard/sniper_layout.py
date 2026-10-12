@@ -63,7 +63,8 @@ STATE_FG = {"ACTIVE": Style("green", bold=True), "EXPIRED": Style("amber", bold=
 STATE_BADGE = {"ACTIVE": Style("white", "green", bold=True), "EXPIRED": Style("ink", "amber", bold=True),
                PENDING_S: Style("ink", "amber", bold=True), "SETTLING": Style("white", "blue", bold=True),
                "SETTLED": Style("white", "rule", bold=True)}
-REDEEM_FG = {"REDEEM PENDING": Style("amber", bold=True), "REDEEMED": Style("green", bold=True)}
+REDEEM_FG = {"REDEEM PENDING": Style("amber", bold=True), "REDEEMED": Style("green", bold=True),
+             "REDEMPTION UNVERIFIED": Style("amber", bold=True)}
 LEVEL_STYLE = {"good": Style("green"), "warn": Style("amber"), "bad": Style("red", bold=True),
                "info": Style("ink")}
 RESULT_STYLE = {"filled": Style("green", bold=True), "missed": Style("amber"), "refused": Style("amber"),
@@ -351,7 +352,7 @@ def _side_body(snap: dict, w: int, h: int) -> list[Row]:
                          + "  fills " + ratio(c.get("fills"), c.get("max_fills")), w))
         out.append(_line("spend", f"{money(c.get('spend'))}/{money(c.get('max_spend'))}"
                          f"  rounds {ratio(c.get('rounds'), c.get('max_rounds'))}", w))
-        out.append(_line("loss", f"{money(c.get('loss'))}/{money(c.get('max_loss'))}"
+        out.append(_line("risk", f"{money(c.get('loss'))}/{money(c.get('max_loss'))}"
                          f"  awaiting {count(c.get('awaiting'))}", w))
         guard = _text(c.get("guard"))
         out.append(_runs([(fit("latency", 9), DIM), (" ", PAPER), (guard, state_fg("OK" if guard == "OK" else "WARN")),
@@ -678,10 +679,14 @@ def _settlement_body(st: dict, w: int) -> tuple[list[Row], str]:
                             else "$0.00 (no position)", pnl_style(realized)))
             rows.append(row("SETTLE TIME", _secs(subject.get("settlement_s")), Style("ink", bold=True)))
             redeem = _text(subject.get("redeem"))
-            amount = _num(subject.get("redeem_amount"))
-            shown = "PENDING" if redeem == "REDEEM PENDING" else redeem     # the label already says REDEEM
+            amount = _num(subject.get("redeem_remaining_amount", subject.get("redeem_amount")))
+            shown = ("PENDING" if redeem == "REDEEM PENDING" else
+                     "UNVERIFIED" if redeem == "REDEMPTION UNVERIFIED" else redeem)
             rows.append(row("REDEEM", shown + (f" {money(amount)}" if amount and redeem != "N/A (PAPER)" else ""),
                             REDEEM_FG.get(redeem, FAINT)))
+            unverified = _num(subject.get("redeem_unverified_amount"))
+            if unverified:
+                rows.append(row("UNVERIFIED", money(unverified) + " collateral not verified", Style("amber")))
         else:
             rows.append(row("PENDING AGE", _secs(subject.get("age_s"))))
     else:

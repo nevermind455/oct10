@@ -51,6 +51,8 @@ class PolyMarketFeed(SupervisedFeed):
         self._sub_lock = threading.RLock()
         self._want: list[str] = []
         self._sent: set[str] = set()
+        self._snapshot_requests: dict[str, int] = {}
+        self._subscription_send_lock = asyncio.Lock()
         self._resync = request_resync      # called with a token list, off-thread
         self.last_trade_price: dict[str, float] = {}
         self.pong_at: float | None = None
@@ -82,9 +84,29 @@ class PolyMarketFeed(SupervisedFeed):
             # Intent and the active set are one serialized transition.
             # Same-state calls can still repair an interrupted transition.
             added, removed = self.book.set_active(tokens)
+            self._snapshot_requests = {token: generation
+                                       for token, generation in self._snapshot_requests.items()
+                                       if token in self._want}
         self._wake_intent()
         if added or removed:
             self.event(f"rotate +{len(added)} -{len(removed)} -> {[t[-6:] for t in tokens]}")
+
+    def request_snapshot(self, token: str, *, expected_generation: int) -> bool:
+        """Request an ordered WS snapshot without disrupting sibling books.
+
+        A REST response has no venue sequence to align with concurrent deltas.
+        Re-subscribing an UNSYNCED token gets a full snapshot on the same
+        ordered stream, so recovery does not require a quiet market. The hub
+        rate-limits this fallback. No network runs on the caller's thread.
+        """
+        with self._sub_lock:
+            view = self.book.view(token)
+            if (token not in self._want or view.generation != expected_generation
+                    or view.status != UNSYNCED):
+                return False
+            self._snapshot_requests[token] = expected_generation
+        self._wake_intent()
+        return True
 
     # ------------------------------------------------------------- status
     def refresh_status(self, tokens=None) -> str:
@@ -104,6 +126,7 @@ class PolyMarketFeed(SupervisedFeed):
             self._ws = ws
             with self._sub_lock:
                 self._sent.clear()
+                self._snapshot_requests.clear()
             # Reset heartbeat state on every socket. A disconnect between PING
             # and PONG must not poison every later reconnect.
             self._ping_sent = None
@@ -136,16 +159,22 @@ class PolyMarketFeed(SupervisedFeed):
                 self._ws = None
                 with self._sub_lock:
                     self._sent.clear()
+                    self._snapshot_requests.clear()
                 self.book.connected = False
                 self.book.desync_all("disconnect")
 
     async def _sync_subscriptions(self, initial: bool = False) -> None:
+        async with self._subscription_send_lock:
+            await self._send_subscriptions(initial)
+
+    async def _send_subscriptions(self, initial: bool = False) -> None:
         ws = self._ws
         if ws is None:
             return
         with self._sub_lock:
             want = set(self._want)
             sent = set(self._sent)
+            requests = dict(self._snapshot_requests)
         if initial:
             if not want:
                 return
@@ -172,6 +201,31 @@ class PolyMarketFeed(SupervisedFeed):
             await ws.send(json.dumps({"assets_ids": drop, "operation": "unsubscribe"}))
             with self._sub_lock:
                 self._sent -= set(drop)
+        for token, generation in requests.items():
+            with self._sub_lock:
+                view = self.book.view(token)
+                valid = (token in self._want and token in self._sent
+                         and token not in add and view.status == UNSYNCED
+                         and view.generation == generation)
+                if self._snapshot_requests.get(token) == generation:
+                    self._snapshot_requests.pop(token, None)
+            if not valid:
+                continue
+            # Same socket, unsubscribe then subscribe: the returned `book`
+            # event and subsequent deltas have one authoritative order.
+            await ws.send(json.dumps({"assets_ids": [token], "operation": "unsubscribe"}))
+            with self._sub_lock:
+                self._sent.discard(token)
+                # Intent can change from the strategy thread during send.
+                refreshed_generation = self.book.subscription_gap(token, expected_generation=generation)
+                valid = token in self._want and refreshed_generation is not None
+            if valid:
+                msg = {"assets_ids": [token], "operation": "subscribe"}
+                if self.custom_features:
+                    msg["custom_feature_enabled"] = True
+                await ws.send(json.dumps(msg))
+                with self._sub_lock:
+                    self._sent.add(token)
 
     async def _subscription_loop(self, ws) -> None:
         while True:
@@ -179,7 +233,7 @@ class PolyMarketFeed(SupervisedFeed):
             # remains pending, and changed intent is reconciled immediately.
             self._intent_event.clear()
             with self._sub_lock:
-                changed = set(self._want) != self._sent
+                changed = set(self._want) != self._sent or bool(self._snapshot_requests)
             if changed:
                 try:
                     await self._sync_subscriptions()

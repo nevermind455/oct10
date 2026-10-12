@@ -1789,9 +1789,13 @@ class DashView:
             # LIVE: winning shares not yet redeemed are worth their payout but are
             # not in the collateral balance - shown, and counted in equity.
             acct = snap["account"]
-            acct["redeemable"] = settlement.get("redeem_pending") or 0.0
-            if acct.get("balance") is not None and acct.get("position_value") is not None:
+            acct["redeemable"] = settlement.get("redeem_pending")
+            acct["redemption_unverified"] = settlement.get("redeem_unverified")
+            if (acct.get("balance") is not None and acct.get("position_value") is not None
+                    and acct["redeemable"] is not None):
                 acct["equity"] = float(acct["balance"]) + acct["position_value"] + acct["redeemable"]
+            else:
+                acct["equity"] = None
         snap["canary"] = self._canary()
         snap["health"] = self._health_rows(summary, health)
         return snap
@@ -1807,7 +1811,8 @@ class DashView:
             return {"halted": st.get("halted") or [], "orders": st.get("orders"), "max_orders": lim.max_orders,
                     "fills": st.get("fills"), "max_fills": lim.max_fills, "spend": st.get("spend_usd"),
                     "max_spend": lim.max_exposure_usd, "rounds": st.get("rounds"), "max_rounds": lim.max_rounds,
-                    "loss": st.get("session_loss_usd"), "max_loss": lim.max_daily_loss_usd,
+                    "loss": st.get("worst_case_loss_usd", st.get("session_loss_usd")),
+                    "realized_loss": st.get("session_loss_usd"), "max_loss": lim.max_daily_loss_usd,
                     "guard": guard.get("state"), "guard_reason": guard.get("reason"),
                     "balance": st.get("balance"), "awaiting": st.get("awaiting_confirmation"),
                     "rules_ready": st.get("rules_ready")}

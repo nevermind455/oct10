@@ -69,7 +69,9 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
     now: the book reacts within the same 250ms, and a mid that already held part of
     the move counted that part twice (journal: `fair_anchor` "before move" / "now",
     `market_mid_now`). The limit is capped there too. Under a minute of price
-    history, or no market mid, there are no buys ("fair value unknown"). A first version
+    history, no pre-move book history, or unavailable market fee rules, there are no
+    buys ("fair value unknown"). The fee curve comes from the same prefetched market
+    rules used by execution, including its exponent. A first version
     priced from Coinbase against the round's start price disagreed with the market by
     10-30c and bought the losing side; it was replaced the same day.
   - **Kelly size (2026-10-11).** Each FAK order buys `SNIPER_KELLY_FRACTION` (1: full Kelly; ¼ before) of the
@@ -78,9 +80,13 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
     reserve, read on every decision; paper: re-read every 5s off the order path, each
     sent order's spend taken off at once), in whole shares,
     from 5 with no per-order cap - only what is left of `SNIPER_MAX_SIDE_SHARES` (200)
-    for the side in the round, and live the canary's per-order cap; under 5 it skips. Each order is sized fresh:
+    for the side in the round, and live the canary's per-order cap; under 5 it skips.
+    Sizing optimizes final wealth in both outcomes using existing UP/DOWN shares;
+    another signal buys only the additional allocation still needed. Unconfirmed
+    orders count as same-side risk and provide no opposing hedge credit. There is
     no carry. The dashboard's "fair" line shows the volatility and the last decision
-    (market mid -> fair, the limit, the size).
+    (market mid -> fair, the limit, the size). The fair model still needs empirical
+    probability calibration; passing formula tests does not establish a profitable edge.
   - **FOK.** `SNIPER_ORDER_TYPE=FOK` keeps the old all-or-nothing order with no carry.
 - **Paper fills.** Paper fills against Polymarket's book at the modelled match
   instant. With `SNIPER_DELAY_SOURCE=live`, each order's delay is drawn from real
@@ -202,13 +208,22 @@ the Binance trigger instead. The recorder keeps a Coinbase ticker only when its
 best bid or ask changed, so the replay's rule restarts after quiet spells a
 little more often than live.
 
+Replay preserves recorded Coinbase exchange times and sequences when present;
+older rows receive deterministic sequences. It reports malformed inputs and
+accepted ticks, and warns when no signals, orders or fills were exercised. Cash
+is withheld until modelled settlement and redemption: defaults are 60 seconds
+after expiry and another 600 seconds until redemption, configurable with
+`--settlement-delay-s` and `--redemption-delay-s`. These are modelling assumptions,
+not observed venue guarantees. Historical research commands identify their older
+Binance/fixed-size strategy separately from this current replay.
+
 ## Settlement
 
 Every market the bot sees is tracked by its condition id, from discovery to its result:
 
 ```
 ACTIVE -> EXPIRED -> PENDING SETTLEMENT -> SETTLING -> SETTLED
-                         (LIVE, winning shares held) -> REDEEM PENDING -> REDEEMED
+                         (LIVE, winning shares held) -> REDEEM PENDING -> REDEMPTION UNVERIFIED
 ```
 
 - **Only the venue's result settles.** A timer reaching zero moves a market to
@@ -227,9 +242,12 @@ ACTIVE -> EXPIRED -> PENDING SETTLEMENT -> SETTLING -> SETTLED
 - **Settled is not redeemed.** Paper credits the payout to cash at settlement. Live,
   winning shares are still outcome tokens in the wallet until they are redeemed for
   collateral (claim on polymarket.com); the dashboard shows REDEEM PENDING and
-  REDEEMABLE until the wallet's on-chain balance proves REDEEMED.
+  REDEEMABLE for the remaining wallet-held payout. Partial token balance reductions
+  reduce that amount; unknown balances leave equity unknown. Token disappearance
+  alone is REDEMPTION UNVERIFIED because a transfer does not prove collateral
+  receipt. Settled winners are restored and checked again after restart.
 - **Events.** `MARKET_EXPIRED`, `SETTLEMENT_PENDING`, `RESULT_RECEIVED`,
-  `ACCOUNTING_SETTLED`, `REDEEM_PENDING`, `REDEEMED`, and on failure
+  `ACCOUNTING_SETTLED`, `REDEEM_PENDING`, `REDEMPTION_UNVERIFIED`, and on failure
   `SETTLEMENT_TIMEOUT`, `RESULT_API_ERROR`, `RESULT_NOT_FINAL`, `ACCOUNTING_ERROR`,
   `REDEEM_FAILED`. They show in the dashboard's events and are appended, with their
   timestamps, to `<ledger>_settlements.jsonl` beside the ledger.
@@ -398,16 +416,16 @@ If the start prints `[DNS] Polymarket name resolution is redirected`, set Window
 Run these as the user that `git pull`s `/opt/btcbot`; the deploy key belongs to that user.
 
 ```bash
-git clone --branch sniperbtc --single-branch "$(git -C /opt/btcbot remote get-url origin)" /opt/sniperbtc
+git clone --branch main --single-branch https://github.com/nevermind455/oct10.git /opt/sniperbtc
 cd /opt/sniperbtc && ./setup.sh
 ```
 
-If `/opt/btcbot`'s remote is not called `origin`, use `git -C /opt/btcbot remote -v` to find the URL.
+Use `BRANCH=<branch> ./setup.sh` when installing a reviewed branch other than `main`.
 
 `setup.sh` does the following:
 
 - Updates the checkout.
-- Makes `.venv` and installs `requirements.txt`.
+- Makes `.venv` and installs the tested versions in `requirements.lock.txt`.
 - Copies `/opt/btcbot/.env` to `.env` and sets it to mode 600. It never prints a value.
 - Re-points any setting that names `/opt/btcbot` to `/opt/sniperbtc`.
 - Lists missing settings, by name only.
@@ -442,7 +460,19 @@ tmux new -s live '.venv/bin/python -u run.py --live --dash'
 .venv/bin/python live_check.py           # afterwards: what the canary measured
 ```
 
-The canary stops sending orders by itself when any cap is reached: `SNIPER_CANARY_MAX_ROUNDS=3` or `SNIPER_CANARY_MAX_LOSS_USD=10`. `touch STOP_LIVE` stops new orders at once. Remove the file and restart to trade again. From the first live run on, run LIVE only from `/opt/sniperbtc`: the old bot's ledger copy is frozen.
+The canary refuses an order if it would exceed its caps. `SNIPER_CANARY_MAX_LOSS_USD=10`
+now checks settled losses plus the conservative cash basis of open positions and
+pending orders, including fees. It gives no hedge credit to uncertain fills and
+can refuse purchases that would improve a hedge. Session fill slots are reserved
+at dispatch, so overlapping UP/DOWN requests cannot bypass the fill cap.
+
+Every signed order has a durable intent written before its first possible socket
+write. An unresolved intent or unconfirmed authorization on restart halts new
+orders until its outcome is reconciled. Never resubmit an uncertain order. This
+adds filesystem durability work to dispatch; the older latency measurements above
+must be remeasured on the deployment disk. `touch STOP_LIVE` stops new orders at
+once. From the first live run on, run LIVE only from `/opt/sniperbtc`: the old
+bot's ledger copy is frozen.
 
 To run under systemd instead of tmux, copy `/etc/systemd/system/btcbot.service` to `sniperbtc.service`. In the copy, set `WorkingDirectory=/opt/sniperbtc`, set `ExecStart=/opt/sniperbtc/.venv/bin/python -u run.py --paper` (without `--dash`), and give it its own log file. `systemctl stop` sends SIGTERM, which is a clean shutdown.
 
@@ -467,6 +497,12 @@ python run_tests.py run feeds    # just tests_run.py and tests_feeds.py
 - **Regression tests written here.** spe24 had none for these two; they are in `tests_run.py`:
   - aa3adc7: a present STOP_LIVE makes preflight FAIL.
   - 7eedf06: a settings error names the bad value.
+- **Safety fixes (2026-10-12).** Six new suites exercise durable dispatch/restart,
+  raced book recovery, execution-leg accounting, portfolio Kelly, redemption
+  lifecycle and the current Coinbase replay. GitHub Actions runs every offline
+  suite on Python 3.12 with `requirements.lock.txt`; update pins only alongside
+  a complete test run. Historical ledger costs are kept when their original
+  execution-leg evidence is unavailable.
 - **The Coinbase trigger (2026-10-10).** `tests_sniper_coinbase.py`: the venue's message shapes, the ack, out-of-order and malformed tickers, heartbeats that do not carry the price, the freshness gate, the socket loop against a local server (silence, starvation, errors, reconnects), and the replay. `tests_latency.py` checks the Coinbase-triggered sniper decides exactly as the old Binance one on the same mids.
 
 ## Keeping up with spe24

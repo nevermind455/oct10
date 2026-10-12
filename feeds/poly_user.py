@@ -27,6 +27,7 @@ import math
 import threading
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal
 
 import websockets
 
@@ -69,9 +70,12 @@ class Fill:
     # taker_paid). The venue's headline `price` is one number for a match that
     # can cross several levels, so price x size can overstate it: a $1.00 buy
     # of 10.322 shares from makers at 0.09/0.10 reported price 0.10 ($1.0322).
-    # None when the legs were not in the message. Never part of the identity
-    # checks below, and never the booked price (REST replays compare that).
+    # None when the legs were not in the message. The headline price remains
+    # available for identity checks; accounting uses the cash-weighted basis.
     paid: float | None = None
+    # Matched shares and prices expressed in the taker's token. Keeping every
+    # leg lets accounting apply the nonlinear fee curve at each execution price.
+    maker_legs: tuple[tuple[float, float], ...] | None = None
 
     @property
     def notional(self) -> float:
@@ -137,7 +141,8 @@ class FillStore:
             "size": _size(size),
             "fee_rate_bps": _nonnegative(fee_rate_bps),
         }
-        paid = taker_paid(incoming["asset_id"], maker_orders, incoming["size"])
+        legs = taker_legs(incoming["asset_id"], maker_orders, incoming["size"])
+        paid = _legs_paid(legs)
         with self._lock:
             rec = self.fills.get(tid)
             if rec is None:
@@ -147,7 +152,8 @@ class FillStore:
                     side=incoming["side"], price=incoming["price"],
                     size=incoming["size"] or 0.0,
                     status=status, first_seen=now, last_seen=now,
-                    sources={str(source)}, fee_rate_bps=incoming["fee_rate_bps"], paid=paid)
+                    sources={str(source)}, fee_rate_bps=incoming["fee_rate_bps"],
+                    paid=paid, maker_legs=legs)
                 if (_has_invalid_numeric(price, incoming["price"], size, incoming["size"],
                                          fee_rate_bps, incoming["fee_rate_bps"])
                         or (side is not None and incoming["side"] is None)):
@@ -175,6 +181,11 @@ class FillStore:
                     and not math.isclose(rec.size, incoming["size"], rel_tol=0.0,
                                          abs_tol=1e-12)):
                 conflicts.append("size")
+            if (rec.paid is not None and paid is not None
+                    and not math.isclose(rec.paid, paid, rel_tol=0.0, abs_tol=1e-6)):
+                conflicts.append("paid")
+            if rec.maker_legs is not None and legs is not None and rec.maker_legs != legs:
+                conflicts.append("maker legs")
             if conflicts:
                 rec.status = "CONFLICT"
                 rec.conflict_reason = "immutable fields changed: " + ",".join(conflicts)
@@ -201,6 +212,8 @@ class FillStore:
                 rec.price = incoming["price"]
             if rec.paid is None and paid is not None:
                 rec.paid = paid
+            if rec.maker_legs is None and legs is not None:
+                rec.maker_legs = legs
             rec.asset_id = rec.asset_id or incoming["asset_id"]
             rec.order_id = rec.order_id or incoming["order_id"]
             rec.market = rec.market or incoming["market"]
@@ -596,9 +609,15 @@ def taker_paid(asset_id, maker_orders, size=None) -> float | None:
     the other outcome, matched by minting) prices the other side, so ours is
     1 - its price. None when anything needed is missing or the legs do not add
     up to the trade's size - the caller then falls back to price x size."""
+    return _legs_paid(taker_legs(asset_id, maker_orders, size))
+
+
+def taker_legs(asset_id, maker_orders, size=None) -> tuple[tuple[float, float], ...] | None:
+    """Validated executions in the taker's token, independent of maker ordering."""
     if not asset_id or not isinstance(maker_orders, list) or not maker_orders:
         return None
     shares = total = 0.0
+    legs = []
     for m in maker_orders:
         if not isinstance(m, dict) or not m.get("asset_id"):
             return None
@@ -606,12 +625,24 @@ def taker_paid(asset_id, maker_orders, size=None) -> float | None:
         if sh is None or sh <= 0 or p is None:
             return None
         shares += sh
-        total += sh * (p if str(m["asset_id"]) == str(asset_id) else 1.0 - p)
+        # Decimal subtraction preserves a literal 0.90 maker price as 0.10
+        # on the complementary token, avoiding fee-rounding boundary errors.
+        taker_price = (p if str(m["asset_id"]) == str(asset_id)
+                       else float(Decimal(1) - Decimal(str(p))))
+        total += sh * taker_price
+        legs.append((sh, taker_price))
         if not math.isfinite(shares) or not math.isfinite(total):
             return None
     if size is not None and not math.isclose(shares, float(size), rel_tol=1e-6, abs_tol=1e-6):
         return None
-    return round(total, 6)
+    return tuple(sorted(legs))
+
+
+def _legs_paid(legs) -> float | None:
+    if legs is None:
+        return None
+    total = sum(Decimal(str(sh)) * Decimal(str(price)) for sh, price in legs)
+    return round(float(total), 6)
 
 
 def _f(v):

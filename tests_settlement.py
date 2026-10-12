@@ -568,15 +568,21 @@ class RequiredCases(Base):
                                                  and w.records[B].state == S.SETTLED))
                 self.assertEqual(w.records[A].redeem, S.REDEEM_PENDING)        # settled is NOT redeemed
                 self.assertEqual(w.records[B].redeem, S.REDEEM_NOT_NEEDED)
+                self.assertTrue(await self.until(lambda: w.panel(self.clock["t"])["redeem_pending"] == 10.0))
                 self.assertAlmostEqual(w.panel(self.clock["t"])["redeem_pending"], 10.0)
-                self.assertTrue(await self.until(lambda: w.records[A].redeem == S.REDEEMED))
-                self.assertGreaterEqual(len(reads), 3)                          # proven from the wallet balance
+                self.assertTrue(await self.until(lambda: w.records[A].redeem == S.REDEEM_UNVERIFIED))
+                self.assertGreaterEqual(len(reads), 3)                          # token absence does not prove cash
+                self.assertAlmostEqual(w.panel(self.clock["t"])["redeem_pending"], 0.0)
+                self.assertAlmostEqual(w.records[A].redeem_unverified_amount, 10.0)
+                self.assertIsNone(w.records[A].redeemed_at)
             finally:
                 await w.stop()
             names = [e.split(" | ")[0] for e in self.events]
             self.assertLess(names.index("ACCOUNTING_SETTLED"), names.index("REDEEM_PENDING"))
-            self.assertLess(names.index("REDEEM_PENDING"), names.index("REDEEMED"))
-            self.assertIn("amount=$10.00", next(e for e in self.events if e.startswith("REDEEMED")))
+            self.assertLess(names.index("REDEEM_PENDING"), names.index("REDEEM_BALANCE"))
+            self.assertNotIn("REDEEMED", names)
+            self.assertIn("collateral proceeds are not verified",
+                          next(e for e in self.events if "unverified=$10.00" in e))
         self.run_async(go())
 
     def test_17b_redeem_check_failure_is_reported_not_assumed(self):

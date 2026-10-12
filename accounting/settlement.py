@@ -1,7 +1,8 @@
 """Settlement - every market's lifecycle from expiry to realized P/L.
 
     ACTIVE -> EXPIRED -> PENDING SETTLEMENT -> SETTLING -> SETTLED
-                                       (LIVE, winning shares held) -> REDEEM PENDING -> REDEEMED
+                                       (LIVE, winning shares held) -> REDEEM PENDING
+                                       (tokens leave wallet) -> REDEMPTION UNVERIFIED
 
 One record per market, keyed by its condition id, so any number of markets
 can wait for their results at once and each settles on its own; the market
@@ -14,8 +15,10 @@ SETTLEMENT; a BTC price never decides a winner.
 
 Settled is not redeemed. Settlement books the payout in the ledger the moment
 the result is known. LIVE, a winning share is still an outcome token in the
-wallet until it is redeemed for collateral, so LIVE tracks REDEEM PENDING and
-proves REDEEMED from the wallet's on-chain balance, never from the winner.
+wallet until it is redeemed for collateral, so LIVE tracks REDEEM PENDING.
+A token balance proves only how many tokens remain in the wallet. Transfers
+also remove tokens: absent tokens are REDEMPTION UNVERIFIED, never proof of
+collateral proceeds. Remaining tokens are valued separately from cash.
 PAPER has no redemption step: its cash is credited at settlement.
 
 Off the hot path by construction: this runs as its own task, every network
@@ -48,6 +51,7 @@ STATES = (ACTIVE, EXPIRED, PENDING, SETTLING, SETTLED)
 
 REDEEM_PENDING = "REDEEM PENDING"
 REDEEMED = "REDEEMED"
+REDEEM_UNVERIFIED = "REDEMPTION UNVERIFIED"
 REDEEM_PAPER = "N/A (PAPER)"            # paper cash is credited at settlement
 REDEEM_NOT_NEEDED = "NOT NEEDED"        # no winning shares held: nothing to redeem
 
@@ -98,6 +102,10 @@ class MarketRecord:
     redeem: str | None = None
     redeem_amount: float | None = None
     redeem_shares: dict = field(default_factory=dict)  # winning token -> shares the ledger holds
+    redeem_remaining_shares: dict | None = None       # wallet-held shares, capped at ledger holdings
+    redeem_remaining_amount: float | None = None      # None until every balance is known
+    redeem_unverified_amount: float | None = None     # tokens absent; collateral not proven
+    redeem_checked_at: float | None = None
     redeemed_at: float | None = None
     redeem_error: str | None = None
     redeem_next: float = 0.0
@@ -151,6 +159,11 @@ class MarketRecord:
             "settlement_s": None if self.settled_at is None or end is None else self.settled_at - end,
             "processing_ms": self.processing_ms, "check_ms": self.check_ms, "checks": self.checks,
             "redeem": self.redeem, "redeem_amount": self.redeem_amount, "redeem_error": self.redeem_error,
+            "redeem_remaining_shares": (None if self.redeem_remaining_shares is None
+                                        else dict(self.redeem_remaining_shares)),
+            "redeem_remaining_amount": self.redeem_remaining_amount,
+            "redeem_unverified_amount": self.redeem_unverified_amount,
+            "redeem_checked_at": self.redeem_checked_at,
             "redeemed_s": None if self.redeemed_at is None or end is None else self.redeemed_at - end,
             "detail": self.detail, "error": self.error, "timed_out": self.timed_out,
             "has_position": bool(self.held()),
@@ -202,6 +215,13 @@ class SettlementWorker:
         self.adopt_every_s = min(1.0, self.interval)
         self.workers = max(1, int(workers))
         self.records: dict[str, MarketRecord] = {}
+        # Finished zero-balance records can leave the bounded history. Remember
+        # their ledger version so each scan does not recreate the same record;
+        # a late fill/settlement changes the version and is adopted again. This
+        # lightweight index is at most one entry per existing ledger condition;
+        # full position/history records and continued zero-balance polling are
+        # bounded by ``history``.
+        self._retired_redemptions: dict[str, tuple] = {}
         self._pools: dict[str, ThreadPoolExecutor] = {}
         self._stop = asyncio.Event()
         self._task = None
@@ -378,16 +398,25 @@ class SettlementWorker:
         return out
 
     def _ledger_scan(self, wanted: frozenset) -> tuple[dict, dict]:
-        """Worker thread: this worker's view of the ledger - every position of
-        a tracked market, and every unsettled position - plus the window end
+        """Worker thread: every tracked/unsettled position and LIVE settled
+        winners (redemption must survive restart), plus the window end
         a live authorization recorded for each of those markets."""
         rows: dict[str, list] = {}
         with self.ledger._lock:
             for p in self.ledger.positions.values():
                 cid = p.condition_id
-                if not cid or not (cid in wanted or (not p.settled and p.shares > 0)):
+                needs_redemption = (not self.paper and p.settled and p.shares > 0
+                                    and _num(p.payout_per_share) > 0)
+                if not cid or not (cid in wanted or (not p.settled and p.shares > 0)
+                                   or needs_redemption):
                     continue
                 rows.setdefault(cid, []).append(_position_row(p))
+            # Include losing rows too when adopting a settled winning market,
+            # so its realized P/L and persisted payouts remain complete.
+            for p in self.ledger.positions.values():
+                if p.condition_id in rows and not any(r["token_id"] == p.token_id
+                                                      for r in rows[p.condition_id]):
+                    rows[p.condition_id].append(_position_row(p))
             ends = {}
             for meta in self.ledger.authorized_orders.values():
                 if isinstance(meta, dict) and meta.get("condition_id") in rows and meta.get("window_end"):
@@ -411,15 +440,24 @@ class SettlementWorker:
             rec = self.records.get(cid)
             if rec is None:
                 open_rows = [r for r in these if not r["settled"] and r["shares"] > 1e-9]
-                if not open_rows:
+                redeem_rows = [r for r in these if r["settled"] and r["shares"] > 1e-9
+                               and _num(r["payout"]) > 0] if not self.paper else []
+                if not open_rows and not redeem_rows:
                     continue
-                newest = max((r["newest_wall"] or 0.0) for r in open_rows)
-                if self.max_age_s is not None and wall - newest > self.max_age_s:
+                if (not open_rows and self._retired_redemptions.get(cid)
+                        == self._redemption_version(these)):
+                    continue
+                newest = max((r["newest_wall"] or 0.0) for r in (open_rows or redeem_rows))
+                if open_rows and self.max_age_s is not None and wall - newest > self.max_age_s:
                     continue
                 end = ends.get(cid) or (int(newest // 300) * 300 + 300 if newest else None)
                 rec = self.records[cid] = MarketRecord(
                     cid, window_start=None if end is None else end - 300, window_end=end, source="ledger")
+                self._retired_redemptions.pop(cid, None)
             rec.positions = these
+            if (not self.paper and rec.resolution is None and rec.held() and not rec.unsettled()
+                    and any(_num(r["payout"]) > 0 for r in rec.held())):
+                self._restore_settlement(rec)
             if rec.state == EXPIRED and rec.finished_mono is not None and rec.unsettled():
                 # Given up as position-less, yet it holds shares: never abandon them.
                 rec.state, rec.finished_mono, rec.detail, rec.next_check = PENDING, None, "", 0.0
@@ -431,8 +469,42 @@ class SettlementWorker:
                 rec.state = PENDING
                 rec.finished_mono = None
                 rec.next_check = 0.0
+                # The ledger only persisted payouts for held tokens. A late
+                # fill of an unseen token needs a fresh authoritative result.
+                if (len(rec.payouts or {}) != 2
+                        or any(r["token_id"] not in (rec.payouts or {}) for r in rec.unsettled())):
+                    rec.resolution = None
                 self._event("LATE_FILL", rec, "warn", positions=rec.positions_text(),
                             detail="a fill confirmed after settlement; re-settling with the confirmed result")
+
+    @staticmethod
+    def _redemption_version(rows: list) -> tuple:
+        return tuple(sorted((r["token_id"], r["shares"], r["settled"], r["payout"],
+                             r.get("settled_wall")) for r in rows))
+
+    def _restore_settlement(self, rec: MarketRecord) -> None:
+        """Restore the already durable result without crediting it a second time."""
+        payouts = {r["token_id"]: r["payout"] for r in rec.held()
+                   if r["settled"] and r["payout"] is not None}
+        if any(r["token_id"] not in payouts for r in rec.held()):
+            return
+        rec.payouts = payouts
+        if rec.up_token in payouts and rec.down_token in payouts:
+            if payouts[rec.up_token] == 1 and payouts[rec.down_token] == 0:
+                rec.winner = "UP"
+            elif payouts[rec.up_token] == 0 and payouts[rec.down_token] == 1:
+                rec.winner = "DOWN"
+        if payouts and all(pay == 0.5 for pay in payouts.values()):
+            rec.winner = "50/50"
+        rec.result_source = "persisted ledger settlement"
+        rec.resolution = res_mod.Resolution(rec.condition_id, res_mod.RESOLVED, payouts,
+                                           winning_label=rec.winner, detail=rec.result_source)
+        rec.settled_at = max((_num(r.get("settled_wall")) for r in rec.positions), default=0) or None
+        rec.realized = sum(_num(r["realized"]) for r in rec.positions
+                           if r["settled"] and r["realized"] is not None)
+        rec.state = SETTLED
+        rec.finished_mono = time.monotonic()
+        self._begin_redemption(rec)
 
     # ------------------------------------------------------------------ loop
     async def _loop(self):
@@ -472,7 +544,7 @@ class SettlementWorker:
                     and mono >= rec.prepare_at):
                 rec.prepare_at = mono + 30.0
                 self._spawn(self._prepare_market(rec), "prepare")
-            if (rec.redeem == REDEEM_PENDING and self._redeem_check is not None
+            if (rec.redeem in (REDEEM_PENDING, REDEEM_UNVERIFIED) and self._redeem_check is not None
                     and not rec.redeem_inflight and mono >= rec.redeem_next):
                 rec.redeem_inflight = True
                 rec.redeem_next = mono + self.redeem_every_s
@@ -522,11 +594,15 @@ class SettlementWorker:
     def _trim(self, mono: float) -> None:
         """Keep every market still owed something; of the finished ones, the newest `history`."""
         finished = [r for r in self.records.values() if r.finished_mono is not None
-                    and r.state in (SETTLED, EXPIRED) and r.redeem != REDEEM_PENDING]
+                    and r.state in (SETTLED, EXPIRED) and r.redeem != REDEEM_PENDING
+                    and not (r.redeem == REDEEM_UNVERIFIED and r.redeem_remaining_amount is None)
+                    and not r.redeem_inflight]
         if len(finished) <= self.history:
             return
         finished.sort(key=lambda r: (r.window_end or 0, r.finished_mono or 0))
         for rec in finished[:len(finished) - self.history]:
+            if rec.redeem == REDEEM_UNVERIFIED:
+                self._retired_redemptions[rec.condition_id] = self._redemption_version(rec.positions)
             self.records.pop(rec.condition_id, None)
 
     async def _prepare_market(self, rec: MarketRecord) -> None:
@@ -670,32 +746,63 @@ class SettlementWorker:
         if not winners:
             rec.redeem = REDEEM_NOT_NEEDED
             return
+        if rec.redeem_shares == winners and rec.redeem_amount == amount:
+            return                              # repeated results cannot reset a balance observation
         rec.redeem, rec.redeem_amount, rec.redeem_shares = REDEEM_PENDING, amount, winners
+        rec.redeem_remaining_shares = rec.redeem_remaining_amount = rec.redeem_unverified_amount = None
+        rec.redeem_checked_at = rec.redeemed_at = None
+        rec.redeem_error = None
         rec.redeem_next = time.monotonic()
         self._event("REDEEM_PENDING", rec, "warn", amount=f"${amount:.2f}",
-                    detail=("winning shares are still outcome tokens in the wallet: not spendable "
-                            "collateral until redeemed (claim on polymarket.com)")
+                    detail=("settled winnings await a wallet token balance check; held winning tokens "
+                            "are not spendable collateral until redeemed (claim on polymarket.com)")
                     + ("" if self._redeem_check is not None else "; not tracked (no wallet address)"))
 
     async def _check_redeem(self, rec: MarketRecord) -> None:
+        # Settlement may replace the inventory while these RPCs are in flight.
+        # Never apply the old observation to a newly settled late fill.
+        shares = dict(rec.redeem_shares)
         try:
             remaining = {}
-            for token, held in rec.redeem_shares.items():
-                balance, detail = await self._in_pool(self._redeem_check, token, net=True)
-                if balance is None:
+            for token, held in shares.items():
+                try:
+                    balance, detail = await self._in_pool(self._redeem_check, token, net=True)
+                    if balance is None:
+                        raise ValueError(str(detail))
+                    balance = float(balance)
+                    if not math.isfinite(balance) or balance < 0:
+                        raise ValueError("invalid wallet token balance")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if shares != rec.redeem_shares:
+                        return
+                    detail = str(exc)[:200]
+                    rec.redeem_remaining_shares = rec.redeem_remaining_amount = None
+                    rec.redeem_unverified_amount = None
                     rec.redeem_error = f"wallet balance unknown: {detail}"
                     self._event("REDEEM_FAILED", rec, "warn", once_per=detail,
                                 detail=f"redemption status could not be read ({detail}); retry in "
                                        f"{self.redeem_every_s:g}s")
                     return
-                if balance >= held - 1e-6:
-                    remaining[token] = held
-            rec.redeem_error = None
-            if remaining:
+                remaining[token] = min(held, balance)
+            if shares != rec.redeem_shares or rec.state != SETTLED:
                 return
-            rec.redeem, rec.redeemed_at = REDEEMED, self._clock()
-            self._event("REDEEMED", rec, "good", amount=f"${_num(rec.redeem_amount):.2f}",
-                        detail="the winning shares have left the wallet (redeemed for collateral)")
+            previous = rec.redeem_remaining_shares
+            payouts = {r["token_id"]: _num(r["payout"]) for r in rec.positions if r["settled"]}
+            amount = sum(held * payouts[token] for token, held in remaining.items())
+            rec.redeem_remaining_shares = remaining
+            rec.redeem_remaining_amount = amount
+            rec.redeem_unverified_amount = max(0.0, _num(rec.redeem_amount) - amount)
+            rec.redeem_checked_at = self._clock()
+            rec.redeem_error = None
+            rec.redeem = REDEEM_PENDING if any(v > 1e-9 for v in remaining.values()) else REDEEM_UNVERIFIED
+            if previous != remaining:
+                self._event("REDEEM_BALANCE", rec, "warn" if rec.redeem_unverified_amount else "info",
+                            remaining=f"${amount:.2f}",
+                            unverified=f"${rec.redeem_unverified_amount:.2f}",
+                            detail=("wallet token balances observed; absent tokens may have been transferred "
+                                    "or redeemed, collateral proceeds are not verified"))
         finally:
             rec.redeem_inflight = False
 
@@ -743,9 +850,14 @@ class SettlementWorker:
             subject = last
         else:
             subject = active
+        redemption = [v for v in views if v["redeem"] in (REDEEM_PENDING, REDEEM_UNVERIFIED)]
+        known = all(v["redeem_remaining_amount"] is not None for v in redemption)
         return {"active": active, "subject": subject, "pending": waiting, "previous": previous,
                 "last_settled": last, "pending_count": len(waiting),
-                "redeem_pending": sum(_num(v["redeem_amount"]) for v in views if v["redeem"] == REDEEM_PENDING)}
+                "redeem_pending": (sum(v["redeem_remaining_amount"] for v in redemption) if known else None),
+                "redeem_unknown": not known,
+                "redeem_unverified": (sum(_num(v["redeem_unverified_amount"]) for v in redemption)
+                                      if known else None)}
 
     def latency(self) -> dict:
         def stats(values):
@@ -792,4 +904,5 @@ def _position_row(p) -> dict:
     return {"token_id": p.token_id, "condition_id": p.condition_id, "shares": float(p.shares),
             "cost": float(p.cost), "fees": float(p.fees), "avg": p.avg_price, "settled": bool(p.settled),
             "realized": p.realized, "payout": p.payout_per_share,
+            "settled_wall": p.settled_wall,
             "newest_wall": max((lot.wall for lot in p.lots), default=None)}

@@ -500,9 +500,9 @@ def norm_cdf(z: float) -> float:
     return _NORMAL.cdf(z)
 
 
-def taker_fee(price: float, rate: float) -> float:
-    """The venue's taker fee per share at this price: rate * p * (1 - p)."""
-    return rate * price * (1.0 - price)
+def taker_fee(price: float, rate: float, exponent: int = 1) -> float:
+    """The venue's taker fee per share under the market's fee curve."""
+    return rate * (price * (1.0 - price)) ** exponent
 
 
 def anchored_fair(market_mid: float, move_bp: float, sigma: float, tau: float) -> float:
@@ -522,28 +522,40 @@ def anchored_fair(market_mid: float, move_bp: float, sigma: float, tau: float) -
     return _NORMAL.cdf(_NORMAL.inv_cdf(m) + dz)
 
 
-def fair_limit(fair: float, margin: float, tick: float, fee_rate: float) -> float:
+def fair_limit(fair: float, margin: float, tick: float, fee_rate: float, fee_exponent: int = 1) -> float:
     """The highest tick price p that still leaves the margin after its fee:
     p + fee(p) + margin <= fair. 0.0 when none does."""
     p = math.floor((fair - margin) / tick + 1e-9) * tick
-    while p > 0 and p + taker_fee(p, fee_rate) + margin > fair + 1e-12:
+    while p > 0 and p + taker_fee(p, fee_rate, fee_exponent) + margin > fair + 1e-12:
         p -= tick
     return round(max(p, 0.0), 4)
 
 
 def kelly_shares(fair: float, ask: float, fee_rate: float, fraction: float, bankroll: float,
-                 max_shares: float) -> tuple[float, float]:
-    """(shares, Kelly fraction) for one binary share bought at the ask: Kelly
-    f* = (q - p) / (1 - p) of the bankroll, q the fair value, p the ask plus its
-    fee; the order is `fraction` of it in whole shares, at most max_shares.
-    (0, f*) when there is no edge or no bankroll."""
-    p = float(ask) + taker_fee(float(ask), fee_rate)
+                 max_shares: float, *, held_shares: float = 0.0, opposite_shares: float = 0.0,
+                 fee_exponent: int = 1) -> tuple[float, float]:
+    """Incremental binary shares, accounting for the existing outcome payouts.
+
+    Cash C and holdings U/D have terminal wealth C+U or C+D. At effective
+    share cost p, full Kelly maximizes q*log(C+U+(1-p)x) +
+    (1-q)*log(C+D-p*x). Fractional Kelly targets that fraction of the optimal
+    total directional position, then subtracts the position already held;
+    repeated signals cannot keep adding the same fractional bet.
+    The second return value remains the standalone Kelly cash fraction.
+    """
+    p = float(ask) + taker_fee(float(ask), fee_rate, fee_exponent)
     if not 0.0 < p < 1.0 or not bankroll or bankroll <= 0:
         return 0.0, 0.0
     f = (float(fair) - p) / (1.0 - p)
     if f <= 0:
         return 0.0, f
-    return float(min(math.floor(fraction * f * bankroll / p + 1e-9), max_shares)), f
+    held, opposite = float(held_shares), float(opposite_shares)
+    if not all(math.isfinite(v) and v >= 0 for v in (held, opposite, float(max_shares))):
+        return 0.0, f
+    wealth = bankroll + p * held + (1.0 - p) * opposite
+    wanted = fraction * (float(fair) - p) * wealth / (p * (1.0 - p)) - (held - opposite)
+    # A hedge may increase the optimum, but it cannot spend unavailable cash.
+    return float(max(0, min(math.floor(wanted + 1e-9), math.floor(bankroll / p + 1e-9), max_shares))), f
 
 
 class Volatility:
@@ -848,10 +860,13 @@ class Settings:
         self.fair = _env_bool("SNIPER_FAIR", True)
         self.fair_margin = _env_float("SNIPER_FAIR_MARGIN", 0.01)
         self.fair_vol_s = _env_float("SNIPER_FAIR_VOL_S", 300)
+        # Retained for environment compatibility; decisions use the prefetched
+        # market's actual fee rate/exponent, never this former model assumption.
         self.fair_fee_rate = _env_float("SNIPER_FAIR_FEE_RATE", 0.07)
         # Kelly size (the frozen spec since 2026-10-11, with the fair value): FAK orders
-        # buy SNIPER_KELLY_FRACTION of the Kelly bet on that fair value, in whole shares,
-        # from the account's cash - no per-order cap, only what is left of the side's
+        # target SNIPER_KELLY_FRACTION of the optimal total directional position,
+        # accounting for cash and both outcome holdings, in whole shares. There is
+        # no per-order cap, only what is left of the side's
         # SNIPER_MAX_SIDE_SHARES in the round (live: also the canary's per-order cap);
         # under the venue's 5-share minimum it skips. Replaces the fixed SNIPER_SHARES + carry.
         self.kelly = _env_bool("SNIPER_KELLY", True)
@@ -1485,6 +1500,57 @@ class Sniper:
         if rd is not None:
             return float(rd[side])
         return float(self.round_baseline.get(str(token), (0.0, 0))[0])
+
+    def _kelly_inventory(self, condition, end, side: str, token, opposite_token) -> tuple[float, float]:
+        """Same-side risk and guaranteed opposing shares, with no venue I/O.
+
+        Provisional/pending fills count as same-side risk. Only confirmed ledger
+        shares provide an opposing payout: a pending FAK could fill nothing.
+        """
+        ledger = getattr(self.live, "ledger", None) if self.live is not None else None
+        ledger = ledger or getattr(self.broker, "ledger", None)
+        read = getattr(ledger, "open_leg_shares", None)
+        own = float(read(condition, token)) if callable(read) else 0.0
+        opposite = float(read(condition, opposite_token)) if callable(read) else 0.0
+        live_risk = getattr(self.live, "own_risk_shares", None)
+        if callable(live_risk):
+            own = max(own, float(live_risk(token, condition)))
+        else:
+            own = max(own, self._side_held(end, side, token))
+            reserved = self.inflight.get(side)
+            if isinstance(reserved, dict) and reserved.get("end") == end:
+                own += float(reserved.get("risk_shares") or 0.0)
+            for row, plan in self._fak_pending.values():
+                if plan.get("cond") == str(condition) and row.get("side") == side:
+                    own += float(plan.get("risk_shares") or 0.0)
+        if not all(math.isfinite(v) and v >= 0 for v in (own, opposite)):
+            raise ValueError("invalid Kelly inventory")
+        return own, opposite
+
+    def _fair_fee_parameters(self, condition, up, down) -> tuple[float, int] | None:
+        """The execution market's prefetched fee curve, never a fetch or guess."""
+        cached = getattr(self.broker, "cached_rules", None)
+        if callable(cached):
+            rules = cached(str(condition))
+        else:
+            hit = getattr(self.broker, "_rules_cache", {}).get(str(condition))
+            ttl = float(getattr(self.broker, "_rules_cache_ttl", 600.0))
+            rules = hit[0] if hit and 0 <= time.time() - float(hit[1]) <= ttl else None
+        if rules is None or str(getattr(rules, "condition_id", "")) != str(condition):
+            return None
+        try:
+            rate = float(rules.fee_rate)
+            exponent = int(rules.fee_exponent)
+            if (isinstance(rules.fee_exponent, bool) or exponent != rules.fee_exponent
+                    or not math.isfinite(rate) or not 0 <= rate <= 1 or not 1 <= exponent <= 8):
+                return None
+            for attr, token in (("up_token_id", up), ("down_token_id", down)):
+                mapped = getattr(rules, attr, None)
+                if mapped is not None and str(mapped) != str(token):
+                    return None
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
+        return rate, exponent
 
     BANKROLL_EVERY_S = 5.0     # paper: the broker's cash is re-read this often, off the order path
     BANKROLL_STALE_S = 30.0    # older than this (no refresher running): read it on the spot
@@ -2617,18 +2683,20 @@ class Sniper:
         the tick), never higher than its mid now. The book on our side reacts
         to BTC within the same 250ms, and the model adds the whole move: a mid
         read after it had already moved part of the way counted that part
-        twice and bid above fair. "before move" / "now" (lower, or no history)."""
+        twice and bid above fair. Missing pre-move history cannot prove an edge."""
         now = getattr(view, "mid", None)
         book = getattr(self.hub, "book", None)
         win = row.get("window_ms")
-        if now is None or win is None or not hasattr(book, "view_at_mono"):
-            return now, "now"
+        if now is None:
+            return None, "no market price"
+        if win is None or not hasattr(book, "view_at_mono"):
+            return None, "history unavailable"
         try:
             then = getattr(book.view_at_mono(token, (float(t_ms) - float(win)) / 1000.0), "mid", None)
-        except Exception:  # noqa: BLE001 - no history: the mid now, as before
+        except Exception:  # noqa: BLE001 - absent/unusable history fails closed
             then = None
         if then is None:
-            return now, "now"
+            return None, "history unavailable"
         row["market_mid_now"] = round(float(now), 4)
         return (then, "before move") if then <= now else (now, "now")
 
@@ -2678,6 +2746,7 @@ class Sniper:
         # never recomputed from a later ask, so it cannot chase the book.
         cap = min(0.99, round(ask + self.s.slip, 4))
         fair = None
+        fee_rate = fee_exponent = None
         if self.s.fair:
             # Buy only at or under what the side is worth right after this move,
             # anchored to the market's own price for it (anchored_fair), less the fee
@@ -2686,15 +2755,22 @@ class Sniper:
             mkt, anchor = self._fair_anchor(str(token), view, row, t_ms)
             tau = float(end) - time.time()
             move = abs(float(row.get("bp") or 0.0))
-            why = ("volatility warming up" if sigma is None else "no market price" if mkt is None
+            why = ("volatility warming up" if sigma is None else
+                   "no pre-move market history" if mkt is None and anchor == "history unavailable" else
+                   "no market price" if mkt is None
                    else "no move" if move <= 0 else "round over" if tau <= 0 else None)
             if why is not None:
                 return self._skip(f"fair value unknown: {why}", row)
+            fees = self._fair_fee_parameters(cond, up, down)
+            if fees is None:
+                return self._skip("fair value unknown: market fee rules not loaded", row)
+            fee_rate, fee_exponent = fees
             fair = anchored_fair(float(mkt), move, sigma, tau)
             tick = getattr(view, "tick_size", None)
-            limit = fair_limit(fair, self.s.fair_margin, float(tick) if tick else 0.01, self.s.fair_fee_rate)
+            limit = fair_limit(fair, self.s.fair_margin, float(tick) if tick else 0.01, fee_rate, fee_exponent)
             row.update(market_mid=round(float(mkt), 4), fair_anchor=anchor, fair=round(fair, 4), fair_limit=limit,
-                       vol_bp=round(sigma * 1e4, 3), tau_s=round(tau, 1))
+                       vol_bp=round(sigma * 1e4, 3), tau_s=round(tau, 1),
+                       fee_rate=fee_rate, fee_exponent=fee_exponent)
             self.last_fair = {"side": side, "market_mid": round(float(mkt), 4), "anchor": anchor, "fair": round(fair, 4),
                               "limit": limit, "ask": ask, "wall": time.time()}
             if ask > limit + 1e-9:
@@ -2711,9 +2787,9 @@ class Sniper:
         kelly = False
         if self.s.order_type == "FAK":
             if fair is not None and self.s.kelly:
-                # Kelly size on the fair value (SNIPER_KELLY): a fraction of the Kelly
-                # bet from the account's cash, whole shares, the venue minimum up to the
-                # max target. Each order is sized fresh: no carry.
+                # Incremental portfolio Kelly: cash and current outcome payouts
+                # determine how much to add. Existing inventory is not a fresh bet.
+                # Whole shares from the venue minimum to the available room; no carry.
                 bank = self._bankroll_now()
                 if bank is None:
                     return self._skip("kelly size unknown: no cash reading", row)
@@ -2724,9 +2800,12 @@ class Sniper:
                 live_cap = getattr(getattr(getattr(self.live, "sender", None), "limits", None), "max_order_shares", None)
                 if live_cap is not None:
                     room = min(room, float(live_cap))
-                shares, f = kelly_shares(fair, ask, self.s.fair_fee_rate, self.s.kelly_fraction, bank,
-                                         max(room, 0.0))
-                row.update(kelly_f=round(f, 4), bankroll=round(bank, 2), kelly_shares=shares)
+                held, opposite = self._kelly_inventory(cond, end, side, token, down if side == "UP" else up)
+                shares, f = kelly_shares(fair, ask, fee_rate, self.s.kelly_fraction, bank,
+                                         max(room, 0.0), held_shares=held, opposite_shares=opposite,
+                                         fee_exponent=fee_exponent)
+                row.update(kelly_f=round(f, 4), bankroll=round(bank, 2), kelly_shares=shares,
+                           kelly_held_shares=round(held, 4), kelly_opposite_shares=round(opposite, 4))
                 self.last_fair["shares"] = shares
                 if shares < KELLY_MIN_SHARES:
                     row.update(ask_seen=ask)
@@ -2784,7 +2863,7 @@ class Sniper:
                 or rd[side] + amount / ask > self.s.max_side_shares):
             return self._skip("round cap", row)
         decided_pc = time.perf_counter_ns()     # every check passed: this signal trades
-        self.inflight[side] = {"end": end, "amount": amount}
+        self.inflight[side] = {"end": end, "amount": amount, "risk_shares": amount / ask}
         row.update(ask_seen=ask, cap=cap, shares=round(amount / ask, 4), amount=round(amount, 4))
         if target is not None:
             row.update(target_shares=round(target, 4), carry_in=round(carry, 4))
@@ -2793,6 +2872,7 @@ class Sniper:
         row.update(latency_ms=round(lat, 1), **parts)
         tick = getattr(view, "tick_size", None)
         return {"end": end, "token": str(token), "amount": amount, "rd": rd, "cap": cap, "lat": lat, "view": view,
+                "risk_shares": amount / ask, "fair_fee_rate": fee_rate, "fair_fee_exponent": fee_exponent,
                 # a Kelly-sized order carries nothing to the next: each is sized fresh
                 "target": target, "carry_market": self.carry_market if target is not None and not kelly else None,
                 "order_type": self.s.order_type, "tick": f"{float(tick):g}" if tick else "0.01",

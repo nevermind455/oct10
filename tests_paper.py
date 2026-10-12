@@ -381,7 +381,13 @@ def t_book_history_reads_the_book_as_it_stood_at_a_venue_time():
     b.desync_all("disconnect")                                    # gap stamped at the newest time seen (T+300)
     check("a feed gap makes the time after it unknown", "gap" in str(asks(T + 300)), str(asks(T + 300)))
     check("...but the time before it is still known", asks(T + 250) == ((0.53, 50.0),), str(asks(T + 250)))
-    b.apply_snapshot("up", [(0.40, 5)], [(0.45, 5)], ts_ms=T + 250, require_exchange_ts=False)
+    check("resync refuses a snapshot predating the newest observed venue update",
+          not b.apply_snapshot("up", [(0.40, 5)], [(0.45, 5)], ts_ms=T + 250,
+                               require_exchange_ts=False))
+    check("a refused old resync leaves the gap unknown", "gap" in str(asks(T + 300)), str(asks(T + 300)))
+    check("a fresh resync installs after the gap",
+          b.apply_snapshot("up", [(0.40, 5)], [(0.45, 5)], ts_ms=T + 310,
+                           require_exchange_ts=False))
     b.note_exchange_ts(T + 400)
     check("a resync snapshot answers from the gap on, never before it",
           asks(T + 350) == ((0.45, 5.0),) and asks(T + 250) == ((0.53, 50.0),), f"{asks(T + 350)} {asks(T + 250)}")

@@ -26,7 +26,7 @@ from dataclasses import dataclass
 
 from .binance import BinanceTradeFeed
 from .book import BookState, BookView
-from .health import LIVE, worst
+from .health import LIVE, UNSYNCED, worst
 from .poly_market import PolyMarketFeed
 from .poly_user import FillStore, PolyUserFeed
 
@@ -124,6 +124,7 @@ class FeedHub:
         self._rest_book_fetch = rest_book_fetch   # callable(token) -> (bids, asks)
         self._resync_wanted: set[str] = set()
         self._next_book_fetch_at: dict[str, tuple[int, float]] = {}
+        self._next_ws_snapshot_at: dict[str, tuple[int, float]] = {}
         self._tasks: list[asyncio.Task] = []
         self._stop = asyncio.Event()
         self._resync_event = asyncio.Event()
@@ -331,6 +332,9 @@ class FeedHub:
                 self._next_book_fetch_at = {token: deadline
                                            for token, deadline in self._next_book_fetch_at.items()
                                            if token in active}
+                self._next_ws_snapshot_at = {token: deadline
+                                            for token, deadline in self._next_ws_snapshot_at.items()
+                                            if token in active}
                 if self._rest_book_fetch is not None and need:
                     await asyncio.gather(*(self._resync_token(token, limiter)
                                            for token in sorted(need)))
@@ -374,6 +378,7 @@ class FeedHub:
             if self.book.apply_snapshot(
                     token, bids, asks, only_if_unsynced=True,
                     expected_generation=view.generation, expected_updates=view.updates,
+                    expected_receive_revision=view.receive_revision,
                     refresh_if_older_than=self.book_refresh_after):
                 self.rest_resyncs += 1
                 with self._lock:
@@ -382,6 +387,20 @@ class FeedHub:
             elif self.book.view(token).status == LIVE:
                 with self._lock:
                     self._resync_wanted.discard(token)
+            else:
+                current = self.book.view(token)
+                # Ignored UNSYNCED deltas now fence REST. On a busy market
+                # every HTTP response can race; use a stream-ordered snapshot
+                # instead of waiting indefinitely for a quiet fetch interval.
+                prior = self._next_ws_snapshot_at.get(token)
+                now = time.monotonic()
+                if (current.status == UNSYNCED and current.generation == view.generation
+                        and current.receive_revision != view.receive_revision
+                        and (prior is None or prior[0] != current.generation or now >= prior[1])
+                        and self.market.request_snapshot(token, expected_generation=current.generation)):
+                    self._next_ws_snapshot_at[token] = (
+                        current.generation, now + max(1.0, self.book_refresh_after))
+                    self._event("resync", f"WS snapshot requested {token[-6:]} after raced REST", "info")
 
     def _wake_resync(self) -> None:
         loop = self._resync_loop_owner

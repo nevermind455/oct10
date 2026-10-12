@@ -1188,7 +1188,7 @@ class Settlement(unittest.TestCase):
             self.assertLess(worst, 0.05)                                     # the loop kept running
         asyncio.run(go())
 
-    def test_live_redemption_is_proven_from_the_wallet_never_assumed(self):
+    def test_token_disappearance_does_not_prove_collateral_redemption(self):
         async def go():
             balances = {}
             w = ST.SettlementWorker(self.led, interval=0.05, fetch=self.fetch, clock=lambda: self.clock[0],
@@ -1204,7 +1204,9 @@ class Settlement(unittest.TestCase):
             self.assertEqual((rec.state, rec.redeem), (ST.SETTLED, ST.REDEEM_PENDING))   # winner known != redeemed
             balances[up] = 0.0                                               # the shares left the wallet
             await self.ticks(20)
-            self.assertEqual(rec.redeem, ST.REDEEMED)
+            self.assertEqual(rec.redeem, ST.REDEEM_UNVERIFIED)
+            self.assertEqual(rec.redeem_remaining_amount, 0.0)
+            self.assertIsNone(rec.redeemed_at)
             await w.stop()
         asyncio.run(go())
 
