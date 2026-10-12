@@ -143,6 +143,32 @@ def fmt_ratio(items) -> str:
     return f"{r:+.2f}" if not se else f"{r:+.2f} +/-{se:.2f} (t={r / se:.1f})"
 
 
+def by_feed_lines(fills, refused, marks, lot_pay) -> list[str]:
+    """Orders split by the feed that fired them (one move, one order: whichever
+    feed signalled first) - the A/B read for a second trigger such as
+    SNIPER_EXTRA_FEEDS=binance_fut. Nothing when only one feed fired."""
+    feeds = sorted({str(r.get("feed") or "?") for r in fills + refused})
+    if len(feeds) < 2:
+        return []
+    out = ["\n   by triggering feed (one move, one order: the feed that saw it first)",
+           f"         {'feed':>12}  {'orders':>6}  {'filled':>6}  {'fill':>5}  {'settled c/share':<26}  5s markout c/share"]
+    for feed in feeds:
+        fl = [f for f in fills if str(f.get("feed") or "?") == feed]
+        n = len(fl) + sum(1 for r in refused if str(r.get("feed") or "?") == feed)
+        settled = []
+        for f in fl:
+            s = lot_pay.get(f.get("order_id"))
+            if s and s[0] and s[1] is not None:
+                shares = float(f.get("shares") or 0)
+                settled.append((f.get("round_end"), (shares * float(s[1]) - float(f.get("cost") or 0)) * 100, shares))
+        mk = [(f.get("round_end"), float(marks[f["order_id"]]["markout_5s_c"]) * float(f.get("shares") or 0),
+               float(f.get("shares") or 0))
+              for f in fl if marks.get(f.get("order_id"), {}).get("markout_5s_c") is not None]
+        rate = f"{len(fl) / n:.0%}" if n else "-"
+        out.append(f"         {feed:>12}  {n:>6}  {len(fl):>6}  {rate:>5}  {fmt_ratio(settled):<26}  {fmt_ratio(mk)}")
+    return out
+
+
 def verdict_line(rep, label, r, se, n_rounds, lab=None):
     t = r / se if se else float("nan")
     sig = "clearly above zero" if t > 2 else ("clearly below zero" if t < -2 else "NOT distinguishable from zero")
@@ -466,6 +492,8 @@ def main() -> int:
             money = f"${sum(v[1] for v in sel) / 100:+.2f}"
             print(f"         {label:>16}  {len(sel):>6}  {money:>9}  "
                   f"{fmt_ratio([(i, v[1], v[2]) for i, v in enumerate(sel)])}")
+    for line in by_feed_lines(fills, refused, marks, lot_pay):
+        print(line)
 
     # ------------------------------------------------------------ latency curve
     print("\n6. LATENCY CURVE (the same orders priced at other latencies - arithmetic only, nothing sent)")

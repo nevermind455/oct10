@@ -316,6 +316,7 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | `SNIPER_COINBASE_FRESHNESS` | 1 (unset) | skip a Coinbase signal unless the feed is shown current: `_STALE_MS` 1000 (match age above its 5-min best), `_BACKLOG_MAX` 20, `_UNKNOWN_MS` 5000 |
 | `SNIPER_COINBASE_SILENT_S` | 5 (unset) | no Coinbase message (heartbeats included) this long: reconnect |
 | `SNIPER_COINBASE_CONNS` | 2 (unset) | Coinbase sockets carrying the same ticker (1 to 4); each ticker used once, from the first to deliver it |
+| `SNIPER_EXTRA_FEEDS` | empty | PAPER A/B only: `binance_fut` adds Binance's USD-M perpetual BTCUSDT book ticker as a second trigger (whichever feed signals first fires; one move, one order; its own freshness gate on each tick's event time). LIVE refuses any second trigger. `sniper_check.py` splits orders, fills, settled P&L and markouts by the feed that fired |
 | `SNIPER_K_BP` / `SNIPER_WINDOW_MS` | 0.5 / 250 | trigger: a move of >= 0.5bp within 250ms |
 | `SNIPER_SHARES` | 10 | base target shares per order (at least $1) |
 | `SNIPER_MAX_TARGET_SHARES` | 20 | cap on base + same-side unfilled carry |

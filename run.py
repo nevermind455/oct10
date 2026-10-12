@@ -1951,6 +1951,15 @@ class DashView:
             behind = "--" if ex.get("p50") is None else f"{ex['p50']}ms"
             rows.append(("BINANCE", str(b.get("status") or "--"),
                          f"behind p50 {behind} backlog max {b.get('backlog_max')} rc {b.get('reconnects')}"))
+        bf = summary.get("binance_fut")
+        if bf:                                       # SNIPER_EXTRA_FEEDS=binance_fut (paper A/B)
+            ex = bf.get("excess_ms") or {}
+            age = bf.get("age_ms") or {}
+            fired = (summary.get("fired_by_feed") or {}).get("binance_fut", 0)
+            rows.append(("BIN FUT", str(bf.get("status") or "--"),
+                         f"2nd trigger  age p50 {'--' if age.get('p50') is None else str(age['p50']) + 'ms'}"
+                         f"  behind p50 {'--' if ex.get('p50') is None else str(ex['p50']) + 'ms'}"
+                         f"  fired {fired}  rc {bf.get('reconnects')}"))
         book = health.get("book") or {}
         pm = health.get("poly_market") or {}
         rows.append(("POLY BOOK", str(book.get("status") or "--"),

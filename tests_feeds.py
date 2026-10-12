@@ -1531,7 +1531,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Reviewed 2026-10-12: user-requested recovery, accounting and portfolio safety fixes.
     # Re-approved 2026-10-12 (audit 20261012): order-task failures stop new decisions; a last
     # freshness check of book and signal at the wire
-    "sniper_mode.py": "e3418d5e72ff62f9426f73ac5fa717993a14803fa7637f66787675742fdc8387",
+    # Re-approved 2026-10-13: SNIPER_EXTRA_FEEDS=binance_fut - Binance's USD-M perpetual
+    # BTCUSDT book ticker as a PAPER second trigger (on_binance_fut, its own freshness gate
+    # bf_fresh on each tick's event time; _gate_for picks a feed's gate). LIVE refuses any
+    # second trigger (exec_latency.spec_violations).
+    "sniper_mode.py": "d9585610521dfb63b0a87413d4a5ce3f6d4fd22c9427c364f7c8be8af4ab3483",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.

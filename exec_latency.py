@@ -92,6 +92,12 @@ def spec_violations(settings, canary_max_shares=None) -> list[str]:
             src = f"{var}={os.environ.get(var)!r}" if os.environ.get(var) not in (None, "") else f"{var} unset (code default)"
             out.append(f"{label}: resolved {fmt.format(got) if got is not None else got} but the frozen spec is "
                        f"{fmt.format(want)} ({src})")
+    extra = tuple(getattr(settings, "extra_feeds", ()) or ())
+    if extra:
+        # A second trigger (e.g. binance_fut since 2026-10-13) is a paper A/B
+        # test: it changes which moves trade, so it is not the frozen spec.
+        out.append(f"second trigger: SNIPER_EXTRA_FEEDS={','.join(extra)} - the frozen spec trades on the "
+                   f"primary feed alone (a second trigger is paper-only until its A/B result is reviewed)")
     target = float(getattr(settings, "max_target_shares", 0) or 0)
     # `not >=` rather than `<`: a NaN cap compares false both ways and must fail here too.
     if canary_max_shares is not None and not float(canary_max_shares) + 1e-9 >= target:
