@@ -417,6 +417,31 @@ def test_execution_latency_and_quality_are_visible() -> None:
     check("no samples reads N/A, never a number", "N/A" in next((ln for ln in text.splitlines() if "TRIG>SEND" in ln), ""))
 
 
+def test_net_line_colours_each_path_by_its_own_limits() -> None:
+    from dashboard.sniper_layout import net_style
+    snap = populated()
+    snap["net"] = {"coinbase": 48.0, "clob": 95.0, "binance": None}
+    frame = build(snap, 120, 40, UNICODE)
+    row = next((r for r in frame if "NET ms" in "".join(t for t, _ in r)), None)
+    check("the NET line is drawn", row is not None, _text(frame))
+    text = "".join(t for t, _ in row or [])
+    check("each path with its ms (unmeasured reads --)",
+          all(p in text for p in ("coinbase 48", "clob 95", "binance --")), text)
+    style = {t: s for t, s in row or []}
+    check("a fast feed is green, a slow CLOB red", style.get("48", Style()).fg == "green"
+          and style.get("95", Style()).fg == "red", str(row))
+    snap["net"] = {"coinbase": 48.0, "clob": 24.0, "binance": 212.0}
+    for cols in (84, 120, 160):
+        row = next((r for r in build(snap, cols, 40, UNICODE) if "NET ms" in "".join(t for t, _ in r)), [])
+        text = "".join(t for t, _ in row)
+        check(f"all three values fit at {cols} columns (names shorten when narrow)",
+              all(v in text for v in (" 48", " 24", " 212")), text)
+    check("limits are per path: 200ms is fine for Binance, not for the CLOB",
+          net_style("binance", 200.0).fg == "green" and net_style("clob", 200.0).fg == "red"
+          and net_style("coinbase", 120.0).fg == "amber" and net_style("clob", None).fg == "faint")
+    check("no NET line when the snapshot has none", "NET " not in _text(build(populated(), 120, 40, UNICODE)))
+
+
 def test_position_manager_panel() -> None:
     text = _text(build(populated(), 120, 60, UNICODE))
     check("the manager panel is drawn when its engine is on and there is room", "POSITION MANAGER" in text, text)

@@ -67,6 +67,12 @@ REDEEM_FG = {"REDEEM PENDING": Style("amber", bold=True), "REDEEMED": Style("gre
              "REDEMPTION UNVERIFIED": Style("amber", bold=True)}
 LEVEL_STYLE = {"good": Style("green"), "warn": Style("amber"), "bad": Style("red", bold=True),
                "info": Style("ink")}
+# The NET line: (green up to, amber up to) milliseconds per path, red above.
+# Coinbase is the trigger feed's delay (receipt - the match's own time); the
+# CLOB and Binance are round trips. Binance sits in Tokyo: from Europe a
+# round trip near 200ms is normal, so its limits are its own.
+NET_LIMITS = {"coinbase": (80.0, 150.0), "clob": (40.0, 80.0), "binance": (250.0, 400.0)}
+NET_ORDER = ("coinbase", "clob", "binance")
 RESULT_STYLE = {"filled": Style("green", bold=True), "missed": Style("amber"), "refused": Style("amber"),
                 "pending": Style("blue", bold=True), "error": Style("red", bold=True),
                 "rejected": Style("red", bold=True), "unknown": Style("purple")}
@@ -127,6 +133,34 @@ def _line(label: str, value: str, cols: int, vstyle: Style = PAPER, lw: int = 9)
 
 def _runs(parts, cols: int) -> Row:
     return pad([(terminal_text(t, 400), s) for t, s in parts if t], cols)
+
+
+def net_style(key: str, ms) -> Style:
+    """Green / amber / red for one NET path by its own limits; faint when unmeasured."""
+    v = _num(ms)
+    if v is None or key not in NET_LIMITS:
+        return FAINT
+    green, amber = NET_LIMITS[key]
+    return Style("green" if v <= green else "amber" if v <= amber else "red", bold=True)
+
+
+NET_SHORT = {"coinbase": "cb", "clob": "clob", "binance": "bn"}
+
+
+def _net_row(net: dict, cols: int) -> Row:
+    """NET ms  coinbase 48  clob 24  binance 212 - each value coloured by its
+    own limits; the names shorten (cb / clob / bn) when the panel is narrow."""
+    def runs(names):
+        out = [(fit("NET ms", 9), DIM), (" ", PAPER)]
+        for key in NET_ORDER:
+            v = _num(net.get(key))
+            out += [(f"{names[key]} ", FAINT), (MISSING if v is None else f"{v:.0f}", net_style(key, v)),
+                    ("  ", PAPER)]
+        return out
+    full = runs({k: k for k in NET_ORDER})
+    if sum(len(t) for t, _ in full) - 2 > cols:
+        full = runs(NET_SHORT)
+    return _runs(full, cols)
 
 
 def _header(snap: dict, cols: int) -> Row:
@@ -367,6 +401,9 @@ def _side_body(snap: dict, w: int, h: int) -> list[Row]:
                 out.append(_runs([(fit("HALT" if first else "", 9), Style("red", bold=True)), (" ", PAPER),
                                   (text[:cw], Style("red"))], w))
                 text, first = text[cw:], False
+    net = snap.get("net")
+    if isinstance(net, dict):
+        out.append(_net_row(net, w))
     for name, state, detail in (snap.get("health") or []):
         st = _text(state)
         out.append(_runs([(fit(_text(name), 9), DIM), (" ", PAPER), (fit(st, 12), state_fg(st)), (" ", PAPER),

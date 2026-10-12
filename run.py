@@ -607,6 +607,7 @@ class Runtime:
     reconciler: object = None
     settler: object = None
     pm: object = None                     # position_manager.PositionManager (off unless enabled)
+    net_probe: object = None              # BinanceProbe: the dashboard's Binance round trip (display only)
     new_canary_session: bool = False      # LIVE: start a new canary budget deliberately (audit F3)
     stop_request: Path | None = None      # a file here asks for a clean shutdown (see _wait_until_stopped)
     journal_path: Path | None = None
@@ -1519,6 +1520,57 @@ def _reserved_cash(rt) -> float:
     return total
 
 
+class BinanceProbe:
+    """DISPLAY ONLY: the round trip to Binance's public REST API, for the
+    dashboard's NET line. Coinbase has been the trigger since 2026-10-10, so the
+    bot keeps no Binance socket to time. One GET /api/v3/time every EVERY_S on
+    one dedicated thread (one warm connection, as the sniper's CLOB probe);
+    the first sample after a failure is dropped (it pays a new handshake). It
+    owns nothing the bot trades on: a failure only shows "--"."""
+
+    URL = "https://api.binance.com/api/v3/time"
+    EVERY_S = 10.0
+    STALE_S = 60.0          # no good sample this long: shown as unknown, not as the old value
+
+    def __init__(self) -> None:
+        self.rtt: collections.deque = collections.deque(maxlen=5)
+        self.good_at: float | None = None
+        self.errors = 0
+
+    def ms(self) -> float | None:
+        if not self.rtt or self.good_at is None or time.monotonic() - self.good_at > self.STALE_S:
+            return None
+        return sorted(self.rtt)[len(self.rtt) // 2]
+
+    def record(self, status: int, ms: float, first: bool) -> bool:
+        """One probe result; True when the next one is a first (a fresh connection)."""
+        if status != 200:
+            self.errors += 1
+            return True
+        if not first and math.isfinite(ms) and ms >= 0:
+            self.rtt.append(ms)
+            self.good_at = time.monotonic()
+        return False
+
+    async def run(self) -> None:
+        import concurrent.futures
+        import sniper_mode
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="binance-rtt")
+        loop = asyncio.get_running_loop()
+        first = True
+        try:
+            while True:
+                try:
+                    status, ms = await loop.run_in_executor(pool, sniper_mode.Sniper._rtt_once, self.URL)
+                    first = self.record(status, ms, first)
+                except Exception:  # noqa: BLE001 - display only: counted, shown as unknown
+                    self.errors += 1
+                    first = True
+                await asyncio.sleep(self.EVERY_S)
+        finally:
+            pool.shutdown(wait=False)
+
+
 class DashView:
     """Builds the dashboard snapshot: plain values copied out of the hub, the
     Sniper, the broker/ledger and the canary. Call snapshot() on the event
@@ -1825,8 +1877,35 @@ class DashView:
             else:
                 acct["equity"] = None
         snap["canary"] = self._canary()
+        snap["net"] = self._net()
         snap["health"] = self._health_rows(summary, health)
         return snap
+
+    NET_FEED_SAMPLES = 200      # Coinbase delay: the median of this many latest tickers
+    NET_FEED_STALE_S = 10.0     # no ticker this long: the feed's delay is unknown, not its old value
+
+    def _net(self) -> dict:
+        """The NET line (ms; None when not measured): Coinbase's delay - receipt
+        minus each ticker's own match time, so it includes this clock's offset
+        to Coinbase's (keep NTP on) - and the round trips to the CLOB (the
+        sniper's own probe) and to Binance (BinanceProbe, display only)."""
+        sn = self.rt.sniper
+        coinbase = clob = None
+        fresh = getattr(sn, "cb_fresh", None)
+        lag = getattr(fresh, "lag", None)
+        last = getattr(fresh, "last_trade_mono", None)
+        if lag and last is not None and time.monotonic() - float(last) <= self.NET_FEED_STALE_S:
+            n = min(len(lag), self.NET_FEED_SAMPLES)
+            xs = sorted(lag[-i] for i in range(1, n + 1))       # deque: O(1) from its end
+            coinbase = round(xs[len(xs) // 2], 1)
+        rtt = getattr(sn, "net_rtt", None)
+        if rtt:
+            xs = sorted(rtt)
+            clob = round(xs[len(xs) // 2], 1)
+        probe = getattr(self.rt, "net_probe", None)
+        binance = probe.ms() if probe is not None else None
+        return {"coinbase": coinbase, "clob": clob,
+                "binance": None if binance is None else round(binance, 1)}
 
     def _canary(self) -> dict | None:
         live = self.rt.live_exec
@@ -1960,6 +2039,18 @@ async def _dashboard(rt: Runtime) -> None:
     and draw on a worker thread (pure Python, would hold BTC ticks unread).
     DASH_FPS (default 2) sets the frame rate: every frame is CPU the sniper
     competes for on a 1-vCPU VPS."""
+    # The NET line's Binance round trip: started and stopped with the dashboard,
+    # never one of the bot's critical tasks (its end can never stop the bot).
+    rt.net_probe = BinanceProbe()
+    probe_task = asyncio.create_task(rt.net_probe.run(), name="binance-rtt")
+    try:
+        await _dashboard_frames(rt)
+    finally:
+        probe_task.cancel()
+        await asyncio.gather(probe_task, return_exceptions=True)
+
+
+async def _dashboard_frames(rt: Runtime) -> None:
     from dashboard import ConsoleCapture, build, glyphs, make_renderer, plain_line
     view = DashView(rt, accounting_every_s=_env_seconds("DASH_ACCOUNTING_S", 1.0), accounting_off_loop=True)
     frame_s = 1.0 / max(0.5, min(10.0, _env_seconds("DASH_FPS", 2.0) or 2.0))

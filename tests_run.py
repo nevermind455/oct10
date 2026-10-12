@@ -574,6 +574,20 @@ class DashViewTests(unittest.TestCase):
         sn.carry_market, sn.carry["UP"] = (str(hub.condition_id), hub.window_end), 4.0
         self.assertEqual(run.DashView(rt).snapshot()["market"]["carry"]["UP"], {"carry": 4.0, "next": 14.0})
         self.assertIn("carry UP 4 DN 0", run.status_text(run.DashView(rt).snapshot()))
+        self.assertEqual(snap["net"], {"coinbase": None, "clob": None, "binance": None})   # nothing measured yet
+        mono = time.monotonic()
+        for i, ms in enumerate([40.0] * 50 + [300.0] * 250):          # the latest 200: all 300ms
+            sn.cb_fresh.lag.append(ms)
+        sn.cb_fresh.last_trade_mono = mono
+        sn.net_rtt.extend([22.0, 30.0, 26.0])
+        rt.net_probe = run.BinanceProbe()
+        rt.net_probe.record(200, 999.0, first=True)                    # a fresh connection's handshake: dropped
+        rt.net_probe.record(200, 210.0, first=False)
+        net = run.DashView(rt).snapshot()["net"]
+        self.assertEqual(net, {"coinbase": 300.0, "clob": 26.0, "binance": 210.0})
+        sn.cb_fresh.last_trade_mono = mono - 30.0                      # no ticker for 30s: unknown, not old
+        rt.net_probe.good_at -= run.BinanceProbe.STALE_S + 1
+        self.assertEqual(run.DashView(rt).snapshot()["net"], {"coinbase": None, "clob": 26.0, "binance": None})
         line = run.status_text(snap)
         for part in ("PAPER", "coinbase=", "signals=7", "orders=2", "filled=1", "skips: cooldown 5"):
             self.assertIn(part, line)                                    # the trigger feed: Coinbase by default
