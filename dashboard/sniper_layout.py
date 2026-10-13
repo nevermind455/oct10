@@ -22,6 +22,8 @@ is optional: a missing value is drawn as "--", never invented.
     exec        latency {metric: {n, last, avg, p50, p95, p99, max, simulated}}
                 (exec_latency.STAGES + TOTALS), quality (exec_latency.ExecQuality
                 summary), paper
+    budget      exec_latency.latency_budget(): primary, feeds {feed: ms}, bot_ms,
+                one_way_ms, hold_ms, venue_ms, venue_simulated, totals {feed: ms}
     market      slug, seconds_left, trade_until_s, book_status, up / down
                 ({bid, ask, status, age_ms}), round_fills, max_fills,
                 round_up_sh, round_down_sh, max_side_shares
@@ -630,12 +632,67 @@ def _pnl_row(label, a, cols, w, bold=False):
                   enumerate(zip(vals, cols))], w)
 
 
+FEED_NAME = {"coinbase": "Coinbase feed", "binance": "Binance feed", "kraken": "Kraken feed",
+             "binance_fut": "Bin fut feed"}
+FEED_SHORT = {"coinbase": "cb", "binance": "bn", "kraken": "kr", "binance_fut": "bin fut"}
+
+
+def _ms_short(v) -> str:
+    f = _num(v)
+    return "N/A" if f is None else f"{f:.1f}ms" if f < 10 else f"{f:.0f}ms"
+
+
+def _budget_body(b: dict, w: int, g: Glyphs) -> list[Row]:
+    """LATENCY BUDGET: BTC trade -> our order matched, p50 parts with their
+    share of the trigger feed's total. N/A where not measured yet; 'sim' marks
+    paper's modelled venue time."""
+    b = b if isinstance(b, dict) else {}
+    feeds = b.get("feeds") if isinstance(b.get("feeds"), dict) else {}
+    totals = b.get("totals") if isinstance(b.get("totals"), dict) else {}
+    primary = _text(b.get("primary"), "")
+    parts = [(FEED_NAME.get(primary, f"{primary} feed"), feeds.get(primary), Style("blue")),
+             ("Bot in-process", b.get("bot_ms"), Style("green")),
+             ("Network > CLOB", b.get("one_way_ms"), Style("amber")),
+             ("Polymarket hold", b.get("hold_ms"), Style("dim")),
+             ("Venue match" + (" sim" if b.get("venue_simulated") else ""), b.get("venue_ms"), Style("purple"))]
+    total = _num(totals.get(primary))
+    known = sum(_num(v) or 0.0 for _, v, _ in parts)
+    base = total if total else known
+    lw, vw, pw = 16, 6, 4
+    bw = max(4, w - lw - vw - pw - 3)
+    rows = []
+    for label, v, style in parts:
+        f = _num(v)
+        frac = max(0.0, f / base) if f is not None and base else 0.0
+        shown = max(frac, 1.0 / (bw * 8)) if frac > 0 else 0.0      # a part > 0 always shows a sliver
+        pct = "" if f is None or not base else "<1%" if 0 < frac < 0.005 else f"{frac * 100:.0f}%"
+        rows.append(_runs([(fit(label, lw), DIM), (" ", PAPER)] + bar(shown, bw, g, style)
+                          + [(" ", PAPER), (fit(_ms_short(f), vw, ">"), Style("ink", bold=True)),
+                             (" ", PAPER), (fit(pct, pw, ">"), FAINT)], w))
+    head = (f"{total:.0f}ms" if total is not None else f">={known:.0f}ms" if known else "N/A")
+    tail = []
+    for k in feeds:
+        if k != primary:
+            tail += [(f"  via {FEED_SHORT.get(k, k)} ", FAINT), (_ms_short(totals.get(k)), Style("ink"))]
+    rows.append(_runs([(fit("BTC > MATCHED", lw), Style("ink", bold=True)), (" ", PAPER),
+                       (head, Style("ink", bold=True))] + tail, w))
+    return rows
+
+
 def _latency_band(snap: dict, cols: int, h: int, g: Glyphs) -> list[Row]:
     ex = snap.get("exec") if isinstance(snap.get("exec"), dict) else {}
     title = "SNIPER EXECUTION LATENCY" + (" (paper: ACK/fill simulated)" if ex.get("paper") else "")
     body_h = max(0, h - 2)
     if cols < 100:
         return panel(title, _latency_body(ex.get("latency"), cols - 2)[:body_h], cols, h, g)
+    budget = snap.get("budget") if isinstance(snap.get("budget"), dict) else None
+    if budget is not None and cols >= 150:
+        w = hsplit(cols, (1.4, 1.15, 0.85), (66, 46, 34))
+        return join([panel(title, _latency_body(ex.get("latency"), w[0] - 2)[:body_h], w[0], h, g),
+                     panel("LATENCY BUDGET  BTC trade > matched (p50)", _budget_body(budget, w[1] - 2, g)[:body_h],
+                           w[1], h, g),
+                     panel("EXECUTION QUALITY", _quality_body(ex.get("quality"), w[2] - 2)[:body_h], w[2], h, g)],
+                    w, h)
     w = hsplit(cols, (1.6, 1.0), (66, 34))
     return join([panel(title, _latency_body(ex.get("latency"), w[0] - 2)[:body_h], w[0], h, g),
                  panel("EXECUTION QUALITY", _quality_body(ex.get("quality"), w[1] - 2)[:body_h], w[1], h, g)], w, h)

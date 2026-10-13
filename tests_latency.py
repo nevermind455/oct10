@@ -723,5 +723,38 @@ class StrategyEquivalence(unittest.TestCase):
                 self.assertEqual(x, y, f"decision {i} differs ({mode_env})")
 
 
+class LatencyBudget(unittest.TestCase):
+    """exec_latency.latency_budget: BTC trade -> matched, the dashboard's LATENCY BUDGET."""
+    LAT = {"feed_to_trigger": {"p50": 0.02}, "trigger_to_send": {"p50": 1.1},
+           "send_to_ack": {"p50": 240.0, "simulated": False}}
+
+    def test_live_takes_the_return_leg_off_the_reply(self):
+        b = X.latency_budget({"coinbase": 46.0, "binance_fut": 109.0}, "coinbase", self.LAT, 34.0)
+        self.assertAlmostEqual(b["one_way_ms"], 17.0)
+        self.assertAlmostEqual(b["bot_ms"], 1.12)
+        self.assertAlmostEqual(b["venue_ms"], 240.0 - 17.0 - 17.0 - X.VENUE_HOLD_MS)   # 56ms after the hold
+        self.assertAlmostEqual(b["totals"]["coinbase"], 46.0 + 1.12 + 17.0 + 150.0 + 56.0)
+        self.assertAlmostEqual(b["totals"]["binance_fut"] - b["totals"]["coinbase"], 63.0)
+        self.assertFalse(b["venue_simulated"])
+
+    def test_paper_send_to_ack_is_already_the_match(self):
+        lat = dict(self.LAT, send_to_ack={"p50": 240.0, "simulated": True})
+        b = X.latency_budget({"coinbase": 46.0}, "coinbase", lat, 34.0)
+        self.assertTrue(b["venue_simulated"])
+        self.assertAlmostEqual(b["venue_ms"], 240.0 - 17.0 - X.VENUE_HOLD_MS)
+
+    def test_unmeasured_parts_are_none_never_guessed(self):
+        b = X.latency_budget({"coinbase": None}, "coinbase", {}, None)
+        self.assertEqual((b["bot_ms"], b["one_way_ms"], b["venue_ms"]), (None, None, None))
+        self.assertEqual(b["totals"], {"coinbase": None})
+        self.assertEqual(b["hold_ms"], X.VENUE_HOLD_MS)
+        b = X.latency_budget({"coinbase": float("nan")}, "coinbase", {"send_to_ack": {"p50": "x"}}, float("inf"))
+        self.assertEqual((b["feeds"]["coinbase"], b["one_way_ms"], b["venue_ms"]), (None, None, None))
+
+    def test_a_reply_faster_than_the_hold_reads_zero_venue_time(self):
+        lat = dict(self.LAT, send_to_ack={"p50": 100.0, "simulated": False})
+        self.assertEqual(X.latency_budget({"coinbase": 46.0}, "coinbase", lat, 34.0)["venue_ms"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

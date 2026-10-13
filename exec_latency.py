@@ -150,8 +150,56 @@ def signing_backend() -> str:
             "NativeECCBackend": "pure-Python eth_keys (slow: pip install coincurve)"}.get(name, name)
 
 
+# ---------------------------------------------------------------- latency budget
+# Polymarket's taker hold on crypto up/down markets (docs changelog: 150ms since
+# 2026-09-04). Documented, not measured: the venue does not report it apart.
+VENUE_HOLD_MS = 150.0
+
+
+def _p50(lat: dict, key: str):
+    v = (lat.get(key) or {}).get("p50") if isinstance(lat.get(key), dict) else None
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) and v >= 0 else None
+
+
+def latency_budget(feeds: dict, primary: str, lat: dict, clob_rtt_ms, hold_ms: float = VENUE_HOLD_MS) -> dict:
+    """BTC trade -> our order matched at Polymarket, as p50 parts in ms (None
+    where not measured yet - never a guess):
+
+      feed     the trigger feed's delay, per feed (receipt - the trade's own time)
+      bot      feed message in -> bytes on the wire (feed_to_trigger + trigger_to_send)
+      network  one way to the CLOB: half the measured round trip
+      hold     the venue's documented taker hold
+      venue    the rest of send -> match. LIVE measures send -> reply, and the reply
+               comes one leg after the match, so match = reply - one way. PAPER's
+               send -> ACK is its modelled match itself (venue_simulated).
+
+    totals: per feed, the sum when every part is known."""
+    lat = lat if isinstance(lat, dict) else {}
+    try:
+        rtt = float(clob_rtt_ms)
+        one_way = rtt / 2.0 if math.isfinite(rtt) and rtt > 0 else None
+    except (TypeError, ValueError):
+        one_way = None
+    send = _p50(lat, "trigger_to_send")
+    bot = None if send is None else send + (_p50(lat, "feed_to_trigger") or 0.0)
+    ack = _p50(lat, "send_to_ack")
+    simulated = bool((lat.get("send_to_ack") or {}).get("simulated")) if isinstance(lat.get("send_to_ack"), dict) else False
+    venue = None
+    if ack is not None and one_way is not None:
+        venue = max(0.0, (ack if simulated else ack - one_way) - one_way - hold_ms)
+    feeds = {k: (float(v) if isinstance(v, (int, float)) and math.isfinite(v) else None) for k, v in (feeds or {}).items()}
+    after = None if None in (bot, one_way, venue) else bot + one_way + hold_ms + venue
+    return {"primary": primary, "feeds": feeds, "bot_ms": bot, "one_way_ms": one_way, "hold_ms": hold_ms,
+            "venue_ms": venue, "venue_simulated": simulated,
+            "totals": {k: (None if v is None or after is None else v + after) for k, v in feeds.items()}}
+
+
 # ---------------------------------------------------------------- stage math
-STAGES = ("feed_to_trigger", "trigger_to_decision", "build", "sign", "dispatch", "send_to_ack", "ack_to_fill")
+STAGES =("feed_to_trigger", "trigger_to_decision", "build", "sign", "dispatch", "send_to_ack", "ack_to_fill")
 TOTALS = ("trigger_to_send", "trigger_to_ack", "trigger_to_fill")
 
 

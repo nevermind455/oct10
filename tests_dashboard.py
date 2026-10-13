@@ -417,6 +417,45 @@ def test_execution_latency_and_quality_are_visible() -> None:
     check("no samples reads N/A, never a number", "N/A" in next((ln for ln in text.splitlines() if "TRIG>SEND" in ln), ""))
 
 
+def test_latency_budget_panel() -> None:
+    import exec_latency
+    snap = populated("LIVE")
+    snap["budget"] = exec_latency.latency_budget({"coinbase": 46.3, "binance_fut": 109.4}, "coinbase",
+                                                 snap["exec"]["latency"], 34.2)
+    text = _text(build(snap, 200, 52, UNICODE))
+    check("the budget panel is drawn on a wide terminal", "LATENCY BUDGET" in text, text)
+    for label in ("Coinbase feed", "Bot in-process", "Network > CLOB", "Polymarket hold", "Venue match",
+                  "BTC > MATCHED", "via bin fut"):
+        check(f"budget shows {label}", label in text, text)
+    row = next((ln for ln in text.splitlines() if "Polymarket hold" in ln), "")
+    check("the hold row has its ms and share", "150ms" in row and "%" in row, row)
+    check("live venue time is not marked sim", "Venue match sim" not in text, text)
+    check("EXECUTION QUALITY stays beside it", "EXECUTION QUALITY" in text and "SNIPER EXECUTION LATENCY" in text, text)
+    paper = populated()
+    paper["exec"]["latency"]["send_to_ack"] = dict(paper["exec"]["latency"]["send_to_ack"], simulated=True)
+    paper["budget"] = exec_latency.latency_budget({"coinbase": 46.3}, "coinbase", paper["exec"]["latency"], 34.2)
+    ptext = _text(build(paper, 200, 52, UNICODE))
+    check("paper marks its venue time sim", "Venue match sim" in ptext, ptext)
+    check("no second-trigger total without a second trigger", "via " not in next(
+        (ln for ln in ptext.splitlines() if "BTC > MATCHED" in ln), "via"), ptext)
+    narrow = _text(build(snap, 120, 52, UNICODE))
+    check("a narrower terminal keeps the old two panels", "LATENCY BUDGET" not in narrow
+          and "EXECUTION QUALITY" in narrow, narrow)
+    unknown = populated("LIVE")
+    unknown["budget"] = exec_latency.latency_budget({"coinbase": 46.3}, "coinbase", {}, None)
+    utext = _text(build(unknown, 200, 52, UNICODE))
+    row = next((ln for ln in utext.splitlines() if "BTC > MATCHED" in ln), "")
+    check("unmeasured parts read N/A and the total is a lower bound", ">=196ms" in row
+          and "N/A" in next((ln for ln in utext.splitlines() if "Venue match" in ln), ""), utext)
+    for bad in ({"feeds": "x", "totals": None}, {"primary": None, "feeds": {"coinbase": float("nan")}},
+                {"bot_ms": "fast", "hold_ms": -5, "totals": {"coinbase": float("inf")}}):
+        hostile = populated("LIVE")
+        hostile["budget"] = bad
+        frame = build(hostile, 200, 52, UNICODE)
+        check(f"a malformed budget is drawn, never raised ({bad})",
+              "layout error" not in _text(frame) and all(sum(len(t) for t, _ in r) == 200 for r in frame))
+
+
 def test_net_line_colours_each_path_by_its_own_limits() -> None:
     from dashboard.sniper_layout import net_style
     snap = populated()

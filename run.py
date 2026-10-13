@@ -1878,6 +1878,7 @@ class DashView:
                 acct["equity"] = None
         snap["canary"] = self._canary()
         snap["net"] = self._net()
+        snap["budget"] = self._budget(summary, snap["net"])
         snap["health"] = self._health_rows(summary, health)
         return snap
 
@@ -1890,14 +1891,8 @@ class DashView:
         to Coinbase's (keep NTP on) - and the round trips to the CLOB (the
         sniper's own probe) and to Binance (BinanceProbe, display only)."""
         sn = self.rt.sniper
-        coinbase = clob = None
-        fresh = getattr(sn, "cb_fresh", None)
-        lag = getattr(fresh, "lag", None)
-        last = getattr(fresh, "last_trade_mono", None)
-        if lag and last is not None and time.monotonic() - float(last) <= self.NET_FEED_STALE_S:
-            n = min(len(lag), self.NET_FEED_SAMPLES)
-            xs = sorted(lag[-i] for i in range(1, n + 1))       # deque: O(1) from its end
-            coinbase = round(xs[len(xs) // 2], 1)
+        clob = None
+        coinbase = self._feed_ms(getattr(sn, "cb_fresh", None))
         rtt = getattr(sn, "net_rtt", None)
         if rtt:
             xs = sorted(rtt)
@@ -1906,6 +1901,31 @@ class DashView:
         binance = probe.ms() if probe is not None else None
         return {"coinbase": coinbase, "clob": clob,
                 "binance": None if binance is None else round(binance, 1)}
+
+    def _feed_ms(self, fresh) -> float | None:
+        """A trigger feed's delay: the median of its latest receipt - trade-time
+        lags; None when it has been silent NET_FEED_STALE_S (unknown, not old)."""
+        lag = getattr(fresh, "lag", None)
+        last = getattr(fresh, "last_trade_mono", None)
+        if not lag or last is None or time.monotonic() - float(last) > self.NET_FEED_STALE_S:
+            return None
+        n = min(len(lag), self.NET_FEED_SAMPLES)
+        xs = sorted(lag[-i] for i in range(1, n + 1))           # deque: O(1) from its end
+        return round(xs[len(xs) // 2], 1)
+
+    def _budget(self, summary: dict, net: dict) -> dict | None:
+        """The LATENCY BUDGET panel: BTC trade -> matched at Polymarket, per
+        trigger feed (exec_latency.latency_budget)."""
+        sn = self.rt.sniper
+        if sn is None:
+            return None
+        import exec_latency
+        primary = sn.s.primary_feed
+        feeds = {primary: net.get("coinbase") if primary == "coinbase" else
+                 self._feed_ms(getattr(sn, "fresh", None)) if primary == "binance" else None}
+        if "binance_fut" in sn.s.extra_feeds:
+            feeds["binance_fut"] = self._feed_ms(getattr(sn, "bf_fresh", None))
+        return exec_latency.latency_budget(feeds, primary, summary.get("exec_latency") or {}, net.get("clob"))
 
     def _canary(self) -> dict | None:
         live = self.rt.live_exec
