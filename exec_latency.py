@@ -74,6 +74,11 @@ FROZEN_SPEC = (
     ("kelly_fraction", "SNIPER_KELLY_FRACTION", 0.5, "kelly fraction", "{:g}"),
 )
 
+# The second triggers LIVE accepts beside the primary feed. 2026-10-13, the
+# operator's choice: Coinbase alone or Coinbase + Binance futures (whichever
+# signals first, the per-side cooldown shared), picked with SNIPER_EXTRA_FEEDS.
+LIVE_EXTRA_FEEDS = ((), ("binance_fut",))
+
 
 def _same(a, b) -> bool:
     if isinstance(b, float):
@@ -95,11 +100,9 @@ def spec_violations(settings, canary_max_shares=None) -> list[str]:
             out.append(f"{label}: resolved {fmt.format(got) if got is not None else got} but the frozen spec is "
                        f"{fmt.format(want)} ({src})")
     extra = tuple(getattr(settings, "extra_feeds", ()) or ())
-    if extra:
-        # A second trigger (e.g. binance_fut since 2026-10-13) is a paper A/B
-        # test: it changes which moves trade, so it is not the frozen spec.
-        out.append(f"second trigger: SNIPER_EXTRA_FEEDS={','.join(extra)} - the frozen spec trades on the "
-                   f"primary feed alone (a second trigger is paper-only until its A/B result is reviewed)")
+    if extra not in LIVE_EXTRA_FEEDS:
+        allowed = " or ".join(",".join(x) or "empty" for x in LIVE_EXTRA_FEEDS)
+        out.append(f"second trigger: SNIPER_EXTRA_FEEDS={','.join(extra)} - live accepts {allowed}")
     target = float(getattr(settings, "max_target_shares", 0) or 0)
     # `not >=` rather than `<`: a NaN cap compares false both ways and must fail here too.
     if canary_max_shares is not None and not float(canary_max_shares) + 1e-9 >= target:
@@ -117,6 +120,9 @@ def effective_config_lines(settings, *, live: bool, canary_max_shares=None) -> l
         src = "env" if os.environ.get(var) not in (None, "") else "default"
         mark = "" if _same(got, want) else f"   <- frozen spec {fmt.format(want)}"
         lines.append(f"  {label:13s} {fmt.format(got) if got is not None else '--':16s} ({var}, {src}){mark}")
+    extra = tuple(getattr(settings, "extra_feeds", ()) or ())
+    lines.append(f"  {'2nd trigger':13s} {','.join(extra) or 'none':16s} (SNIPER_EXTRA_FEEDS; whichever feed "
+                 f"signals first)" + ("" if extra in LIVE_EXTRA_FEEDS else "   <- not accepted live"))
     if canary_max_shares is not None:
         target = float(getattr(settings, "max_target_shares", 0) or 0)
         ok = float(canary_max_shares) + 1e-9 >= target

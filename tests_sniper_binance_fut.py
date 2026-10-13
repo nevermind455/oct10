@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Binance USD-M perpetual BTCUSDT as a SECOND trigger beside the Coinbase
-ticker (SNIPER_EXTRA_FEEDS=binance_fut) - a paper A/B test since 2026-10-13.
+ticker (SNIPER_EXTRA_FEEDS=binance_fut) - paper since 2026-10-13, live allowed
+since 2026-10-13 (exec_latency.LIVE_EXTRA_FEEDS).
 
     python tests_sniper_binance_fut.py
 
@@ -57,23 +58,30 @@ def armed(extra_env=None, keep_in_flight=False):
 
 
 class SettingsTests(unittest.TestCase):
-    def test_it_is_a_second_trigger_and_never_the_frozen_spec(self):
+    def test_it_is_a_second_trigger_live_may_add(self):
         with env(SNIPER_LATENCY_MS="200", **DUAL):
             st = S.Settings()
         self.assertEqual((st.primary_feed, st.extra_feeds), ("coinbase", ("binance_fut",)))
         self.assertIn("second trigger: binance_fut", st.lines()[0])
-        bad = X.spec_violations(st)
-        self.assertTrue(any("second trigger" in v and "paper-only" in v for v in bad), bad)
+        self.assertFalse(any("second trigger" in v for v in X.spec_violations(st)))
         with env(SNIPER_LATENCY_MS="200"):
             self.assertFalse(any("second trigger" in v for v in X.spec_violations(S.Settings())))
+        other = types.SimpleNamespace(**{**vars(st), "extra_feeds": ("kraken",)})
+        self.assertTrue(any("second trigger: SNIPER_EXTRA_FEEDS=kraken" in v for v in X.spec_violations(other)))
         with env(SNIPER_LATENCY_MS="200", SNIPER_EXTRA_FEEDS="binance_perp"), \
                 self.assertRaisesRegex(ValueError, "binance_fut"):
             S.Settings()                                                   # a typo names the supported feeds
 
-    def test_live_refuses_to_start_with_it(self):
+    def test_live_starts_with_or_without_it(self):
         import run
-        with env(SNIPER_LATENCY_MS="200", SNIPER_ONLY="1", SNIPER_LIVE_CANARY="1", **DUAL),                 self.assertRaisesRegex(RuntimeError, r"(?s)refusing LIVE.*second trigger: SNIPER_EXTRA_FEEDS=binance_fut"):
-            run._live_sniper_gate(paper=False)
+        for extra in (DUAL, {}):
+            with self.subTest(extra=extra), env(SNIPER_LATENCY_MS="200", SNIPER_ONLY="1", SNIPER_LIVE_CANARY="1",
+                                                **extra):
+                self.assertTrue(run._live_sniper_gate(paper=False))
+                lines = X.effective_config_lines(S.Settings(), live=True)
+                second = next(x for x in lines if "2nd trigger" in x)
+                self.assertIn("binance_fut" if extra else "none", second)
+                self.assertNotIn("not accepted live", second)
 
 
 class HandlerTests(unittest.TestCase):
