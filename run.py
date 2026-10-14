@@ -109,11 +109,30 @@ def _drain_loop(loop: asyncio.AbstractEventLoop) -> None:
             loop.run_until_complete(shutdown_executor())
 
 
+def uvloop_wanted(env=None) -> bool:
+    """SNIPER_UVLOOP=1: run on uvloop instead of asyncio's own loop (audit L10).
+    Off by default and PAPER only until a Linux benchmark on the VPS shows a
+    measurable gain without regressions (bench_execution.py --uvloop)."""
+    env = os.environ if env is None else env
+    return str(env.get("SNIPER_UVLOOP", "")).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _new_event_loop():
+    if uvloop_wanted():
+        try:
+            import uvloop
+            return uvloop.new_event_loop()
+        except ImportError:
+            print(f"{TAG} SNIPER_UVLOOP=1 but uvloop is not installed (pip install uvloop): asyncio's loop",
+                  file=sys.stderr)
+    return asyncio.new_event_loop()
+
+
 def run_quietly(coro) -> int:
     """Run *coro*. Ctrl+C or SIGTERM is a clean shutdown, never a traceback:
     the first one cancels the run (which then shuts down in order), a second
     Ctrl+C forces the exit. Returns 0, 130 (interrupt) or 143 (SIGTERM)."""
-    loop = asyncio.new_event_loop()
+    loop = _new_event_loop()
     asyncio.set_event_loop(loop)
     task = loop.create_task(coro)
     hits = 0
@@ -568,6 +587,9 @@ def _live_sniper_gate(paper: bool) -> bool:
     if not sniper_mode.live_canary():
         raise RuntimeError("SNIPER_ONLY with --live trades real money with the sniper: refusing to start LIVE "
                            "unless SNIPER_LIVE_CANARY=1 is set too")
+    if uvloop_wanted():
+        raise RuntimeError("SNIPER_UVLOOP=1 is PAPER only until a Linux benchmark shows a gain without "
+                           "regressions (bench_execution.py --uvloop on the VPS): unset it for --live")
     if str(os.environ.get("POSITION_MANAGER_LIVE_ENABLED", "")).strip().lower() in ("1", "true", "yes", "on"):
         raise RuntimeError("POSITION_MANAGER_LIVE_ENABLED=1: real Position Manager orders are not implemented "
                            "until its paper/replay results are reviewed (replay_ab.py). Unset it; with "

@@ -307,6 +307,20 @@ class PreviousRunReconciliation(unittest.IsolatedAsyncioTestCase):
                 self.session.open(self.limits, L.KillSwitch(), self.ledger)
                 self.sender.session = self.session
 
+    async def test_an_expired_market_alone_never_releases_an_unresolved_order(self):
+        """Scenario 15: the round of an order whose outcome is unknown has ended.
+        Expiry is no evidence: without the venue's terminal record it stays
+        unresolved, its worst case reserved, the start-up halt in place."""
+        p, session, limits, kill = self.crashed_run()
+        for key, _intent in session.unresolved():
+            session.intents[key]["end"] = time.time() - 600                    # the market expired 10 min ago
+        exposure = limits.exposure_usd
+        ex = self.execution(session, limits, kill, {})                          # the venue has no record (yet)
+        await ex._reconcile_previous_run()
+        self.assertTrue(kill.tripped)
+        self.assertEqual(len(session.unresolved()), 1)
+        self.assertEqual(limits.exposure_usd, exposure)                         # nothing released by the clock
+
     async def test_nothing_is_sent_while_reconciling(self):
         p, session, limits, kill = self.crashed_run()
         before = len(self.venue.orders)

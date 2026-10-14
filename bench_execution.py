@@ -540,9 +540,20 @@ def main(argv=None) -> int:
     ap.add_argument("--pm", choices=("off", "on", "stress"), default="off",
                     help="Position Manager beside the sniper: off, on (5ms polls, an evaluation whenever the state changed), "
                          "stress (a full evaluation every 5ms). Use a fresh process per setting.")
+    ap.add_argument("--uvloop", action="store_true",
+                    help="run on uvloop (Linux/macOS, pip install uvloop) - compare with a run without it "
+                         "before setting SNIPER_UVLOOP=1 (audit L10)")
     args = ap.parse_args(argv)
-    res = asyncio.run(main_async(args))
+    if args.uvloop:
+        import uvloop                                    # ImportError: not installed / not supported here
+        with asyncio.Runner(loop_factory=uvloop.new_event_loop) as runner:
+            res = runner.run(main_async(args))
+        res["event_loop"] = "uvloop " + getattr(uvloop, "__version__", "?")
+    else:
+        res = asyncio.run(main_async(args))
+        res["event_loop"] = "asyncio"
     print(table(res))
+    print(f"event loop: {res['event_loop']}")
     if args.json:
         pathlib.Path(args.json).write_text(json.dumps(res, indent=1, default=str), encoding="utf-8")
         print(f"\nwritten {args.json}")

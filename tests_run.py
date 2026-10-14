@@ -106,6 +106,34 @@ class LiveGateTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "SNIPER_LIVE_CANARY"):
                 run._live_sniper_gate(False)                      # the opt-in is not the canary flag
 
+    def test_uvloop_is_opt_in_paper_only_and_falls_back_when_missing(self):
+        """Audit L10: off by default; refused for --live until a Linux benchmark
+        shows a gain; when asked for but not installed, asyncio's own loop."""
+        self.assertFalse(run.uvloop_wanted({}))
+        self.assertTrue(run.uvloop_wanted({"SNIPER_UVLOOP": "1"}))
+        self.assertFalse(run.uvloop_wanted({"SNIPER_UVLOOP": "0"}))
+        with env(**{**SNIPER_ENV, "SNIPER_LIVE_CANARY": "1", "SNIPER_UVLOOP": "1"}):
+            with self.assertRaisesRegex(RuntimeError, "SNIPER_UVLOOP=1 is PAPER only"):
+                run._live_sniper_gate(False)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertFalse(run._live_sniper_gate(True))           # paper may try it
+        import builtins
+        real_import = builtins.__import__
+
+        def no_uvloop(name, *a, **k):
+            if name == "uvloop":
+                raise ImportError("not installed")
+            return real_import(name, *a, **k)
+        with env(SNIPER_UVLOOP="1"), patched(builtins, __import__=no_uvloop), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            loop = run._new_event_loop()
+        try:
+            self.assertIsInstance(loop, asyncio.AbstractEventLoop)
+            self.assertNotIn("uvloop", type(loop).__module__)
+            self.assertIn("not installed", err.getvalue())
+        finally:
+            loop.close()
+
     def test_a_refused_live_start_touches_nothing(self):
         with tempfile.TemporaryDirectory() as tmp, env(**SNIPER_ENV, BOT_LOCK_PATH=f"{tmp}/live.lock"):
             with self.assertRaisesRegex(RuntimeError, "SNIPER_LIVE_CANARY"):
