@@ -332,7 +332,7 @@ class ReconcileTool(unittest.TestCase):
         self.assertIn(f"1 trade(s), {INCIDENT_SHARES} shares", text)
         self.assertEqual(before, after)                                     # read-only
 
-    def incident_state(self, tmp, *, with_lot=True, reply_tids=("tr-1",), trades=None):
+    def incident_state(self, tmp, *, with_lot=True, reply_tids=("tr-1",), trades=None, totals=None):
         """A live ledger, journal and canary state as the halted VPS had them:
         the order accepted (its canary intent ACCEPTED), its trade booked."""
         import polymarket_trade as pt
@@ -354,7 +354,9 @@ class ReconcileTool(unittest.TestCase):
             fh.write(json.dumps({"result": "live_send", "order_id": oid, "amount": INCIDENT_AMOUNT,
                                  "cap": INCIDENT_CAP, "condition_id": COND, "token": UP,
                                  "response": {"success": True, "status": "matched", "orderID": oid,
-                                              "tradeIDs": list(reply_tids)}}) + "\n")
+                                              "tradeIDs": list(reply_tids),
+                                              **({"makingAmount": totals[0], "takingAmount": totals[1]}
+                                                 if totals else {})}}) + "\n")
         holder = "0x" + "1" * 40
         canary = os.path.join(tmp, "live_canary_state.json")
         session = L.CanarySession(canary, L.CanarySession.wallet_key_for(holder))
@@ -431,6 +433,46 @@ class ReconcileTool(unittest.TestCase):
             self.assertEqual(L.CanarySession.durable_view(canary)["intents"]["key-1"]["status"], "ACCEPTED")
 
 
+    def test_the_vps_case_no_trade_ids_no_record_settles_from_the_replys_totals(self):
+        """As on the VPS 2026-10-15: the reply named no trade ids and the CLOB no longer
+        keeps the order; the reply's totals ($3.74, 12.896552 shares) equal the one
+        CONFIRMED trade found for the order, which the ledger booked."""
+        with tempfile.TemporaryDirectory() as tmp:
+            oid, canary, client, env = self.incident_state(tmp, reply_tids=(), totals=("3.74", "12.896552"))
+            code, text = self.run_tool(client, env)
+            self.assertEqual(code, 0, text)
+            self.assertIn("add up to the reply's own totals", text)
+            code, text = self.run_tool(client, env, "--settle")
+            self.assertEqual(code, 0, text)
+            intent = L.CanarySession.durable_view(canary)["intents"].get("key-1")
+            self.assertTrue(intent is None or intent["status"] == "CONFIRMED", intent)
+
+    def test_trades_that_do_not_add_up_to_the_replys_totals_are_not_settled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            oid, canary, client, env = self.incident_state(tmp, reply_tids=(), totals=("3.74", "13.5"))
+            code, text = self.run_tool(client, env, "--settle")
+            self.assertEqual(code, 1, text)
+            self.assertIn("differ from the reply's totals", text)
+            self.assertEqual(L.CanarySession.durable_view(canary)["intents"]["key-1"]["status"], "ACCEPTED")
+
+    def test_no_trade_ids_and_no_totals_is_not_settled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            oid, canary, client, env = self.incident_state(tmp, reply_tids=())
+            code, text = self.run_tool(client, env, "--settle")
+            self.assertEqual(code, 1, text)
+            self.assertIn("completeness unproven", text)
+
+
+class ReplyTotals(unittest.TestCase):
+    def test_decimal_and_base_unit_replies(self):
+        self.assertEqual(L.reply_totals({"makingAmount": "3.74", "takingAmount": "12.896552"}), (3.74, 12.896552))
+        self.assertEqual(L.reply_totals({"makingAmount": "3740000", "takingAmount": "12896552"}), (3.74, 12.896552))
+        self.assertEqual(L.reply_totals({"makingAmount": 5, "takingAmount": "10"}), (5.0, 10.0))
+        for bad in ({}, {"makingAmount": "0", "takingAmount": "1"}, {"makingAmount": "x", "takingAmount": "1"},
+                    {"makingAmount": True, "takingAmount": "1"}, None):
+            self.assertIsNone(L.reply_totals(bad), bad)
+
+
 class RestartEvidence(unittest.IsolatedAsyncioTestCase):
     """A restart settles an accepted order the venue keeps no record of only from
     the reply's trade ids, each booked under the order's authorization."""
@@ -478,6 +520,16 @@ class RestartEvidence(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.ex._previous_run_verdict(self.intent(oid, ["t1", "t2"]), {}))  # t2 not booked
         self.assertIsNone(self.ex._previous_run_verdict(self.intent(oid, ["t1"]), {}))        # t9 is foreign
 
+    async def test_reply_totals_settle_a_missing_record_without_trade_ids(self):
+        oid = "0x" + "a1" * 32
+        self.book(oid, [], [("t1", INCIDENT_SHARES)])
+        intent = dict(self.intent(oid, []), reply_totals=[INCIDENT_AMOUNT, INCIDENT_SHARES])
+        verdict = self.ex._previous_run_verdict(intent, None)
+        self.assertEqual(verdict[0], "CONFIRMED")
+        self.assertAlmostEqual(verdict[1], INCIDENT_AMOUNT, places=5)
+        short = dict(intent, reply_totals=[INCIDENT_AMOUNT, INCIDENT_SHARES + 1])             # a trade missing
+        self.assertIsNone(self.ex._previous_run_verdict(short, None))
+
     async def test_the_canary_intent_keeps_the_replys_trade_ids(self):
         from accounting.ledger import Ledger
         T = self.T
@@ -489,9 +541,11 @@ class RestartEvidence(unittest.IsolatedAsyncioTestCase):
         p.reserve, p.order_hash = 3.5, "0x" + "ef" * 32
         session.before_send(p, limits, kill)
         session.outcome(p, {"kind": L.MATCHED, "order_id": p.order_hash,
-                            "response": {"tradeIDs": ["t1", "t2"]}}, limits, kill)
+                            "response": {"tradeIDs": ["t1", "t2"], "makingAmount": "3.19",
+                                         "takingAmount": "11"}}, limits, kill)
         session.close()
-        self.assertEqual(L.CanarySession.durable_view(path)["intents"]["k"]["trade_ids"], ["t1", "t2"])
+        intent = L.CanarySession.durable_view(path)["intents"]["k"]
+        self.assertEqual((intent["trade_ids"], intent["reply_totals"]), (["t1", "t2"], [3.19, 11.0]))
 
 
 if __name__ == "__main__":

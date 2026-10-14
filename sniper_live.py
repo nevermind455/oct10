@@ -66,6 +66,31 @@ class Refused(Exception):
     """This one order must not be sent; trading may continue."""
 
 
+def reply_totals(resp) -> tuple[float, float] | None:
+    """(USDC spent, shares received) from an accepted BUY reply's makingAmount /
+    takingAmount - the venue's totals for the whole execution - or None. The
+    CLOB has sent them as decimals ("3.74") and, in older replies, as 6-decimal
+    base units ("3740000"); a whole number >= 1000 is read as base units (no
+    canary order spends $1000 or buys 1000 shares)."""
+    if not isinstance(resp, dict):
+        return None
+    out = []
+    for key in ("makingAmount", "takingAmount"):
+        raw = resp.get(key)
+        if raw is None or isinstance(raw, bool):
+            return None
+        try:
+            v = Decimal(str(raw).strip())
+        except (ArithmeticError, ValueError):
+            return None
+        if not v.is_finite() or v <= 0:
+            return None
+        if "." not in str(raw) and v >= 1000:
+            v = v / Decimal(1_000_000)
+        out.append(float(v))
+    return out[0], out[1]
+
+
 class KillSwitch:
     """Once tripped, every new order is refused until a human clears it."""
 
@@ -601,6 +626,11 @@ class CanarySession:
         if tids is not None and (not isinstance(tids, list)
                                  or any(not isinstance(t, str) or not t for t in tids)):
             raise ValueError("invalid canary intent trade ids")
+        totals = intent.get("reply_totals")
+        if totals is not None and (not isinstance(totals, list) or len(totals) != 2
+                                   or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                                          or not math.isfinite(v) or v <= 0 for v in totals)):
+            raise ValueError("invalid canary intent reply totals")
 
     @staticmethod
     def _validate_counters(c) -> dict:
@@ -690,7 +720,7 @@ class CanarySession:
         elif op in ("outcome", "resolve"):
             intent = intents.get(rec.get("key"))
             if intent is not None:          # (else archived by a later compaction: nothing to update)
-                for k in ("status", "kind", "order_id", "spent", "trade_ids"):
+                for k in ("status", "kind", "order_id", "spent", "trade_ids", "reply_totals"):
                     if k in rec:
                         intent[k] = rec[k]
                 self._validate_intent(rec["key"], intent)
@@ -1012,6 +1042,9 @@ class CanarySession:
             tids = resp.get("tradeIDs") or resp.get("trade_ids")
             if isinstance(tids, list) and tids and all(isinstance(t, str) and t for t in tids):
                 intent["trade_ids"] = rec["trade_ids"] = list(tids)
+            totals = reply_totals(resp) if kind in (MATCHED, PENDING) else None
+            if totals is not None:
+                intent["reply_totals"] = rec["reply_totals"] = list(totals)
             line = self._line(rec)
         self._submit(line, "live send outcome", kill)
 
@@ -2682,22 +2715,31 @@ class LiveExecution:
     # ------------------------------------------------------------ a previous run's orders (restart halt)
     def _previous_run_by_trades(self, intent: dict) -> tuple | None:
         """CONFIRMED when the venue has no record of the order but its accepted
-        reply named trades, and the ledger booked exactly those under the
-        order's authorization (the ledger books CONFIRMED trades only). None
-        otherwise: a missing record is never evidence of zero execution."""
-        tids = intent.get("trade_ids")
+        reply proves the complete execution, and the ledger booked exactly that
+        under the order's authorization (the ledger books CONFIRMED trades
+        only): the reply's trade ids, every one booked and no other trade; or,
+        when it named none, the reply's own totals (USDC spent, shares
+        received) equal to the order's booked lots. None otherwise: a missing
+        record is never evidence of zero execution."""
+        tids, totals = intent.get("trade_ids"), intent.get("reply_totals")
         h = str(intent.get("order_hash") or intent.get("order_id") or "")
-        if not tids or not h or intent.get("kind") not in (MATCHED, PENDING):
+        if (not tids and not totals) or not h or intent.get("kind") not in (MATCHED, PENDING):
             return None
         led = self.ledger
         with led._lock:
-            if h not in led.authorized_orders or not set(tids) <= set(led.seen):
+            if h not in led.authorized_orders:
                 return None
             lots = [lot for pos in led.positions.values() for lot in pos.lots
                     if getattr(lot, "order_id", None) == h and str(lot.side).upper() == "BUY"]
-            if not lots or {str(lot.trade_id) for lot in lots} - set(tids):
+            if not lots:
                 return None
+            shares = sum(float(lot.shares) for lot in lots)
             spent = sum(float(lot.shares) * float(lot.price) for lot in lots)
+            if tids:
+                if not set(tids) <= set(led.seen) or {str(lot.trade_id) for lot in lots} - set(tids):
+                    return None
+            elif abs(shares - float(totals[1])) > 1e-6 or abs(spent - float(totals[0])) > 1e-4:
+                return None
         return "CONFIRMED", spent
 
     def _previous_run_verdict(self, intent: dict, order) -> tuple | None:

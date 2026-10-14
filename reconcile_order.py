@@ -84,6 +84,16 @@ def first(rows, *keys):
     return None
 
 
+def reply_totals_of(rows):
+    """The venue reply's totals (USDC spent, shares received), from the journal."""
+    from sniper_live import reply_totals
+    for r in rows:
+        totals = reply_totals(r.get("response"))
+        if totals is not None:
+            return Decimal(str(totals[0])), Decimal(str(totals[1]))
+    return None
+
+
 def reply_trade_ids(rows) -> list:
     out = []
     for r in rows:
@@ -114,9 +124,11 @@ def main() -> int:
     cond = first(rows, "condition_id", "cond", "market")
     token = first(rows, "token", "token_id", "asset_id")
     reply_tids = reply_trade_ids(rows)
+    totals = reply_totals_of(rows)
     print(f"order ...{oid[-12:]}")
     print(f"  journal : {len(rows)} row(s) {[r.get('result') for r in rows]}; signed ${amount} at cap {cap}; "
-          f"the reply named {len(reply_tids)} trade(s)")
+          f"the reply named {len(reply_tids)} trade(s)"
+          + (f", totals ${totals[0]} for {totals[1]} shares" if totals else ", no totals"))
 
     import polymarket_trade
     from py_clob_client_v2 import TradeParams
@@ -186,15 +198,19 @@ def main() -> int:
     pos_size = None
     if not args.no_position:
         holder = getattr(client.builder, "funder", None) or client.signer.address()
-        q = urllib.parse.urlencode({"user": holder, "market": cond, "sizeThreshold": 0})
+        q = urllib.parse.urlencode({"user": holder, "market": cond})
+        req = urllib.request.Request(f"https://data-api.polymarket.com/positions?{q}",
+                                     headers={"User-Agent": "sniperbtc-reconcile/1", "Accept": "application/json"})
         try:
-            with urllib.request.urlopen(f"https://data-api.polymarket.com/positions?{q}", timeout=10) as r:
+            with urllib.request.urlopen(req, timeout=10) as r:
                 rows_ = json.loads(r.read().decode())
             pos_size = sum((d(p.get("size")) or Decimal(0) for p in rows_ if str(p.get("asset")) == str(token)),
                            Decimal(0))
             print(f"  position: the wallet holds {pos_size} shares of this outcome (ledger, open: {held})")
         except Exception as exc:  # noqa: BLE001
-            print(f"  position: lookup failed ({type(exc).__name__}); check it on polymarket.com")
+            code = getattr(exc, "code", None)
+            print(f"  position: lookup failed ({type(exc).__name__}{f' {code}' if code else ''}); "
+                  f"check it on polymarket.com (the market may already be settled and redeemed)")
 
     problems = []
     if not trades:
@@ -202,8 +218,16 @@ def main() -> int:
     if expected and set(trades) != expected:
         problems.append(f"the venue's trades {sorted(t[-8:] for t in trades)} are not the order's "
                         f"{sorted(t[-8:] for t in expected)}")
-    if not expected:
-        problems.append("neither the reply nor an order record lists the order's trades: completeness unproven")
+    by_totals = bool(trades and totals and abs(v_shares - totals[1]) <= TOL
+                     and abs(v_paid - totals[0]) <= Decimal("0.0001"))
+    if not expected and not by_totals:
+        problems.append("neither the reply nor an order record lists the order's trades, and the trades do not "
+                        "add up to the reply's totals: completeness unproven")
+    if by_totals and not expected:
+        print(f"  complete: the trades add up to the reply's own totals (${totals[0]}, {totals[1]} shares)")
+    if totals and trades and not by_totals:
+        problems.append(f"the trades (${v_paid:.6f}, {v_shares} sh) differ from the reply's totals "
+                        f"(${totals[0]}, {totals[1]} sh)")
     if order is not None and d(order.get("size_matched")) is not None \
             and abs(d(order.get("size_matched")) - v_shares) > TOL:
         problems.append(f"size_matched {order.get('size_matched')} != the trades' {v_shares}")

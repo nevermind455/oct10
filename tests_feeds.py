@@ -1565,11 +1565,13 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # sniper_live.py: a FAK whose own evidence halted trading is not timed out a second time.
     # 2026-10-15: the canary intent keeps the reply's trade ids; a restart settles an accepted order
     # the CLOB has no record of from exactly those trades booked under its authorization.
+    # It also keeps the reply's totals (makingAmount, takingAmount): with no trade ids, the order's
+    # booked lots must add up to them exactly.
     # Re-approved 2026-10-14 (restart halt): a previous run's unresolved send intents are looked
     # up on the venue by their own order hash at start (_reconcile_previous_run, M7's evidence
     # rules); proven zero or fully booked resolves them and lifts the derived start-up halt
     # (CanarySession.PREVIOUS_RUN, never persisted). Nothing is ever resent.
-    "sniper_live.py": "dc17ae6a58ed5f98f50dfdd9a5b5559ca7225b4e5208792da5b04c2910b75e97",
+    "sniper_live.py": "b14232b9f12c9fd9f3c619de2b122e6a3fe345bd2a6f7f1943846841bc2ccd3a",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads
