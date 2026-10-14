@@ -222,6 +222,38 @@ class LiveShareSized(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((ex.reserved, ex._risk_orders), (0.0, {}))
         self.assertFalse(ex.kill.tripped)
 
+    async def test_a_lost_fill_notification_keeps_the_risk_and_halts_at_the_deadline(self):
+        """Scenario 12: the venue says MATCHED with a trade id; the private
+        channel never delivers that trade. Nothing is released on a guess: the
+        order's worst case stays reserved, and the reconciler halts at the
+        confirmation deadline for a reconcile by hand."""
+        T = self.T
+        ex = await self.canary()
+        ex.order_status = None                                   # no venue status record either
+        before = ex.balance
+        self.fake.script.append(("json", 200, T.MATCHED_REPLY))
+        p = ex.prepare(self.plan(10))
+        res = await ex.send(p)
+        self.assertEqual(res["kind"], L.MATCHED)
+        for _ in range(300):                                     # the receipt is authorized on a worker
+            a = ex.awaiting.get("0xorder1")
+            if a is not None and a.get("authorized") is not False:
+                break
+            await asyncio.sleep(0.01)
+        self.assertIsNotNone(ex.awaiting.get("0xorder1"))
+        self.assertIsNone(ex.fill_for("0xorder1"))               # no trade has arrived
+        ex.reconcile_once()
+        self.assertFalse(ex.kill.tripped)                        # inside the deadline: waiting, at risk
+        self.assertIn(p.client_order_id, ex._risk_orders)
+        self.assertAlmostEqual(ex.balance, before - p.reserve, places=9)        # its worst case is spent, or may be
+        ex.awaiting["0xorder1"]["wall"] -= ex.confirm_within_s + 1
+        ex.reconcile_once()
+        self.assertTrue(ex.kill.tripped)
+        self.assertIn("not completely confirmed", "; ".join(ex.kill.reasons))
+        self.assertIn(p.client_order_id, ex._risk_orders)        # still counted after the halt
+        self.assertAlmostEqual(ex.balance, before - p.reserve, places=9)
+        self.assertEqual(self.fake.hits[("POST", "/order")], 1)  # and nothing re-sent
+
     async def test_a_delayed_reply_keeps_the_order_at_risk_until_its_outcome(self):
         ex = await self.canary()
         before = ex.balance

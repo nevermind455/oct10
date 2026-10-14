@@ -107,6 +107,35 @@ class C1WriteAhead(Workspace):
         # one short record each (a few bytes vary: timestamps), with 3,000 orders of history behind it
         self.assertLess(max(appended) - min(appended), 64, appended)
 
+    def test_a_session_with_10000_prior_orders_sends_like_a_fresh_one(self):
+        """Scenario 1: a fresh session and one with 10,000 earlier orders write
+        the same short record per send, and both reopen with their counters."""
+        sizes = {}
+        for label, history in (("fresh", 0), ("10k", 10_000)):
+            self.state.unlink(missing_ok=True)
+            for old in self.dir.glob("live_canary_state.json.*"):
+                old.unlink()
+            if history:
+                self.write_v2({f"old-{i}": intent(i) for i in range(history)})
+                s, limits, kill = self.boot()
+            else:
+                s, limits, kill = self.boot(new=True)
+            self.assertEqual(s.intents, {})
+            self.assertEqual(limits.orders, history)
+            seg = s._segment_path(s._segment)
+            before = seg.stat().st_size if seg.exists() else 0
+            with mock.patch.object(L.CanarySession, "state", side_effect=AssertionError("no full state on send")):
+                s.before_send(prepared(f"new-{label}"), limits, kill)
+            sizes[label] = seg.stat().st_size - before
+            s.close()
+            self.sessions.remove(s)
+            again, limits2, kill2 = self.boot()
+            self.assertIn(f"new-{label}", again.intents)                     # unresolved: kept, and it halts
+            self.assertTrue(kill2.tripped)
+            again.close()
+            self.sessions.remove(again)
+        self.assertLess(abs(sizes["10k"] - sizes["fresh"]), 64, sizes)
+
     def test_the_intent_is_durable_before_the_call_returns(self):
         s, limits, kill = self.boot()
         synced = []

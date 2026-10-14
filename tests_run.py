@@ -192,6 +192,44 @@ class LockTests(unittest.TestCase):
             lock.acquire()
             lock.release()
 
+    def test_ledger_compact_folds_the_journal_and_never_runs_beside_a_bot(self):
+        """Rollback helper: code from before the 2026-10-14 repair cannot read an
+        'authorize' journal entry; ledger_compact.py folds the journal into the
+        snapshot - and refuses while a bot holds that ledger's lock."""
+        import ledger_compact
+        from accounting.ledger import Ledger
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "live_ledger.json"
+            led = Ledger(path=str(path), category="crypto")
+            led.save()
+            cond = "0x" + "ab" * 32
+            receipt = {"condition_id": cond, "token_id": "11", "window_end": (int(time.time()) // 300 + 1) * 300,
+                       "requested_notional": 5.0, "fee_rate": 0.07, "fee_exponent": 1}
+            self.assertTrue(led.authorize_order_durable("0xa", receipt, venue_min_shares=5.0, price_cap=0.95))
+            self.assertTrue(led.record_fill_durable("t-1", "11", shares=5.0, price=0.5, condition_id=cond,
+                                                    fee=0.0875, order_id="0xa"))
+            self.assertEqual(led.journal_pending(), 2)
+            journal = pathlib.Path(str(path) + ".journal")
+            self.assertIn('"authorize"', journal.read_text(encoding="utf-8"))
+            holder = subprocess.Popen([sys.executable, "-c", HOLDER, str(ROOT), str(path) + ".lock"],
+                                      stdout=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(holder.stdout.readline().strip(), "held")
+                with self.assertRaisesRegex(SystemExit, "stop it first"):
+                    ledger_compact.compact(str(path))
+                self.assertEqual(Ledger(path=str(path), category="crypto").journal_pending(), 2)   # untouched
+            finally:
+                holder.kill()
+                holder.wait()
+                holder.stdout.close()
+            out = ledger_compact.compact(str(path))
+            self.assertEqual((out["journal_entries_folded"], out["journal_left"]), (2, 0))
+            self.assertEqual(journal.stat().st_size if journal.exists() else 0, 0)
+            again = Ledger(path=str(path), category="crypto")
+            self.assertEqual(again.authorized_orders["0xa"], led.authorized_orders["0xa"])
+            self.assertAlmostEqual(again.positions["11"].shares, 5.0)
+            self.assertEqual(ledger_compact.compact(str(path))["journal_entries_folded"], 0)   # idempotent
+
     def test_probe_never_creates_a_lock_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             missing = pathlib.Path(tmp) / "nothing.lock"
