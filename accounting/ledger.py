@@ -1407,16 +1407,29 @@ class Ledger:
         identities of the objects, so a replaced position is always re-encoded.
         """
         out, keep = _PositionTexts(), {}
+        now = time.time()
         for k, v in self.positions.items():
             lots = v.lots
-            fp = (id(v), id(lots), _get_scalars(v), len(lots), tuple(map(_get_consumed, lots)))
             hit = self._pos_text.get(k)
+            if hit is not None and hit[2] is v and v.settled and len(lots) == hit[3]:
+                # Settled long ago: nothing in this module changes it again (a
+                # late fill reopens it first, and adds a lot) - the text stands
+                # without re-fingerprinting every lot under the lock (audit C2:
+                # 28-50ms a snapshot at 20,000 positions, the order path waiting).
+                keep[k] = hit
+                out.append(hit[1])
+                continue
+            fp = (id(v), id(lots), _get_scalars(v), len(lots), tuple(map(_get_consumed, lots)))
             entry = (hit[1] if hit is not None and hit[0] == fp
                      else f"{json.dumps(k)}: {json.dumps(_pos_dict(v), allow_nan=False)}")
-            keep[k] = (fp, entry)
+            frozen = (v if v.settled and v.settled_wall is not None
+                      and now - float(v.settled_wall) > self.FREEZE_SETTLED_AFTER_S else None)
+            keep[k] = (fp, entry, frozen, len(lots))
             out.append(entry)
         self._pos_text = keep
         return out
+
+    FREEZE_SETTLED_AFTER_S = 600.0
 
     def _seen_json(self) -> "_RawJSON":
         """json.dumps(sorted(self.seen)), re-done only when the set changed."""

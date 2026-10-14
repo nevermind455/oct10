@@ -1168,6 +1168,10 @@ class LeanSender:
         self.max_consecutive_errors, self.consecutive_errors = max_consecutive_errors, 0
         self.realized_loss = realized_loss
         self.session: CanarySession | None = None
+        # Audit M7: orders whose outcome is unknown and being reconciled with
+        # the venue by their hash. While any is, no new order is sent.
+        self.unresolved: dict = {}
+        self.ambiguity_resolver = None
         self._lib = dict(CreateOrderOptions=CreateOrderOptions, MarketOrderArgsV2=MarketOrderArgsV2,
                          FOK=OrderType.FOK, FAK=OrderType.FAK, RequestArgs=RequestArgs, POST_ORDER=POST_ORDER,
                          l2=create_level_2_headers, BUY=BUY, to_json=order_to_json_v2)
@@ -1180,6 +1184,8 @@ class LeanSender:
             raise Refused(f"unknown order type {order_type!r}")
         self.kill.check()
         self.guard.check()                            # Refused while the venue guard has new orders paused
+        if getattr(self, "unresolved", None):
+            raise Refused("an earlier order's outcome is being reconciled with the venue")
         ts = self.clock.now_s()                       # Halted before any work if the time is not trusted
         rules = self.rules.get(condition, up, down)
         if self.pt._ambiguous_blocks(str(condition), str(token)):
@@ -1205,6 +1211,12 @@ class LeanSender:
         st["signed_pc"] = time.perf_counter_ns()
         if getattr(self.builder, "last_sign_ns", None):
             st["sign_start_pc"], st["sign_end_pc"] = self.builder.last_sign_ns     # T3, T4
+        order_hash = getattr(self.builder, "last_order_hash", None)
+        if order_hash is None and self.version == 2:
+            from sniper_mode import order_hash_v2
+            chain = getattr(self.signer, "get_chain_id", lambda: 137)()
+            order_hash = order_hash_v2(getattr(signed, "order", signed), neg_risk=bool(rules["neg_risk"]),
+                                       chain_id=chain, signer=self.signer)
         payload = lib["to_json"](signed, self.creds.api_key, lib[order_type])
         body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
         # No Connection header: HTTP/2 forbids connection-specific headers
@@ -1216,13 +1228,17 @@ class LeanSender:
                                                     body=payload, serialized_body=body), timestamp=ts))
         st["ready_pc"] = time.perf_counter_ns()       # REQUEST READY (not sent)
         salt = getattr(getattr(signed, "order", signed), "salt", None) or payload.get("order", {}).get("salt")
-        return Prepared(side, str(token), str(condition), float(end), float(amount), float(cap),
-                        float(exact), tick, str(salt), body, headers, dict(rules), st, order_type)
+        p = Prepared(side, str(token), str(condition), float(end), float(amount), float(cap),
+                     float(exact), tick, str(salt), body, headers, dict(rules), st, order_type)
+        p.order_hash = order_hash
+        return p
 
     # ------------------------------------------------------------ the write, synchronous
     def _check_send(self, p: Prepared, *, budget: bool = True) -> None:
         self.kill.check()
         self.guard.check()
+        if getattr(self, "unresolved", None):
+            raise Refused("an earlier order's outcome is being reconciled with the venue")
         self.clock.now_s()
         current_rules = self.rules.get(p.condition, p.rules["up_token"], p.rules["down_token"])
         if current_rules != p.rules:
@@ -1453,7 +1469,16 @@ class LeanSender:
             self.limits.record_outcome(kind, p.amount)
         if kind == AMBIGUOUS:
             self.pt._mark_ambiguous(p.condition, p.end, p.token)
-            self.kill.trip(f"order {p.client_order_id} outcome unknown ({row['error']}): reconcile before trading")
+            resolver = getattr(self, "ambiguity_resolver", None)
+            if resolver is not None and getattr(p, "order_hash", None) and p.order_type == "FAK":
+                # Not sent again: looked up by its own hash. No new order until
+                # the venue's answer is known; none in time -> the kill switch.
+                self.unresolved = getattr(self, "unresolved", None) or {}
+                self.unresolved[p.client_order_id] = p
+                row["auto_reconcile"] = True
+                resolver(p, dict(row))
+            else:
+                self.kill.trip(f"order {p.client_order_id} outcome unknown ({row['error']}): reconcile before trading")
         text = str(row["error"]).lower()
         if kind == REJECTED:
             hit = next((why for w, why in self.HALT_ON.items() if w in text), None)
@@ -1671,6 +1696,11 @@ class LiveExecution:
         self._persist_failures = 0
         sender.realized_loss = lambda: self.session_loss
         sender.guard.on_event = self.on_event
+        # M6 / M7: per-order reconciliation tasks (fast FAK resolution, unknown outcomes)
+        self._order_tasks: set = set()
+        self.fast_fak_delays_s = (0.25, 0.5, 1.0, 2.0, 4.0)
+        self.ambiguity_delays_s = (0.5, 1.0, 2.0, 4.0, 8.0, 15.0, 30.0, 60.0)
+        sender.ambiguity_resolver = self._schedule_ambiguity
 
     @property
     def kill(self) -> KillSwitch:
@@ -1733,10 +1763,11 @@ class LiveExecution:
                 self._trip(f"canary session state cannot be written ({self.session.last_error})")
 
     async def stop(self) -> None:
-        for t in self._tasks:
+        for t in list(self._tasks) + list(self._order_tasks):
             t.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
+        await asyncio.gather(*self._tasks, *self._order_tasks, return_exceptions=True)
         self._tasks = []
+        self._order_tasks = set()
         if self.session is not None:
             await asyncio.to_thread(self.session.flush)
             await asyncio.to_thread(self.session.save, self.sender.limits, self.kill)
@@ -1788,6 +1819,7 @@ class LiveExecution:
         UP/DOWN mapping, through the audited validator) as soon as the hub is
         on a new round, and again before they expire - never on the order path."""
         done, at = None, 0.0
+        prepared_done, prepared_at = None, 0.0
         while True:
             key = (getattr(hub, "condition_id", None), getattr(hub, "up_token", None),
                    getattr(hub, "down_token", None))
@@ -1802,6 +1834,11 @@ class LiveExecution:
                     await asyncio.sleep(0.5)
                     continue
                 missing = missing or self.shim.cached_rules(str(key[0])) is None
+            if all(key) and not missing and key != done and key == prepared_done:
+                # Loaded before the boundary for exactly this round (audit M5):
+                # ready at once - no invalidation, no refetch, no gap.
+                done, at, self.rules_ready = key, prepared_at, key
+                self.n["rules ready at the boundary (prefetched)"] += 1
             if all(key) and (missing or key != done or time.monotonic() - at > self.rules_refresh_s):
                 cond, up, down = (str(x) for x in key)
                 self.rules_ready = None
@@ -1823,7 +1860,33 @@ class LiveExecution:
                         self.on_event("sniper", f"LIVE CANARY {msg}", "warn")
                     await asyncio.sleep(2.0)
                     continue
-            await asyncio.sleep(0.5)
+            # The next round, prepared before its boundary: its order rules
+            # (the audited CLOB mapping check) and sizing rules, loaded now.
+            prepared = getattr(hub, "prepared_round", None) or {}
+            pkey = tuple(str(prepared.get(k) or "") for k in ("condition_id", "up_token_id", "down_token_id"))
+            if all(pkey) and pkey != prepared_done and pkey != done:
+                try:
+                    await self.sender.rules.prefetch(*pkey)
+                    sizing = await asyncio.to_thread(self.shim._rules, pkey[0], force=True)
+                    signing = self.sender.rules.get(*pkey)
+                    if sizing.tick_size != signing["tick"] or sizing.min_order_size != signing["minimum"]:
+                        self.sender.rules.invalidate(pkey[0])
+                        raise Refused("signing and sizing rules disagree for the next round")
+                    prepared_done, prepared_at = pkey, time.monotonic()
+                    self.n["next round rules prefetched"] += 1
+                except Exception as exc:  # noqa: BLE001 - retried; the boundary then loads them the old way
+                    self.n["next round rules prefetch errors"] += 1
+                    msg = f"next round rules not prefetched: {type(exc).__name__}: {exc}"[:200]
+                    if msg not in self._announced:
+                        self._announced.add(msg)
+                        self.on_event("sniper", f"LIVE CANARY {msg}", "info")
+            # Poll fast around a boundary (promotion is then seen within 50ms).
+            end = getattr(hub, "window_end", None)
+            try:
+                left = float(end) - time.time() if end else None
+            except (TypeError, ValueError):
+                left = None
+            await asyncio.sleep(0.05 if left is None or left < 2.0 or left > 298.0 else 0.5)
 
     async def health_probe(self) -> tuple[bool, str]:
         """One recovery check of everything an order needs, off the order
@@ -2085,40 +2148,46 @@ class LiveExecution:
                            f"confirmed in the ledger after {self.confirm_within_s:.0f}s: reconcile")
         self.session_loss = max(0.0, -self._session_realized())
 
+    def _fak_status(self, oid, a, now) -> None:
+        """Ask the venue for an accepted FAK's final size and trade ids (its
+        status record). Only complete, identity-matched evidence is kept."""
+        a["checked_at"] = now
+        try:
+            order = self.order_status(oid) or {}
+        except Exception:
+            order = {}
+            self.n["order status errors"] += 1
+        if not order:
+            return
+        if (str(order.get("id")) != str(oid) or str(order.get("asset_id")) != a["token"]
+                or str(order.get("market")) != a["condition"] or order.get("side") != "BUY"):
+            self._trip(f"FAK order {oid} status identity mismatch: reconcile")
+            return
+        status = str(order.get("status") or "").lower()
+        a["venue_status"] = status
+        if status in ("matched", "canceled", "cancelled", "unmatched", "killed", "expired"):
+            try:
+                size = Decimal(str(order["size_matched"]))
+                tids = order.get("associate_trades")
+                if not size.is_finite() or size < 0 or not isinstance(tids, list):
+                    raise ValueError("missing final trade evidence")
+                if any(not isinstance(t, str) or not t for t in tids):
+                    raise ValueError("invalid trade ids")
+                if size == 0 and status == "matched":
+                    raise ValueError("matched is not evidence of zero execution")
+                a["trade_ids"] = set(tids)
+                a["final_size"] = float(size)
+                a.setdefault("final_mono", time.monotonic())   # when the final size became known
+            except (KeyError, ArithmeticError, TypeError, ValueError):
+                pass                          # incomplete evidence keeps the full reservation
+
     def _reconcile_fak(self, oid, a, now):
         """A canceled FAK can still have fills. Resolve all trades before
         releasing unused spend; never treat cancellation alone as zero."""
         age = now - a["wall"]
-        if (not a.get("trade_ids") and self.order_status is not None and age > 1
+        if (not a.get("trade_ids") and a.get("final_size") is None and self.order_status is not None and age > 1
                 and now - a.get("checked_at", 0) > self.reconcile_every_s):
-            a["checked_at"] = now
-            try:
-                order = self.order_status(oid) or {}
-            except Exception:
-                order = {}
-                self.n["order status errors"] += 1
-            if order:
-                if (str(order.get("id")) != str(oid) or str(order.get("asset_id")) != a["token"]
-                        or str(order.get("market")) != a["condition"] or order.get("side") != "BUY"):
-                    self._trip(f"FAK order {oid} status identity mismatch: reconcile")
-                    return
-                status = str(order.get("status") or "").lower()
-                a["venue_status"] = status
-                if status in ("matched", "canceled", "cancelled", "unmatched", "killed", "expired"):
-                    try:
-                        size = Decimal(str(order["size_matched"]))
-                        tids = order.get("associate_trades")
-                        if not size.is_finite() or size < 0 or not isinstance(tids, list):
-                            raise ValueError("missing final trade evidence")
-                        if any(not isinstance(t, str) or not t for t in tids):
-                            raise ValueError("invalid trade ids")
-                        if size == 0 and status == "matched":
-                            raise ValueError("matched is not evidence of zero execution")
-                        a["trade_ids"] = set(tids)
-                        a["final_size"] = float(size)
-                        a.setdefault("final_mono", time.monotonic())   # when the final size became known
-                    except (KeyError, ArithmeticError, TypeError, ValueError):
-                        pass                          # incomplete evidence keeps the full reservation
+            self._fak_status(oid, a, now)
         fill = self.fill_for(oid)
         if fill is not None:
             if fill["shares"] == 0:
@@ -2231,6 +2300,9 @@ class LiveExecution:
             cost += trade_cost
         if cost > Decimal(str(a["amount"])) + Decimal("0.000001"):
             self._trip(f"FAK order {oid} filled above its budget: reconcile")
+            return None
+        if a.get("size") is not None and shares > Decimal(str(a["size"])) + Decimal("0.000001"):
+            self._trip(f"FAK order {oid} filled above its signed size: reconcile")
             return None
         if a.get("final_size") is not None and abs(float(shares) - a["final_size"]) > 1e-6:
             return None                            # not all final fills have arrived yet
@@ -2397,16 +2469,139 @@ class LiveExecution:
             await asyncio.to_thread(self._authorize, p, row)
         elif kind in (MATCHED, PENDING):
             self._trip(f"accepted order with no order id ({row.get('venue_status')}): reconcile")
-        if kind == AMBIGUOUS:
+        if kind == AMBIGUOUS and not row.get("auto_reconcile"):
             self._trip(f"order outcome unknown ({row.get('error')}): check the venue and the ledger by hand")
         if kind in (MATCHED, PENDING) and p.order_type == "FAK":
             # Do not infer response amount units. Private trade records give
             # decimal quantities and the complete trade set.
             row["fill"] = self.fill_for(row.get("order_id"))
+            a = self.fak_orders.get(row.get("order_id"))
+            if (row["fill"] is None and a is not None and not a.get("trade_ids")
+                    and self.order_status is not None):
+                # M6: the reply named no trades - ask the venue for the order's
+                # final size now, not at the next reconcile (this side waits on it).
+                self._track(asyncio.get_running_loop().create_task(self._fast_fak(row["order_id"])))
         elif kind == MATCHED:
             row["fill"] = self._fill_from_response(row) or self.fill_for(row.get("order_id"))
         self.n[kind] += 1
         return row
+
+    def _track(self, task) -> None:
+        self._order_tasks.add(task)
+        task.add_done_callback(self._order_tasks.discard)
+
+    async def _fast_fak(self, oid) -> None:
+        """M6: resolve an accepted FAK's quantity within about a second."""
+        for delay in self.fast_fak_delays_s:
+            await asyncio.sleep(delay)
+            a = self.fak_orders.get(oid)
+            if a is None or a.get("quantity_resolved") or oid not in self.awaiting:
+                return
+            if a.get("trade_ids") or a.get("final_size") is not None:
+                break                               # the evidence is in; the trades complete it
+            await asyncio.to_thread(self._fak_status, oid, a, time.time())
+        self.n["fast FAK lookups"] += 1
+        self._sync_fak()
+
+    # ------------------------------------------------------------ unknown outcomes (audit M7)
+    def _schedule_ambiguity(self, p, row) -> None:
+        if self.order_status is None:
+            self.sender.unresolved.pop(p.client_order_id, None)
+            self._trip(f"order {p.client_order_id} outcome unknown ({row.get('error')}): reconcile before trading")
+            return
+        self._track(asyncio.get_running_loop().create_task(self._resolve_ambiguity(p, row)))
+
+    def _ambiguity_evidence(self, order, p):
+        """(kind, size, trade ids) from the venue's record of this order, or
+        None while that record does not settle it (absent, not terminal,
+        incomplete). An identity mismatch is not evidence: it halts."""
+        if not isinstance(order, dict) or not order:
+            return None
+        if (str(order.get("id")) != str(p.order_hash) or str(order.get("asset_id")) != str(p.token)
+                or str(order.get("market")) != str(p.condition) or order.get("side") != "BUY"):
+            raise RuntimeError("the venue's record of this order hash does not match it")
+        status = str(order.get("status") or "").lower()
+        if status not in ("matched", "canceled", "cancelled", "unmatched", "killed", "expired"):
+            return None
+        try:
+            size = Decimal(str(order["size_matched"]))
+            tids = order.get("associate_trades")
+            if not size.is_finite() or size < 0 or not isinstance(tids, list):
+                return None
+            if any(not isinstance(t, str) or not t for t in tids):
+                return None
+        except (KeyError, ArithmeticError, TypeError, ValueError):
+            return None
+        if size == 0:
+            if tids or status == "matched":
+                return None                         # not proof of zero execution
+            return NO_MATCH, 0.0, []
+        return MATCHED, float(size), list(tids)
+
+    async def _resolve_ambiguity(self, p, row) -> None:
+        """An order whose outcome is unknown: the venue's record of its hash
+        decides - matched (authorized, its fills then count as any other's)
+        or proven zero execution (its reservation released). Nothing is ever
+        sent again. No record in time: the kill switch, as before."""
+        evidence = None
+        why = "the venue has no terminal record of it"
+        for delay in self.ambiguity_delays_s:
+            await asyncio.sleep(delay)
+            try:
+                order = await asyncio.to_thread(self.order_status, p.order_hash)
+                evidence = self._ambiguity_evidence(order, p)
+            except RuntimeError as exc:
+                why = str(exc)
+                break
+            except Exception:  # noqa: BLE001 - a lookup that failed is not evidence
+                self.n["order status errors"] += 1
+                continue
+            if evidence is not None:
+                break
+        limits = self.sender.limits
+        if evidence is None:
+            self.sender.unresolved.pop(p.client_order_id, None)
+            self._trip(f"order {p.client_order_id} outcome unknown ({row.get('error')}); {why}: reconcile by hand")
+            return
+        kind, size, tids = evidence
+        oid = str(p.order_hash)
+        limits.record_outcome(kind, p.amount)
+        if self.session is not None:
+            self.session.outcome(p, {"kind": kind, "order_id": oid}, limits, self.kill)
+        if kind == MATCHED:
+            accepted = dict(row, kind=MATCHED, order_id=oid, venue_status="matched",
+                            response={"orderID": oid, "status": "matched", "tradeIDs": tids})
+            await asyncio.to_thread(self._authorize, p, accepted)
+            a = self.awaiting.get(oid)
+            if a is not None:
+                a["trade_ids"] = set(tids)
+                a["final_size"] = size
+                a.setdefault("final_mono", time.monotonic())
+        else:
+            with self._risk_lock:
+                self._risk_orders.pop(p.client_order_id, None)
+            if self.session is not None:
+                self.session.resolve(p.client_order_id, NO_MATCH, limits, self.kill, spent=0.0)
+            # the sniper holds this order as a pending FAK under its hash: a
+            # proven zero fill releases its round slot (fill_for -> 0 shares)
+            rules = getattr(p, "rules", None) or {}
+            self.fak_orders[oid] = {"wall": time.time(), "condition": p.condition, "token": p.token,
+                                    "amount": p.amount, "kind": NO_MATCH, "client_order_id": p.client_order_id,
+                                    "order_type": "FAK", "cap": p.price, "trade_ids": set(), "final_size": 0.0,
+                                    "fee_rate": float(rules.get("fee_rate") or 0),
+                                    "fee_exponent": int(rules.get("fee_exponent") or 1),
+                                    "final_mono": time.monotonic()}
+        self.pt._resolve_ambiguous(p.condition, p.token)
+        self.sender.unresolved.pop(p.client_order_id, None)
+        self._sync_fak()
+        self.n[f"unknown outcome resolved {kind}"] += 1
+        journal = getattr(self, "_journal", None)
+        if journal is not None:
+            journal({"wall": time.time(), "result": "outcome_reconciled", "client_order_id": p.client_order_id,
+                     "order_id": oid, "kind": kind, "shares": size, "trades": len(tids),
+                     "was": row.get("error")})
+        self.on_event("sniper", f"LIVE order {p.client_order_id[-8:]} outcome reconciled with the venue: "
+                                f"{kind} ({size:g} shares)", "warn")
 
     @staticmethod
     def _fill_from_response(row: dict) -> dict | None:
@@ -2446,7 +2641,8 @@ class LiveExecution:
                 self._risk_orders[p.client_order_id]["order_id"] = oid
         if p.order_type == "FAK":
             a.update(order_type="FAK", cap=p.price, fee_rate=float(rules.get("fee_rate") or 0),
-                     fee_exponent=int(rules.get("fee_exponent") or 1))
+                     fee_exponent=int(rules.get("fee_exponent") or 1),
+                     size=getattr(p, "shares", None))
             self.fak_orders[oid] = a
         try:
             ok = self.receipt_sink(receipt)

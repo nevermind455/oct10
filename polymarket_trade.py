@@ -689,6 +689,18 @@ def _mark_ambiguous(condition_id: str, window_end: float,
             _ambiguous_tokens.clear()
 
 
+def _resolve_ambiguous(condition_id: str, token_id: str) -> None:
+    """Lift one token's resubmission block after its unknown order was
+    reconciled with the venue (sniper_live, audit M7). Other blocks stay."""
+    global _ambiguous_condition, _ambiguous_until, _ambiguous_all_tokens
+    with _state_lock:
+        if _ambiguous_condition != str(condition_id):
+            return
+        _ambiguous_tokens.discard(str(token_id))
+        if not _ambiguous_tokens and not _ambiguous_all_tokens:
+            _ambiguous_condition, _ambiguous_until = None, 0.0
+
+
 def _ambiguous_blocks(condition_id: str, token_id: str) -> bool:
     with _state_lock:
         if str(token_id) in _ambiguous_exit_tokens:

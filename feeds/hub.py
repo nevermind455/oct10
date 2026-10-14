@@ -171,7 +171,14 @@ class FeedHub:
         # A same-state reconciliation may have had to re-add a missing token.
         # It now needs the same REST-resync treatment as a normal transition.
         self._resync_wanted.update(set(desired_tokens) - active_before)
-        self.user.set_markets(tuple(self._user_markets))
+        # The prepared next round's market too: its private fill channel is
+        # subscribed (and proven by heartbeat) before its boundary, so the first
+        # order of the round is not refused for coverage (audit M5).
+        markets = list(self._user_markets)
+        prepared = (self.prepared_round or {}).get("condition_id")
+        if prepared and prepared not in markets:
+            markets.append(prepared)
+        self.user.set_markets(tuple(markets))
 
     def set_round(self, up_token, down_token, condition_id=None,
                   window_start=None, window_end=None) -> bool:

@@ -1263,10 +1263,25 @@ async def _rotation_loop(hub, stop, on_round=None) -> None:
             window = timer.window_start(sampled)
             key = window
             if key != cleared_key:
-                # Remove the previous round from every read surface at once. A
-                # prewarmed next book stays subscribed but is not promoted until
-                # fresh discovery agrees.
-                hub.set_round(None, None, None, window, window + 300)
+                # The previous round leaves every read surface at once. A round
+                # prepared before this boundary - discovered for exactly this
+                # window, its books, private channel and (live) order rules
+                # already loaded - is promoted now instead of waiting for a fresh
+                # discovery call; that call still runs just below and replaces it
+                # if it disagrees (audit M5: the round's first seconds were a
+                # no-trade gap of discovery + rules loading).
+                prepared = getattr(hub, "prepared_round", None) or {}
+                try:
+                    promote = int(prepared.get("window_start") or 0) == window
+                except (TypeError, ValueError):
+                    promote = False
+                if promote:
+                    hub.set_round(prepared["up_token_id"], prepared["down_token_id"], prepared["condition_id"],
+                                  window, window + 300)
+                    on_event("rotation", f"prepared round promoted at the boundary "
+                                         f"({timer.seconds_left()}s left); confirming with discovery", "info")
+                else:
+                    hub.set_round(None, None, None, window, window + 300)
                 cleared_key = key
                 last_key = None
                 prepared_key = None
@@ -1274,10 +1289,14 @@ async def _rotation_loop(hub, stop, on_round=None) -> None:
                 tokens = await asyncio.to_thread(market_discovery.get_tokens_for_current_round, window)
                 now_window = timer.window_start()
                 if (tokens and int(tokens.get("window_start") or 0) == window and now_window == window):
+                    promoted = hub.up_token is not None
                     changed = hub.set_round(tokens.get("up_token_id"), tokens.get("down_token_id"),
                                             tokens.get("condition_id"), tokens.get("window_start"),
                                             tokens.get("window_end"))
-                    if changed:
+                    if changed and promoted:
+                        on_event("rotation", "discovery DISAGREED with the prepared round: switched to "
+                                             f"the discovered tokens with {timer.seconds_left()}s left", "warn")
+                    elif changed:
                         on_event("rotation", f"round tokens subscribed with {timer.seconds_left()}s left", "info")
                     if on_round is not None:
                         on_round(tokens)
@@ -1307,8 +1326,9 @@ async def _rotation_loop(hub, stop, on_round=None) -> None:
 async def _ledger_loop(hub, ledger, stop) -> None:
     """LIVE: pull venue-reported fills into the ledger and mark the wallet, on
     a worker thread. Each booked fill is durable as one journal line (audit
-    F2); the full snapshot that folds the journal in is written once a minute,
-    not after every batch (it rewrote every position the ledger ever held)."""
+    F2); the full snapshot that folds the journal in is written after 200
+    journal entries or 15 minutes, not after every batch (it rewrote every
+    position the ledger ever held)."""
     last_save = time.monotonic()
     last_balance = 0.0
     while not stop.is_set():
@@ -1324,7 +1344,11 @@ async def _ledger_loop(hub, ledger, stop) -> None:
                         ledger.mark_balance(bal["balance"])
                 except Exception as exc:
                     on_event("ledger", f"balance read failed: {type(exc).__name__}", "warn")
-            if time.monotonic() - last_save > 60 and getattr(ledger, "journal_pending", lambda: 1)():
+            pending = getattr(ledger, "journal_pending", lambda: 1)()
+            if pending and (pending >= 200 or time.monotonic() - last_save > 900):
+                # Compaction only: every fill, settlement and authorization is
+                # already durable in the journal. The snapshot rewrites every
+                # position the ledger holds (27MB at 20,000), so not every minute.
                 if not await asyncio.to_thread(ledger.save):
                     raise RuntimeError("periodic ledger save failed")
                 last_save = time.monotonic()

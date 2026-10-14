@@ -538,6 +538,250 @@ class L8CoinbaseSockets(unittest.TestCase):
         self.assertEqual(len(fired), 1)
 
 
+class M5RoundStart(unittest.IsolatedAsyncioTestCase):
+    """The next round is ready before its boundary and promoted at it."""
+    SPEED = 40.0                                        # fake seconds per real second
+
+    async def asyncSetUp(self):
+        import run
+        import timer
+        self.run, self.timer = run, timer
+        self.boundary = (1_800_000_000 // 300 + 1) * 300
+        self.real0, self.fake0 = time.monotonic(), self.boundary - 29.6
+        self.saved = (timer.unix, run.asyncio)
+        timer.unix = lambda ts=None: float(ts) if ts is not None else self.now()
+        fast = types.SimpleNamespace(**{k: getattr(asyncio, k) for k in dir(asyncio) if not k.startswith("_")})
+        fast.sleep = lambda s, *a, **k: asyncio.sleep(max(0.0, s) / self.SPEED)
+        run.asyncio = fast
+
+    async def asyncTearDown(self):
+        self.timer.unix, self.run.asyncio = self.saved
+
+    def now(self) -> float:
+        return self.fake0 + (time.monotonic() - self.real0) * self.SPEED
+
+    def tokens(self, window, tag="a"):
+        return {"up_token_id": f"{window}{tag}1", "down_token_id": f"{window}{tag}2", "condition_id": f"0x{window}{tag}",
+                "window_start": window, "window_end": window + 300}
+
+    async def rotate(self, discovery):
+        from feeds.hub import FeedHub
+        import market_discovery
+        hub = FeedHub()
+        stop = asyncio.Event()
+        with mock.patch.object(market_discovery, "get_tokens_for_current_round", side_effect=discovery):
+            task = asyncio.create_task(self.run._rotation_loop(hub, stop))
+            seen = {}
+            while self.now() < self.boundary + 3:
+                if self.now() < self.boundary - 1 and hub.prepared_round and "want" not in seen:
+                    seen["want"] = list(hub.user._want)
+                await asyncio.sleep(0.005)
+            stop.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        return hub, seen
+
+    async def test_the_prepared_round_is_promoted_before_discovery_returns(self):
+        at_call = {}
+
+        def discovery(window):
+            if window == self.boundary and self.now() >= self.boundary and "up" not in at_call:
+                at_call["up"] = None
+                at_call["hub_up"] = self.hub_ref.up_token if hasattr(self, "hub_ref") else None
+            time.sleep(0.05)                            # 2 fake seconds of discovery
+            return self.tokens(window)
+        from feeds.hub import FeedHub
+        real_init = FeedHub.__init__
+
+        def init(hub, *a, **k):
+            real_init(hub, *a, **k)
+            self.hub_ref = hub
+        with mock.patch.object(FeedHub, "__init__", init):
+            hub, seen = await self.rotate(discovery)
+        prepared = self.tokens(self.boundary)
+        self.assertIn(prepared["condition_id"], seen.get("want", []),
+                      "the next round's private channel is subscribed before its boundary")
+        self.assertEqual(at_call.get("hub_up"), prepared["up_token_id"],
+                         "promoted at the boundary, not after the discovery call")
+        self.assertEqual(hub.up_token, prepared["up_token_id"])
+
+    async def test_a_disagreeing_discovery_replaces_the_prepared_round(self):
+        def discovery(window):
+            return self.tokens(window, "b" if window == self.boundary and self.now() >= self.boundary else "a")
+        hub, _ = await self.rotate(discovery)
+        self.assertEqual(hub.up_token, self.tokens(self.boundary, "b")["up_token_id"])
+        self.assertTrue(any("DISAGREED" in text for _w, _s, text, _l in self.run.recent_events(50)))
+
+
+class M5LiveRules(unittest.IsolatedAsyncioTestCase):
+    async def test_rules_prefetched_for_the_prepared_round_are_ready_at_promotion(self):
+        import tests_sniper_live as T
+        fake = await T.FakeClob().start()
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            ex, *_ = await T.make_canary(fake, tmp.name, load_rules=False)
+            hub = types.SimpleNamespace(condition_id=None, up_token=None, down_token=None, window_end=None,
+                                        prepared_round={"condition_id": T.COND, "up_token_id": T.UP,
+                                                        "down_token_id": T.DN})
+            task = asyncio.create_task(ex._rules_loop(hub))
+            for _ in range(200):
+                if ex.n["next round rules prefetched"]:
+                    break
+                await asyncio.sleep(0.01)
+            fetches = ex.sender.rules.fetches
+            self.assertEqual(ex.n["next round rules prefetched"], 1)
+            # the boundary: the prepared round becomes the current one
+            hub.condition_id, hub.up_token, hub.down_token, hub.prepared_round = T.COND, T.UP, T.DN, None
+            for _ in range(200):
+                if ex.rules_ready:
+                    break
+                await asyncio.sleep(0.01)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            self.assertEqual(ex.rules_ready, (T.COND, T.UP, T.DN))
+            self.assertEqual(ex.sender.rules.fetches, fetches, "no refetch at the boundary")
+            self.assertIsNotNone(ex.shim.cached_rules(T.COND))
+            ex.sender.rules.get(T.COND, T.UP, T.DN)                     # an order would be signed now
+        finally:
+            await ex.sender.http.aclose()
+            await fake.stop()
+            tmp.cleanup()
+
+
+class M6M7Live(unittest.IsolatedAsyncioTestCase):
+    """Accepted FAKs without trade ids resolve fast (M6); unknown outcomes are
+    reconciled by the order's hash, never resent (M7)."""
+
+    async def asyncSetUp(self):
+        import tests_sniper_live as T
+        self.T = T
+        T.reset_ambiguity()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.fake = await T.FakeClob().start()
+        self.ex, self.ledger, self.store, _, _ = await T.make_canary(self.fake, self.tmp.name)
+        self.ex.fast_fak_delays_s = (0.05, 0.1, 0.2)
+        self.ex.ambiguity_delays_s = (0.05, 0.1, 0.2, 0.4)
+
+    async def asyncTearDown(self):
+        for task in list(self.ex._order_tasks):
+            task.cancel()
+        await asyncio.gather(*self.ex._order_tasks, return_exceptions=True)
+        await self.ex.sender.http.aclose()
+        await self.fake.stop()
+        self.tmp.cleanup()
+        self.T.reset_ambiguity()
+
+    def plan(self, side="UP"):
+        T = self.T
+        book = T.live_book()
+        return dict(T.live_plan(book.view(T.UP if side == "UP" else T.DN), side=side, amount=5), order_type="FAK")
+
+    def record(self, oid, status, size, trades, token=None):
+        T = self.T
+        return {"id": oid, "asset_id": token or T.UP, "market": T.COND, "side": "BUY", "status": status,
+                "size_matched": str(size), "associate_trades": list(trades)}
+
+    async def wait_for(self, cond, timeout=2.0):
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            if cond():
+                return time.monotonic() - t0
+            await asyncio.sleep(0.01)
+        return None
+
+    async def test_m6_a_fak_reply_without_trade_ids_resolves_within_a_second(self):
+        T = self.T
+        self.fake.script.append(("json", 200, {"success": True, "status": "matched", "orderID": "0xorder1"}))
+        self.ex.order_status = lambda oid: self.record(oid, "matched", 10, ["trade-1"])
+        await self.ex.send(self.ex.prepare(self.plan()))
+        self.store.record_trade("trade-1", order_id="0xorder1", asset_id=T.UP, market=T.COND, side="BUY",
+                                price=0.5, size=10, status="MATCHED")
+        took = await self.wait_for(lambda: self.ex.fill_for("0xorder1") is not None)
+        self.assertIsNotNone(took, "resolved without the 5s reconcile")
+        self.assertLess(took, 1.0)
+        self.assertEqual(self.ex.fill_for("0xorder1")["shares"], 10.0)
+
+    async def test_m6_unknown_venue_status_keeps_the_side_blocked(self):
+        self.fake.script.append(("json", 200, {"success": True, "status": "matched", "orderID": "0xorder1"}))
+        self.ex.order_status = lambda oid: {}
+        await self.ex.send(self.ex.prepare(self.plan()))
+        await asyncio.sleep(0.5)
+        self.assertIsNone(self.ex.fill_for("0xorder1"))
+        with self.assertRaisesRegex(L.Refused, "awaiting complete fill quantities"):
+            self.ex.prepare(self.plan())
+
+    async def test_m7_a_reset_after_the_write_is_reconciled_as_matched_without_resending(self):
+        self.fake.script.append(("reset",))
+        seen = []
+
+        def status(oid):
+            seen.append(oid)
+            return self.record(oid, "matched", 10, ["trade-9"])
+        self.ex.order_status = status
+        p = self.ex.prepare(self.plan())
+        res = await self.ex.send(p)
+        self.assertEqual(res["kind"], L.AMBIGUOUS)
+        self.assertTrue(self.ex.sender.unresolved, "no new order while it is unknown")
+        with self.assertRaisesRegex(L.Refused, "reconciled with the venue"):
+            self.ex.sender._check_send(self.ex.prepare(self.plan(side="DOWN")))
+        took = await self.wait_for(lambda: not self.ex.sender.unresolved)
+        self.assertIsNotNone(took)
+        self.assertFalse(self.ex.kill.tripped)
+        self.assertEqual(seen[0], p.order_hash, "looked up by its own hash")
+        self.assertIn(p.order_hash, self.ledger.authorized_orders)
+        self.assertEqual(len(self.fake.orders), 1, "never sent again")
+        self.assertEqual(self.ex.sender.limits.pending_fills, 0)
+
+    async def test_m7_proven_zero_execution_releases_the_reservation(self):
+        self.fake.script.append(("reset",))
+        self.ex.order_status = lambda oid: self.record(oid, "canceled", 0, [])
+        p = self.ex.prepare(self.plan())
+        await self.ex.send(p)
+        self.assertIsNotNone(await self.wait_for(lambda: not self.ex.sender.unresolved))
+        self.assertFalse(self.ex.kill.tripped)
+        self.assertEqual(self.ex._risk_orders, {})
+        self.assertEqual(self.ex.fill_for(p.order_hash)["shares"], 0.0)
+        self.assertEqual(len(self.fake.orders), 1)
+
+    async def test_m7_no_venue_record_in_time_trips_the_kill_switch_as_before(self):
+        self.fake.script.append(("reset",))
+        self.ex.order_status = lambda oid: {}
+        await self.ex.send(self.ex.prepare(self.plan()))
+        self.assertIsNotNone(await self.wait_for(lambda: self.ex.kill.tripped))
+        self.assertTrue(any("reconcile by hand" in r for r in self.ex.kill.reasons))
+        self.assertEqual(len(self.fake.orders), 1)
+
+    async def test_m7_a_record_that_does_not_match_the_order_halts(self):
+        self.fake.script.append(("reset",))
+        self.ex.order_status = lambda oid: self.record(oid, "matched", 10, ["t"], token="someone-else")
+        await self.ex.send(self.ex.prepare(self.plan()))
+        self.assertIsNotNone(await self.wait_for(lambda: self.ex.kill.tripped))
+
+    async def test_m7_without_an_order_status_reader_halts_at_once(self):
+        self.fake.script.append(("reset",))
+        self.ex.order_status = None
+        await self.ex.send(self.ex.prepare(self.plan()))
+        self.assertTrue(self.ex.kill.tripped)
+
+    def test_the_order_hash_is_the_librarys_order_hash(self):
+        import secrets
+        from py_clob_client_v2.clob_types import CreateOrderOptions, MarketOrderArgsV2, OrderType
+        from py_clob_client_v2.order_builder.builder import OrderBuilder
+        from py_clob_client_v2.order_builder.constants import BUY
+        from py_clob_client_v2.order_builder import builder as bm
+        signer = S.fast_signer("0x" + secrets.token_hex(32), 137)
+        fast = S.FastOrderBuilder(OrderBuilder(signer))
+        for i in range(5):
+            signed = fast.build_market_order(MarketOrderArgsV2(token_id=self.T.UP, amount=S.signing_amount(5 + i),
+                                                               side=BUY, price=0.55, order_type=OrderType.FAK),
+                                             CreateOrderOptions(tick_size="0.01", neg_risk=bool(i % 2)), version=2)
+            cc = bm.get_contract_config(137)
+            eb = bm.ExchangeOrderBuilderV2(cc.neg_risk_exchange_v2 if i % 2 else cc.exchange_v2, 137, signer)
+            fields = {k: getattr(signed, k) for k in signed.__dataclass_fields__ if k != "signature"}
+            order = bm.OrderV2(**fields) if hasattr(bm, "OrderV2") else signed
+            self.assertEqual(fast.last_order_hash, eb.build_order_hash(eb.build_order_typed_data(order)))
+
+
 class FillStoreIndex(unittest.TestCase):
     def test_fills_for_order_matches_a_full_scan(self):
         rng = random.Random(5)

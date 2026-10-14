@@ -727,6 +727,7 @@ class FastOrderBuilder:
         self._exchange: dict = {}
         self._key = None
         self.last_sign_ns = None          # (T3, T4) of the newest order built here
+        self.last_order_hash = None       # the EIP-712 digest just signed = the venue's order id
 
     def _pk(self):
         if self._key is None:
@@ -768,20 +769,43 @@ class FastOrderBuilder:
     def sign(self, eb, order) -> str:
         """The order's EIP-712 signature: '0x' + r || s || v (v = 27/28), as
         eth_account's sign_message returns it."""
-        from eth_utils import keccak
-        from py_clob_client_v2.order_utils import exchange_order_builder_v2 as ev2
-
-        def word(n):
-            return int(n).to_bytes(32, "big")
-
-        def addr(a):
-            return bytes(12) + bytes.fromhex(str(a)[2:])
-        struct = keccak(ev2.ORDER_TYPE_HASH + word(order.salt) + addr(order.maker) + addr(order.signer)
-                        + word(order.tokenId) + word(order.makerAmount) + word(order.takerAmount)
-                        + word(int(order.side)) + word(int(order.signatureType)) + word(order.timestamp)
-                        + ev2._bytes32(order.metadata) + ev2._bytes32(order.builder))
-        sig = self._pk().sign_msg_hash(keccak(b"\x19\x01" + eb.app_domain_separator + struct))
+        digest = order_digest_v2(eb.app_domain_separator, order)
+        # The digest signed IS the order's hash - the library's build_order_hash
+        # and the id the venue knows the order by (M7: an order whose reply was
+        # lost is looked up by it, never sent again).
+        self.last_order_hash = "0x" + digest.hex()
+        sig = self._pk().sign_msg_hash(digest)
         return "0x" + (sig.r.to_bytes(32, "big") + sig.s.to_bytes(32, "big") + bytes([sig.v + 27])).hex()
+
+
+def order_digest_v2(domain_separator: bytes, order) -> bytes:
+    """keccak(0x1901 || domain || hashStruct(order)): what a v2 order's
+    signature signs, and the order's hash - the id the venue knows it by."""
+    from eth_utils import keccak
+    from py_clob_client_v2.order_utils import exchange_order_builder_v2 as ev2
+
+    def word(n):
+        return int(n).to_bytes(32, "big")
+
+    def addr(a):
+        return bytes(12) + bytes.fromhex(str(a)[2:])
+    struct = keccak(ev2.ORDER_TYPE_HASH + word(order.salt) + addr(order.maker) + addr(order.signer)
+                    + word(order.tokenId) + word(order.makerAmount) + word(order.takerAmount)
+                    + word(int(order.side)) + word(int(order.signatureType)) + word(order.timestamp)
+                    + ev2._bytes32(order.metadata) + ev2._bytes32(order.builder))
+    return keccak(b"\x19\x01" + domain_separator + struct)
+
+
+def order_hash_v2(signed, *, neg_risk: bool, chain_id: int, signer=None) -> str | None:
+    """The order hash of a signed v2 order built by any builder (the fast one
+    hands it over directly; this recomputes it). None if it cannot be had."""
+    try:
+        from py_clob_client_v2.order_builder import builder as bm
+        cc = bm.get_contract_config(int(chain_id))
+        eb = bm.ExchangeOrderBuilderV2(cc.neg_risk_exchange_v2 if neg_risk else cc.exchange_v2, int(chain_id), signer)
+        return "0x" + order_digest_v2(eb.app_domain_separator, signed).hex()
+    except Exception:  # noqa: BLE001 - no hash: an unknown outcome then halts, as before
+        return None
 
 
 def code_version() -> str | None:
@@ -1582,16 +1606,19 @@ class Sniper:
         fetch = getattr(self.broker, "_rules", None)
         if fetch is None:
             return
-        done = None
+        done: list = []
         while True:
-            cond = getattr(self.hub, "condition_id", None)
-            if cond and cond != done:
-                try:
-                    await asyncio.to_thread(fetch, cond)
-                    done = cond
-                    self.n["rules prefetched"] += 1
-                except Exception:  # noqa: BLE001 - the order path fetches them itself if this fails
-                    self.n["rules prefetch errors"] += 1
+            # this round's market, and the next one's once it is prepared - so
+            # its fee curve is cached before its boundary (audit M5)
+            prepared = getattr(self.hub, "prepared_round", None) or {}
+            for cond in (getattr(self.hub, "condition_id", None), prepared.get("condition_id")):
+                if cond and cond not in done:
+                    try:
+                        await asyncio.to_thread(fetch, cond)
+                        done = (done + [cond])[-4:]
+                        self.n["rules prefetched"] += 1
+                    except Exception:  # noqa: BLE001 - the order path fetches them itself if this fails
+                        self.n["rules prefetch errors"] += 1
             await asyncio.sleep(0.5)
 
     async def _gc_schedule(self) -> None:
@@ -2739,6 +2766,8 @@ class Sniper:
         try:
             res = await self.live.send(p, started)
             kind = res["kind"]
+            if res.get("auto_reconcile"):
+                row["live_send_auto_reconcile"] = True
             ts = res.get("ts_us") or {}                 # microseconds after the decision
             est = getattr(p, "estimate", None) or {}
             row.update(live=True, kind=kind, outcome=self.LIVE_OUTCOME.get(kind, kind),
@@ -2761,6 +2790,20 @@ class Sniper:
             if kind == NO_MATCH:
                 self._stamp_fill_confirmed(row, plan)            # the reply says nothing filled
                 self._latency_fill(row, plan, None, "ACK")
+            if p.order_type == "FAK" and row.get("live_send_auto_reconcile"):
+                # Outcome unknown, being reconciled with the venue by the order's
+                # hash (audit M7): held exactly like an accepted FAK whose size is
+                # not known yet - its round slot reserved, this side waiting - so
+                # recovery can never let the round caps be overrun.
+                rd["fills"] += 1
+                self.n["pending"] += 1
+                row.update(result="pending", shares=None, price=None, fee=None, cost=None,
+                           order_id=p.order_hash, reason="outcome unknown; reconciling with the venue")
+                self._observe_live(row)
+                self._fak_pending[p.order_hash] = (dict(row), plan)
+                self._write(row)
+                self._table_row(side, p.amount, "pending", end, order_id=p.order_hash)
+                return
             if p.order_type == "FAK" and kind in (MATCHED, PENDING):
                 rd["fills"] += 1           # reserve one slot, even before the quantity is known
                 fill = res.get("fill")
