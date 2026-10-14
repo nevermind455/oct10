@@ -287,11 +287,9 @@ class Gate(I.PaperIOCBase):
         # the unchanged round guard conservatively counts $8.58/.41 > 20.
         r = self.order("UP", [(0.41, 1), (0.43, 1000)], mid=0.40, move_bp=5.0)
         self.assertEqual(r["result"], "filled")
-        # the gate judges the dollar stake, as before; F1 then signs 20 whole shares
-        self.assertEqual((r["target_shares"], r["est_cost"], r["cap"]), (20.0, 8.20, 0.43))
-        self.assertLessEqual(r["est_cost"] / r["ask_seen"], 20.0)
-        self.assertEqual((r["order_shares"], r["amount"]), (20, 8.60))
-        self.assertEqual(r["shares"], 20.0)                                 # exactly the room, never past it
+        self.assertEqual((r["target_shares"], r["amount"], r["cap"]), (20.0, 8.20, 0.43))
+        self.assertLessEqual(r["amount"] / r["ask_seen"], 20.0)
+        self.assertGreater(r["shares"], 18.0)
         self.assertLessEqual(rd["UP"], self.sn.s.max_side_shares)
         self.assertEqual(self.sn.carry["UP"], 0.0)
 
@@ -304,9 +302,8 @@ class Gate(I.PaperIOCBase):
         # 19.99 * .41 = $8.1959. Rounding UP to $8.20 would count
         # 20 shares and miss a valid smaller order; $8.19 stays within room.
         r = self.order("UP", [(0.41, 1000)], mid=0.40, move_bp=5.0)
-        self.assertEqual((r["result"], r["est_cost"]), ("filled", 8.19))
-        self.assertLessEqual(r["est_cost"] / r["ask_seen"], 19.99)
-        self.assertEqual((r["order_shares"], r["amount"], r["shares"]), (19, 8.17, 19.0))   # F1: whole shares
+        self.assertEqual((r["result"], r["amount"]), ("filled", 8.19))
+        self.assertLessEqual(r["amount"] / r["ask_seen"], 19.99)
         self.assertLessEqual(rd["UP"], self.sn.s.max_side_shares)
 
     def test_minimum_at_the_signed_limit_cannot_enlarge_stake_past_round_room(self):
@@ -332,9 +329,8 @@ class Gate(I.PaperIOCBase):
         self.m.set(self.m.up_token, [(0.41, 1), (0.43, 1000)])
         plan = self.sn._decide("UP", {"bp": 5.0, "window_ms": 250.0}, time.monotonic() * 1000.0)
         self.assertIsNotNone(plan)
-        self.assertEqual((plan["target"], plan["est_cost"]), (20.0, 8.20))
-        self.assertLessEqual(plan["est_cost"] / plan["view"].best_ask, 20.0)
-        self.assertEqual((plan["shares"], plan["amount"]), (20, 8.60))      # F1: <= the canary's 20 per order
+        self.assertEqual((plan["target"], plan["amount"]), (20.0, 8.20))
+        self.assertLessEqual(plan["amount"] / plan["view"].best_ask, 20.0)
 
     def anchored_order(self, then, now, move_bp=5.0, ask=0.41):
         """An UP order whose book stood at mid `then` when the move began
@@ -384,8 +380,7 @@ class Gate(I.PaperIOCBase):
         r1 = self.order("UP", [(0.41, 1000)], mid=0.40, move_bp=5.0)
         r2 = self.order("DOWN", [(0.41, 1000)], mid=0.40, move_bp=-5.0)   # before the next cash reading
         self.assertEqual(r1["bankroll"], 1000.0)
-        # Kelly's cash estimate takes the order's expected cost, as it did before F1
-        self.assertAlmostEqual(r2["bankroll"], 1000.0 - r1["est_cost"], places=2)
+        self.assertAlmostEqual(r2["bankroll"], 1000.0 - r1["amount"], places=2)
 
     def test_a_cap_at_the_price_floor_is_skipped_not_sent(self):
         """10-12 VPS run: 14 orders with ask 0.05 = MIN_BUY_PRICE and cap 0.05

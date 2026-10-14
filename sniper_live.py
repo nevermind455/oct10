@@ -2000,6 +2000,12 @@ class LiveExecution:
             except Exception as exc:  # noqa: BLE001 - an unexplained state stops new orders
                 self._trip(f"reconciliation failed: {type(exc).__name__}: {exc}")
 
+    def _trip_fak(self, a: dict, reason: str) -> None:
+        """A FAK's own evidence halts trading: the order keeps its reservation
+        and stays awaiting, and is not timed out again for the same order."""
+        a.setdefault("halted_for", reason)
+        self._trip(reason)
+
     def _trip(self, reason: str) -> None:
         self.kill.trip(reason)
         if reason not in self._announced:
@@ -2245,7 +2251,9 @@ class LiveExecution:
                 self.awaiting.pop(oid, None)
                 self.n["confirmed in ledger"] += 1
                 return
-        if age > self.confirm_within_s:
+        if age > self.confirm_within_s and not a.get("halted_for"):
+            # An order whose own evidence already halted trading is not timed out
+            # a second time: one halt, with its real reason (2026-10-14).
             self._trip(f"FAK order {oid} not completely confirmed after {self.confirm_within_s:.0f}s: reconcile")
 
     def fill_for(self, order_id) -> dict | None:
@@ -2286,7 +2294,7 @@ class LiveExecution:
         expected = a.get("trade_ids") or set()
         if a.get("final_size") == 0:
             if rows or expected or a["kind"] == MATCHED:
-                self._trip(f"FAK order {oid} has contradictory zero-fill evidence: reconcile")
+                self._trip_fak(a, f"FAK order {oid} has contradictory zero-fill evidence: reconcile")
                 return None
             a["quantity_resolved"] = True
             return {"shares": 0.0, "cost": 0.0, "fee": 0.0, "price": None,
@@ -2294,7 +2302,7 @@ class LiveExecution:
                     "seen_mono": a.get("final_mono")}
         actual_ids = {str(f.trade_id) for f in rows}
         if expected and actual_ids - expected:
-            self._trip(f"FAK order {oid} has unexpected trades: reconcile")
+            self._trip_fak(a, f"FAK order {oid} has unexpected trades: reconcile")
             return None
         if not rows or (expected and actual_ids != expected):
             return None
@@ -2305,7 +2313,7 @@ class LiveExecution:
         for f in rows:
             status = str(f.status or "").upper()
             if status in ("FAILED", "CONFLICT"):
-                self._trip(f"FAK order {oid} has a {status} trade: reconcile")
+                self._trip_fak(a, f"FAK order {oid} has a {status} trade: reconcile")
                 return None
             if status not in ("MATCHED", "MATCHED_NOT_BROADCASTED", "MINED", "CONFIRMED"):
                 return None
@@ -2316,7 +2324,7 @@ class LiveExecution:
                 if not valid:
                     raise ValueError("identity, price or quantity")
             except (ArithmeticError, TypeError, ValueError):
-                self._trip(f"FAK order {oid} has an invalid fill: reconcile")
+                self._trip_fak(a, f"FAK order {oid} has an invalid fill: reconcile")
                 return None
             shares += qty
             paid = getattr(f, "paid", None)
@@ -2332,17 +2340,17 @@ class LiveExecution:
                             or abs(sum(q * price for q, price in parsed_legs) - trade_cost) > Decimal("0.000001")):
                         raise ValueError("invalid maker execution legs")
                 except (ArithmeticError, TypeError, ValueError):
-                    self._trip(f"FAK order {oid} has invalid maker execution legs: reconcile")
+                    self._trip_fak(a, f"FAK order {oid} has invalid maker execution legs: reconcile")
                     return None
                 fee += sum(curve_fee(q, price, rules) for q, price in parsed_legs)
             else:
                 fee += curve_fee(qty, trade_cost / qty, rules)
             cost += trade_cost
         if cost > Decimal(str(a["amount"])) + Decimal("0.000001"):
-            self._trip(f"FAK order {oid} filled above its budget: reconcile")
+            self._trip_fak(a, f"FAK order {oid} filled above its budget: reconcile")
             return None
         if a.get("size") is not None and shares > Decimal(str(a["size"])) + Decimal("0.000001"):
-            self._trip(f"FAK order {oid} filled above its signed size: reconcile")
+            self._trip_fak(a, f"FAK order {oid} filled above its signed size: reconcile")
             return None
         if a.get("final_size") is not None and abs(float(shares) - a["final_size"]) > 1e-6:
             return None                            # not all final fills have arrived yet

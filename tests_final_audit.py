@@ -503,14 +503,12 @@ class Execution(I.PaperIOCBase):
         self.assertEqual(self.sn.carry["DOWN"], 0.0)
 
     def test_FINDING_a_dollar_ioc_buys_more_than_its_target_when_the_ask_falls(self):
-        """The audit's F1, kept as the record of the DOLLAR order (paper A/B only since
-        2026-10-14: SNIPER_ORDER_SIZING=dollars): the IOC is signed as a dollar amount,
-        sized for the share target at the decision's levels. If the ask falls before the
-        match, the stake buys MORE shares than the target - and share limits (round side
-        cap, canary shares/order) are checked on the decision's estimate. The share-sized
-        order (the default) cannot: test_F1_a_share_sized_ioc_never_buys_more_than_its_target."""
-        self.sn = S.Sniper(self.m, self.broker, settings=I.settings(SNIPER_MAX_SIDE_SHARES="20",
-                                                                    SNIPER_ORDER_SIZING="dollars"))
+        """Documented, NOT changed (it is the execution model): the IOC is signed as a
+        dollar amount (makerAmount in USDC, as live), sized for the share target at the
+        decision's levels. If the ask falls before the match, the stake buys MORE shares
+        than the target - and share limits (round side cap, canary shares/order) are
+        checked on the decision's estimate. The next order sees the real count."""
+        self.sn = S.Sniper(self.m, self.broker, settings=I.settings(SNIPER_MAX_SIDE_SHARES="20"))
         self.sn._write = self.rows.append
         r = self.fire("UP", [(0.50, 100)], [(0.30, 100)])
         self.assertEqual((r["target_shares"], r["amount"]), (10.0, 5.0))
@@ -519,27 +517,6 @@ class Execution(I.PaperIOCBase):
         self.sn.last_fire_by_side["UP"] = -1e18
         r = self.fire("UP", [(0.50, 100)], [(0.30, 100)])
         self.assertEqual((r["result"], r["reason"]), ("skipped", "round cap"))        # 16.67 + 10 > 20
-
-    def test_F1_a_share_sized_ioc_never_buys_more_than_its_target(self):
-        """F1 fixed (2026-10-14): the order is 10 whole shares at the 0.55 cap. The ask
-        falls to 0.30 before the match: it buys exactly 10 for $3.00 - never 16.67 - and
-        the side cap is exact: 10 + 10 = 20 fills, a third order is the round cap."""
-        self.sn = S.Sniper(self.m, self.broker, settings=I.settings(SNIPER_MAX_SIDE_SHARES="20"))
-        self.sn._write = self.rows.append
-        r = self.fire("UP", [(0.50, 100)], [(0.30, 100)])
-        self.assertEqual((r["result"], r["target_shares"], r["order_shares"]), ("filled", 10.0, 10))
-        self.assertAlmostEqual(r["amount"], 5.50, places=6)                          # the most it may spend
-        self.assertAlmostEqual(r["shares"], 10.0, places=6)                          # never above the order
-        self.assertAlmostEqual(r["price"], 0.30, places=6)                           # the improvement is a saving
-        self.assertNotIn("over_target", r)
-        self.assertEqual(self.sn.carry["UP"], 0.0)
-        self.sn.last_fire_by_side["UP"] = -1e18
-        r = self.fire("UP", [(0.50, 100)], [(0.30, 100)])
-        self.assertEqual((r["result"], r["shares"]), ("filled", 10.0))              # 10 + 10 = the cap of 20
-        self.assertAlmostEqual(self.sn.rounds[self.m.window_end]["UP"], 20.0, places=6)
-        self.sn.last_fire_by_side["UP"] = -1e18
-        r = self.fire("UP", [(0.50, 100)], [(0.30, 100)])
-        self.assertEqual((r["result"], r["reason"]), ("skipped", "round cap"))
 
     def test_D6_an_ioc_meeting_an_empty_book_is_a_zero_fill(self):
         r = self.fire("UP", [(0.47, 100)], [])

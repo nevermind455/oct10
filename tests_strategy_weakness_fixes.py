@@ -96,7 +96,7 @@ class DecisionPath(unittest.TestCase):
                                               _rules_cache={"market": (self.rules, 1000.0)}, _rules_cache_ttl=600)
         self.sn.s = types.SimpleNamespace(fair=True, kelly=True, fair_margin=.01, fair_fee_rate=0,
                                          stale_ms=2000, slip=.05, order_type="FAK", max_side_shares=200,
-                                         kelly_fraction=1, max_fills_round=20, order_sizing="shares")
+                                         kelly_fraction=1, max_fills_round=20)
         self.sn.live = None
         self.sn._fak_pending = {}
         self.sn.inflight = {"UP": None, "DOWN": None}

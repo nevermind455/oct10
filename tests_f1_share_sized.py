@@ -3,10 +3,17 @@
 
     python tests_f1_share_sized.py
 
-A FAK is a limit order for whole shares at the cap (takerAmount = shares,
-makerAmount = shares x limit), so no fill can exceed its share count, the
-side's cap or the canary's per-order cap; price improvement lowers the cost,
-never raises the size. Every dollar limit reserves the order's maximum spend.
+WITHDRAWN from the strategy on 2026-10-14: live, Polymarket filled an
+11-share order (makerAmount $3.74 = 11 x the 0.34 cap) with 12.896552 shares
+at 0.29 - it fills a FAK BUY by its dollars, so a share-sized order cannot
+cap the shares there. The sniper sends a FAK's shares as their book cost
+again and SNIPER_ORDER_SIZING=shares is refused. The signing and execution
+plumbing below stays tested (the kill switch's "filled above its signed size"
+check is what caught it), but no strategy path uses it.
+
+The plumbing's design: a limit order for whole shares at the cap
+(takerAmount = shares, makerAmount = shares x limit); every dollar limit
+reserves the order's maximum spend.
 
   - the signed amounts are exact for every whole share count and cent price
     (the library's own get_order_amounts);
@@ -15,8 +22,8 @@ never raises the size. Every dollar limit reserves the order's maximum spend.
     fractional / sub-minimum / over-cap sizes, trips on a fill above its size;
     UP and DOWN in flight together each reserve their own worst case;
   - paper: the share estimate never exceeds its shares or the cap (random books
-    against a brute-force oracle); a deeper, cheaper book at the match buys no more;
-  - live refuses SNIPER_ORDER_SIZING=dollars (the frozen spec).
+    against a brute-force oracle);
+  - the sniper sends the shares' book cost, and SNIPER_ORDER_SIZING=shares is refused.
 """
 from __future__ import annotations
 
@@ -370,10 +377,15 @@ class PaperShareEstimate(unittest.TestCase):
 
 
 class PaperShareSized(I.PaperIOCBase):
-    def test_a_deeper_cheaper_book_at_the_match_buys_no_more(self):
-        r = self.fire("UP", [(0.50, 100)], [(0.20, 1000), (0.30, 1000)])
-        self.assertEqual((r["result"], r["order_shares"], r["shares"]), ("filled", 10, 10.0))
-        self.assertAlmostEqual(r["price"], 0.20, places=9)
+    def test_the_sniper_sends_the_shares_book_cost_never_a_share_sized_order(self):
+        sent = []
+        place = self.broker.place_trade
+        self.broker.place_trade = lambda *a, **k: (sent.append(k), place(*a, **k))[1]
+        r = self.fire("UP", [(0.47, 5), (0.50, 100)])
+        self.assertEqual(r["result"], "filled")
+        self.assertAlmostEqual(r["amount"], 4.85, places=6)              # 5 x 0.47 + 5 x 0.50: the book cost
+        self.assertNotIn("shares", sent[-1])
+        self.assertNotIn("order_shares", r)
 
     def test_the_broker_refuses_a_share_sized_fok_and_fractional_shares(self):
         m = self.m
@@ -389,12 +401,14 @@ class PaperShareSized(I.PaperIOCBase):
 
 
 class FrozenSpec(unittest.TestCase):
-    def test_live_requires_share_sized_orders(self):
-        dollars = [v for v in X.spec_violations(I.settings(SNIPER_ORDER_SIZING="dollars")) if "order sizing" in v]
-        shares = [v for v in X.spec_violations(I.settings()) if "order sizing" in v]
-        self.assertEqual(len(dollars), 1, dollars)
-        self.assertIn("SNIPER_ORDER_SIZING", dollars[0])
-        self.assertEqual(shares, [])
+    def test_share_sized_orders_are_withdrawn(self):
+        """2026-10-14 live: Polymarket filled an 11-share order ($3.74 at the 0.34 cap)
+        with 12.896552 shares at 0.29 - it fills a FAK BUY by its dollars."""
+        self.assertEqual(I.settings().order_sizing, "dollars")
+        self.assertEqual([v for v in X.spec_violations(I.settings()) if "order sizing" in v], [])
+        with self.assertRaises(ValueError) as cm:
+            I.settings(SNIPER_ORDER_SIZING="shares")
+        self.assertIn("withdrawn", str(cm.exception))
 
     def test_an_unknown_sizing_is_refused_at_startup(self):
         with self.assertRaises(ValueError):

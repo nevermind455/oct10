@@ -1547,7 +1547,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # second trigger (exec_latency.spec_violations).
     # Re-approved 2026-10-13 (the operator's choice): SNIPER_KELLY_FRACTION defaults to the
     # frozen spec's 0.5 (half Kelly; was full).
-    "sniper_mode.py": "f3e13ca2ce1534d50ee57d501a3a027f6331fa4511c3c6d3e7bca3300d3db8fd",
+    "sniper_mode.py": "eb3f46dfc55aeec08c019599a878195cc9bffb64342f11114f33328c3f13af3b",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
@@ -1558,11 +1558,16 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Reviewed 2026-10-12: user-requested recovery, accounting and portfolio safety fixes.
     # Re-approved 2026-10-12 (audit 20261012): one outcome per prepared order; monotonic server
     # clock; conflicting venue evidence is AMBIGUOUS
+    # Re-approved 2026-10-14 evening (live evidence, the operator's choice "Kelly shares at book
+    # cost"): Polymarket filled an 11-share FAK ($3.74 at the 0.34 cap) with 12.896552 shares,
+    # so share sizing (F1) is withdrawn - SNIPER_ORDER_SIZING=shares is refused and _decide is
+    # the pre-repair one again (syntax-tree identical to fd916fb); the plumbing stays tested.
+    # sniper_live.py: a FAK whose own evidence halted trading is not timed out a second time.
     # Re-approved 2026-10-14 (restart halt): a previous run's unresolved send intents are looked
     # up on the venue by their own order hash at start (_reconcile_previous_run, M7's evidence
     # rules); proven zero or fully booked resolves them and lifts the derived start-up halt
     # (CanarySession.PREVIOUS_RUN, never persisted). Nothing is ever resent.
-    "sniper_live.py": "6ad82566b47cf20167a8f55ca6a2d9811e81f0160eaaa59f554cef731bc25c0b",
+    "sniper_live.py": "c6add51898eed21442307745d6603e559fa879bcabbf7598d402cbd8832b5ce9",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads
