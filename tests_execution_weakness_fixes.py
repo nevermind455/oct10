@@ -220,8 +220,15 @@ class PreviousRunReconciliation(unittest.IsolatedAsyncioTestCase):
     """The restart halt: a previous run's unresolved order is settled by the
     venue's record of its own order hash - proven or still halted."""
 
-    asyncSetUp, asyncTearDown = DurableWarmDispatch.asyncSetUp, DurableWarmDispatch.asyncTearDown
-    reboot = DurableWarmDispatch.reboot
+    asyncSetUp, reboot = DurableWarmDispatch.asyncSetUp, DurableWarmDispatch.reboot
+
+    async def asyncTearDown(self):
+        # The restart sessions keep their journal segment open: close them before
+        # the temporary directory goes (Windows cannot delete an open file, and
+        # addCleanup callbacks run only after asyncTearDown).
+        for session in getattr(self, "restarts", []):
+            session.close()
+        await DurableWarmDispatch.asyncTearDown(self)
 
     HASH = "0x" + "ab" * 32
 
@@ -235,7 +242,7 @@ class PreviousRunReconciliation(unittest.IsolatedAsyncioTestCase):
         limits, kill = L.CanaryLimits(max_daily_loss_usd=100), L.KillSwitch()
         session = L.CanarySession(self.path, "offline-wallet")
         session.open(limits, kill, self.ledger)
-        self.addCleanup(session.close)
+        self.restarts = getattr(self, "restarts", []) + [session]
         return p, session, limits, kill
 
     def execution(self, session, limits, kill, venue_order):
