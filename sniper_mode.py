@@ -154,6 +154,31 @@ def rx_backlog(ws) -> int | None:
     return len(msgs) if msgs is not None and hasattr(msgs, "__len__") else None
 
 
+def quantiles(xs, digits: int | None = 1) -> dict | None:
+    """p50/p90/p95/p99/max/n of a list exactly as sorted()[min(n-1, int(n*p/100))]
+    reads them - the same values the old full sort gave - by selecting only
+    those order statistics (numpy partition, which releases the GIL on a large
+    array). Called on a worker for the dashboard and the journal summary rows;
+    the event loop only copies the samples."""
+    n = len(xs)
+    if not n:
+        return None
+    idx = {p: min(n - 1, int(n * p / 100)) for p in (50, 90, 95, 99)}
+    if n >= 2048:
+        import numpy as np
+        a = np.asarray(xs, dtype=float)
+        kth = sorted(set(idx.values()) | {n - 1})
+        part = np.partition(a, kth)
+        pick = {p: float(part[i]) for p, i in idx.items()}
+        top = float(part[n - 1])
+    else:
+        ys = sorted(xs)
+        pick = {p: ys[i] for p, i in idx.items()}
+        top = ys[-1]
+    r = (lambda v: round(v, digits)) if digits is not None else (lambda v: v)
+    return {"p50": r(pick[50]), "p90": r(pick[90]), "p95": r(pick[95]), "p99": r(pick[99]), "max": r(top), "n": n}
+
+
 class BinanceFreshness:
     """Is the Binance feed current enough to act on? Fail closed: no new signal
     unless every answer is yes. Only the live socket enables it (run()); replays
@@ -190,6 +215,14 @@ class BinanceFreshness:
         self.lag: collections.deque = collections.deque(maxlen=20000)
         self.excess: collections.deque = collections.deque(maxlen=20000)
         self.n = collections.Counter()
+        self.mode = "count"                 # Settings.backlog_gate
+        self.fresh_ms = 100.0               # Settings.backlog_fresh_ms
+
+    def fresh_burst(self) -> bool:
+        """A receive backlog whose newest-read tick is still within fresh_ms of
+        the feed's usual delay: frames that arrived together, not a stall."""
+        return (self.backlog > self.backlog_max and self.last_excess is not None
+                and self.last_excess <= self.fresh_ms)
 
     def on_connect(self) -> None:
         self.connected = True
@@ -235,7 +268,7 @@ class BinanceFreshness:
             return None
         if not self.connected:
             return self._why["disconnected"]
-        if self.backlog > self.backlog_max:
+        if self.backlog > self.backlog_max and not (self.mode == "age" and self.fresh_burst()):
             return self._why["receive backlog"]
         if self.last_trade_mono is None or (now_mono - self.last_trade_mono) * 1000.0 > self.unknown_ms:
             return self._why["age unknown"]
@@ -255,16 +288,19 @@ class BinanceFreshness:
 
     @staticmethod
     def _q(xs):
-        xs = sorted(xs)
-        if not xs:
-            return None
-        q = lambda p: round(xs[min(len(xs) - 1, int(len(xs) * p / 100))], 1)
-        return {"p50": q(50), "p90": q(90), "p95": q(95), "p99": q(99), "max": round(xs[-1], 1), "n": len(xs)}
+        return quantiles(list(xs))
 
-    def summary(self) -> dict:
-        base = self._min[0][1] if self._min else None
+    def snapshot(self) -> dict:
+        """What summary() reads, copied (event loop: list() of a deque is one C call)."""
         return {"status": self.status(), "trades": self.n["trades"], "backlog_max": self.backlog_max_seen,
-                "excess_ms": self._q(self.excess), "age_ms": self._q(self.lag),
+                "excess": list(self.excess), "lag": list(self.lag),
+                "base": self._min[0][1] if self._min else None}
+
+    def summary(self, snap: dict | None = None) -> dict:
+        snap = self.snapshot() if snap is None else snap
+        base = snap["base"]
+        return {"status": snap["status"], "trades": snap["trades"], "backlog_max": snap["backlog_max"],
+                "excess_ms": quantiles(snap["excess"]), "age_ms": quantiles(snap["lag"]),
                 # receive wall - Binance E at its best: one-way network + clock offset.
                 # Negative = this clock is behind Binance's by at least that much.
                 "baseline_ms": round(base, 1) if base is not None else None,
@@ -924,6 +960,23 @@ class Settings:
         self.binance_unknown_ms = _env_float("SNIPER_BINANCE_UNKNOWN_MS", 5000)
         self.binance_backlog_max = int(_env_float("SNIPER_BINANCE_BACKLOG_MAX", 20))
         self.binance_silent_s = _env_float("SNIPER_BINANCE_SILENT_S", 5)
+        # Receive-backlog gate (audit H4). "count" - the default, unchanged: a
+        # signal is refused while more than the feed's BACKLOG_MAX frames wait
+        # behind the one read. "age": refused only when that tick is also more
+        # than SNIPER_BACKLOG_FRESH_MS older than the feed's usual delay - frames
+        # that arrived together in one network read are a burst, not a stalled
+        # feed. It changes which signals pass, so it is off until approved
+        # (exec_latency refuses LIVE with it).
+        self.backlog_gate = str(os.environ.get("SNIPER_BACKLOG_GATE", "count")).strip().lower() or "count"
+        if self.backlog_gate not in ("count", "age"):
+            raise ValueError(f"invalid SNIPER_BACKLOG_GATE {self.backlog_gate!r}: count or age")
+        self.backlog_fresh_ms = _env_float("SNIPER_BACKLOG_FRESH_MS", 100)
+        # Latest-frame coalescing for the Binance futures trigger (audit H4):
+        # frames already queued behind the one read are folded into the rule's
+        # price history and only the newest is evaluated. It changes which ticks
+        # the rule evaluates, so it is off until approved (LIVE refuses it).
+        self.feed_coalesce = str(os.environ.get("SNIPER_FEED_COALESCE", "0")).strip().lower() in (
+            "1", "true", "yes", "on")
         # Which feed triggers the sniper: Coinbase's BTC-USD ticker (the default,
         # and the frozen spec's feed since 2026-10-10), Binance's BTCUSDT book
         # ticker, or Kraken's BTC/USD best bid/offer - paper only unless
@@ -1241,6 +1294,20 @@ class Trigger:
         while len(q) >= 2 and q[1][0] <= cut:
             q.popleft()
 
+    def observe(self, t_ms: float, mid: float) -> None:
+        """A price folded into the history exactly as update() folds it - never
+        evaluated (SNIPER_FEED_COALESCE: a frame with newer ones queued)."""
+        q = self.q
+        if not math.isfinite(t_ms) or not math.isfinite(mid) or mid <= 0:
+            q.clear()
+            return
+        if q and (t_ms <= q[-1][0] or t_ms - q[-1][0] > self.max_gap_ms):
+            q.clear()
+        q.append((t_ms, mid))
+        cut = t_ms - self.window_ms
+        while len(q) >= 2 and q[1][0] <= cut:
+            q.popleft()
+
     def update(self, t_ms: float, mid: float):
         q = self.q
         if not math.isfinite(t_ms) or not math.isfinite(mid) or mid <= 0:
@@ -1322,6 +1389,9 @@ class Sniper:
         # freshness gate on each book ticker's event time, Binance's limits.
         self.bf_fresh = BinanceFreshness(self.s.binance_stale_ms, self.s.binance_unknown_ms,
                                          self.s.binance_backlog_max, name="binance_fut")
+        self._bf_last_u = None
+        for gate in (self.fresh, self.cb_fresh, self.bf_fresh):
+            gate.mode, gate.fresh_ms = self.s.backlog_gate, self.s.backlog_fresh_ms
         self.journal = Path(journal_path) if journal_path else None
         # When each side's last order was submitted (monotonic ms, the ticks'
         # clock). An UP order cools down UP only; DOWN stays free, and back.
@@ -1422,10 +1492,54 @@ class Sniper:
         if self.journal is None:
             return
         try:
-            with open(self.journal, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(row, separators=(",", ":"), default=str) + "\n")
+            line = json.dumps(row, separators=(",", ":"), default=str) + "\n"
+            if os.name == "nt":
+                # Windows cannot rename or delete a file held open (log tools,
+                # test cleanup): open, append, close per row there.
+                with open(self.journal, "a", encoding="utf-8") as fh:
+                    fh.write(line)
+                return
+            self._journal_append(line.encode("utf-8"))
         except OSError:
+            self._journal_close()
             self.n["journal errors"] += 1
+
+    JOURNAL_RECHECK_S = 5.0
+
+    def _journal_append(self, data: bytes) -> None:
+        """POSIX: one write() on a kept-open O_APPEND descriptor - no open and
+        close per row on the event loop (audit L9). The descriptor is reopened
+        when the path no longer names the file it holds (rotated, moved or
+        deleted), checked every JOURNAL_RECHECK_S, so rows never go to an
+        unlinked file for longer than that. Not fsynced, as before: the journal
+        is diagnostics; orders and fills are made durable elsewhere."""
+        fd = getattr(self, "_jfd", None)
+        now = time.monotonic()
+        if fd is not None and now - getattr(self, "_jfd_checked", 0.0) > self.JOURNAL_RECHECK_S:
+            self._jfd_checked = now
+            try:
+                st, cur = os.stat(self.journal), os.fstat(fd)
+                same = (st.st_ino, st.st_dev) == (cur.st_ino, cur.st_dev)
+            except OSError:
+                same = False
+            if not same:
+                self._journal_close()
+                fd = None
+        if fd is None:
+            fd = os.open(self.journal, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o666)
+            self._jfd, self._jfd_checked = fd, now
+        view = memoryview(data)
+        while view:
+            n = os.write(fd, view)
+            view = view[n:]
+
+    def _journal_close(self) -> None:
+        fd, self._jfd = getattr(self, "_jfd", None), None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     def _table_row(self, side: str, amount, result: str, end, *, order_id=None) -> None:
         rows = self.trade_rows
@@ -1698,6 +1812,7 @@ class Sniper:
         watch = getattr(self, "stallwatch", None)
         if watch is not None:
             watch.stop()
+        self._journal_close()
 
     # ---------------------------------------------------------------- ticks
     def on_tick(self, raw) -> None:
@@ -1816,7 +1931,7 @@ class Sniper:
         self._coinbase_prev_t = t
         return "tick"
 
-    def on_binance_fut(self, raw) -> str:
+    def on_binance_fut(self, raw, evaluate: bool = True) -> str:
         """Binance USD-M perpetual BTCUSDT book ticker - a SECOND trigger only
         (SNIPER_EXTRA_FEEDS=binance_fut; PAPER: the frozen spec has none and
         LIVE refuses it). Returns "tick" (a usable best bid/ask, fed to its own
@@ -1841,9 +1956,18 @@ class Sniper:
             return "malformed"
         self.bf_fresh.note_trade(d.get("E"), time.time() * 1000.0, t / 1000.0)
         self.n["binance_fut ticks"] += 1
+        update_id = d.get("u")
+        if isinstance(update_id, int) and not isinstance(update_id, bool):
+            if self._bf_last_u is not None and update_id < self._bf_last_u:
+                self.n["binance_fut out of order"] += 1        # counted only (one socket delivers in order)
+            self._bf_last_u = update_id
         trig = self.triggers.get("binance_fut")
         if trig is not None:
-            self._signal("binance_fut", trig, (bid + ask) / 2.0, t, t_pc)
+            if evaluate:
+                self._signal("binance_fut", trig, (bid + ask) / 2.0, t, t_pc)
+            else:
+                trig.observe(t, (bid + ask) / 2.0)
+                self.n["binance_fut coalesced"] += 1
         return "tick"
 
     def on_kraken(self, raw) -> str:
@@ -1965,6 +2089,9 @@ class Sniper:
         if gate is not None:
             why = gate.why_not(t / 1000.0)
             if why is not None:
+                if why.endswith("receive backlog"):
+                    # H4 evidence: was the refused tick itself fresh (a burst) or old (a stall)?
+                    self.n[f"backlog refusals {'with fresh data' if gate.fresh_burst() else 'stale'} {feed}"] += 1
                 # The move was measured on ticks that cannot be shown current
                 # (a backlog compresses seconds of movement into milliseconds):
                 # drop the reference too, so the rule restarts on fresh ticks only.
@@ -3234,6 +3361,7 @@ class Sniper:
         from before a gap is no reference for "moved within 250ms"."""
         url, sub = EXTRA_FEEDS[name]
         handler = getattr(self, f"on_{name}")
+        coalesce = self.s.feed_coalesce and name == "binance_fut"
         from feeds.supervisor import backoff_delay
         fresh = self._gate_for(name)
         if fresh is not None:
@@ -3249,6 +3377,8 @@ class Sniper:
                     if sub is not None:                     # binance_fut: the stream is in the URL
                         await ws.send(json.dumps(sub))
                     self.triggers[name] = Trigger(self.s.k_bp, self.s.window_ms)
+                    if name == "binance_fut":
+                        self._bf_last_u = None
                     if name == "coinbase":
                         self._coinbase_seq = self._coinbase_prev_t = None    # a new connection's own order
                     if fresh is not None:
@@ -3264,6 +3394,14 @@ class Sniper:
                         now = time.monotonic()
                         if fresh is not None:
                             fresh.note_message(now, rx_backlog(ws))
+                        if coalesce:
+                            # Frames already queued: history only; the newest is evaluated.
+                            while (rx_backlog(ws) or 0) > 0:
+                                handler(raw.decode() if isinstance(raw, bytes) else raw, evaluate=False)
+                                raw = await ws.recv()
+                                now = time.monotonic()
+                                if fresh is not None:
+                                    fresh.note_message(now, rx_backlog(ws))
                         kind = handler(raw.decode() if isinstance(raw, bytes) else raw)
                         if kind in ("tick", "late"):
                             last_tick = now
@@ -3284,64 +3422,105 @@ class Sniper:
 
     # ---------------------------------------------------------------- status
     def summary(self) -> dict:
+        """The status summary (dashboard, journal rows, reports). On the event
+        loop prefer summary_snapshot() there and summary_from() on a worker:
+        the percentiles of the feeds' sample windows (tens of thousands of
+        samples) cost ~8ms of sorting a call, and every BTC tick waited for it."""
+        return self.summary_from(self.summary_snapshot())
+
+    def summary_snapshot(self) -> dict:
+        """Everything summary() reads, copied: cheap, for the event loop."""
+        book = getattr(self.hub, "book", None)
+        return {"n": dict(self.n), "marks_1s": list(self.marks["1s"]), "marks_5s": list(self.marks["5s"]),
+                "kraken_lag": list(self.kraken_lag) if self.s.primary_feed == "kraken" else None,
+                "kraken_gap_max": self.kraken_gap_max, "kraken_system": self.kraken_system,
+                "coinbase": self.cb_fresh.snapshot() if self.s.primary_feed == "coinbase" else None,
+                "coinbase_gap_max": self.coinbase_gap_max, "cb_up": len(self._cb_up),
+                "cb_behind": list(self.cb_behind) if self.s.coinbase_conns > 1 else None,
+                "binance_fut": self.bf_fresh.snapshot() if "binance_fut" in self.s.extra_feeds else None,
+                "binance": self.fresh.snapshot(),
+                "carry": self.carry_view() if self.s.order_type == "FAK" else None,
+                "fair": ({"vol_bp": (round(v * 1e4, 3) if (v := self.vol_model.vol()) is not None else None),
+                          "samples": len(self.vol_model._incs),
+                          "bankroll": self._bankroll if self.live is None else self._read_bankroll(),
+                          "last": self.last_fair} if self.s.fair else None),
+                "latency_ms": round(self.latency_plan()[0], 1),
+                "exec_latency": self.latency.snapshot(), "exec_quality": self.quality.summary(),
+                "clob_rtt_ms": round(sorted(self.net_rtt)[len(self.net_rtt) // 2], 1) if self.net_rtt else None,
+                "loop_lag": list(self.loop_lag),
+                "book_feed_age": book.feed_age_samples() if hasattr(book, "feed_age_samples") else (
+                    book.feed_age_summary() if hasattr(book, "feed_age_summary") else None),
+                "live": self.live.status() if self.live is not None else None}
+
+    def summary_from(self, snap: dict) -> dict:
+        """summary() from a summary_snapshot() - any thread; the sorting is here."""
+        n = collections.Counter(snap["n"])
         avg = lambda xs: round(sum(xs) / len(xs), 2) if xs else None
-        done = self.n["filled"] + self.n["refused"]
-        return {"signals": self.n["signals"], "orders": self.n["orders"], "filled": self.n["filled"],
-                "refused": self.n["refused"], "fill_rate": round(self.n["filled"] / done, 3) if done else None,
-                "markout_1s_c": avg(self.marks["1s"]), "markout_5s_c": avg(self.marks["5s"]),
-                "skips": {k[6:]: v for k, v in self.n.items() if k.startswith("skip: ")},
-                "fired_by_feed": {k[6:]: v for k, v in self.n.items() if k.startswith("fired ")},
-                **({"signals_by_feed": {self.s.primary_feed: self.n["signals"],
-                                        **{f: self.n[f"signals {f}"] for f in self.s.extra_feeds}}}
+        done = n["filled"] + n["refused"]
+        book_age = snap["book_feed_age"]
+        return {"signals": n["signals"], "orders": n["orders"], "filled": n["filled"],
+                "refused": n["refused"], "fill_rate": round(n["filled"] / done, 3) if done else None,
+                "markout_1s_c": avg(snap["marks_1s"]), "markout_5s_c": avg(snap["marks_5s"]),
+                "skips": {k[6:]: v for k, v in n.items() if k.startswith("skip: ")},
+                "fired_by_feed": {k[6:]: v for k, v in n.items() if k.startswith("fired ")},
+                **({"signals_by_feed": {self.s.primary_feed: n["signals"],
+                                        **{f: n[f"signals {f}"] for f in self.s.extra_feeds}}}
                    if self.s.extra_feeds else {}),
-                **({"kraken": {"ticks": self.n["kraken ticks"], "heartbeats": self.n["kraken heartbeats"],
-                               "malformed": self.n["kraken malformed"], "reconnects": self.n["reconnects"],
-                               "gaps_over_max_gap": self.n["kraken gaps over max gap"],
-                               "gap_ms_max": round(self.kraken_gap_max, 1),
-                               "lag_ms": BinanceFreshness._q(self.kraken_lag), "system": self.kraken_system}}
+                **({"kraken": {"ticks": n["kraken ticks"], "heartbeats": n["kraken heartbeats"],
+                               "malformed": n["kraken malformed"], "reconnects": n["reconnects"],
+                               "gaps_over_max_gap": n["kraken gaps over max gap"],
+                               "gap_ms_max": round(snap["kraken_gap_max"], 1),
+                               "lag_ms": quantiles(snap["kraken_lag"]), "system": snap["kraken_system"]}}
                    if self.s.primary_feed == "kraken" else {}),
-                **({"coinbase": {**self.cb_fresh.summary(), "ticks": self.n["coinbase ticks"],
-                                 "heartbeats": self.n["coinbase heartbeats"],
-                                 "malformed": self.n["coinbase malformed"],
-                                 "out_of_order": self.n["coinbase out of order"], "reconnects": self.n["reconnects"],
-                                 "gaps_over_max_gap": self.n["coinbase gaps over max gap"],
-                                 "gap_ms_max": round(self.coinbase_gap_max, 1),
-                                 **({"sockets": self.s.coinbase_conns, "sockets_up": len(self._cb_up),
-                                     "already_heard": self.n["coinbase already heard"],
-                                     "first_by_socket": [self.n[f"coinbase first on conn {j + 1}"]
+                **({"coinbase": {**self.cb_fresh.summary(snap["coinbase"]), "ticks": n["coinbase ticks"],
+                                 "heartbeats": n["coinbase heartbeats"],
+                                 "malformed": n["coinbase malformed"],
+                                 "out_of_order": n["coinbase out of order"], "reconnects": n["reconnects"],
+                                 "gaps_over_max_gap": n["coinbase gaps over max gap"],
+                                 "gap_ms_max": round(snap["coinbase_gap_max"], 1),
+                                 **({"sockets": self.s.coinbase_conns, "sockets_up": snap["cb_up"],
+                                     "already_heard": n["coinbase already heard"],
+                                     "first_by_socket": [n[f"coinbase first on conn {j + 1}"]
                                                          for j in range(self.s.coinbase_conns)],
-                                     "copy_behind_ms": BinanceFreshness._q(self.cb_behind)}
+                                     "copy_behind_ms": quantiles(snap["cb_behind"])}
                                     if self.s.coinbase_conns > 1 else {})}}
                    if self.s.primary_feed == "coinbase" else {}),
-                **({"binance_fut": {**self.bf_fresh.summary(), "ticks": self.n["binance_fut ticks"],
-                                    "malformed": self.n["binance_fut malformed"],
-                                    "reconnects": self.n["binance_fut reconnects"]}}
+                **({"binance_fut": {**self.bf_fresh.summary(snap["binance_fut"]), "ticks": n["binance_fut ticks"],
+                                    "malformed": n["binance_fut malformed"],
+                                    "reconnects": n["binance_fut reconnects"]}}
                    if "binance_fut" in self.s.extra_feeds else {}),
-                **({"carry": self.carry_view()} if self.s.order_type == "FAK" else {}),
-                **({"fair": {"vol_bp": (round(v * 1e4, 3) if (v := self.vol_model.vol()) is not None else None),
-                             "samples": len(self.vol_model._incs),
-                             "bankroll": self._bankroll if self.live is None else self._read_bankroll(),
-                             "last": self.last_fair}}
-                   if self.s.fair else {}),
-                "errors": self.n["errors"], "shadow_errors": self.n["shadow errors"],
-                "latency_ms": round(self.latency_plan()[0], 1),       # paper's MODELLED flight, not a measurement
-                "exec_latency": self.latency.summary(), "exec_quality": self.quality.summary(),
-                "clob_rtt_ms": round(sorted(self.net_rtt)[len(self.net_rtt) // 2], 1) if self.net_rtt else None,
-                "loop_lag_ms": self._lag_summary(),
+                **({"carry": snap["carry"]} if self.s.order_type == "FAK" else {}),
+                **({"fair": snap["fair"]} if self.s.fair else {}),
+                "errors": n["errors"], "shadow_errors": n["shadow errors"],
+                "latency_ms": snap["latency_ms"],       # paper's MODELLED flight, not a measurement
+                "exec_latency": self.latency.summary_from(snap["exec_latency"]), "exec_quality": snap["exec_quality"],
+                "clob_rtt_ms": snap["clob_rtt_ms"],
+                "loop_lag_ms": self._lag_summary(snap["loop_lag"]),
                 # (the trigger socket's reconnects: Binance's only when it is the trigger)
-                "binance": {**self.fresh.summary(),
-                            "reconnects": self.n["reconnects"] if self.s.primary_feed == "binance" else 0,
-                            "parse_errors": self.n["binance parse errors"]},
-                "book_feed_age_ms": (self.hub.book.feed_age_summary()
-                                     if hasattr(getattr(self.hub, "book", None), "feed_age_summary") else None),
-                **({"pending": self.n["pending"], "live": self.live.status()} if self.live is not None else {})}
+                "binance": {**self.fresh.summary(snap["binance"]),
+                            "reconnects": n["reconnects"] if self.s.primary_feed == "binance" else 0,
+                            "parse_errors": n["binance parse errors"]},
+                "book_feed_age_ms": (book_age if not isinstance(book_age, list) else
+                                     ({k: v for k, v in quantiles(book_age).items() if k != "p95"}
+                                      if book_age else None)),
+                **({"pending": n["pending"], "live": snap["live"]} if self.live is not None else {})}
 
-    def _lag_summary(self):
-        xs = sorted(self.loop_lag)
-        if not xs:
+    def _lag_summary(self, xs=None):
+        q = quantiles(list(self.loop_lag) if xs is None else xs, digits=2)
+        if q is None:
             return None
-        q = lambda p: round(xs[min(len(xs) - 1, int(len(xs) * p / 100))], 2)
-        return {"p50": q(50), "p90": q(90), "p99": q(99), "max": round(xs[-1], 2), "n": len(xs)}
+        return {k: v for k, v in q.items() if k != "p95"}
+
+    async def report(self, describe) -> None:
+        """The 5-minute status: event line + journal summary row, with the
+        sorting on a worker (it used to stall the tick loop ~8ms each time)."""
+        try:
+            s = await asyncio.get_running_loop().run_in_executor(None, self.summary_from, self.summary_snapshot())
+        except Exception as exc:  # noqa: BLE001 - a status row must never stop the feed
+            self.on_event("sniper", f"status summary failed: {type(exc).__name__}: {exc}", "warn")
+            return
+        self.on_event("sniper", describe(s), "info")
+        self._write({"wall": time.time(), "result": "summary", **s})
 
     async def _loop_lag_probe(self) -> None:
         """How late a 100ms timer wakes, every 100ms, for the last ~5 minutes.
@@ -3422,15 +3601,16 @@ class Sniper:
                         self.on_tick(raw.decode() if isinstance(raw, bytes) else raw)
                         if time.monotonic() >= report_at:
                             report_at = time.monotonic() + 300
-                            s = self.summary()
-                            b = s.get("binance") or {}
-                            ex = b.get("excess_ms") or {}
-                            self.on_event("sniper", f"orders {s['orders']} filled {s['filled']} "
-                                                    f"refused {s['refused']} markout 5s {s['markout_5s_c']}c; "
-                                                    f"binance {b.get('status')} excess p50/p99 "
-                                                    f"{ex.get('p50')}/{ex.get('p99')}ms "
-                                                    f"backlog max {b.get('backlog_max')}", "info")
-                            self._write({"wall": time.time(), "result": "summary", **s})
+
+                            def describe(s):
+                                b = s.get("binance") or {}
+                                ex = b.get("excess_ms") or {}
+                                return (f"orders {s['orders']} filled {s['filled']} "
+                                        f"refused {s['refused']} markout 5s {s['markout_5s_c']}c; "
+                                        f"binance {b.get('status')} excess p50/p99 "
+                                        f"{ex.get('p50')}/{ex.get('p99')}ms "
+                                        f"backlog max {b.get('backlog_max')}")
+                            self._spawn(self.report(describe))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - reconnect; the bot keeps running
@@ -3535,17 +3715,17 @@ class Sniper:
                                                     f"(heartbeats only): subscription lost")
                         if now >= self._cb_report_at:
                             self._cb_report_at = now + 300
-                            s = self.summary()
-                            c = s.get("coinbase") or {}
-                            ex = c.get("excess_ms") or {}
-                            self.on_event("sniper", f"orders {s['orders']} filled {s['filled']} "
-                                                    f"refused {s['refused']} markout 5s {s['markout_5s_c']}c; "
-                                                    f"coinbase {c.get('status')} {c.get('ticks')} tickers, excess "
-                                                    f"p50/p99 {ex.get('p50')}/{ex.get('p99')}ms, longest gap "
-                                                    f"{c.get('gap_ms_max')}ms"
-                                                    + (f", sockets up {len(self._cb_up)}/{n}" if n > 1 else ""),
-                                          "info")
-                            self._write({"wall": time.time(), "result": "summary", **s})
+
+                            def describe(s, n=n):
+                                c = s.get("coinbase") or {}
+                                ex = c.get("excess_ms") or {}
+                                return (f"orders {s['orders']} filled {s['filled']} "
+                                        f"refused {s['refused']} markout 5s {s['markout_5s_c']}c; "
+                                        f"coinbase {c.get('status')} {c.get('ticks')} tickers, excess "
+                                        f"p50/p99 {ex.get('p50')}/{ex.get('p99')}ms, longest gap "
+                                        f"{c.get('gap_ms_max')}ms"
+                                        + (f", sockets up {c.get('sockets_up')}/{n}" if n > 1 else ""))
+                            self._spawn(self.report(describe))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - reconnect; the bot keeps running
@@ -3617,15 +3797,16 @@ class Sniper:
                                                   f"(heartbeats only): subscription lost")
                         if time.monotonic() >= report_at:
                             report_at = time.monotonic() + 300
-                            s = self.summary()
-                            k = s.get("kraken") or {}
-                            lag = k.get("lag_ms") or {}
-                            self.on_event("sniper", f"orders {s['orders']} filled {s['filled']} "
-                                                    f"refused {s['refused']} markout 5s {s['markout_5s_c']}c; "
-                                                    f"kraken {k.get('ticks')} updates, lag p50/p99 "
-                                                    f"{lag.get('p50')}/{lag.get('p99')}ms, longest gap "
-                                                    f"{k.get('gap_ms_max')}ms", "info")
-                            self._write({"wall": time.time(), "result": "summary", **s})
+
+                            def describe(s):
+                                k = s.get("kraken") or {}
+                                lag = k.get("lag_ms") or {}
+                                return (f"orders {s['orders']} filled {s['filled']} "
+                                        f"refused {s['refused']} markout 5s {s['markout_5s_c']}c; "
+                                        f"kraken {k.get('ticks')} updates, lag p50/p99 "
+                                        f"{lag.get('p50')}/{lag.get('p99')}ms, longest gap "
+                                        f"{k.get('gap_ms_max')}ms")
+                            self._spawn(self.report(describe))
                         if time.monotonic() >= next_ping:
                             next_ping = time.monotonic() + KRAKEN_PING_S
                             await ws.send('{"method":"ping"}')

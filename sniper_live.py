@@ -455,18 +455,44 @@ class CanaryLimits:
 
 
 class CanarySession:
-    """Durable send intents and session budgets.
+    """Durable send intents and session budgets (write-ahead, append-only).
 
-    A signed order's intent and reservation are fsynced BEFORE its first
-    possible socket write. A crash with an unresolved intent halts the next
-    run; neither a restart nor a new budget silently retries that order.
+    A signed order's intent and reservation are on disk BEFORE its first
+    possible socket write: one appended, fsynced journal line - never a
+    rewrite of the whole state, so the cost per order does not grow with the
+    session's history. A crash with an unresolved intent halts the next run;
+    neither a restart nor a new budget silently retries that order.
     Definitive no-fill replies and complete ledger confirmations resolve
-    intents atomically. Periodic saves also retain halt reasons.
+    intents; halts are recorded too.
+
+    On disk (``path`` is the state file the operator knows):
+      path                      snapshot: counters, rounds, halts and the
+                                intents still open when it was taken
+                                (journal_seq says which records it includes)
+      path.journal.<k>          append-only segments, one JSON line per intent
+                                / outcome / resolution / counter change, each
+                                with a rising seq
+      path.archive.jsonl        finished intents moved out of the hot state at
+                                compaction - the audit trail, read only at start
+    open() = snapshot + every newer record from every segment, in seq order. A
+    torn final line (an append that never returned, so its order was never
+    written) is dropped; damage anywhere else fails closed. Compaction (save(),
+    on a worker) archives finished intents, starts a new segment, writes a new
+    snapshot and deletes the segments it includes; the order path never waits
+    for it beyond the instant the segment is switched.
+
+    Only the pre-send intent is written in the caller's step. Outcomes and
+    resolutions go to a writer thread (ordered by seq); a crash before one of
+    them reached the disk leaves its intent unresolved - the next start halts
+    and reconciles, as a crash before the reply always did.
     """
-    VERSION = 2
+    VERSION = 3
     UNRESOLVED = {"DISPATCHING", "ACCEPTED", "AMBIGUOUS"}
+    FINAL = {NO_MATCH, REJECTED, NOT_SENT, "CONFIRMED"}
     RECENT_S = 86_400.0
     TRANSIENT = ("shutting down",)          # halts that are not about the session's risk
+    COMPACT_RECORDS = 256                   # journal records between compactions
+    COMPACT_FINISHED = 128                  # finished intents held before they are archived
 
     def __init__(self, path, wallet_key: str) -> None:
         import threading
@@ -474,23 +500,111 @@ class CanarySession:
         self.wallet_key = str(wallet_key)
         self.session_id: str | None = None
         self.started_wall: float | None = None
-        self._last: tuple | None = None
         self.last_error: str | None = None
         self.restored: dict = {}
-        self.intents: dict = {}
-        self._save_lock = threading.RLock()
+        self.intents: dict = {}             # open intents + finished ones not archived yet
+        self._save_lock = threading.RLock()     # one compaction at a time
+        self._lock = threading.RLock()          # in-memory state and seq
+        self._journal_lock = threading.Lock()   # the active segment's fd
+        self._seq = 0                       # last record seq assigned
+        self._snap_seq = 0                  # last record the snapshot on disk includes
+        self._segment = 0                   # active segment number
+        self._since = 0                     # records since the last compaction
+        self._marker = None                 # counters + halts as last recorded
+        self._writer = None
+        self.gaps = 0                       # records missing on replay (a crash lost an async record)
+        self.migrated_from: int | None = None
 
+    # ------------------------------------------------------------ files
     @staticmethod
     def wallet_key_for(address: str) -> str:
         """A stable, non-reversible account id for the file (never the address)."""
         import hashlib
         return hashlib.sha256(str(address or "").strip().lower().encode()).hexdigest()[:16]
 
+    def _segment_path(self, k: int) -> Path:
+        return self.path.with_name(f"{self.path.name}.journal.{int(k)}")
+
+    @property
+    def archive_path(self) -> Path:
+        return self.path.with_name(f"{self.path.name}.archive.jsonl")
+
+    def _segments(self) -> list[int]:
+        prefix = f"{self.path.name}.journal."
+        out = []
+        for p in self.path.parent.glob(f"{self.path.name}.journal.*"):
+            tail = p.name[len(prefix):]
+            if tail.isdigit():
+                out.append(int(tail))
+        return sorted(out)
+
+    @staticmethod
+    def _fsync_dir(directory: Path) -> None:
+        if os.name == "nt":
+            return                          # Windows: the file flush is what exists
+        fd = os.open(str(directory), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _sync(fd: int) -> None:
+        (getattr(os, "fdatasync", None) or os.fsync)(fd)
+
+    def _create_segment(self, k: int) -> int:
+        """A segment whose directory entry is durable, open for appends (the
+        caller closes it). No file is held open between appends: Windows
+        cannot rename or delete an open file, and a restart, a new session or
+        compaction must be able to."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(self._segment_path(k)), os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0),
+                     0o600)
+        try:
+            self._fsync_dir(self.path.parent)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
+    # ------------------------------------------------------------ reading
+    @classmethod
+    def _validate_intent(cls, key, intent) -> None:
+        if (not isinstance(key, str) or not key or not isinstance(intent, dict)
+                or intent.get("status") not in cls.UNRESOLVED | cls.FINAL
+                or not isinstance(intent.get("condition"), str) or not intent["condition"]
+                or not isinstance(intent.get("token"), str) or not intent["token"]):
+            raise ValueError("malformed canary send intent")
+        for field_name in ("amount", "reserve", "wall", "end"):
+            value = intent.get(field_name)
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0):
+                raise ValueError("malformed canary intent reservation")
+        if intent["reserve"] < intent["amount"]:
+            raise ValueError("canary intent reserve below notional")
+        spent = intent.get("spent")
+        if spent is not None and (isinstance(spent, bool) or not isinstance(spent, (int, float))
+                                  or not math.isfinite(spent) or not 0 <= spent <= intent["amount"] + 1e-6):
+            raise ValueError("invalid resolved canary spend")
+
+    @staticmethod
+    def _validate_counters(c) -> dict:
+        if not isinstance(c, dict):
+            raise ValueError("malformed canary counters")
+        for k in ("orders", "fills", "pending_fills", "exposure_usd"):
+            v = c.get(k)
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
+                raise ValueError("malformed canary counters")
+            if k != "exposure_usd" and v != int(v):
+                raise ValueError("malformed canary counters")
+        return c
+
     def _read(self) -> dict | None:
+        """The snapshot on disk (version 1, 2 or 3), validated; None if there is none."""
         if not self.path.exists():
             return None
         data = json.loads(self.path.read_text(encoding="utf-8"), parse_constant=lambda c: float("nan"))
-        ok = (isinstance(data, dict) and data.get("version") in (1, self.VERSION)
+        ok = (isinstance(data, dict) and data.get("version") in (1, 2, self.VERSION)
               and isinstance(data.get("session_id"), str) and data["session_id"]
               and isinstance(data.get("wallet"), str)
               and isinstance(data.get("rounds"), list) and isinstance(data.get("kill_reasons"), list))
@@ -505,44 +619,133 @@ class CanarySession:
             raise ValueError("malformed canary session state")
         pending = data.get("pending_fills", 0)
         intents = data.get("intents", {})
-        if data["version"] == self.VERSION and ("pending_fills" not in data or "intents" not in data):
+        if data["version"] >= 2 and ("pending_fills" not in data or "intents" not in data):
             raise ValueError("missing durable canary reservations")
         if (isinstance(pending, bool) or not isinstance(pending, int) or pending < 0
                 or not isinstance(intents, dict)):
             raise ValueError("malformed canary send reservations")
         for key, intent in intents.items():
-            if (not isinstance(key, str) or not key or not isinstance(intent, dict)
-                    or intent.get("status") not in self.UNRESOLVED | {NO_MATCH, REJECTED, NOT_SENT, "CONFIRMED"}
-                    or not isinstance(intent.get("condition"), str) or not intent["condition"]
-                    or not isinstance(intent.get("token"), str) or not intent["token"]):
-                raise ValueError("malformed canary send intent")
-            for field_name in ("amount", "reserve", "wall", "end"):
-                value = intent.get(field_name)
-                if (isinstance(value, bool) or not isinstance(value, (int, float))
-                        or not math.isfinite(value) or value < 0):
-                    raise ValueError("malformed canary intent reservation")
-            if intent["reserve"] < intent["amount"]:
-                raise ValueError("canary intent reserve below notional")
-            spent = intent.get("spent")
-            if spent is not None and (isinstance(spent, bool) or not isinstance(spent, (int, float))
-                                      or not math.isfinite(spent) or not 0 <= spent <= intent["amount"] + 1e-6):
-                raise ValueError("invalid resolved canary spend")
+            self._validate_intent(key, intent)
+        if data["version"] == self.VERSION:
+            for k in ("journal_seq", "segment"):
+                v = data.get(k)
+                if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                    raise ValueError("malformed canary journal position")
         return data
 
+    def _records(self, after_seq: int) -> list[dict]:
+        """Every journal record newer than after_seq, from every segment, in
+        seq order. A torn final line of the last segment is dropped; any other
+        damaged line fails closed."""
+        segments = self._segments()
+        out = []
+        for i, k in enumerate(segments):
+            raw = self._segment_path(k).read_bytes()
+            lines = raw.split(b"\n")
+            torn = lines.pop()
+            if torn.strip() and i != len(segments) - 1:
+                raise ValueError(f"canary journal segment {k} ends with an incomplete record")
+            # (a torn final line of the last segment: an append that never
+            # completed, so it was never acknowledged and its order never left)
+            for line in lines:
+                if not line.strip():
+                    raise ValueError(f"blank line inside canary journal segment {k}")
+                rec = json.loads(line.decode("utf-8"), parse_constant=lambda c: float("nan"))
+                if (not isinstance(rec, dict) or isinstance(rec.get("seq"), bool)
+                        or not isinstance(rec.get("seq"), int) or rec["seq"] <= 0
+                        or rec.get("op") not in ("intent", "outcome", "resolve", "state")):
+                    raise ValueError(f"malformed canary journal record in segment {k}")
+                if rec["seq"] > after_seq:
+                    out.append(rec)
+        out.sort(key=lambda r: r["seq"])
+        return out
+
+    def _apply(self, data: dict, rec: dict) -> None:
+        """One journal record onto a snapshot-shaped dict (open() and durable_view())."""
+        op, intents = rec["op"], data.setdefault("intents", {})
+        if "c" in rec:
+            c = self._validate_counters(rec["c"])
+            data.update(orders=int(c["orders"]), fills=int(c["fills"]), pending_fills=int(c["pending_fills"]),
+                        exposure_usd=float(c["exposure_usd"]))
+        if op == "intent":
+            self._validate_intent(rec.get("key"), rec.get("intent"))
+            intents[rec["key"]] = dict(rec["intent"])
+            if isinstance(rec.get("round"), str) and rec["round"] not in data["rounds"]:
+                data["rounds"].append(rec["round"])
+        elif op in ("outcome", "resolve"):
+            intent = intents.get(rec.get("key"))
+            if intent is not None:          # (else archived by a later compaction: nothing to update)
+                for k in ("status", "kind", "order_id", "spent"):
+                    if k in rec:
+                        intent[k] = rec[k]
+                self._validate_intent(rec["key"], intent)
+        elif op == "state":
+            reasons = rec.get("kill_reasons")
+            if not isinstance(reasons, list):
+                raise ValueError("malformed canary halt record")
+            data["kill_reasons"] = [str(r) for r in reasons]
+        data["journal_seq"] = rec["seq"]
+
+    def _load_durable(self) -> dict | None:
+        """Snapshot + journal as one state dict (the version it was read as is kept)."""
+        data = self._read()
+        if data is None:
+            if self._segments():
+                raise ValueError("canary journal exists without its snapshot")
+            return None
+        data.setdefault("journal_seq", 0)
+        data.setdefault("segment", 0)
+        if data["version"] == self.VERSION:
+            expected = None
+            for rec in self._records(int(data["journal_seq"])):
+                if expected is not None and rec["seq"] != expected:
+                    self.gaps += rec["seq"] - expected
+                self._apply(data, rec)
+                expected = rec["seq"] + 1
+        return data
+
+    @classmethod
+    def durable_view(cls, path) -> dict | None:
+        """What a restart would read - snapshot + journal - without opening a
+        session (tools, tests). Archived intents are not included."""
+        return cls(path, "")._load_durable()
+
+    def _archived(self, since_wall: float) -> dict:
+        """Finished intents from the archive file (for the ledger proof at start)."""
+        out = {}
+        p = self.archive_path
+        if not p.exists():
+            return out
+        lines = p.read_bytes().split(b"\n")
+        lines.pop()                         # a torn last line: an archive append that never completed
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line.decode("utf-8"))
+            except ValueError:
+                raise ValueError("damaged canary archive line") from None
+            if not isinstance(rec, dict) or not isinstance(rec.get("intent"), dict):
+                raise ValueError("damaged canary archive line")
+            if float(rec["intent"].get("wall") or 0) >= since_wall - self.RECENT_S:
+                out[str(rec.get("key"))] = rec["intent"]
+        return out
+
+    # ------------------------------------------------------------ open
     @staticmethod
     def _ledger_view(ledger, since_wall: float, intents: dict | None = None) -> dict:
         """What the live ledger's durable authorizations prove since since_wall."""
         orders, spend, rounds, filled = 0, 0.0, set(), set()
         by_order = {intent.get("order_id"): intent for intent in (intents or {}).values() if intent.get("order_id")}
         with ledger._lock:
+            ids = set()
             for oid, meta in ledger.authorized_orders.items():
                 if not isinstance(meta, dict) or float(meta.get("window_end") or 0) < since_wall:
                     continue
                 orders += 1
+                ids.add(oid)
                 if meta.get("condition_id"):
                     rounds.add(str(meta["condition_id"]))
-            ids = {oid for oid, meta in ledger.authorized_orders.items()
-                   if isinstance(meta, dict) and float(meta.get("window_end") or 0) >= since_wall}
             for pos in ledger.positions.values():
                 for lot in pos.lots:
                     if lot.order_id in ids:
@@ -565,10 +768,11 @@ class CanarySession:
              now: float | None = None) -> str:
         """Restore this wallet's session (or start one). Raises RuntimeError:
         the caller must not trade then. Returns a one-line description."""
+        import shutil
         import uuid
         now = time.time() if now is None else float(now)
         try:
-            data = self._read()
+            data = self._load_durable()
         except Exception as exc:  # noqa: BLE001 - any unreadable state fails closed
             raise RuntimeError(f"canary session state {self.path} is unreadable ({type(exc).__name__}): "
                                f"restore it, or start a NEW budget deliberately with --new-canary-session") from None
@@ -581,8 +785,18 @@ class CanarySession:
             if new_session and any(i["status"] in self.UNRESOLVED for i in data.get("intents", {}).values()):
                 raise RuntimeError("unresolved live send intent: reconcile the venue before starting a new canary budget")
         if new_session and data is not None:
-            self.path.replace(self.path.with_name(f"{self.path.name}.{int(now)}.bak"))
+            # The old session, consolidated (snapshot + journal), stays beside the new one.
+            stamp = int(now)
+            self.path.with_name(f"{self.path.name}.{stamp}.bak").write_text(
+                json.dumps({**data, "version": max(int(data["version"]), 2)}, sort_keys=True), encoding="utf-8")
+            self.path.unlink()
+            for k in self._segments():
+                self._segment_path(k).replace(self.path.with_name(f"{self.path.name}.journal.{k}.{stamp}.bak"))
             data = None
+        if data is not None and data["version"] < self.VERSION:
+            # Format upgrade: the file as it was stays beside the new one.
+            self.migrated_from = int(data["version"])
+            shutil.copy2(self.path, self.path.with_name(f"{self.path.name}.v{data['version']}.bak"))
         if data is None:
             recent = self._ledger_view(ledger, now - self.RECENT_S)
             if recent["orders"] and not new_session:
@@ -591,13 +805,19 @@ class CanarySession:
                                    f"budget silently - pass --new-canary-session to start one deliberately")
             data = {"version": self.VERSION, "session_id": uuid.uuid4().hex, "wallet": self.wallet_key,
                     "started_wall": now, "orders": 0, "fills": 0, "exposure_usd": 0.0, "rounds": [],
-                    "kill_reasons": []}
+                    "kill_reasons": [], "pending_fills": 0, "intents": {}, "journal_seq": 0, "segment": 0}
             how = "new canary session"
         else:
             how = "canary session restored"
         self.session_id, self.started_wall = data["session_id"], float(data["started_wall"])
         self.intents = copy.deepcopy(data.get("intents", {}))
-        proof = self._ledger_view(ledger, self.started_wall, self.intents)
+        self._seq = self._snap_seq = int(data.get("journal_seq", 0))
+        self._segment = max([int(data.get("segment", 0))] + self._segments())
+        try:
+            archived = self._archived(self.started_wall)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"canary archive {self.archive_path} is unreadable ({type(exc).__name__})") from None
+        proof = self._ledger_view(ledger, self.started_wall, {**archived, **self.intents})
         limits.orders = max(int(data["orders"]), proof["orders"])
         limits.fills = max(int(data["fills"]), proof["fills"])
         accepted_ids = {i.get("order_id") for i in self.intents.values() if i.get("kind") in (MATCHED, PENDING)}
@@ -616,26 +836,56 @@ class CanarySession:
                       f"{len(proof['unconfirmed'])} unconfirmed authorizations): reconcile before trading")
         self.restored = {"orders": limits.orders, "fills": limits.fills, "spend": round(limits.exposure_usd, 4),
                          "rounds": len(limits.rounds), "halts": list(kill.reasons)}
-        self._last = None
+        self._marker = None
         if not self.save(limits, kill):
             raise RuntimeError(f"canary session state {self.path} cannot be written ({self.last_error}): "
                                f"refusing to trade without a durable budget")
+        self._start_writer(kill)
         return (f"{how} {self.session_id[:8]} (since {time.strftime('%m-%d %H:%M', time.localtime(self.started_wall))}): "
                 f"{limits.orders} orders, {limits.fills} fills, ${limits.exposure_usd:.2f} spent, "
-                f"{len(limits.rounds)} rounds" + (f"; HALTED: {'; '.join(kill.reasons)}" if kill.reasons else ""))
+                f"{len(limits.rounds)} rounds" + (f"; HALTED: {'; '.join(kill.reasons)}" if kill.reasons else "")
+                + (f"; state file upgraded from format {self.migrated_from}" if self.migrated_from else ""))
+
+    # ------------------------------------------------------------ state
+    @staticmethod
+    def _counters(limits: "CanaryLimits") -> dict:
+        with limits._lock:
+            return {"orders": int(limits.orders), "fills": int(limits.fills),
+                    "pending_fills": int(limits.pending_fills), "exposure_usd": float(limits.exposure_usd)}
 
     def state(self, limits: "CanaryLimits", kill: KillSwitch) -> dict:
+        """The snapshot as it would be written now: counters, rounds, halts and
+        every intent still in the hot state - the open ones, and finished ones
+        a compaction has not archived yet (one that finished while a compaction
+        ran is in neither its archive batch nor, were it left out here, any
+        file at all once the older segments are deleted)."""
         with limits._lock:
-            return {"version": self.VERSION, "session_id": self.session_id, "wallet": self.wallet_key,
-                    "started_wall": self.started_wall, "orders": int(limits.orders), "fills": int(limits.fills),
-                    "exposure_usd": float(limits.exposure_usd), "rounds": sorted(map(str, limits.rounds)),
-                    "pending_fills": int(limits.pending_fills), "intents": copy.deepcopy(self.intents),
-                    "kill_reasons": [r for r in kill.reasons if not str(r).startswith(self.TRANSIENT)]}
+            counters = self._counters(limits)
+            rounds = sorted(map(str, limits.rounds))
+        with self._lock:
+            intents = {k: dict(v) for k, v in self.intents.items()}
+            seq = self._seq
+        return {"version": self.VERSION, "session_id": self.session_id, "wallet": self.wallet_key,
+                "started_wall": self.started_wall, **counters, "rounds": rounds, "intents": intents,
+                "kill_reasons": [r for r in kill.reasons if not str(r).startswith(self.TRANSIENT)],
+                "journal_seq": seq, "segment": self._segment}
 
+    def _next(self) -> int:
+        self._seq += 1
+        self._since += 1
+        return self._seq
+
+    @staticmethod
+    def _line(rec: dict) -> bytes:
+        return (json.dumps(rec, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+
+    # ------------------------------------------------------------ the order path
     def before_send(self, p: "Prepared", limits: "CanaryLimits", kill: KillSwitch) -> None:
-        """Persist risk and signed identity before the transport may write."""
+        """Persist risk and signed identity before the transport may write: one
+        fsynced journal line. Raises Halted (nothing may be written) when it
+        cannot be made durable."""
         import hashlib
-        with self._save_lock:
+        with self._lock:
             key = p.client_order_id
             if key in self.intents:
                 kill.trip("duplicate durable live send intent")
@@ -643,78 +893,205 @@ class CanarySession:
             payload = json.loads(p.body)
             limits.record_send(p.amount, p.condition)
             p.stamps["budget_recorded"] = True
-            self.intents[key] = {"status": "DISPATCHING", "wall": time.time(), "end": p.end,
-                                 "condition": p.condition, "token": p.token, "side": p.side,
-                                 "amount": p.amount, "reserve": float(getattr(p, "reserve", p.amount)),
-                                 "order_type": p.order_type, "price": p.price,
-                                 "body_sha256": hashlib.sha256(p.body.encode()).hexdigest(),
-                                 "signed_order": payload.get("order"), "order_id": None}
-            if not self._save_unlocked(limits, kill):
-                kill.trip(f"live send intent cannot be persisted ({self.last_error})")
-                raise Halted("live send intent cannot be persisted; order not sent")
+            intent = {"status": "DISPATCHING", "wall": time.time(), "end": p.end,
+                      "condition": p.condition, "token": p.token, "side": p.side,
+                      "amount": p.amount, "reserve": float(getattr(p, "reserve", p.amount)),
+                      "order_type": p.order_type, "price": p.price,
+                      "body_sha256": hashlib.sha256(p.body.encode()).hexdigest(),
+                      "signed_order": payload.get("order"), "order_id": None}
+            order_hash = getattr(p, "order_hash", None)
+            if order_hash:
+                intent["order_hash"] = str(order_hash)
+            self.intents[key] = intent
+            line = self._line({"seq": self._next(), "op": "intent", "key": key, "intent": intent,
+                               "round": p.condition, "c": self._counters(limits)})
+        if not self._durable_append(line):
+            kill.trip(f"live send intent cannot be persisted ({self.last_error})")
+            raise Halted("live send intent cannot be persisted; order not sent")
+
+    def _durable_append(self, line: bytes) -> bool:
+        """Append one record to the active segment and flush it to the disk.
+        True only when it is durable."""
+        try:
+            with self._journal_lock:
+                try:
+                    fd = os.open(str(self._segment_path(self._segment)),
+                                 os.O_WRONLY | os.O_APPEND | getattr(os, "O_BINARY", 0))
+                except FileNotFoundError:
+                    fd = self._create_segment(self._segment)     # its directory entry made durable first
+                try:
+                    view = memoryview(line)
+                    while view:
+                        n = os.write(fd, view)
+                        view = view[n:]
+                    self._sync(fd)
+                finally:
+                    os.close(fd)
+            self.last_error = None
+            return True
+        except Exception as exc:  # noqa: BLE001 - reported; the caller halts
+            self.last_error = f"{type(exc).__name__}: {exc}"[:200]
+            return False
+
+    # ------------------------------------------------------------ after the send (never the order path)
+    def _start_writer(self, kill: KillSwitch) -> None:
+        import queue
+        import threading
+        if self._writer is not None:
+            return
+        q: "queue.Queue" = queue.Queue()
+
+        def loop():
+            while True:
+                item = q.get()
+                try:
+                    if item is None:
+                        return
+                    line, why = item
+                    if not self._durable_append(line):
+                        kill.trip(f"{why} cannot be persisted ({self.last_error})")
+                finally:
+                    q.task_done()
+        t = threading.Thread(target=loop, name="canary-journal", daemon=True)
+        t.start()
+        self._writer = (q, t)
+
+    def _submit(self, line: bytes, why: str, kill: KillSwitch) -> None:
+        if self._writer is None:
+            if not self._durable_append(line):
+                kill.trip(f"{why} cannot be persisted ({self.last_error})")
+            return
+        self._writer[0].put((line, why))
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        """Wait until every queued record is on disk (tests, shutdown)."""
+        if self._writer is None:
+            return True
+        q = self._writer[0]
+        deadline = time.monotonic() + timeout
+        while q.unfinished_tasks and time.monotonic() < deadline:
+            time.sleep(0.001)
+        return not q.unfinished_tasks
+
+    def close(self) -> None:
+        """Drain the writer and stop it."""
+        self.flush()
+        if self._writer is not None:
+            self._writer[0].put(None)
+            self._writer[1].join(timeout=5)
+            self._writer = None
 
     def outcome(self, p: "Prepared", row: dict, limits: "CanaryLimits", kill: KillSwitch) -> None:
-        with self._save_lock:
+        with self._lock:
             intent = self.intents.get(p.client_order_id)
             if intent is None:
                 return
             kind = row["kind"]
-            intent.update(status="ACCEPTED" if kind in (MATCHED, PENDING) else kind,
-                          kind=kind, order_id=row.get("order_id"))
-            if not self._save_unlocked(limits, kill):
-                kill.trip(f"live send outcome cannot be persisted ({self.last_error})")
+            status = "ACCEPTED" if kind in (MATCHED, PENDING) else kind
+            intent.update(status=status, kind=kind, order_id=row.get("order_id"))
+            line = self._line({"seq": self._next(), "op": "outcome", "key": p.client_order_id, "status": status,
+                               "kind": kind, "order_id": row.get("order_id"), "c": self._counters(limits)})
+        self._submit(line, "live send outcome", kill)
 
     def resolve(self, client_order_id: str | None, status: str, limits: "CanaryLimits", kill: KillSwitch,
                 *, spent: float | None = None) -> None:
-        with self._save_lock:
+        with self._lock:
             intent = self.intents.get(client_order_id)
             if intent is None:
                 return
             intent["status"] = status
+            rec = {"seq": self._next(), "op": "resolve", "key": client_order_id, "status": status,
+                   "c": self._counters(limits)}
             if spent is not None:
                 intent["spent"] = float(spent)
-            if not self._save_unlocked(limits, kill):
-                kill.trip(f"live send reconciliation cannot be persisted ({self.last_error})")
+                rec["spent"] = float(spent)
+            line = self._line(rec)
+        self._submit(line, "live send reconciliation", kill)
 
+    def persist(self, limits: "CanaryLimits", kill: KillSwitch) -> bool:
+        """Periodic (a worker): record counter or halt changes not tied to an
+        intent - one small line, only when something changed - and compact
+        once the journal has grown. True when the disk holds the current state."""
+        counters = self._counters(limits)
+        reasons = [r for r in kill.reasons if not str(r).startswith(self.TRANSIENT)]
+        marker = (tuple(sorted(counters.items())), tuple(reasons), len(limits.rounds))
+        ok = True
+        if marker != self._marker:
+            with self._lock:
+                line = self._line({"seq": self._next(), "op": "state", "kill_reasons": reasons, "c": counters})
+            ok = self._durable_append(line)
+            if ok:
+                self._marker = marker
+        with self._lock:
+            finished = sum(1 for v in self.intents.values() if v.get("status") in self.FINAL)
+            due = self._since >= self.COMPACT_RECORDS or finished >= self.COMPACT_FINISHED
+        if due:
+            ok = self.save(limits, kill) and ok
+        return ok
+
+    # ------------------------------------------------------------ compaction
     def save(self, limits: "CanaryLimits", kill: KillSwitch) -> bool:
-        """Atomic write when something changed (worker thread). True when the
-        file holds the current state."""
-        # Cancelling a periodic to_thread waiter does not stop its write. The
-        # final shutdown save must follow it, including taking the newer state,
-        # so an older in-flight snapshot cannot overwrite final risk counters.
+        """Compaction - a durable checkpoint (open, shutdown, a grown journal;
+        a worker thread): archive finished intents, switch to a new segment,
+        write the snapshot, delete the segments it includes. True when the file
+        holds the current state."""
         with self._save_lock:
             return self._save_unlocked(limits, kill)
 
     def _save_unlocked(self, limits: "CanaryLimits", kill: KillSwitch) -> bool:
-        state = self.state(limits, kill)
-        key = json.dumps(state, sort_keys=True)
-        if key == self._last:
-            return True
         import tempfile
+        from durable_io import replace_atomic
         tmp = None
+        new_fd = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self._lock:
+                finished = {k: dict(v) for k, v in self.intents.items() if v.get("status") in self.FINAL}
+            if finished:
+                # The audit trail first: once archived, a finished intent may leave the hot state.
+                with open(self.archive_path, "ab") as fh:
+                    created = fh.tell() == 0
+                    for k, v in finished.items():
+                        fh.write(self._line({"key": k, "session_id": self.session_id, "intent": v}))
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                if created:
+                    self._fsync_dir(self.path.parent)
+            new_fd = self._create_segment(self._segment + 1)
+            os.close(new_fd)
+            new_fd = None
+            with self._journal_lock, self._lock:
+                # Every record up to this seq is in the old segments; every later one goes to the new.
+                state = self.state(limits, kill)
+                state["segment"] = self._segment + 1
+                self._segment += 1
+                for k, v in finished.items():
+                    if self.intents.get(k, {}).get("status") == v.get("status"):
+                        del self.intents[k]
+                self._since = 0
             fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), suffix=".tmp")
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(json.dumps({**state, "updated_wall": time.time()}, sort_keys=True))
                 fh.flush()
                 os.fsync(fh.fileno())
-            from durable_io import replace_atomic
             replace_atomic(tmp, self.path)
             tmp = None
-            if os.name != "nt":
-                # The file flush alone cannot make its new directory entry
-                # survive a host failure. Any POSIX directory-flush failure
-                # must prevent the subsequent order write.
-                directory = os.open(str(self.path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-                try:
-                    os.fsync(directory)
-                finally:
-                    os.close(directory)
-            self._last, self.last_error = key, None
+            self._fsync_dir(self.path.parent)
+            self._snap_seq = state["journal_seq"]
+            for k in self._segments():
+                if k < state["segment"]:
+                    try:
+                        self._segment_path(k).unlink()
+                    except OSError:
+                        pass                # replayed again at the next start: harmless, older than the snapshot
+            self._marker = (tuple(sorted(self._counters(limits).items())), tuple(state["kill_reasons"]),
+                            len(limits.rounds))
+            self.last_error = None
             return True
         except Exception as exc:  # noqa: BLE001 - reported; the caller halts on repeated failure
             self.last_error = f"{type(exc).__name__}: {exc}"[:200]
+            if new_fd is not None:
+                os.close(new_fd)
             if tmp is not None:
                 try:
                     os.unlink(tmp)
@@ -1345,11 +1722,12 @@ class LiveExecution:
 
     async def _session_loop(self) -> None:
         """Persist the canary's counters and halts within persist_every_s of a
-        change, on a worker. Three failed writes in a row halt new orders: a
-        budget that cannot be made durable is not a budget."""
+        change, on a worker - one small journal line when something changed,
+        a compaction when the journal has grown. Three failed writes in a row
+        halt new orders: a budget that cannot be made durable is not a budget."""
         while True:
             await asyncio.sleep(self.persist_every_s)
-            ok = await asyncio.to_thread(self.session.save, self.sender.limits, self.kill)
+            ok = await asyncio.to_thread(self.session.persist, self.sender.limits, self.kill)
             self._persist_failures = 0 if ok else self._persist_failures + 1
             if self._persist_failures >= 3:
                 self._trip(f"canary session state cannot be written ({self.session.last_error})")
@@ -1360,7 +1738,9 @@ class LiveExecution:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks = []
         if self.session is not None:
+            await asyncio.to_thread(self.session.flush)
             await asyncio.to_thread(self.session.save, self.sender.limits, self.kill)
+            await asyncio.to_thread(self.session.close)
         try:
             await self.sender.http.aclose()
         except Exception:  # noqa: BLE001 - shutting down
@@ -1531,16 +1911,29 @@ class LiveExecution:
         authorization is booked on the next pass and drops out of this set."""
         led = self.ledger
         with led._lock:
-            return ((set(getattr(led, "reported_unauthorized", ())) | set(getattr(led, "reported_mismatch", ())))
-                    - set(led.seen))
+            seen = led.seen
+            return {t for group in (getattr(led, "reported_unauthorized", ()), getattr(led, "reported_mismatch", ()))
+                    for t in group if t not in seen}
 
-    def _confirmed_orders(self) -> set:
-        led = self.ledger
-        with led._lock:
-            return {lot.order_id for pos in led.positions.values() for lot in getattr(pos, "lots", ())
-                    if getattr(lot, "order_id", None)}
+    def _order_booked(self, oid, token) -> bool:
+        """Any fill of this order booked in the ledger (on its own token)."""
+        has = getattr(self.ledger, "order_has_lots", None)
+        if callable(has):
+            return has(oid, token)
+        with self.ledger._lock:
+            return any(lot.order_id == oid for pos in self.ledger.positions.values() for lot in pos.lots)
+
+    def _trades_booked(self, trade_ids) -> bool:
+        booked = getattr(self.ledger, "trades_booked", None)
+        if callable(booked):
+            return booked(trade_ids)
+        with self.ledger._lock:
+            return all(t in self.ledger.seen for t in trade_ids)
 
     def _session_realized(self) -> float:
+        since = getattr(self.ledger, "realized_since", None)
+        if callable(since):
+            return since(self.session_start)
         led = self.ledger
         with led._lock:
             return sum(float(getattr(p, "realized", 0) or 0) for p in led.positions.values()
@@ -1555,18 +1948,25 @@ class LiveExecution:
         """
         with self._risk_lock:
             reservations = [dict(a) for a in self._risk_orders.values()]
-        with self.ledger._lock:
-            positions = list(self.ledger.positions.values())
-            realized = sum(float(getattr(p, "realized", 0) or 0) for p in positions
-                           if getattr(p, "settled", False)
-                           and float(getattr(p, "settled_wall", 0) or 0) >= self.session_start)
-            open_basis = sum(float(p.cost) for p in positions if not p.settled and p.shares > 0)
-            booked = collections.defaultdict(float)
-            for pos in positions:
-                for lot in pos.lots:
-                    if not getattr(lot, "order_id", None) or str(lot.side).upper() != "BUY":
-                        continue
-                    booked[lot.order_id] += float(lot.cost)
+        view = getattr(self.ledger, "risk_view", None)
+        if callable(view):
+            # O(open positions + this session's settlements + the reserved
+            # orders' lots) under the ledger lock - never its whole history.
+            realized, open_basis, booked = view(self.session_start,
+                                                [(a.get("order_id"), a.get("token")) for a in reservations])
+        else:
+            with self.ledger._lock:
+                positions = list(self.ledger.positions.values())
+                realized = sum(float(getattr(p, "realized", 0) or 0) for p in positions
+                               if getattr(p, "settled", False)
+                               and float(getattr(p, "settled_wall", 0) or 0) >= self.session_start)
+                open_basis = sum(float(p.cost) for p in positions if not p.settled and p.shares > 0)
+                booked = collections.defaultdict(float)
+                for pos in positions:
+                    for lot in pos.lots:
+                        if not getattr(lot, "order_id", None) or str(lot.side).upper() != "BUY":
+                            continue
+                        booked[lot.order_id] += float(lot.cost)
         # Settlement of a partially booked position is not proof that the
         # unresolved remainder never executed. Retain that remaining risk.
         uncertain = sum(max(0.0, a["reserve"] - booked.get(a.get("order_id"), 0.0)) for a in reservations)
@@ -1588,6 +1988,10 @@ class LiveExecution:
         if error:
             self._trip(f"durable fill execution evidence conflicts with the ledger: {error}")
             self.kill.check()
+        halt = getattr(self.ledger, "persistence_halt", None)
+        if halt:
+            self._trip(f"the live ledger could not make booked accounting durable: {halt}")
+            self.kill.check()
 
     def own_risk_shares(self, token: str, condition: str) -> float:
         """Booked plus uncertain own-side inventory; never hedge credit."""
@@ -1595,8 +1999,10 @@ class LiveExecution:
             reservations = [dict(a) for a in self._risk_orders.values()
                             if a["token"] == str(token) and a["condition"] == str(condition)]
         with self.ledger._lock:
-            positions = [p for p in self.ledger.positions.values()
-                         if str(p.token_id) == str(token) and str(p.condition_id) == str(condition) and not p.settled]
+            # positions are keyed by their token: one lookup, not a walk of every position held
+            pos = self.ledger.positions.get(str(token))
+            positions = ([pos] if pos is not None and str(pos.token_id) == str(token)
+                         and str(pos.condition_id) == str(condition) and not pos.settled else [])
             held = sum(float(p.shares) for p in positions)
             booked = collections.defaultdict(float)
             for pos in positions:
@@ -1628,7 +2034,6 @@ class LiveExecution:
             if now - first > self.unexplained_grace_s:
                 self._trip(f"a confirmed fill on this wallet that no order of ours explains "
                            f"(trade ...{str(tid)[-10:]}): reconcile by hand")
-        confirmed = self._confirmed_orders()
         for oid, a in list(self.awaiting.items()):
             if a.get("authorized") is False:
                 if now - a["wall"] > self.confirm_within_s:
@@ -1637,9 +2042,8 @@ class LiveExecution:
             if a.get("order_type") == "FAK":
                 self._reconcile_fak(oid, a, now)
                 continue
-            if oid in confirmed:
-                with self.ledger._lock:
-                    complete = not a.get("trade_ids") or set(a["trade_ids"]) <= set(self.ledger.seen)
+            if self._order_booked(oid, a.get("token")):
+                complete = not a.get("trade_ids") or self._trades_booked(a["trade_ids"])
                 if complete:
                     self._resolve_risk(a, filled=True)
                     self.awaiting.pop(oid, None)
@@ -1723,8 +2127,7 @@ class LiveExecution:
                 self.awaiting.pop(oid, None)
                 self.n["accepted but never filled"] += 1
                 return
-            with self.ledger._lock:
-                booked = set(fill["trade_ids"]) <= set(self.ledger.seen)
+            booked = self._trades_booked(fill["trade_ids"])
             if fill["statuses"] == ["CONFIRMED"] and booked:
                 # Only the proven unused notional is returned to the session cap.
                 unused = max(0.0, a["amount"] - fill["cost"])
@@ -1743,13 +2146,17 @@ class LiveExecution:
         store = self.fills
         if store is None or not order_id:
             return None
-        lock = getattr(store, "_lock", None)
-        if lock is None:
-            rows = [copy.copy(f) for f in store.fills.values()]
+        for_order = getattr(store, "fills_for_order", None)
+        if callable(for_order):
+            rows = for_order(order_id)               # copies of this order's fills only
         else:
-            with lock:
+            lock = getattr(store, "_lock", None)
+            if lock is None:
                 rows = [copy.copy(f) for f in store.fills.values()]
-        rows = [f for f in rows if str(getattr(f, "order_id", "") or "") == str(order_id)]
+            else:
+                with lock:
+                    rows = [copy.copy(f) for f in store.fills.values()]
+            rows = [f for f in rows if str(getattr(f, "order_id", "") or "") == str(order_id)]
         a = self.fak_orders.get(order_id)
         if a is not None:
             return self._fak_fill(order_id, a, rows)

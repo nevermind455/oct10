@@ -22,6 +22,7 @@ so the record keeps the maximum instead.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import math
 import threading
@@ -123,6 +124,29 @@ class FillStore:
         self.invalid_updates = 0
         self.identity_conflicts = 0
         self._summary_cache: dict | None = None
+        # order id -> its trade ids, so one order's fills are found without
+        # copying every fill this process has seen (the live order path asks
+        # while a FAK is unresolved). Rebuilt if `fills` was changed directly.
+        self._by_order: dict[str, list[str]] = {}
+        self._by_order_n = 0
+
+    def _index_order_locked(self, rec) -> None:
+        if rec.order_id:
+            ids = self._by_order.setdefault(rec.order_id, [])
+            if rec.trade_id not in ids:
+                ids.append(rec.trade_id)
+
+    def fills_for_order(self, order_id) -> list:
+        """Copies of this order's fills (any status), in the order first seen."""
+        oid = str(order_id or "")
+        with self._lock:
+            if self._by_order_n != len(self.fills):
+                self._by_order = {}
+                for rec in self.fills.values():
+                    self._index_order_locked(rec)
+                self._by_order_n = len(self.fills)
+            return [copy.copy(self.fills[t]) for t in self._by_order.get(oid, ())
+                    if t in self.fills and str(self.fills[t].order_id or "") == oid]
 
     def record_trade(self, trade_id, *, order_id=None, asset_id=None, market=None, side=None,
                      price=None, size=None, status="", source="ws",
@@ -156,6 +180,9 @@ class FillStore:
                     status=status, first_seen=now, last_seen=now,
                     sources={str(source)}, fee_rate_bps=incoming["fee_rate_bps"],
                     paid=paid, maker_legs=legs)
+                if self._by_order_n == len(self.fills) - 1:
+                    self._index_order_locked(self.fills[tid])
+                    self._by_order_n = len(self.fills)
                 if (_has_invalid_numeric(price, incoming["price"], size, incoming["size"],
                                          fee_rate_bps, incoming["fee_rate_bps"])
                         or (side is not None and incoming["side"] is None)):
@@ -217,7 +244,9 @@ class FillStore:
             if rec.maker_legs is None and legs is not None:
                 rec.maker_legs = legs
             rec.asset_id = rec.asset_id or incoming["asset_id"]
-            rec.order_id = rec.order_id or incoming["order_id"]
+            if not rec.order_id and incoming["order_id"]:
+                rec.order_id = incoming["order_id"]
+                self._index_order_locked(rec)
             rec.market = rec.market or incoming["market"]
             rec.side = rec.side or incoming["side"]
             if rec.fee_rate_bps is None:

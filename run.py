@@ -672,6 +672,20 @@ def build_paper(rt: Runtime, *, paper_balance: float | None = None) -> None:
     rt.pm = build_manager(rt, broker=rt.broker)
 
 
+def make_order_observer(ledger, *, venue_min_shares, price_cap):
+    """The live ledger's authorization of every accepted order, durable before
+    its fills can count: one fsynced journal line (Ledger.authorize_order_durable),
+    no longer a rewrite of the whole ledger - which grew with every position
+    ever held and was built under the lock the order path reads with (audit C2)."""
+    def journal_live_order(receipt: dict) -> bool:
+        order_id = receipt.get("order_id")
+        if not ledger.authorize_order_durable(order_id, receipt, venue_min_shares=venue_min_shares,
+                                              price_cap=price_cap):
+            raise RuntimeError("accepted order id cannot be authorized in the live ledger")
+        return True
+    return journal_live_order
+
+
 async def build_live(rt: Runtime) -> None:
     """LIVE CANARY: the live ledger authorizes every accepted order before its
     fills can count; the lean sender executes the Sniper's decisions."""
@@ -686,15 +700,8 @@ async def build_live(rt: Runtime) -> None:
                     allow_sells=config.STOP_LOSS_ENABLED or config.FLIP_EXIT_ENABLED)
     rt.ledger = ledger
 
-    def journal_live_order(receipt: dict) -> bool:
-        order_id = receipt.get("order_id")
-        ledger.authorize_order(order_id, receipt, venue_min_shares=config.VENUE_MIN_SHARES,
-                               price_cap=config.MAX_BUY_PRICE)
-        if not ledger.save():
-            raise RuntimeError("authorized-order ledger save failed")
-        return True
-
-    polymarket_trade.set_order_observer(journal_live_order)
+    polymarket_trade.set_order_observer(make_order_observer(ledger, venue_min_shares=config.VENUE_MIN_SHARES,
+                                                            price_cap=config.MAX_BUY_PRICE))
     # Live diagnostics (live_attempts.jsonl, live_fill_timing.jsonl) go beside
     # the bot - only ever switched on here.
     polymarket_trade._telemetry_dir = ROOT
@@ -1298,17 +1305,16 @@ async def _rotation_loop(hub, stop, on_round=None) -> None:
 
 
 async def _ledger_loop(hub, ledger, stop) -> None:
-    """LIVE: pull venue-reported fills into the ledger and mark the wallet,
-    on a worker thread (a save rewrites and fsyncs the whole file)."""
-    last_save = 0.0
+    """LIVE: pull venue-reported fills into the ledger and mark the wallet, on
+    a worker thread. Each booked fill is durable as one journal line (audit
+    F2); the full snapshot that folds the journal in is written once a minute,
+    not after every batch (it rewrote every position the ledger ever held)."""
+    last_save = time.monotonic()
     last_balance = 0.0
     while not stop.is_set():
         await asyncio.sleep(2.0)
         try:
-            if await asyncio.to_thread(ledger.ingest_fill_store, hub.fill_store):
-                if not await asyncio.to_thread(ledger.save):
-                    raise RuntimeError("ledger save failed after confirmed fill")
-                last_save = time.monotonic()
+            await asyncio.to_thread(ledger.ingest_fill_store, hub.fill_store)
             if time.monotonic() - last_balance > 120:
                 last_balance = time.monotonic()
                 try:
@@ -1318,7 +1324,7 @@ async def _ledger_loop(hub, ledger, stop) -> None:
                         ledger.mark_balance(bal["balance"])
                 except Exception as exc:
                     on_event("ledger", f"balance read failed: {type(exc).__name__}", "warn")
-            if time.monotonic() - last_save > 60:
+            if time.monotonic() - last_save > 60 and getattr(ledger, "journal_pending", lambda: 1)():
                 if not await asyncio.to_thread(ledger.save):
                     raise RuntimeError("periodic ledger save failed")
                 last_save = time.monotonic()
@@ -1469,14 +1475,37 @@ def _lot_source(source: str) -> str:
     return "untagged" if s == "paper_live_book" else "live"
 
 
-def _attribution(ledger, active: str, bids: dict) -> dict:
+def _attribution(ledger, active: str, bids: dict, cache: dict | None = None) -> dict:
     """P/L by source (sniper / manager), from every BUY lot - actual fills,
     never requests. Settled lots: shares x payout - cost (fees in). Lots in the
     market trading now: marked to its bid. Lots waiting for a result: at cost.
-    Caller holds the ledger lock (worker thread)."""
-    out: dict = {}
-    for pos in ledger.positions.values():
-        for lot in pos.lots:
+
+    The ledger lock is held only for a reference copy of the positions. With
+    `cache` (the dashboard's), the settled positions - which never change
+    again - are summed once per settlement, not once a second."""
+    with ledger._lock:
+        positions = list(ledger.positions.values())
+    key = (getattr(ledger, "_settled_n", None), len(positions),
+           frozenset(id(p) for p in positions if not p.settled))
+    if cache is not None and key[0] is not None and cache.get("key") == key:
+        settled_part = cache["settled"]
+    else:
+        settled_part = _attribution_of([p for p in positions if p.settled], active, bids)
+        if cache is not None:
+            cache.update(key=key, settled=settled_part)
+    out = _attribution_of([p for p in positions if not p.settled], active, bids, base=settled_part)
+    for a in out.values():
+        markets = a.pop("_markets")
+        a["wins"] = sum(1 for v in markets.values() if v > 0)
+        a["losses"] = sum(1 for v in markets.values() if v <= 0)
+        a["total"] = a["realized"] + a["unrealized"]
+    return out
+
+
+def _attribution_of(positions, active: str, bids: dict, base: dict | None = None) -> dict:
+    out: dict = {k: {**v, "_markets": dict(v["_markets"])} for k, v in (base or {}).items()}
+    for pos in positions:
+        for lot in list(pos.lots):
             if str(lot.side or "").upper() != "BUY":
                 continue
             a = out.setdefault(_lot_source(lot.source), {"fills": 0, "spend": 0.0, "fees": 0.0, "shares": 0.0,
@@ -1495,11 +1524,6 @@ def _attribution(ledger, active: str, bids: dict) -> dict:
                 a["unrealized"] += lot.shares * float(bids[str(pos.token_id)]) - cost
             else:
                 a["pending_cost"] += cost
-    for a in out.values():
-        markets = a.pop("_markets")
-        a["wins"] = sum(1 for v in markets.values() if v > 0)
-        a["losses"] = sum(1 for v in markets.values() if v <= 0)
-        a["total"] = a["realized"] + a["unrealized"]
     return out
 
 
@@ -1593,6 +1617,8 @@ class DashView:
         self._slow_at = -1e9
         self._positions: dict = {}
         self.every = accounting_every_s
+        self._summary_future = None
+        self._attr_cache: dict = {}
 
     # ---- slow parts, refreshed once a second
     def _refresh_slow(self) -> None:
@@ -1600,8 +1626,29 @@ class DashView:
         if now - self._slow_at < self.every:
             return
         self._slow_at = now
+        sniper = self.rt.sniper
         try:
-            self._slow["summary"] = self.rt.sniper.summary() if self.rt.sniper is not None else {}
+            if sniper is None:
+                self._slow["summary"] = {}
+            elif self.off_loop and hasattr(sniper, "summary_snapshot"):
+                # Copy on the loop, sort on a worker: the summary's percentiles
+                # cost ~8ms of sorting, and every BTC tick waited behind it (H3).
+                fut = self._summary_future
+                if fut is not None and fut.done():
+                    self._summary_future = None
+                    try:
+                        self._slow["summary"] = fut.result()
+                    except Exception:
+                        self._slow["summary"] = {}
+                if self._summary_future is None:
+                    snap = sniper.summary_snapshot()
+                    try:
+                        self._summary_future = asyncio.get_running_loop().run_in_executor(
+                            None, sniper.summary_from, snap)
+                    except RuntimeError:                 # no running loop (a final report)
+                        self._slow["summary"] = sniper.summary_from(snap)
+            else:
+                self._slow["summary"] = sniper.summary()
         except Exception:
             self._slow["summary"] = {}
         try:
@@ -1664,9 +1711,15 @@ class DashView:
         ledger = rt.ledger
         if ledger is None:
             return {}
+        # A write holding the ledger lock right now: skip this refresh rather
+        # than wait for it. The lock is no longer held across the pass: every
+        # read below takes it only briefly (a reference copy, the open
+        # positions), so a fill or an order never waits for the dashboard (C2).
         lock = getattr(ledger, "_lock", None)
-        if lock is not None and not lock.acquire(blocking=False):
-            return None
+        if lock is not None:
+            if not lock.acquire(blocking=False):
+                return None
+            lock.release()
         try:
             hub = rt.hub
             mark = _mark(hub)
@@ -1677,16 +1730,20 @@ class DashView:
             table = {side: {"side": side, "shares": 0.0, "avg": None, "cost": 0.0} for side in ("UP", "DOWN")}
             pending = {"markets": set(), "shares": 0.0, "cost": 0.0}
             active_value, unrealized, unmarkable = 0.0, 0.0, 0
-            for pos in ledger.positions.values():
-                if pos.settled or pos.shares <= 0:
+            if hasattr(ledger, "open_positions"):
+                open_rows = ledger.open_positions()
+            else:
+                with ledger._lock:
+                    open_rows = [(p.token_id, p.condition_id, float(p.shares), p.avg_price, float(p.cost))
+                                 for p in ledger.positions.values() if not p.settled and p.shares > 0]
+            for token_id, condition_id, shares, avg_price, cost in open_rows:
+                if active and condition_id == active and str(token_id) in sides:
+                    row = table[sides[str(token_id)]]
+                    row.update(shares=shares, avg=avg_price, cost=cost)
                     continue
-                if active and pos.condition_id == active and str(pos.token_id) in sides:
-                    row = table[sides[str(pos.token_id)]]
-                    row.update(shares=float(pos.shares), avg=pos.avg_price, cost=float(pos.cost))
-                    continue
-                pending["markets"].add(pos.condition_id)
-                pending["shares"] += float(pos.shares)
-                pending["cost"] += float(pos.cost)
+                pending["markets"].add(condition_id)
+                pending["shares"] += shares
+                pending["cost"] += cost
             for side, row in table.items():
                 token = next((t for t, sd in sides.items() if sd == side), None)
                 bid = None
@@ -1709,7 +1766,7 @@ class DashView:
             position_value = None if unmarkable else active_value + pending["cost"]
             realized = s.get("realized_pnl")
             bids = {str(t): row.get("bid") for t, sd in sides.items() for row in (table[sd],)}
-            attribution = _attribution(ledger, active, bids)
+            attribution = _attribution(ledger, active, bids, self._attr_cache)
             reserved = _reserved_cash(rt)
             out = {"realized": realized, "unrealized": None if unmarkable else unrealized,
                    "attribution": attribution, "reserved": reserved,
@@ -1739,9 +1796,6 @@ class DashView:
             return out
         except Exception:
             return None
-        finally:
-            if lock is not None:
-                lock.release()
 
     def _settlement(self) -> dict | None:
         """The settlement worker's panel, with each market labelled by its

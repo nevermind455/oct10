@@ -218,9 +218,13 @@ class BookState:
                     return (None if e[4] is None else self._entry_view(str(token), e))
             return None
 
-    def feed_age_summary(self):
+    def feed_age_samples(self) -> list:
+        """The recent feed ages, copied under the lock (sorting them is the caller's)."""
         with self._lock:
-            xs = sorted(self.feed_age_ms)
+            return list(self.feed_age_ms)
+
+    def feed_age_summary(self):
+        xs = sorted(self.feed_age_samples())          # the sort runs outside the book lock
         if not xs:
             return None
         q = lambda p: round(xs[min(len(xs) - 1, int(len(xs) * p / 100))], 1)

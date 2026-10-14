@@ -33,6 +33,13 @@ def prepared(key="intent-1", side="UP", amount=5.0):
     return p
 
 
+def durable(session) -> dict:
+    """What a restart would read now: the snapshot plus every journal record
+    (outcomes are written by the session's writer thread - wait for it)."""
+    session.flush()
+    return L.CanarySession.durable_view(session.path)
+
+
 class WarmMemoryVenue:
     """The synchronous transport boundary, with real Stream/Resp semantics."""
     connected = True
@@ -83,20 +90,23 @@ class DurableWarmDispatch(unittest.IsolatedAsyncioTestCase):
         self.sender.journal = lambda row: None
 
     async def asyncTearDown(self):
+        self.session.close()
         self.tmp.cleanup()
         T.reset_ambiguity()
 
     def reboot(self, *, new=False):
         limits, kill = L.CanaryLimits(), L.KillSwitch()
         session = L.CanarySession(self.path, "offline-wallet")
+        self.session.flush()
         session.open(limits, kill, self.ledger, new_session=new)
+        session.close()
         return session, limits, kill
 
     async def test_intent_is_durable_before_write_and_crash_restart_halts(self):
         observed = []
 
         def at_write():
-            state = json.loads(self.path.read_text())
+            state = L.CanarySession.durable_view(self.path)        # the write-ahead record, read as a restart would
             observed.append(state)
             self.assertEqual(state["intents"]["intent-1"]["status"], "DISPATCHING")
             self.assertEqual((state["orders"], state["pending_fills"], state["exposure_usd"]), (1, 1, 5))
@@ -115,19 +125,19 @@ class DurableWarmDispatch(unittest.IsolatedAsyncioTestCase):
 
     async def test_fsync_stall_expiring_guard_sends_nothing_and_resolves_unsent_intent(self):
         p = prepared()
-        original_save = self.session._save_unlocked
+        original_append = self.session._durable_append
 
-        def delayed_flush(limits, kill):
-            result = original_save(limits, kill)
+        def delayed_flush(line):
+            result = original_append(line)
             p.end = time.time() - 1  # signal expires while the disk operation is outstanding
             return result
 
-        with patch.object(self.session, "_save_unlocked", side_effect=delayed_flush):
+        with patch.object(self.session, "_durable_append", side_effect=delayed_flush):
             result = await self.sender.send(p, self.sender.start(p))
         self.assertEqual(result["kind"], L.NOT_SENT)
         self.assertEqual(self.venue.orders, [])
         self.assertEqual((self.limits.pending_fills, self.limits.exposure_usd), (0, 0))
-        self.assertEqual(json.loads(self.path.read_text())["intents"][p.client_order_id]["status"], L.NOT_SENT)
+        self.assertEqual(durable(self.session)["intents"][p.client_order_id]["status"], L.NOT_SENT)
         self.assertFalse(self.reboot()[2].tripped)
 
     @unittest.skipIf(os.name == "nt", "POSIX directory durability")
@@ -139,6 +149,17 @@ class DurableWarmDispatch(unittest.IsolatedAsyncioTestCase):
                 raise OSError("directory flush failed")
             return original_fsync(fd)
 
+        # The segment an intent is appended to is created - its directory entry
+        # flushed - before any intent can use it. A session whose new segment
+        # cannot be made durable never opens: nothing can be sent at all.
+        fresh = L.CanarySession(Path(self.tmp.name) / "other.json", "offline-wallet")
+        with patch.object(L.os, "fsync", side_effect=fail_directory):
+            with self.assertRaisesRegex(RuntimeError, "cannot be written"):
+                fresh.open(L.CanaryLimits(), L.KillSwitch(), self.ledger)
+        # With no durable segment (one lost, or never created), the first intent
+        # creates one: a failed directory flush then halts before any write.
+        self.session.flush()
+        self.session._segment_path(self.session._segment).unlink()
         p = prepared()
         with patch.object(L.os, "fsync", side_effect=fail_directory):
             result = await self.sender.send(p, self.sender.start(p))
@@ -173,7 +194,7 @@ class DurableWarmDispatch(unittest.IsolatedAsyncioTestCase):
         p = prepared()
         result = await self.sender.send(p, self.sender.start(p))
         self.assertEqual((result["kind"], result["order_id"]), (L.MATCHED, "snake-order"))
-        intent = json.loads(self.path.read_text())["intents"][p.client_order_id]
+        intent = durable(self.session)["intents"][p.client_order_id]
         self.assertEqual((intent["status"], intent["order_id"]), ("ACCEPTED", "snake-order"))
 
     async def test_legacy_unconfirmed_authorizations_halt_when_upgraded(self):
@@ -181,6 +202,7 @@ class DurableWarmDispatch(unittest.IsolatedAsyncioTestCase):
             "condition_id": T.COND, "token_id": T.UP, "window_end": T.round_end(),
             "requested_notional": 5, "fee_rate": .07, "fee_exponent": 1,
         })
+        self.session.close()
         state = json.loads(self.path.read_text())
         state["version"] = 1
         state.pop("intents")
@@ -189,7 +211,9 @@ class DurableWarmDispatch(unittest.IsolatedAsyncioTestCase):
         _, limits, kill = self.reboot()
         self.assertEqual((limits.orders, limits.exposure_usd), (1, 5))
         self.assertTrue(kill.tripped)
-        self.assertEqual(json.loads(self.path.read_text())["version"], 2)
+        # upgraded to the journal format; the file as it was is kept beside it
+        self.assertEqual(json.loads(self.path.read_text())["version"], L.CanarySession.VERSION)
+        self.assertTrue(self.path.with_name(self.path.name + ".v1.bak").exists())
 
 
 class LiveVenueAndRisk(unittest.IsolatedAsyncioTestCase):
@@ -204,6 +228,7 @@ class LiveVenueAndRisk(unittest.IsolatedAsyncioTestCase):
         self.ex.sender.session = self.ex.session
 
     async def asyncTearDown(self):
+        self.ex.session.close()
         await self.ex.sender.http.aclose()
         await self.fake.stop()
         self.tmp.cleanup()
@@ -227,10 +252,11 @@ class LiveVenueAndRisk(unittest.IsolatedAsyncioTestCase):
                 break
             await asyncio.sleep(.005)
         self.assertEqual(len(self.fake.orders), 1)
-        state = json.loads(self.path.read_text())
+        state = durable(self.ex.session)
         self.assertEqual(state["intents"][p.client_order_id]["status"], "DISPATCHING")
         self.assertEqual(state["pending_fills"], 1)
         limits, kill = L.CanaryLimits(), L.KillSwitch()
+        self.ex.session.flush()
         L.CanarySession(self.path, "offline-wallet").open(limits, kill, self.ledger)
         self.assertTrue(kill.tripped)
         result = await waiter
@@ -308,6 +334,7 @@ class LiveVenueAndRisk(unittest.IsolatedAsyncioTestCase):
         }
         self.ex.reconcile_once()
         limits, kill = L.CanaryLimits(), L.KillSwitch()
+        self.ex.session.flush()
         L.CanarySession(self.path, "offline-wallet").open(limits, kill, self.ledger)
         self.assertEqual((limits.orders, limits.fills, limits.pending_fills, limits.exposure_usd), (1, 0, 0, 0))
         self.assertFalse(kill.tripped)
@@ -318,6 +345,7 @@ class LiveVenueAndRisk(unittest.IsolatedAsyncioTestCase):
         self.ledger.ingest_fill_store(self.store)
         self.ex.reconcile_once()
         limits, kill = L.CanaryLimits(), L.KillSwitch()
+        self.ex.session.flush()
         L.CanarySession(self.path, "offline-wallet").open(limits, kill, self.ledger)
         self.assertAlmostEqual(limits.exposure_usd, 1.5)
         self.assertEqual((limits.fills, limits.pending_fills), (1, 0))

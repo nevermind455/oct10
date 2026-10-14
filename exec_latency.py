@@ -103,6 +103,13 @@ def spec_violations(settings, canary_max_shares=None) -> list[str]:
     if extra not in LIVE_EXTRA_FEEDS:
         allowed = " or ".join(",".join(x) or "empty" for x in LIVE_EXTRA_FEEDS)
         out.append(f"second trigger: SNIPER_EXTRA_FEEDS={','.join(extra)} - live accepts {allowed}")
+    # Audit H4's options change which ticks the rule evaluates / which signals
+    # pass the freshness gate: paper only until their results are approved.
+    if str(getattr(settings, "backlog_gate", "count")) != "count":
+        out.append(f"backlog gate: SNIPER_BACKLOG_GATE={settings.backlog_gate} - live trades on the count gate "
+                   f"until the age gate is approved")
+    if getattr(settings, "feed_coalesce", False):
+        out.append("feed coalescing: SNIPER_FEED_COALESCE=1 - live evaluates every tick until coalescing is approved")
     target = float(getattr(settings, "max_target_shares", 0) or 0)
     # `not >=` rather than `<`: a NaN cap compares false both ways and must fail here too.
     if canary_max_shares is not None and not float(canary_max_shares) + 1e-9 >= target:
@@ -276,18 +283,31 @@ class LatencyStats:
         return {"n": len(s), "last": xs[-1], "avg": sum(s) / len(s), "p50": q(50), "p95": q(95), "p99": q(99),
                 "max": s[-1]}
 
+    def snapshot(self):
+        """The samples, copied (event loop); None when the cached summary is current."""
+        version = self._version
+        if self._cache[0] == version:
+            return (version, None)
+        return (version, {key: list(xs) for key, xs in list(self.samples.items())})
+
     def summary(self) -> dict:
-        if self._cache[0] == self._version:
-            return self._cache[1]
+        return self.summary_from(self.snapshot())
+
+    def summary_from(self, snap) -> dict:
+        """summary() from a snapshot() - any thread; the sorting is here."""
+        version, samples = snap
+        cached = self._cache
+        if samples is None or cached[0] == version:
+            return cached[1] if cached[0] == version else {}
         out = {}
-        for (k, sim), xs in self.samples.items():
-            d = self.describe(list(xs))
+        for (k, sim), xs in samples.items():
+            d = self.describe(xs)
             if d is None:
                 continue
             d["simulated"] = sim
             if k not in out or (out[k]["simulated"] and not sim):     # a measured figure wins over a modelled one
                 out[k] = d
-        self._cache = (self._version, out)
+        self._cache = (version, out)
         return out
 
 

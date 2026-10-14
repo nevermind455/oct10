@@ -24,6 +24,7 @@ import json
 import math
 import operator
 import os
+import bisect
 import copy
 import tempfile
 import threading
@@ -183,6 +184,28 @@ class Ledger:
         self._journal_since = 0              # entries since the last snapshot
         self._journal_dirty = False          # a failed append: next write is a snapshot
         self.journal_replayed = 0            # entries replayed by the last load()
+        # Indexes for the reads on the order path (audit C2): every one of
+        # them used to walk every position the ledger ever held, under the
+        # lock fills are booked with. Maintained by record_fill / settle /
+        # load; rebuilt in full whenever `positions` was replaced or resized
+        # behind the ledger's back (a test, a tool).
+        #   _open_pos       token -> position that may still be open (settled
+        #                   ones are dropped lazily, on the next read)
+        #   _settled        (settled_wall, n, position), sorted: realized P/L
+        #                   since a time without visiting older history
+        #   _by_condition   condition -> its tokens
+        #   _lot_by_trade   trade id -> lot
+        self._open_pos: dict[str, Position] = {}
+        self._settled: list = []
+        self._settled_n = 0
+        self._by_condition: dict[str, list[str]] = {}
+        self._lot_by_trade: dict[str, Lot] = {}
+        self._indexed = None
+        # A fill or settlement whose journal write failed AFTER other threads
+        # could see it (the state lock is not held across the disk flush):
+        # the books may have been read in a state that was then rolled back.
+        # LIVE halts new orders on it, like an integrity error.
+        self.persistence_halt: str | None = None
         if not os.path.exists(self.path) and _journal_has_entries(self.journal_path):
             raise RuntimeError(
                 f"ledger file is missing but its journal {self.journal_path!r} holds fills; "
@@ -212,13 +235,34 @@ class Ledger:
                 price_cap=price_cap)
         _validate_authorization_metadata(metadata)
         with self._lock:
-            existing = self.authorized_orders.get(oid)
-            if existing is not None and metadata and existing and existing != metadata:
-                raise RuntimeError("order authorization metadata changed")
-            was_new = existing is None
-            if existing is None or (not existing and metadata):
-                self.authorized_orders[oid] = metadata
+            return self._apply_authorization_locked(oid, metadata)
+
+    def _apply_authorization_locked(self, oid: str, metadata: dict) -> bool:
+        existing = self.authorized_orders.get(oid)
+        if existing is not None and metadata and existing and existing != metadata:
+            raise RuntimeError("order authorization metadata changed")
+        was_new = existing is None
+        if existing is None or (not existing and metadata):
+            self.authorized_orders[oid] = metadata
         return was_new
+
+    def authorize_order_durable(self, order_id, receipt: dict | None = None, *,
+                                venue_min_shares: float | None = None,
+                                price_cap: float | None = None) -> bool:
+        """authorize_order, made durable by one fsynced journal line - not a
+        rewrite of the whole ledger (which grew with every position ever
+        held, under the lock the order path reads with). False when the order
+        id is not safe to store; raises when the line cannot be written."""
+        oid = str(order_id or "")
+        with self._save_lock:
+            self.authorize_order(order_id, receipt, venue_min_shares=venue_min_shares, price_cap=price_cap)
+            with self._lock:
+                metadata = self.authorized_orders.get(oid)
+                if metadata is None:
+                    return False
+                if not self._persist_locked({"op": "authorize", "order_id": oid, "metadata": dict(metadata)}):
+                    raise RuntimeError("authorized order could not be persisted")
+            return True
 
     def authorized_notional_for_window(self, window_start: int) -> float:
         """Raw accepted order notional (legacy reporting compatibility)."""
@@ -273,8 +317,8 @@ class Ledger:
             return 0.0
         with self._lock:
             return sum(
-                lot.notional for position in self.positions.values()
-                if position.condition_id == condition for lot in position.lots
+                lot.notional for position in self._condition_positions_locked(condition)
+                for lot in position.lots
             )
 
     def confirmed_cost_for_condition(self, condition_id: str | None) -> float:
@@ -284,8 +328,8 @@ class Ledger:
             return 0.0
         with self._lock:
             total = sum(
-                lot.cost for position in self.positions.values()
-                if position.condition_id == condition for lot in position.lots
+                lot.cost for position in self._condition_positions_locked(condition)
+                for lot in position.lots
             )
             if not math.isfinite(total) or total < 0:
                 raise RuntimeError("confirmed all-in exposure is invalid")
@@ -303,8 +347,8 @@ class Ledger:
         settlement was backed up upstream.
         """
         with self._lock:
-            total = sum(position.cost for position in self.positions.values()
-                        if not position.settled and position.shares > 0)
+            total = sum(position.cost for position in self._open_positions_locked()
+                        if position.shares > 0)
         if not math.isfinite(total) or total < 0:
             raise RuntimeError("unsettled exposure is invalid")
         return float(total)
@@ -316,9 +360,8 @@ class Ledger:
             return frozenset()
         with self._lock:
             return frozenset(
-                position.token_id for position in self.positions.values()
-                if (position.condition_id == condition and position.shares > 0
-                    and not position.settled)
+                position.token_id for position in self._open_positions_locked()
+                if position.condition_id == condition and position.shares > 0
             )
 
     def open_leg_shares(self, condition_id: str | None,
@@ -334,14 +377,12 @@ class Ledger:
         if not condition or not token:
             return 0.0
         with self._lock:
-            for position in self.positions.values():
-                if (position.condition_id != condition
-                        or position.token_id != token
-                        or position.settled or position.shares <= 0):
-                    continue
-                shares = float(position.shares)
-                return shares if math.isfinite(shares) and shares > 0 else 0.0
-        return 0.0
+            position = self.positions.get(token)       # positions are keyed by their token
+            if (position is None or position.condition_id != condition
+                    or position.token_id != token or position.settled or position.shares <= 0):
+                return 0.0
+            shares = float(position.shares)
+            return shares if math.isfinite(shares) and shares > 0 else 0.0
 
     def open_leg_basis(self, condition_id: str | None,
                        token_id: str | None) -> tuple[float, float] | None:
@@ -358,8 +399,8 @@ class Ledger:
         if not condition or not token:
             return None
         with self._lock:
-            for position in self.positions.values():
-                if (position.condition_id != condition
+            for position in (self.positions.get(token),):     # positions are keyed by their token
+                if (position is None or position.condition_id != condition
                         or position.token_id != token
                         or position.settled or position.shares <= 0):
                     continue
@@ -448,9 +489,7 @@ class Ledger:
         if not trade_id:
             return False
         with self._lock:
-            lot = next((candidate for position in self.positions.values()
-                        for candidate in position.lots
-                        if candidate.trade_id == trade_id), None)
+            lot = self._lot_for_trade_locked(trade_id, row.get("asset_id"))
             authorization = copy.deepcopy(self.authorized_orders.get(lot.order_id, {})) if lot else {}
         if lot is None:
             return False
@@ -530,6 +569,7 @@ class Ledger:
             return False
         st = str(status or "").upper()
         with self._lock:
+            self._check_index_locked()
             if tid in self.seen:
                 self.duplicates += 1
                 return False
@@ -640,6 +680,7 @@ class Ledger:
                     pos.settled_wall = time.time()
                 self.seen.add(tid)
                 self._seen_rev += 1
+                self._index_fill_locked(pos)
                 return True
             pos.lots.append(Lot(tid, token, condition, order_side,
                                 sh, px, f, st, lot_wall, source_text,
@@ -649,6 +690,7 @@ class Ledger:
             pos.cost += sh * px + f
             self.seen.add(tid)
             self._seen_rev += 1
+            self._index_fill_locked(pos)
             return True
 
     def record_fill_durable(self, trade_id, token_id, **kwargs) -> bool:
@@ -664,6 +706,7 @@ class Ledger:
         tid = str(trade_id or "")
         with self._save_lock:
             with self._lock:
+                self._check_index_locked()
                 position = self.positions.get(token)
                 # A BUY changes scalar fields and appends one lot; it never
                 # changes earlier lots. Deep-copying the entire history here
@@ -681,13 +724,18 @@ class Ledger:
                 if not inserted:
                     return False
                 lot = self.positions[token].lots[-1]
-                if self._persist_locked({
-                        "op": "fill", "trade_id": lot.trade_id, "token_id": lot.token_id,
-                        "condition_id": lot.condition_id, "side": lot.side, "shares": lot.shares,
-                        "price": lot.price, "fee": lot.fee, "status": lot.status, "wall": lot.wall,
-                        "source": lot.source, "order_id": lot.order_id,
-                        "reported_price": lot.reported_price}):
-                    return True
+                entry = {
+                    "op": "fill", "trade_id": lot.trade_id, "token_id": lot.token_id,
+                    "condition_id": lot.condition_id, "side": lot.side, "shares": lot.shares,
+                    "price": lot.price, "fee": lot.fee, "status": lot.status, "wall": lot.wall,
+                    "source": lot.source, "order_id": lot.order_id,
+                    "reported_price": lot.reported_price}
+            # The disk flush runs with only the save lock held - every other
+            # writer (fills, settlement, snapshots) still waits for it, but the
+            # order path's reads do not wait for the disk (audit C2).
+            if self._persist_locked(entry):
+                return True
+            with self._lock:
                 if previous is not None:
                     del position.lots[previous_length:]
                     for old_lot, old_consumed in consumed:
@@ -697,7 +745,12 @@ class Ledger:
                     self.positions.pop(token, None)
                 self.seen.discard(tid)
                 self._seen_rev += 1
-                raise RuntimeError("confirmed fill could not be persisted")
+                self._reindex_locked()
+                # Readers could see this fill before the write failed.
+                self.persistence_halt = self.persistence_halt or (
+                    f"fill {tid[-12:]} could not be made durable after it was booked: "
+                    f"{self.last_persistence_error or 'journal write failed'}")[:300]
+            raise RuntimeError("confirmed fill could not be persisted")
 
     def ingest_fill_store(self, store) -> int:
         """Pull everything from the feeds FillStore. Safe to call repeatedly."""
@@ -804,9 +857,11 @@ class Ledger:
         except (KeyError, TypeError, ValueError, OverflowError):
             return False
         with self._lock:
+            # an order's lots live in its own token's position
+            position = self.positions.get(str(authorization.get("token_id") or ""))
             already = sum(
-                lot.notional for position in self.positions.values()
-                for lot in position.lots if lot.order_id == order_id
+                lot.notional for lot in (position.lots if position is not None else ())
+                if lot.order_id == order_id
             )
         return (math.isfinite(candidate) and candidate > 0
                 and already + candidate <= requested + 0.02)
@@ -837,6 +892,7 @@ class Ledger:
                 settled_wall = time.time()
                 for pos in targets:
                     self._settle_position_locked(pos, payouts[pos.token_id], settled_wall)
+                    self._note_settled_locked(pos)
                     done.append(pos)
                 if not self._persist_locked({
                         "op": "settle", "condition_id": condition, "wall": settled_wall,
@@ -849,6 +905,7 @@ class Ledger:
                         pos.realized = None
                         pos.settled = False
                         pos.settled_wall = None
+                        self._open_pos[pos.token_id] = pos
                     raise RuntimeError("settlement could not be persisted")
         return done
 
@@ -863,9 +920,10 @@ class Ledger:
     JOURNAL_COMPACT_EVERY = 500
 
     def _persist_locked(self, entry: dict) -> bool:
-        """Make one mutation durable; the caller holds _save_lock and _lock.
-        One journal line when a snapshot is on disk to append to, else (the
-        ledger's first write, or after a failed append) a full snapshot."""
+        """Make one mutation durable; the caller holds _save_lock (every writer
+        does, so seq and the journal are its alone) - and may hold _lock, or
+        not. One journal line when a snapshot is on disk to append to, else
+        (the ledger's first write, or after a failed append) a full snapshot."""
         if not self.loaded_from_disk or self._journal_dirty or not os.path.exists(self.path):
             return self._snapshot_locked()
         entry = {"seq": self.journal_seq + 1, **entry}
@@ -904,8 +962,11 @@ class Ledger:
     def _snapshot_locked(self) -> bool:
         """A full snapshot (it includes every journal entry so far), then an
         empty journal. A crash between the two is harmless: load() replays
-        only entries newer than the snapshot's journal_seq."""
-        if not self._write_payload(self._payload_locked()):
+        only entries newer than the snapshot's journal_seq. The caller holds
+        _save_lock; the state lock is taken only to build the payload."""
+        with self._lock:
+            payload = self._payload_locked()
+        if not self._write_payload(payload):
             return False
         self._truncate_journal()
         return True
@@ -959,7 +1020,13 @@ class Ledger:
             expected += 1
         applied = 0
         for e in newer:
-            if e["op"] == "fill":
+            if e["op"] == "authorize":
+                metadata = _authorization_metadata(e["metadata"])
+                _validate_authorization_metadata(metadata)
+                if not _safe_identifier(e["order_id"]):
+                    raise ValueError(f"ledger journal authorization {e['seq']} has an unsafe order id")
+                self._apply_authorization_locked(e["order_id"], metadata)
+            elif e["op"] == "fill":
                 if not self.record_fill(e["trade_id"], e["token_id"], shares=e["shares"], price=e["price"],
                                         side=e["side"], condition_id=e["condition_id"], status=e["status"],
                                         source=e["source"], fee=e["fee"], order_id=e["order_id"],
@@ -972,9 +1039,145 @@ class Ledger:
                     raise ValueError(f"ledger journal settlement {e['seq']} does not match the positions")
                 for p in targets:
                     self._settle_position_locked(p, float(e["payouts"][p.token_id]), float(e["wall"]))
+                    self._note_settled_locked(p)
             self.journal_seq = e["seq"]
             applied += 1
         return applied
+
+    # -------------------------------------------------------------- indexes
+    def _reindex_locked(self) -> None:
+        """Rebuild every index from `positions` (load, a rollback, or state
+        changed behind the ledger's back)."""
+        self._open_pos, self._settled, self._settled_n = {}, [], 0
+        self._by_condition, self._lot_by_trade = {}, {}
+        for key, p in self.positions.items():
+            self._by_condition.setdefault(str(p.condition_id), []).append(key)
+            if p.settled:
+                self._note_settled_locked(p)
+            else:
+                self._open_pos[key] = p
+            for lot in p.lots:
+                self._lot_by_trade[lot.trade_id] = lot
+        self._indexed = (id(self.positions), len(self.positions))
+
+    def _check_index_locked(self) -> None:
+        if self._indexed != (id(self.positions), len(self.positions)):
+            self._reindex_locked()
+
+    def _index_fill_locked(self, pos: Position) -> None:
+        """record_fill just booked pos.lots[-1] (and may have created, reopened
+        or closed pos)."""
+        key = pos.token_id
+        tokens = self._by_condition.setdefault(str(pos.condition_id), [])
+        if key not in tokens:
+            tokens.append(key)
+        if pos.settled:
+            self._note_settled_locked(pos)
+        else:
+            self._open_pos[key] = pos
+        lot = pos.lots[-1]
+        self._lot_by_trade[lot.trade_id] = lot
+        self._indexed = (id(self.positions), len(self.positions))
+
+    def _note_settled_locked(self, pos: Position) -> None:
+        wall = pos.settled_wall
+        try:
+            wall = float(wall)
+        except (TypeError, ValueError):
+            return
+        self._settled_n += 1
+        bisect.insort(self._settled, (wall, self._settled_n, pos), key=lambda e: (e[0], e[1]))
+
+    def _open_positions_locked(self) -> list:
+        """The positions still unsettled. Settled ones leave the index here,
+        however they were settled."""
+        self._check_index_locked()
+        out, gone = [], []
+        for key, p in self._open_pos.items():
+            if p.settled:
+                gone.append(key)
+            else:
+                out.append(p)
+        for key in gone:
+            p = self._open_pos.pop(key)
+            if self.positions.get(key) is p:
+                self._note_settled_locked(p)
+        return out
+
+    def _condition_positions_locked(self, condition: str) -> list:
+        self._check_index_locked()
+        return [self.positions[t] for t in self._by_condition.get(condition, ())
+                if t in self.positions and self.positions[t].condition_id == condition]
+
+    def _lot_for_trade_locked(self, trade_id: str, token=None):
+        """The booked lot of one trade: its token's position first, then the
+        trade index, then (state changed behind the ledger's back) a full scan."""
+        position = self.positions.get(str(token)) if token else None
+        if position is not None:
+            for lot in position.lots:
+                if lot.trade_id == trade_id:
+                    return lot
+        self._check_index_locked()
+        lot = self._lot_by_trade.get(trade_id)
+        if lot is not None:
+            holder = self.positions.get(lot.token_id)
+            if holder is not None and any(candidate is lot for candidate in holder.lots):
+                return lot
+        return next((candidate for position in self.positions.values()
+                     for candidate in position.lots if candidate.trade_id == trade_id), None)
+
+    def realized_since(self, since_wall: float) -> float:
+        """Realized P/L of the positions settled at or after since_wall."""
+        with self._lock:
+            return self._realized_since_locked(since_wall)
+
+    def _realized_since_locked(self, since_wall: float) -> float:
+        self._open_positions_locked()           # index anything settled since the last read
+        total, counted = 0.0, set()
+        start = bisect.bisect_left(self._settled, (since_wall, -1), key=lambda e: (e[0], e[1]))
+        for wall, _n, p in self._settled[start:]:
+            # an entry is current only while the position is still settled at that time
+            if id(p) in counted or not p.settled or p.settled_wall != wall:
+                continue
+            counted.add(id(p))
+            total += float(getattr(p, "realized", 0) or 0)
+        return total
+
+    def risk_view(self, since_wall: float, orders) -> tuple[float, float, dict]:
+        """One consistent read for the live loss budget (audit C2):
+        (realized P/L of positions settled since since_wall, the cost basis
+        of every open position, {order id: its booked BUY cost}) for orders =
+        [(order_id, token), ...]. Visits the open positions, the positions
+        settled since since_wall and the lots of the given orders' tokens -
+        never the whole history."""
+        with self._lock:
+            realized = self._realized_since_locked(since_wall)
+            open_basis = sum(float(p.cost) for p in self._open_positions_locked() if p.shares > 0)
+            booked: dict = {}
+            for order_id, token in orders:
+                if not order_id or order_id in booked:
+                    continue
+                position = self.positions.get(str(token))
+                booked[order_id] = sum(float(lot.cost) for lot in (position.lots if position is not None else ())
+                                       if lot.order_id == order_id and str(lot.side).upper() == "BUY")
+            return realized, open_basis, booked
+
+    def order_has_lots(self, order_id, token) -> bool:
+        """Whether any fill of this order (on its token) is booked."""
+        with self._lock:
+            position = self.positions.get(str(token))
+            return position is not None and any(lot.order_id == order_id for lot in position.lots)
+
+    def trades_booked(self, trade_ids) -> bool:
+        """Whether every one of these trade ids is booked (no copy of `seen`)."""
+        with self._lock:
+            return all(str(t) in self.seen for t in trade_ids)
+
+    def open_positions(self) -> list:
+        """Snapshot of the open positions' figures (dashboard)."""
+        with self._lock:
+            return [(p.token_id, p.condition_id, float(p.shares), p.avg_price, float(p.cost))
+                    for p in self._open_positions_locked() if p.shares > 0]
 
     # -------------------------------------------------------------- reads
     def unrealized(self, mark) -> tuple[float, int]:
@@ -988,8 +1191,8 @@ class Ledger:
         with self._lock:
             open_snapshot = [
                 (pos.token_id, pos.shares, pos.cost)
-                for pos in self.positions.values()
-                if not pos.settled and pos.shares > 0
+                for pos in self._open_positions_locked()
+                if pos.shares > 0
             ]
         cycle_error = None
         for token, shares, cost in open_snapshot:
@@ -1005,9 +1208,22 @@ class Ledger:
         return total, unmarkable
 
     def summary(self, mark=None) -> dict:
+        # The lock is held for a reference copy of the positions and the open
+        # ones' figures - not for a pass over every position the ledger ever
+        # held (that pass blocked the order path's reads for its length).
+        # Settled positions never change again (a late fill reopens one: it
+        # is then open on the next summary), so they are read outside it.
         with self._lock:
-            settled = [p for p in self.positions.values() if p.settled]
-            open_ = [p for p in self.positions.values() if not p.settled and p.shares > 0]
+            everything = list(self.positions.values())
+            open_ = [p for p in self._open_positions_locked() if p.shares > 0]
+            open_ids = {id(p) for p in open_}
+            open_rows = [(p.token_id, p.condition_id, p.shares, p.avg_price, p.cost, p.fees,
+                          max((lot.wall for lot in p.lots), default=None)) for p in open_]
+            counters = (len(self.seen), self.duplicates, self.skipped_status, self.skipped_side,
+                        self.skipped_unauthorized, self.skipped_authorization_mismatch,
+                        self.last_persistence_error, self.last_ingest_error, self.integrity_error)
+        if True:
+            settled = [p for p in everything if id(p) not in open_ids and p.settled]
             realized = sum(p.realized or 0.0 for p in settled)
             # Grade one market once. If the strategy bought both outcomes in
             # a round, counting the winner token as a win and the loser token
@@ -1019,39 +1235,42 @@ class Ledger:
                 market_results[key] = market_results.get(key, 0.0) + (p.realized or 0.0)
             wins = sum(1 for pnl in market_results.values() if pnl > 0)
             losses = sum(1 for pnl in market_results.values() if pnl <= 0)
-            staked = sum(p.cost for p in self.positions.values())
+            open_cost = {id(p): row[4] for p, row in zip(open_, open_rows)}
+            open_fees = {id(p): row[5] for p, row in zip(open_, open_rows)}
+            staked = sum(open_cost.get(id(p), p.cost) for p in everything)
+            (fills_counted, duplicates, skipped_status, skipped_side, skipped_unauthorized,
+             skipped_mismatch, persistence_error, ingest_error, integrity_error) = counters
             out = {
                 "realized_pnl": realized,
                 "settled_positions": len(settled),
                 "settled_markets": len(market_results),
                 "open_positions": len(open_),
-                "pending_cost": sum(p.cost for p in open_),
+                "pending_cost": sum(row[4] for row in open_rows),
                 "wins": wins,
                 "losses": losses,
                 "win_rate": (wins / (wins + losses)) if (wins + losses) else None,
-                "fees_paid": sum(p.fees for p in self.positions.values()),
+                "fees_paid": sum(open_fees.get(id(p), p.fees) for p in everything),
                 "total_cost": staked,
-                "fills_counted": len(self.seen),
-                "duplicates_suppressed": self.duplicates,
-                "skipped_not_a_fill": self.skipped_status,
-                "skipped_non_buy": self.skipped_side,
-                "skipped_unauthorized": self.skipped_unauthorized,
-                "skipped_authorization_mismatch": self.skipped_authorization_mismatch,
-                "persistence_error": self.last_persistence_error,
-                "ingest_error": self.last_ingest_error,
-                "integrity_error": self.integrity_error,
+                "fills_counted": fills_counted,
+                "duplicates_suppressed": duplicates,
+                "skipped_not_a_fill": skipped_status,
+                "skipped_non_buy": skipped_side,
+                "skipped_unauthorized": skipped_unauthorized,
+                "skipped_authorization_mismatch": skipped_mismatch,
+                "persistence_error": persistence_error,
+                "ingest_error": ingest_error,
+                "integrity_error": integrity_error,
                 "open_position_details": [
                     {
-                        "token_id": p.token_id,
-                        "condition_id": p.condition_id,
-                        "shares": p.shares,
-                        "average_entry_price": p.avg_price,
-                        "cost": p.cost,
-                        "fees": p.fees,
-                        "latest_fill_wall": max(
-                            (lot.wall for lot in p.lots), default=None),
+                        "token_id": token,
+                        "condition_id": condition,
+                        "shares": shares,
+                        "average_entry_price": avg,
+                        "cost": cost,
+                        "fees": fees,
+                        "latest_fill_wall": latest,
                     }
-                    for p in open_
+                    for token, condition, shares, avg, cost, fees, latest in open_rows
                 ],
             }
             out["realized_after_fees"] = realized   # fees already inside cost
@@ -1118,14 +1337,18 @@ class Ledger:
                 return {"status": "NO_DATA",
                         "detail": "need at least two balance reads"}
             (t0, b0), (t1, b1) = self.balance_marks[0], self.balance_marks[-1]
+            # lots are append-only and never change once booked: walk them
+            # outside the lock, over reference copies taken inside it
+            lots = [list(position.lots) for position in self.positions.values()]
+        if True:
             observed = b1 - b0
             purchased = sum(
-                lot.cost for position in self.positions.values()
-                for lot in position.lots if lot.side == "BUY" and t0 <= lot.wall <= t1
+                lot.cost for group in lots
+                for lot in group if lot.side == "BUY" and t0 <= lot.wall <= t1
             )
             sold = sum(
-                lot.notional - lot.fee for position in self.positions.values()
-                for lot in position.lots if lot.side == "SELL" and t0 <= lot.wall <= t1
+                lot.notional - lot.fee for group in lots
+                for lot in group if lot.side == "SELL" and t0 <= lot.wall <= t1
             )
             expected = sold - purchased
             diff = observed - expected
@@ -1160,10 +1383,12 @@ class Ledger:
             "integrity_error": self.integrity_error,
             "reported_unauthorized": sorted(self.reported_unauthorized),
             "reported_mismatch": sorted(self.reported_mismatch),
-            # Nested authorization dicts used to remain shared with live
-            # state after releasing _lock, allowing json.dump to see a
-            # concurrent mutation or raise "dictionary changed size".
-            "authorized_orders": copy.deepcopy(self.authorized_orders),
+            # A copy of the registry, so json.dumps after _lock is released
+            # cannot see it change size. Its metadata dicts are never mutated
+            # in place (authorize replaces the value), so a shallow copy is a
+            # snapshot - a deep copy of every authorization the ledger ever
+            # held cost O(history) under the lock on every save (audit C2).
+            "authorized_orders": dict(self.authorized_orders),
             "positions": self._position_texts_locked(),
             "balance_marks": list(self.balance_marks[-50:]),
             "journal_seq": self.journal_seq,
@@ -1409,6 +1634,7 @@ class Ledger:
                 self.balance_marks = balance_marks
                 self.positions = positions
                 self._pos_text = {}
+                self._reindex_locked()
                 self.journal_seq = journal_seq
                 self.journal_replayed = self._replay_journal(journal_seq)
                 self._journal_since = self.journal_replayed
@@ -1433,13 +1659,14 @@ _JOURNAL_FILL = {"seq": int, "op": str, "trade_id": str, "token_id": str, "condi
                  "wall": (int, float), "source": str, "order_id": (str, type(None))}
 _JOURNAL_SETTLE = {"seq": int, "op": str, "condition_id": str, "wall": (int, float), "payouts": dict,
                    "tokens": list}
+_JOURNAL_AUTHORIZE = {"seq": int, "op": str, "order_id": str, "metadata": dict}
 
 
 def _journal_entry(e) -> dict:
     """One journal line, checked field by field (a malformed one fails the load)."""
-    if not isinstance(e, dict) or e.get("op") not in ("fill", "settle"):
+    if not isinstance(e, dict) or e.get("op") not in ("fill", "settle", "authorize"):
         raise ValueError("invalid ledger journal entry")
-    shape = _JOURNAL_FILL if e["op"] == "fill" else _JOURNAL_SETTLE
+    shape = {"fill": _JOURNAL_FILL, "settle": _JOURNAL_SETTLE, "authorize": _JOURNAL_AUTHORIZE}[e["op"]]
     if e["op"] == "fill" and "reported_price" in e:
         # Old journals predate a separate headline price and remain readable.
         shape = {**shape, "reported_price": (int, float, type(None))}
