@@ -216,6 +216,105 @@ class DurableWarmDispatch(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.path.with_name(self.path.name + ".v1.bak").exists())
 
 
+class PreviousRunReconciliation(unittest.IsolatedAsyncioTestCase):
+    """The restart halt: a previous run's unresolved order is settled by the
+    venue's record of its own order hash - proven or still halted."""
+
+    asyncSetUp, asyncTearDown = DurableWarmDispatch.asyncSetUp, DurableWarmDispatch.asyncTearDown
+    reboot = DurableWarmDispatch.reboot
+
+    HASH = "0x" + "ab" * 32
+
+    def crashed_run(self, response=None):
+        """An order written to the wire, then the process lost before its reply;
+        the restart's session, limits and kill switch (left open)."""
+        p = prepared()
+        p.order_hash = self.HASH
+        self.sender.start(p)
+        self.session.flush()
+        limits, kill = L.CanaryLimits(max_daily_loss_usd=100), L.KillSwitch()
+        session = L.CanarySession(self.path, "offline-wallet")
+        session.open(limits, kill, self.ledger)
+        self.addCleanup(session.close)
+        return p, session, limits, kill
+
+    def execution(self, session, limits, kill, venue_order):
+        ex = L.LiveExecution.__new__(L.LiveExecution)
+        ex.session, ex.ledger = session, self.ledger
+        ex.sender = types.SimpleNamespace(limits=limits, kill=kill)          # LiveExecution.kill is the sender's
+        ex.order_status = venue_order if callable(venue_order) else (lambda h: venue_order)
+        ex.n = __import__("collections").Counter()
+        ex.events = []
+        ex.on_event = lambda src, text, level: ex.events.append((text, level))
+        ex.previous_run_delays_s = (0.0,)
+        return ex
+
+    def record(self, **kw):
+        return {"id": self.HASH, "asset_id": T.UP, "market": T.COND, "side": "BUY", "status": "canceled",
+                "size_matched": "0", "associate_trades": [], **kw}
+
+    async def test_a_proven_zero_fill_lifts_the_halt_and_stays_lifted(self):
+        p, session, limits, kill = self.crashed_run()
+        self.assertTrue(any(r.startswith(L.CanarySession.PREVIOUS_RUN) for r in kill.reasons))
+        ex = self.execution(session, limits, kill, self.record())
+        await ex._reconcile_previous_run()
+        self.assertFalse(kill.tripped, kill.reasons)
+        self.assertEqual(session.unresolved(), [])
+        self.assertEqual((limits.pending_fills, limits.exposure_usd), (0, 0))
+        self.assertIn("halt lifted", ex.events[-1][0])
+        session.flush()
+        _, limits2, kill2 = self.reboot()                                 # and the next start is clean
+        self.assertFalse(kill2.tripped, kill2.reasons)
+
+    async def test_a_match_booked_under_its_authorization_is_confirmed(self):
+        p, session, limits, kill = self.crashed_run()
+        self.ledger.authorize_order(self.HASH, {
+            "condition_id": T.COND, "token_id": T.UP, "window_end": T.round_end(),
+            "requested_notional": 5, "fee_rate": .07, "fee_exponent": 1, "trade_ids": ["t-prev-1"]})
+        self.assertTrue(self.ledger.record_fill("t-prev-1", T.UP, shares=9.0, price=.5, condition_id=T.COND,
+                                                fee=.1, order_id=self.HASH))
+        ex = self.execution(session, limits, kill, self.record(status="matched", size_matched="9",
+                                                               associate_trades=["t-prev-1"]))
+        await ex._reconcile_previous_run()
+        self.assertFalse(kill.tripped, kill.reasons)
+        self.assertEqual(session.intents[p.client_order_id]["status"], "CONFIRMED")
+        self.assertAlmostEqual(session.intents[p.client_order_id]["spent"], 4.5)
+
+    async def test_a_match_not_yet_booked_stays_halted(self):
+        p, session, limits, kill = self.crashed_run()
+        ex = self.execution(session, limits, kill, self.record(status="matched", size_matched="9",
+                                                               associate_trades=["t-prev-1"]))
+        await ex._reconcile_previous_run()
+        self.assertTrue(kill.tripped)
+        self.assertEqual(len(session.unresolved()), 1)
+        self.assertIn("not in the ledger yet", ex.events[-1][0])
+
+    async def test_a_record_of_another_order_or_none_is_never_evidence(self):
+        for venue, why in ((self.record(asset_id=T.DN), "does not match"),
+                           ({}, "no terminal venue record"),
+                           (self.record(status="live"), "no terminal venue record")):
+            with self.subTest(why=why):
+                p, session, limits, kill = self.crashed_run()
+                ex = self.execution(session, limits, kill, venue)
+                await ex._reconcile_previous_run()
+                self.assertTrue(kill.tripped)
+                self.assertIn(why, ex.events[-1][0])
+                session.close()
+                self.path.unlink()                                       # a fresh session for the next case
+                for seg in self.path.parent.glob(self.path.name + ".*"):
+                    seg.unlink()
+                self.session = L.CanarySession(self.path, "offline-wallet")
+                self.session.open(self.limits, L.KillSwitch(), self.ledger)
+                self.sender.session = self.session
+
+    async def test_nothing_is_sent_while_reconciling(self):
+        p, session, limits, kill = self.crashed_run()
+        before = len(self.venue.orders)
+        ex = self.execution(session, limits, kill, self.record())
+        await ex._reconcile_previous_run()
+        self.assertEqual(len(self.venue.orders), before)
+
+
 class LiveVenueAndRisk(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         T.reset_ambiguity()

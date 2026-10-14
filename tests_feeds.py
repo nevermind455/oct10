@@ -1558,7 +1558,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Reviewed 2026-10-12: user-requested recovery, accounting and portfolio safety fixes.
     # Re-approved 2026-10-12 (audit 20261012): one outcome per prepared order; monotonic server
     # clock; conflicting venue evidence is AMBIGUOUS
-    "sniper_live.py": "ee13bd9d99832cbff8b2b5ff3f6018517d32a7d1bb493b6ebedd1495d3995ed5",
+    # Re-approved 2026-10-14 (restart halt): a previous run's unresolved send intents are looked
+    # up on the venue by their own order hash at start (_reconcile_previous_run, M7's evidence
+    # rules); proven zero or fully booked resolves them and lifts the derived start-up halt
+    # (CanarySession.PREVIOUS_RUN, never persisted). Nothing is ever resent.
+    "sniper_live.py": "6ad82566b47cf20167a8f55ca6a2d9811e81f0160eaaa59f554cef731bc25c0b",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads

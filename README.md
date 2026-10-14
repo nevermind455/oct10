@@ -469,7 +469,12 @@ at dispatch, so overlapping UP/DOWN requests cannot bypass the fill cap.
 
 Every signed order has a durable intent written before its first possible socket
 write. An unresolved intent or unconfirmed authorization on restart halts new
-orders until its outcome is reconciled. Never resubmit an uncertain order. This
+orders until its outcome is reconciled. Never resubmit an uncertain order. At start the
+bot looks each one up on the venue by its own order hash (for up to ~4 minutes, while the
+reconciler books trades): proven zero execution, or a match whose trades are all in the
+ledger under its authorization, resolves it and the start-up halt lifts by itself. Anything
+else stays halted with what the venue said (an order sent by a version without order hashes
+needs reconciling by hand). This
 adds filesystem durability work to dispatch; the older latency measurements above
 must be remeasured on the deployment disk. `touch STOP_LIVE` stops new orders at
 once. From the first live run on, run LIVE only from `/opt/sniperbtc`: the old

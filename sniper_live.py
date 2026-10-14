@@ -44,6 +44,7 @@ import math
 import os
 import statistics
 import time
+import types
 import dataclasses
 from dataclasses import dataclass, field
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
@@ -490,7 +491,17 @@ class CanarySession:
     UNRESOLVED = {"DISPATCHING", "ACCEPTED", "AMBIGUOUS"}
     FINAL = {NO_MATCH, REJECTED, NOT_SENT, "CONFIRMED"}
     RECENT_S = 86_400.0
-    TRANSIENT = ("shutting down",)          # halts that are not about the session's risk
+    # The start-up halt for a previous run's unresolved orders is DERIVED: open()
+    # works it out from the intents on every start, and LiveExecution lifts it
+    # once the venue proves each one (_reconcile_previous_run). Persisted, it
+    # would come back after the orders were long settled.
+    PREVIOUS_RUN = "unresolved live orders from a previous run"
+    TRANSIENT = ("shutting down", PREVIOUS_RUN)   # halts that are not persisted (see above)
+
+    def unresolved(self) -> list:
+        """[(client order id, intent copy)] still awaiting their outcome."""
+        with self._lock:
+            return [(k, dict(i)) for k, i in self.intents.items() if i.get("status") in self.UNRESOLVED]
     COMPACT_RECORDS = 256                   # journal records between compactions
     COMPACT_FINISHED = 128                  # finished intents held before they are archived
 
@@ -1724,6 +1735,9 @@ class LiveExecution:
         self._order_tasks: set = set()
         self.fast_fak_delays_s = (0.25, 0.5, 1.0, 2.0, 4.0)
         self.ambiguity_delays_s = (0.5, 1.0, 2.0, 4.0, 8.0, 15.0, 30.0, 60.0)
+        # A previous run's unresolved orders: looked up again after each delay
+        # (the ledger books their trades as the reconciler catches up).
+        self.previous_run_delays_s = (0.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0)
         sender.ambiguity_resolver = self._schedule_ambiguity
 
     @property
@@ -1769,6 +1783,8 @@ class LiveExecution:
                        loop.create_task(self._rules_loop(hub)), loop.create_task(self._guard_loop())]
         if self.session is not None:
             self._tasks.append(loop.create_task(self._session_loop()))
+            # A previous run's unresolved orders: proven by the venue, or still halted.
+            self._tasks.append(loop.create_task(self._reconcile_previous_run()))
         if self.kill.stop_file is not None and self.kill.stop_file.exists():
             self.on_event("sniper", f"LIVE CANARY: stop file {self.kill.stop_file} present - no orders "
                                     f"(remove it and restart to trade)", "bad")
@@ -2643,6 +2659,97 @@ class LiveExecution:
                      "was": row.get("error")})
         self.on_event("sniper", f"LIVE order {p.client_order_id[-8:]} outcome reconciled with the venue: "
                                 f"{kind} ({size:g} shares)", "warn")
+
+    # ------------------------------------------------------------ a previous run's orders (restart halt)
+    def _previous_run_verdict(self, intent: dict, order) -> tuple | None:
+        """(status, spent) settling one of a previous run's unresolved send
+        intents from the venue's record of its own order hash, or None while
+        nothing proves it: NO_MATCH = terminal with zero execution; CONFIRMED =
+        matched, its authorization in the ledger and every one of its trades
+        booked there. An identity mismatch raises (it is never evidence)."""
+        h = str(intent["order_hash"])
+        if not isinstance(order, dict) or not order:
+            return None
+        if (str(order.get("id")) != h or str(order.get("asset_id")) != str(intent.get("token"))
+                or str(order.get("market")) != str(intent.get("condition")) or order.get("side") != "BUY"):
+            raise RuntimeError(f"the venue's record of order hash ...{h[-10:]} does not match its intent")
+        p = types.SimpleNamespace(order_hash=h, token=intent.get("token"), condition=intent.get("condition"))
+        evidence = self._ambiguity_evidence(order, p)
+        if evidence is None:
+            return None
+        kind, _size, tids = evidence
+        if kind == NO_MATCH:
+            return NO_MATCH, 0.0
+        led = self.ledger
+        with led._lock:
+            if h not in led.authorized_orders or not set(tids) <= set(led.seen):
+                return None                         # matched, but not (yet) booked under its authorization
+            spent = sum(float(lot.shares) * float(lot.price) for pos in led.positions.values()
+                        for lot in pos.lots if getattr(lot, "order_id", None) == h
+                        and str(lot.side).upper() == "BUY")
+        return "CONFIRMED", spent
+
+    async def _reconcile_previous_run(self) -> None:
+        """The restart halt (audit follow-up): every send intent a previous run
+        left unresolved is looked up on the venue by its own order hash - the
+        same evidence rules as an unknown outcome in this run (M7). Proven zero
+        execution, or a match fully booked under its authorization, resolves
+        it; nothing is ever sent again. When none is left and no authorization
+        lacks its trades, the start-up halt is lifted. Otherwise it stays, with
+        what the venue said about each order."""
+        session = self.session
+        if session is None or not any(str(r).startswith(session.PREVIOUS_RUN) for r in self.kill.reasons):
+            return
+        limits, notes = self.sender.limits, {}
+        for delay in self.previous_run_delays_s:
+            await asyncio.sleep(delay)
+            for key, intent in session.unresolved():
+                if not intent.get("order_hash") or self.order_status is None:
+                    notes[key] = "no order hash recorded (sent by an older version): reconcile by hand"
+                    continue
+                try:
+                    order = await asyncio.to_thread(self.order_status, intent["order_hash"])
+                    verdict = self._previous_run_verdict(intent, order)
+                except RuntimeError as exc:
+                    notes[key] = str(exc)
+                    continue
+                except Exception as exc:  # noqa: BLE001 - a lookup that failed is not evidence
+                    self.n["order status errors"] += 1
+                    notes[key] = f"venue lookup failed ({type(exc).__name__})"
+                    continue
+                if verdict is None:
+                    notes[key] = "no terminal venue record, or its trades are not in the ledger yet"
+                    continue
+                status, spent = verdict
+                accepted = intent.get("kind") in (MATCHED, PENDING)
+                amount = float(intent.get("amount") or 0.0)
+                if status == NO_MATCH:
+                    if accepted:
+                        limits.resolve_accepted(amount, zero_fill=True)
+                    else:
+                        limits.record_outcome(NO_MATCH, amount)
+                else:
+                    if not accepted:
+                        limits.record_outcome(MATCHED, amount)
+                    limits.resolve_accepted(max(0.0, amount - spent))
+                session.resolve(key, status, limits, self.kill, spent=spent)
+                notes.pop(key, None)
+                self.n[f"previous run order resolved {status}"] += 1
+                self.on_event("sniper", f"LIVE previous run's order {key[-8:]} reconciled with the venue: "
+                                        f"{status}" + (f" (${spent:.2f})" if spent else ""), "warn")
+            if not session.unresolved():
+                proof = session._ledger_view(self.ledger, session.started_wall, session.intents)
+                if not proof["unconfirmed"]:
+                    self.kill.reasons[:] = [r for r in self.kill.reasons
+                                            if not str(r).startswith(session.PREVIOUS_RUN)]
+                    session.persist(limits, self.kill)
+                    self.on_event("sniper", "LIVE previous run's orders all reconciled with the venue: start-up "
+                                            "halt lifted" + ("" if not self.kill.reasons else
+                                                             f" (still halted: {'; '.join(self.kill.reasons)})"),
+                                  "good" if not self.kill.reasons else "warn")
+                    return
+        for key, why in notes.items():
+            self.on_event("sniper", f"LIVE previous run's order {key[-8:]} still unresolved: {why}", "bad")
 
     @staticmethod
     def _fill_from_response(row: dict) -> dict | None:
