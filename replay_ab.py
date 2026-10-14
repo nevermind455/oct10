@@ -245,6 +245,7 @@ class ReplayBroker:
     replay clock reaches the arrival); the manager submits from the driver."""
     supports_size_at_limit = False
     supports_arrival_book = False
+    supports_share_sized = True       # F1: a share-sized FAK buys at most its shares
     own_fill_ttl_s = 0
 
     def __init__(self, ledger: Ledger, clock: Clock, book, *, start_cash: float, latency_ms: float,
@@ -281,7 +282,8 @@ class ReplayBroker:
                                                          Decimal("0.01")), self.clock.now)
         return hit[0]
 
-    def _enqueue(self, side, amount, up, down, cond, end, cap, tag, ref_ask, callback=None, fok=False):
+    def _enqueue(self, side, amount, up, down, cond, end, cap, tag, ref_ask, callback=None, fok=False,
+                 shares=None):
         ev, slot = threading.Event(), {}
         token = up if side == "UP" else down
         with self.lock:
@@ -289,14 +291,15 @@ class ReplayBroker:
             self.pending.append({"arrival": self.clock.now + self.latency_s, "side": side, "amount": float(amount),
                                  "token": str(token), "cond": str(cond), "end": float(end), "cap": float(cap),
                                  "tag": tag, "ref_ask": ref_ask, "decided": self.clock.now, "ev": ev, "slot": slot,
-                                 "callback": callback, "fok": bool(fok)})
+                                 "callback": callback, "fok": bool(fok),
+                                 "shares": None if shares is None else float(shares)})
         return ev, slot
 
     def place_trade(self, side, amount, up, down, cond, end, max_price, min_price=None, *, latency_ms=None,
-                    tag=None, fak=False, **_kw) -> bool:
+                    tag=None, fak=False, shares=None, **_kw) -> bool:
         view = self.book.view(str(up if side == "UP" else down))
         ev, slot = self._enqueue(side, amount, up, down, cond, end, max_price, tag or "sniper", view.best_ask,
-                                 fok=not fak)
+                                 fok=not fak, shares=shares)
         ev.wait(120)
         self._local.fill, self._local.error = slot.get("fill"), slot.get("error")
         return bool(slot.get("ok"))
@@ -358,10 +361,11 @@ class ReplayBroker:
         if err is None:
             cap = math.floor(o["cap"] * 100 + 1e-9) / 100
             spend, shares, notional, fee, used = o["amount"], 0.0, 0.0, 0.0, []
+            want = o.get("shares")            # F1: a share-sized order stops at its shares
             for p, q in asks:
-                if p > cap + 1e-9 or spend <= 1e-9:
+                if p > cap + 1e-9 or spend <= 1e-9 or (want is not None and shares >= want - 1e-9):
                     break
-                take = min(q, spend / p)
+                take = min(q, spend / p) if want is None else min(q, want - shares)
                 shares += take
                 notional += take * p
                 fee += take * FEE_RATE * (p * (1 - p)) ** FEE_EXP
@@ -385,10 +389,12 @@ class ReplayBroker:
             for p, take in used:
                 self.own[tok].append((self.clock.now, round(p, 4), take))
             fill = {"tag": o["tag"], "order_id": oid, "shares": shares, "average_price": vwap, "fee": fee,
-                    "total_cost": notional + fee, "partial": notional < o["amount"] - 0.01}
+                    "total_cost": notional + fee,
+                    "partial": (notional < o["amount"] - 0.01) if o.get("shares") is None
+                    else shares < o["shares"] - 1e-9}
             slot.update(ok=True, error=None, fill=fill)
         self.orders.append({"tag": o["tag"], "side": o["side"], "cond": o["cond"], "decided": o["decided"],
-                            "ref_ask": o["ref_ask"], "cap": o["cap"], "amount": o["amount"],
+                            "ref_ask": o["ref_ask"], "cap": o["cap"], "amount": o["amount"], "shares": o.get("shares"),
                             "fill": slot.get("fill"), "error": slot.get("error")})
         if o["callback"] is not None:
             o["callback"](slot.get("ok", False), slot.get("fill"), slot.get("error"))

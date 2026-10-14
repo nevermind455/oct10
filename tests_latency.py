@@ -21,6 +21,7 @@ import asyncio
 import builtins
 import importlib.util
 import json
+import math
 import os
 import pathlib
 import random
@@ -624,7 +625,31 @@ class ReplayBroker:
         return True
 
 
-async def replay(mod, steps, env, feed: str = "binance") -> list:
+class FixedReplayBroker(ReplayBroker):
+    """Fills a fixed share count per order, whatever its sizing: the dollar
+    and the share-sized order then leave the same state behind (F1 parity)."""
+    supports_share_sized = True
+
+    def __init__(self):
+        super().__init__()
+        self.shares_kw = []
+
+    def place_trade(self, side, amount, up, down, cond, end, cap, _x, latency_ms=None, tag=None, **kw):
+        self.shares_kw.append(kw.get("shares"))
+        f = self.FRACTIONS[self.n % len(self.FRACTIONS)]
+        self.n += 1
+        if f == 0:
+            self._local.fill, self._local.error = None, "FAK no-fill: nothing at or below the cap"
+            return False
+        price = round(cap - 0.03, 4)
+        shares = round(5.0 * f + 1.0, 4)
+        self._local.error = None
+        self._local.fill = {"tag": tag, "order_id": f"r{self.n}", "shares": shares, "average_price": price,
+                            "total_cost": round(shares * price, 4), "fee": 0.0, "partial": f < 1.0}
+        return True
+
+
+async def replay(mod, steps, env, feed: str = "binance", broker=None, extra_keys=()) -> list:
     """Feed one module's Sniper the same ticks and books; return its decisions.
     feed: whose wire message carries each mid (the old module knows Binance only)."""
     from feeds.book import BookState
@@ -641,7 +666,8 @@ async def replay(mod, steps, env, feed: str = "binance") -> list:
     # with the replay's - and right after a reboot (uptime below the replay's ~1,000s)
     # every book read as stale and no order was replayed at all.
     with patch.object(mod, "time", fake), patch("feeds.book.time", fake):
-        sn = mod.Sniper(hub, ReplayBroker(), journal_path=journal, settings=settings, trade_rows=[], own_rounds=True)
+        sn = mod.Sniper(hub, broker or ReplayBroker(), journal_path=journal, settings=settings, trade_rows=[],
+                        own_rounds=True)
         sn.fresh.enabled = False
         for dt_ms, mid, ask_up, ask_dn, end in steps:
             fake.mono += dt_ms / 1000.0
@@ -665,7 +691,7 @@ async def replay(mod, steps, env, feed: str = "binance") -> list:
             task.cancel()
         await asyncio.gather(*sn._tasks, return_exceptions=True)
     keys = ("result", "reason", "side", "bp", "ask_seen", "cap", "amount", "shares", "target_shares", "carry_in",
-            "carry_out", "round_end")
+            "carry_out", "round_end") + tuple(extra_keys)
     rows = [json.loads(x) for x in journal.read_text(encoding="utf-8").splitlines()]
     return [{k: r.get(k) for k in keys} for r in rows if r.get("result") in ("filled", "refused", "skipped", "error")]
 
@@ -697,7 +723,9 @@ class StrategyEquivalence(unittest.TestCase):
         # the replay's clock: each round's trade window is open (300s..10s left) for most steps
         steps = [(dt, mid, au, ad, end) for dt, mid, au, ad, end in steps]
         for mode_env in ({"SNIPER_LATENCY_MS": "5"}, {"SNIPER_LATENCY_MS": ""}):
-            env = dict(SPEC_ENV, SNIPER_SHADOW_MS="", **mode_env)
+            # the old layer signs dollars: compared as the dollar order (F1 changed the sizing,
+            # not the rule - test_share_sized_orders_qualify_the_same_signals checks that)
+            env = dict(SPEC_ENV, SNIPER_SHADOW_MS="", SNIPER_ORDER_SIZING="dollars", **mode_env)
             a = asyncio.run(replay(old, steps, env))
             b = asyncio.run(replay(S, steps, env))
             self.assertGreater(sum(1 for r in a if r["result"] in ("filled", "refused")), 20, "too few orders replayed")
@@ -714,13 +742,43 @@ class StrategyEquivalence(unittest.TestCase):
             self.skipTest(f"git history with {OLD_COMMIT} is not available")
         steps = replay_steps(11, 1500)
         for mode_env in ({"SNIPER_LATENCY_MS": "5"}, {"SNIPER_LATENCY_MS": ""}):
-            env = dict(SPEC_ENV, SNIPER_SHADOW_MS="", **mode_env)
+            env = dict(SPEC_ENV, SNIPER_SHADOW_MS="", SNIPER_ORDER_SIZING="dollars", **mode_env)
             a = asyncio.run(replay(old, steps, env, feed="binance"))
             b = asyncio.run(replay(S, steps, env, feed="coinbase"))
             self.assertGreater(sum(1 for r in a if r["result"] in ("filled", "refused")), 20, "too few orders replayed")
             self.assertEqual(len(a), len(b))
             for i, (x, y) in enumerate(zip(a, b)):
                 self.assertEqual(x, y, f"decision {i} differs ({mode_env})")
+
+    def test_share_sized_orders_qualify_the_same_signals(self):
+        """F1 (2026-10-14) changed how an order is sized, not which signals trade:
+        the same replay as dollars and as shares - every decision has the same
+        result, reason, side, move, ask, cap and target; a share-sized order's
+        amount is its whole shares x the cap's cent limit."""
+        steps = replay_steps(7, 1500)
+        extra = ("order_shares", "est_cost")
+        for mode_env in ({"SNIPER_LATENCY_MS": "5"}, {"SNIPER_LATENCY_MS": ""}):
+            env = dict(SPEC_ENV, SNIPER_SHADOW_MS="", **mode_env)
+            dollars, shares = FixedReplayBroker(), FixedReplayBroker()
+            a = asyncio.run(replay(S, steps, dict(env, SNIPER_ORDER_SIZING="dollars"), broker=dollars, extra_keys=extra))
+            b = asyncio.run(replay(S, steps, dict(env, SNIPER_ORDER_SIZING="shares"), broker=shares, extra_keys=extra))
+            orders = [r for r in b if r["result"] in ("filled", "refused")]
+            self.assertGreater(len(orders), 20, "too few orders replayed")
+            self.assertEqual(len(a), len(b))
+            for i, (x, y) in enumerate(zip(a, b)):
+                if y["result"] in ("filled", "refused"):
+                    # the share-sized order: the target's whole shares (>= the venue's 5) x the
+                    # cap's cent limit; the dollar order's stake is its expected cost
+                    n = max(math.floor(y["target_shares"] + 1e-9), 5)
+                    self.assertEqual(y["order_shares"], n, f"decision {i}")
+                    self.assertAlmostEqual(y["amount"], n * math.floor(y["cap"] * 100 + 1e-9) / 100, places=6)
+                    self.assertAlmostEqual(y["est_cost"], x["amount"], places=6, msg=f"decision {i}")
+                    x, y = dict(x, amount=None), dict(y, amount=None)
+                self.assertEqual(dict(x, order_shares=None, est_cost=None), dict(y, order_shares=None, est_cost=None),
+                                 f"decision {i} ({mode_env})")
+            self.assertEqual([s for s in dollars.shares_kw], [None] * len(dollars.shares_kw))
+            self.assertEqual(shares.shares_kw, [r["order_shares"] for r in orders if r.get("order_shares")] or
+                             shares.shares_kw)
 
 
 class LatencyBudget(unittest.TestCase):

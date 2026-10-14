@@ -1499,6 +1499,16 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Binance/Kraken still selectable. A Binance tick moves no rule unless Binance is the trigger.
     # Re-approved 2026-10-11 (the operator's change): the SNIPER_K_BP default is the frozen
     # spec's 0.3bp (was 0.5bp).
+    # Re-approved 2026-10-14 (repair branch repair/2026-10-14, the operator's master prompt):
+    # C1 canary intents are one fsynced journal line per send (v3 state, compaction, archive);
+    # C2/H3/M5/M6/M7/L9 ledger indexes, off-lock snapshot payloads, off-loop summaries, next-round
+    # rules prefetch, fast FAK resolution, order-hash reconciliation of unknown outcomes; H4
+    # backlog-gate/coalescing options (paper only, off); F1 share-sized FAK limit orders (the
+    # gates judge the dollar order exactly as before - same signals qualify; the order is whole
+    # shares at the cap; SNIPER_ORDER_SIZING=dollars for paper A/B, live refuses it); P2 opt-in
+    # SNIPER_BOOK_QUIET (off). feeds/poly_market.py and feeds/hub.py already differed from this
+    # table at fd916fb (commit fc52ab0, 2026-10-12, recorded no re-approval); hub.py also adds
+    # the prepared round to the user channel (M5). Re-recorded here; see the repair report.
     # Re-approved 2026-10-11 (the operator's rule, SNIPER_FAIR): the below-average rule is
     # removed; every buy only at or under FairValue's fair price less the taker fee and
     # SNIPER_FAIR_MARGIN, the limit capped there - fair UP = Phi(ln(S/S0) / (sigma sqrt tau)),
@@ -1537,7 +1547,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # second trigger (exec_latency.spec_violations).
     # Re-approved 2026-10-13 (the operator's choice): SNIPER_KELLY_FRACTION defaults to the
     # frozen spec's 0.5 (half Kelly; was full).
-    "sniper_mode.py": "d65bb50d3218b81ad05c55ac8a50f6136fa700e1c3340890e1791e479f8f172e",
+    "sniper_mode.py": "f3e13ca2ce1534d50ee57d501a3a027f6331fa4511c3c6d3e7bca3300d3db8fd",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
@@ -1548,7 +1558,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Reviewed 2026-10-12: user-requested recovery, accounting and portfolio safety fixes.
     # Re-approved 2026-10-12 (audit 20261012): one outcome per prepared order; monotonic server
     # clock; conflicting venue evidence is AMBIGUOUS
-    "sniper_live.py": "243293f7890f40a5f204f4594fa027592c750d973273018b3c2b01017ffca442",
+    "sniper_live.py": "ee13bd9d99832cbff8b2b5ff3f6018517d32a7d1bb493b6ebedd1495d3995ed5",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads
@@ -1565,10 +1575,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # (paper_live_book/sniper, /manager) - per-source P/L from actual fills.
     # Re-approved 2026-10-12 (audit 20261012): a failing event observer cannot change a committed
     # paper fill or rejection
-    "paper_trade.py": "042cd08f2334b0c617bfbf36acdf7638df4f760126b7eafc93f2ddc77018698a",
+    "paper_trade.py": "74de9530f5b66469f54f4a8eb18400342289a482610dfd2c557d80af0ad48f4e",
     # Re-approved 2026-10-12 (audit 20261012): a rejection that also carries acceptance evidence
     # is not definitive
-    "polymarket_trade.py": "6dd32d0a02b3d34b82f1195988afe16d949ded8fe6a157b9603a301018ff9b9f",
+    "polymarket_trade.py": "398c55b670843db6f978e76c4848005cacfdaf46ab31a27bbae8b4dd50e89362",
     # Re-approved 2026-10-12 (audit 20261012): supplied/cached books pass the same level
     # validation; crossed books refused
     "orderbook.py": "da71e154a518bebbad1eb95f2a4259f5d228ee51b0f26ccffd9071bcc5a2f8b3",
@@ -1582,7 +1592,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Reviewed 2026-10-12: user-requested recovery, accounting and portfolio safety fixes.
     # Re-approved 2026-10-12 (audit 20261012): durable-fill rollback keeps an undo record instead
     # of deep-copying the position history
-    "accounting/ledger.py": "792f8b5bd1bedb01570326ef603bdc163e78ada188b864a77ba47a1ff4450e3c",
+    "accounting/ledger.py": "c435b293872f0d5ad8202d1091ecb28ce7dd1ad68f112dcc266db3a25d766951",
     "accounting/fees.py": "44e45be00c7c3b330ef0ff11950fa42944029ba83a61ec8066af3494c0956dc7",
     # Re-approved (settlement audit): one record per market (condition id), checked from
     # expiry, concurrently, on the worker's own pool; explicit lifecycle events and a journal;
@@ -1606,13 +1616,13 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved 2026-10-12 (audit 20261012): deltas fenced by the newest observed exchange time,
     # so a REST snapshot cannot rewind them; timestamped tick changes; REST tuples cannot certify
     # a past venue instant
-    "feeds/book.py": "75c6eb40bc9c86399c55a74d4804f92334e859315098a8d1d329652633f0599c",
+    "feeds/book.py": "4df242f5023bbc5e5c9bb7d1d5810791e2ef018ef0441acb428a3efd30526055",
     # Reviewed 2026-10-12: user-requested recovery, accounting and portfolio safety fixes.
     # Re-approved 2026-10-12 (audit 20261012): FillStore summary cached until the next mutation
-    "feeds/poly_user.py": "5b13a011bc1cfd7c5445ea17013100728ed02134ba75e4049a37d96c26699660",
+    "feeds/poly_user.py": "6ff37ccc1cda3238b7b702233f339093b84b7bf026576364f87e29111f68facd",
     # Reviewed 2026-10-12: receive fencing and ordered public-token snapshot recovery.
-    "feeds/hub.py": "45b61d911502da1eaf424d154ca33d0e9226d727f9b076acf74eff7ca8d2c22a",
-    "feeds/poly_market.py": "a1bb16261905e0b2f39b63afa25c6e50c25140d1ee3fd931b15134065a7ad6f4",
+    "feeds/hub.py": "c7dafeb425bec13e51a9e811aad72e01d765c32d8147ad540fd21d77bc9010f4",
+    "feeds/poly_market.py": "459f43fbd6bc582c48446442f37d2341762932f14f321d5016d2a398e962c70a",
     "feeds/reconcile.py": "71dea5e832fb970e5cfac1880686cf5eff477a34c48c9b91ba961f77b3e9cb6f",
 }
 SIDES = (None, "UP", "DOWN")

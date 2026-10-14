@@ -176,17 +176,26 @@ class BookState:
                         asks=tuple(sorted(e[5].items(), key=lambda kv: kv[0])),
                         updated_mono=e[1], exchange_ts_ms=e[3], tick_size=e[6])
 
-    def view_at(self, token: str, venue_ms: float):
+    def view_at(self, token: str, venue_ms: float, *, allow_quiet: bool = False):
         """(BookView, info) of the book as it stood at venue time venue_ms, or
         (None, info) with info["why"] when that cannot be known: the feed has
         not yet carried anything stamped after it, the history does not reach
-        back that far, or the feed had a gap (disconnect/resync) then."""
+        back that far, or the feed had a gap (disconnect/resync) then.
+
+        allow_quiet (paper's opt-in SNIPER_BOOK_QUIET, audit P2): when the feed
+        has not passed venue_ms but is connected and this token is LIVE (no
+        gap, nothing stale), the last book delivered is returned as the book
+        then, with info["evidence"] = "quiet" - an inference from silence, not
+        a proof (a change could still be in flight), so it is labelled."""
         token = str(token)
         with self._lock:
             info = {"hwm_ms": self.ts_hwm}
             if self.ts_hwm is None or self.ts_hwm <= venue_ms:
-                info["why"] = "the feed has not yet passed that time"
-                return None, info
+                if not (allow_quiet and self.ts_hwm is not None and self.connected
+                        and token in self._active and self._status(token) == LIVE):
+                    info["why"] = "the feed has not yet passed that time"
+                    return None, info
+                info["evidence"] = "quiet"
             h = self._hist.get(token)
             if not h:
                 info["why"] = "no book history for this token"

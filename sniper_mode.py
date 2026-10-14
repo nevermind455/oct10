@@ -766,6 +766,33 @@ class FastOrderBuilder:
         self.last_sign_ns = (t3, time.perf_counter_ns())
         return bm.SignedOrderV2(**{**fields, "signature": signature})
 
+    def build_order(self, order_args, options, version: int = 2, fee_rate_bps=None):
+        """OrderBuilder.build_order (a v2 limit order, F1's share-sized FAK)
+        with the fast digest; amounts, salt and fields are the library's own."""
+        import dataclasses
+        from py_clob_client_v2.order_builder import builder as bm
+        b = self.b
+        if version != 2 or b.signature_type == bm.SignatureTypeV2.POLY_1271:
+            return b.build_order(order_args, options, version=version, fee_rate_bps=fee_rate_bps)
+        side, maker_amount, taker_amount = b.get_order_amounts(
+            order_args.side, order_args.size, order_args.price, bm.ROUNDING_CONFIG[options.tick_size])
+        chain = b.signer.get_chain_id()
+        cc = bm.get_contract_config(chain)
+        exchange = cc.neg_risk_exchange_v2 if options.neg_risk else cc.exchange_v2
+        eb = self._exchange.get(exchange)
+        if eb is None:
+            eb = self._exchange[exchange] = bm.ExchangeOrderBuilderV2(exchange, chain, b.signer)
+        order = eb.build_order(bm.OrderDataV2(
+            maker=b.funder, tokenId=order_args.token_id, makerAmount=str(maker_amount),
+            takerAmount=str(taker_amount), side=side, signer=b._v2_order_signer(), signatureType=b.signature_type,
+            timestamp=str(time.time_ns() // 1_000_000), metadata=getattr(order_args, "metadata", bm.BYTES32_ZERO),
+            builder=order_args.builder_code, expiration=str(getattr(order_args, "expiration", 0))))
+        fields = dataclasses.asdict(order)
+        t3 = time.perf_counter_ns()
+        signature = self.sign(eb, order)
+        self.last_sign_ns = (t3, time.perf_counter_ns())
+        return bm.SignedOrderV2(**{**fields, "signature": signature})
+
     def sign(self, eb, order) -> str:
         """The order's EIP-712 signature: '0x' + r || s || v (v = 27/28), as
         eth_account's sign_message returns it."""
@@ -957,6 +984,11 @@ class Settings:
         if self.book_clock not in ("exchange", "local", "wake"):
             self.book_clock = "exchange"
         self.book_wait_ms = _env_float("SNIPER_BOOK_WAIT_MS", 500)
+        # Audit P2 (opt-in, off): when the feed has carried nothing past the
+        # match instant by the end of the wait, a connected, gap-free, LIVE
+        # feed's last book is taken as the book then - inferred, labelled
+        # (arrival.evidence = "quiet") and counted. Off: UNKNOWN, as before.
+        self.book_quiet = str(os.environ.get("SNIPER_BOOK_QUIET", "0")).strip().lower() in ("1", "true", "yes", "on")
         self.venue_offset_ms = _env_float("SNIPER_VENUE_CLOCK_OFFSET_MS", 0)
         raw = os.environ.get("SNIPER_SHADOW_MS", "100,200,300,400,500")
         try:
@@ -976,6 +1008,14 @@ class Settings:
         self.order_type = str(os.environ.get("SNIPER_ORDER_TYPE", default_type)).strip().upper() or default_type
         if self.order_type not in ("FOK", "FAK"):
             raise ValueError(f"invalid SNIPER_ORDER_TYPE {self.order_type!r}: FOK or FAK")
+        # F1 (2026-10-14): a FAK is sized in SHARES - a limit order for the
+        # target's whole shares at the cap - so a fill can never exceed the
+        # share target, the side cap or a per-order cap (a dollar-sized market
+        # BUY turned price improvement into extra shares). "dollars" restores
+        # the old order for paper A/B; LIVE requires "shares" (exec_latency).
+        self.order_sizing = str(os.environ.get("SNIPER_ORDER_SIZING", "shares")).strip().lower() or "shares"
+        if self.order_sizing not in ("shares", "dollars"):
+            raise ValueError(f"invalid SNIPER_ORDER_SIZING {self.order_sizing!r}: shares or dollars")
         self.binance_url = binance_url(os.environ.get("SNIPER_BINANCE_URL"))
         # Binance freshness gate (BinanceFreshness): on by default; 0 restores the
         # bare bookTicker socket with no exchange timestamps and no gate.
@@ -1082,6 +1122,13 @@ class Settings:
         return (f" (+ same-side unfilled carry, <= {self.max_target_shares:g} sh)"
                 if self.order_type == "FAK" else "")
 
+    def sizing_text(self) -> str:
+        """F1: how a FAK is sized - a share-sized limit never buys more."""
+        if self.order_type != "FAK":
+            return ""
+        return (" (a share-sized limit: never buys more)" if self.order_sizing == "shares"
+                else " (dollar-sized: buys more when the ask falls)")
+
     def fair_text(self) -> str:
         if not self.fair:
             return ""
@@ -1094,13 +1141,14 @@ class Settings:
     def lines(self, live: bool = False) -> list[str]:
         if live:
             return [f"SNIPER LIVE CANARY{self.lead_text()}: spot mid >= {self.k_bp}bp within {self.window_ms:.0f}ms -> real {self.order_type} "
-                    f"{self.shares:.0f} sh{self.carry_text()} at ask+{self.slip:.2f}, cooldown {self.cooldown_ms:.0f}ms per side, "
+                    f"{self.shares:.0f} sh{self.carry_text()} at ask+{self.slip:.2f}{self.sizing_text()}, "
+                    f"cooldown {self.cooldown_ms:.0f}ms per side, "
                     f">= {self.min_left_s:.0f}s left, <= {self.max_fills_round} fills and "
                     f"{self.max_side_shares:.0f} sh/side per round" + self.fair_text()
                     + (f"; shadow fills at {','.join(map(str, self.shadow_ms))}ms (arithmetic only)"
                        if self.shadow_ms else "") + self.feeds_text()]
         return [f"SNIPER paper-only{self.lead_text()}: spot mid >= {self.k_bp}bp within {self.window_ms:.0f}ms -> {self.order_type} "
-                f"{self.shares:.0f} sh{self.carry_text()} at ask+{self.slip:.2f}, "
+                f"{self.shares:.0f} sh{self.carry_text()} at ask+{self.slip:.2f}{self.sizing_text()}, "
                 + (f"matched {self.latency_ms:.0f}ms after deciding (fixed); " if self.fixed_latency else
                    f"real order signing + {self.delay_note}; " if self.delay_note else
                    f"live-like: real order signing + measured one-way to the CLOB + {self.hold_ms:.0f}ms hold "
@@ -1111,7 +1159,8 @@ class Settings:
                 + (f"; shadow fills at {','.join(map(str, self.shadow_ms))}ms (arithmetic only)"
                    if self.shadow_ms else "")
                 + ("" if self.fixed_latency else
-                   f"; paper fills against the book at the modelled match instant ({self.book_clock} clock)")
+                   f"; paper fills against the book at the modelled match instant ({self.book_clock} clock"
+                   + (", a quiet feed's last book inferred" if self.book_quiet else "") + ")")
                 + self.feeds_text()]
 
 
@@ -2224,6 +2273,8 @@ class Sniper:
             kw["fak"] = True
         if getattr(self.broker, "supports_size_at_limit", False):
             kw["size_at_limit"] = True               # sized as the live sender sizes it
+        if plan.get("shares") is not None and getattr(self.broker, "supports_share_sized", False):
+            kw["shares"] = plan["shares"]            # F1: the order's whole shares at the cap
         if kw and self._history_book() is not None and getattr(self.broker, "supports_arrival_book", False):
             arrival_ms = plan["sent_wall"] * 1000.0 + float(latency_ms) + self.s.venue_offset_ms
             arrival_mono = plan["sent_mono"] + float(latency_ms) / 1000.0
@@ -2292,6 +2343,9 @@ class Sniper:
                     or time.perf_counter() >= deadline):
                 break
             time.sleep(0.005)
+        if (view is None and getattr(self.s, "book_quiet", False) and self.s.book_clock == "exchange"
+                and str(info.get("why", "")).startswith("the feed has not yet")):
+            view, info = book.view_at(token, arrival_ms, allow_quiet=True)        # P2, opt-in: labelled
         local = book.view_at_mono(token, arrival_mono)
         info = dict(info)
         hwm = info.pop("hwm_ms", None)
@@ -2683,11 +2737,11 @@ class Sniper:
             else:
                 st["handoff_pc"] = time.perf_counter_ns()
                 fut = loop.run_in_executor(None, self._match, plan, sign_ms, st)
-                self._bankroll_spent(plan["amount"])
+                self._bankroll_spent(plan.get("est_cost", plan["amount"]))
             if self.s.shadow_ms:
                 # After the send: the shadow sleeps until absolute times anyway.
                 self._spawn(self._shadow(row, plan["token"], plan["other"], plan["cond"],
-                                         plan["amount"], plan["cap"], plan["t0"]))
+                                         plan.get("est_cost", plan["amount"]), plan["cap"], plan["t0"]))
             return self._spawn(self._finish(side, r_bp, row, plan, fut, t_pc, start_pc, st["sign_pc"]), order=True)
         except Exception as exc:  # noqa: BLE001 - a sniper fault must never stop the bot
             self.n["errors"] += 1
@@ -2728,7 +2782,7 @@ class Sniper:
         task = self._spawn(self._finish_live(side, r_bp, row, plan, p, t_pc, started), order=True)
         if self.s.shadow_ms:
             self._spawn(self._shadow(row, plan["token"], plan["other"], plan["cond"],
-                                     plan["amount"], plan["cap"], plan["t0"]))
+                                     plan.get("est_cost", plan["amount"]), plan["cap"], plan["t0"]))
         return task
 
     def _check_dispatch_age(self, plan, gate, original_excess) -> None:
@@ -2879,8 +2933,10 @@ class Sniper:
     def _note_over_target(self, row: dict, plan: dict, shares) -> None:
         """F1 (audit): a dollar-sized IOC whose ask fell before the match buys
         more shares than its target. Journalled and counted - never hidden.
-        Diagnostics only, after the fill: no decision reads it."""
-        target = plan.get("target")
+        A share-sized order is bounded by its own share count (the venue's
+        minimums may lift it above the target), so it can only show here if
+        the fill broke that bound. Diagnostics only: no decision reads it."""
+        target = plan.get("shares") if plan.get("shares") is not None else plan.get("target")
         try:
             got = float(shares or 0)
         except (TypeError, ValueError):
@@ -3129,6 +3185,39 @@ class Sniper:
             # The venue refuses a marketable BUY under $1, so under 10c the
             # 10-share clip becomes $1 - the smallest order live could place.
             amount = max(self.s.shares * ask, MIN_ORDER_USD)
+        # The gates below judge the dollar order exactly as before F1 - its
+        # dollars and its shares estimated at the best ask - so the same
+        # signals qualify. A share-sized order is then bounded exactly too.
+        est_cost, gate_shares, order_shares = amount, amount / ask, None
+        share_sized = self.s.order_type == "FAK" and self.s.order_sizing == "shares"
+        if share_sized:
+            # F1: the order IS a whole number of shares at the cap - a fill can
+            # never exceed it: the target's whole shares, lifted to the floors
+            # the dollar order had (the venue's 5 shares, its $1 at the limit).
+            # `amount` becomes the most it can spend (shares x limit: what is
+            # signed and reserved); `est_cost` the dollar order's stake (the
+            # bankroll estimate and the shadow fills, as before).
+            cent = Decimal("0.01")
+            tick = Decimal(str(getattr(view, "tick_size", None) or 0.01))
+            limit = (Decimal(str(min(cap, hi))) / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+            if tick < cent:
+                # Whole shares x a sub-cent limit is not always whole cents
+                # (a signed amount must be): the limit goes down to a cent,
+                # never up past the cap.
+                limit = (limit / cent).to_integral_value(rounding=ROUND_FLOOR) * cent
+                if limit <= 0 or float(limit) + 1e-9 < ask:
+                    row.update(ask_seen=ask, cap=cap)
+                    return self._skip("ask above the order's whole-cent limit", row)
+                cap = float(limit)
+            floor_shares = max(KELLY_MIN_SHARES, int((Decimal(str(MIN_ORDER_USD)) / limit).to_integral_value(
+                rounding="ROUND_CEILING")))
+            order_shares = max(int(math.floor(target + 1e-9)), floor_shares)
+            if kelly and order_shares > room + 1e-9:
+                row.update(ask_seen=ask, order_shares=order_shares, room_shares=round(room, 4))
+                return self._skip("kelly room under venue minimum at price cap", row)
+            amount = float(Decimal(order_shares) * limit)
+        # what an order in flight may add to its side: never less than it can buy
+        risk_shares = max(gate_shares, float(order_shares)) if share_sized else gate_shares
         rd = self.rounds.get(end)
         if rd is None:
             # A new round: rounds that ended over an hour ago go (one entry per
@@ -3147,11 +3236,14 @@ class Sniper:
         other = self.inflight.get("DOWN" if side == "UP" else "UP")
         in_flight = 1 if isinstance(other, dict) and other.get("end") == end else 0
         if (rd["fills"] + in_flight >= self.s.max_fills_round
-                or rd[side] + amount / ask > self.s.max_side_shares):
+                or rd[side] + gate_shares > self.s.max_side_shares
+                or (share_sized and rd[side] + order_shares > self.s.max_side_shares + 1e-9)):
             return self._skip("round cap", row)
         decided_pc = time.perf_counter_ns()     # every check passed: this signal trades
-        self.inflight[side] = {"end": end, "amount": amount, "risk_shares": amount / ask}
-        row.update(ask_seen=ask, cap=cap, shares=round(amount / ask, 4), amount=round(amount, 4))
+        self.inflight[side] = {"end": end, "amount": amount, "risk_shares": risk_shares}
+        row.update(ask_seen=ask, cap=cap, shares=round(gate_shares, 4), amount=round(amount, 4))
+        if share_sized:
+            row.update(order_shares=order_shares, est_cost=round(est_cost, 4))
         if target is not None:
             row.update(target_shares=round(target, 4), carry_in=round(carry, 4))
         self.n["orders"] += 1
@@ -3159,7 +3251,8 @@ class Sniper:
         row.update(latency_ms=round(lat, 1), **parts)
         tick = getattr(view, "tick_size", None)
         return {"end": end, "token": str(token), "amount": amount, "rd": rd, "cap": cap, "lat": lat, "view": view,
-                "risk_shares": amount / ask, "fair_fee_rate": fee_rate, "fair_fee_exponent": fee_exponent,
+                "risk_shares": risk_shares, "fair_fee_rate": fee_rate, "fair_fee_exponent": fee_exponent,
+                "shares": order_shares, "est_cost": est_cost,
                 # a Kelly-sized order carries nothing to the next: each is sized fresh
                 "target": target, "carry_market": self.carry_market if target is not None and not kelly else None,
                 "order_type": self.s.order_type, "tick": f"{float(tick):g}" if tick else "0.01",
@@ -3198,6 +3291,9 @@ class Sniper:
                 woke = (arrival.get("wake") or {}).get("fill")
                 if late is not None and late >= 10.0:
                     row["late_recovered"] = True       # the timer woke >=10ms late; the book did not move with it
+                if arrival.get("evidence") == "quiet":
+                    row["book_evidence"] = "quiet"         # P2 opt-in: inferred, not proven
+                    self.n["paper orders on an inferred quiet-feed book"] += 1
                 if woke is not None and row["outcome"] != "UNKNOWN_BOOK_STATE" and woke != filled:
                     row["old_rule"] = "false_miss" if filled else "false_fill"
                 row["arrival_ms"] = arrival.get("arrival_ms")

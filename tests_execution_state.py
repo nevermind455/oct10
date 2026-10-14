@@ -109,7 +109,9 @@ class SignedStakeTests(unittest.TestCase):
                 case.reply()
                 await case.tick(60_000.0, 60_003.6)
                 body, _ = case.last_post()
-                self.assertEqual(D(str(body["order"]["makerAmount"])), D("5100000"))   # 10 x 0.51, not 5.09
+                # F1: the whole order is signed - 10 shares at the 0.56 ceiling
+                self.assertEqual(D(str(body["order"]["takerAmount"])), D("10000000"))
+                self.assertEqual(D(str(body["order"]["makerAmount"])), D("5600000"))
             finally:
                 await case.teardown_live()
         asyncio.run(go())

@@ -72,6 +72,9 @@ FROZEN_SPEC = (
     # 2026-10-13, the operator's choice: half Kelly (was 1.0) - about 3/4 of full Kelly's
     # long-run growth for about half its swings while the fair value is still unproven.
     ("kelly_fraction", "SNIPER_KELLY_FRACTION", 0.5, "kelly fraction", "{:g}"),
+    # 2026-10-14, the operator's mandate (audit F1): FAKs are share-sized, so a
+    # fill can never exceed the share target or a share cap.
+    ("order_sizing", "SNIPER_ORDER_SIZING", "shares", "order sizing", "{}"),
 )
 
 # The second triggers LIVE accepts beside the primary feed. 2026-10-13, the

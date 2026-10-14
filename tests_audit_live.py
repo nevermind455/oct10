@@ -246,8 +246,11 @@ class LivePathAudit(LivePathBase):
             self.assertEqual(body["orderType"], "FAK")                 # Polymarket's IOC: fill what can, kill the rest
             self.assertNotIn(body["orderType"], ("FOK", "GTC", "GTD"))
             self.assertIn(str(order["side"]).upper(), ("BUY", "0"))
-            self.assertEqual(making, D("5500000"))                      # 10 shares x the 0.55 reference ask
-            self.assertLessEqual(abs(limit - D("0.60")), D("0.001"))    # the ceiling: reference ask + 0.05
+            # F1: a share-sized limit order - exactly 10 shares at the 0.60 ceiling
+            # (reference ask + 0.05); its USDC amount is the most it may spend.
+            self.assertEqual(taking, D("10000000"))
+            self.assertEqual(making, D("6000000"))
+            self.assertEqual(limit, D("0.6"))
             pend = self.rows("pending")[-1]
             self.assertEqual((pend["order_type"], pend["target_shares"], pend["carry_in"], pend["ask_seen"],
                               pend["cap"]), ("FAK", 10.0, 0.0, 0.55, 0.6))
@@ -268,27 +271,39 @@ class LivePathAudit(LivePathBase):
                 f"(fees ${pos.fees:.4f})")
             self.assertAlmostEqual(pos.shares, 6.0)
             self.assertAlmostEqual(pos.avg_price, 0.55, places=6)
-            # --- canary exposure: requested $5.50 at send, actual cost once confirmed
+            # --- canary exposure: the signed $6.00 (10 x the 0.60 limit) at send, actual cost once confirmed
             before = self.ex.sender.limits.exposure_usd
             await asyncio.to_thread(self.ex.reconcile_once)
             after = self.ex.sender.limits.exposure_usd
             say(f"canary spend: ${before:.2f} counted at send (requested) -> ${after:.2f} after confirmation (actual)")
-            self.assertAlmostEqual(before, 5.50, places=6)
+            self.assertAlmostEqual(before, 6.00, places=6)
             self.assertAlmostEqual(after, 6 * 0.55, places=2)
             # --- signal 2 (same side): 10 base + 4 carry = 14
             oid2, tid2 = self.reply()
             await self.tick(60_000.0, 60_003.6)
             body, _ = self.last_post()
-            self.assertEqual(D(str(body["order"]["makerAmount"])), D("7700000"))   # 14 x 0.55
+            self.assertEqual(D(str(body["order"]["takerAmount"])), D("14000000"))  # F1: 14 shares
+            self.assertEqual(D(str(body["order"]["makerAmount"])), D("8400000"))   # x the 0.60 limit
             self.trade(tid2, oid2, 11, 0.55)
             self.sn._sync_live_fak()
             say(log_line({**self.rows("pending")[-1], **self.rows("live_fill_update")[-1]}))
             self.assertEqual(self.sn.carry["UP"], 3.0)
-            # --- signal 3: 10 + 3 = 13
+            # --- signal 3: 10 + 3 = 13. F1: every order reserves its worst case (shares x
+            # limit), so 13 x 0.60 + fees on top of the open $8.40 + $3.30 passes the canary's
+            # $20 loss budget: refused before anything is sent ...
+            await self.tick(60_000.0, 60_003.6)
+            refused = self.rows("skipped")[-1]
+            self.assertEqual((refused["reason"], refused["order_shares"]), ("live refused", 13))
+            self.assertIn("canary loss budget", refused["detail"])
+            self.assertEqual(self.fake.hits[("POST", "/order")], 2)
+            # ... and with room in the budget the carried 13 shares are signed
+            self.ex.sender.limits.max_daily_loss_usd = 30.0
+            self.sn.last_fire_by_side["UP"] = -1e18
             oid3, tid3 = self.reply()
             await self.tick(60_000.0, 60_003.6)
             body, _ = self.last_post()
-            self.assertEqual(D(str(body["order"]["makerAmount"])), D("7150000"))   # 13 x 0.55
+            self.assertEqual(D(str(body["order"]["takerAmount"])), D("13000000"))  # F1: 13 shares
+            self.assertEqual(D(str(body["order"]["makerAmount"])), D("7800000"))   # x the 0.60 limit
             self.assertEqual(self.rows("pending")[-1]["target_shares"], 13.0)
             self.assertEqual(self.fake.hits[("POST", "/order")], 3)               # one POST per signal, no retry
         finally:
@@ -371,15 +386,18 @@ class LivePathAudit(LivePathBase):
         async def go():
             await self.setup_live()
             try:
-                amounts = []
+                amounts, sizes = [], []
                 for _ in range(3):
                     self.reply(status=400, body={"success": False, "errorMsg": "no orders found to match with FAK order"})
                     await self.tick(60_000.0, 60_003.6)
-                    amounts.append(D(str(self.last_post()[0]["order"]["makerAmount"])) / D(1_000_000))
+                    order = self.last_post()[0]["order"]
+                    amounts.append(D(str(order["makerAmount"])) / D(1_000_000))
+                    sizes.append(D(str(order["takerAmount"])) / D(1_000_000))
                 targets = [r["target_shares"] for r in self.rows("refused")]
                 say(f"three zero fills: targets {targets}, posted ${', $'.join(str(a) for a in amounts)}")
                 self.assertEqual(targets, [10.0, 20.0, 20.0])
-                self.assertEqual(amounts, [D("5.5"), D("11"), D("11")])
+                self.assertEqual(sizes, [D("10"), D("20"), D("20")])             # F1: the signed share count
+                self.assertEqual(amounts, [D("6"), D("12"), D("12")])            # x the 0.60 ceiling
             finally:
                 await self.teardown_live()
         self.run_async(go())
@@ -397,10 +415,12 @@ class LivePathAudit(LivePathBase):
                 down = self.rows("pending")[-1]
                 body, _ = self.last_post()
                 say(f"DOWN after an UP carry of 4: target {down['target_shares']}, carry_in {down['carry_in']}, "
-                    f"posted ${D(str(body['order']['makerAmount'])) / D(1_000_000)} (10 x 0.51)")
+                    f"posted ${D(str(body['order']['makerAmount'])) / D(1_000_000)} (10 x the 0.56 ceiling)")
                 self.assertEqual((down["side"], down["target_shares"], down["carry_in"]), ("DOWN", 10.0, 0.0))
-                self.assertAlmostEqual(down["amount"], 5.10, places=6)          # 10 x 0.51, no UP carry in it
-                self.assertEqual(D(str(body["order"]["makerAmount"])), D("5100000"))    # the whole $5.10 is signed
+                self.assertAlmostEqual(down["est_cost"], 5.10, places=6)        # 10 x 0.51, no UP carry in it
+                self.assertAlmostEqual(down["amount"], 5.60, places=6)          # F1: at most 10 x the 0.56 ceiling
+                self.assertEqual(D(str(body["order"]["takerAmount"])), D("10000000"))   # exactly 10 shares
+                self.assertEqual(D(str(body["order"]["makerAmount"])), D("5600000"))
                 self.assertEqual(self.sn.carry["UP"], 4.0)
             finally:
                 await self.teardown_live()

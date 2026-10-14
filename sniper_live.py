@@ -1150,7 +1150,8 @@ class LeanSender:
                  latency_extreme_ms: float = 5000.0, guard: "VenueGuard | None" = None,
                  realized_loss=None) -> None:
         import polymarket_trade as pt
-        from py_clob_client_v2.clob_types import CreateOrderOptions, MarketOrderArgsV2, OrderType, RequestArgs
+        from py_clob_client_v2.clob_types import (CreateOrderOptions, MarketOrderArgsV2, OrderArgsV2, OrderType,
+                                                  RequestArgs)
         from py_clob_client_v2.endpoints import POST_ORDER
         from py_clob_client_v2.headers.headers import create_level_2_headers
         from py_clob_client_v2.order_builder.constants import BUY
@@ -1173,12 +1174,14 @@ class LeanSender:
         self.unresolved: dict = {}
         self.ambiguity_resolver = None
         self._lib = dict(CreateOrderOptions=CreateOrderOptions, MarketOrderArgsV2=MarketOrderArgsV2,
+                         OrderArgsV2=OrderArgsV2,
                          FOK=OrderType.FOK, FAK=OrderType.FAK, RequestArgs=RequestArgs, POST_ORDER=POST_ORDER,
                          l2=create_level_2_headers, BUY=BUY, to_json=order_to_json_v2)
 
     # ------------------------------------------------------------ hot path, synchronous
     def prepare(self, *, side: str, token: str, up: str, down: str, condition: str, end: float,
-                amount: float, cap: float, decided_pc: int | None = None, order_type: str = "FOK") -> Prepared:
+                amount: float, cap: float, decided_pc: int | None = None, order_type: str = "FOK",
+                shares: float | None = None) -> Prepared:
         st = {"decided_pc": decided_pc, "prepare_pc": time.perf_counter_ns()}
         if order_type not in ("FOK", "FAK"):
             raise Refused(f"unknown order type {order_type!r}")
@@ -1195,19 +1198,39 @@ class LeanSender:
         exact = (Decimal(str(cap)) / step).to_integral_value(rounding=ROUND_FLOOR) * step
         if not (step <= exact <= 1 - step and exact <= Decimal(str(cap))):
             raise Refused(f"capped price {exact} outside the tradable range for tick {tick}")
-        shares = Decimal(str(amount)) / exact
-        if shares < Decimal(str(rules["minimum"])):
-            raise Refused(f"{shares:.4f} shares at {exact} is below the venue minimum {rules['minimum']}")
-        self.limits.check(float(amount), float(shares), str(condition), self.kill,
+        size = None
+        if shares is not None:
+            # F1: a share-sized FAK - a limit order for exactly these whole
+            # shares at the cap. Its USDC amount (the most it can spend) is
+            # shares x limit: whole cents, as every signed stake is.
+            if order_type != "FAK":
+                raise Refused("a share-sized order is a fill-and-kill")
+            size = Decimal(str(shares))
+            if size != size.to_integral_value() or size <= 0:
+                raise Refused("a share-sized order is whole shares")
+            maker = size * exact
+            if maker != maker.quantize(Decimal("0.01")):
+                raise Refused(f"{size} shares at {exact} is not a whole-cent amount")
+            amount = float(maker)
+        n_shares = size if size is not None else Decimal(str(amount)) / exact
+        if n_shares < Decimal(str(rules["minimum"])):
+            raise Refused(f"{n_shares:.4f} shares at {exact} is below the venue minimum {rules['minimum']}")
+        self.limits.check(float(amount), float(n_shares), str(condition), self.kill,
                           self.realized_loss() if self.realized_loss else None)
         lib = self._lib
         st["build_pc"] = time.perf_counter_ns()
         if hasattr(self.builder, "last_sign_ns"):
             self.builder.last_sign_ns = None
-        signed = self.builder.build_market_order(
-            lib["MarketOrderArgsV2"](token_id=str(token), amount=signing_amount(amount), side=lib["BUY"],
-                                     price=signing_price(cap, tick), order_type=lib[order_type]),
-            lib["CreateOrderOptions"](tick_size=tick, neg_risk=bool(rules["neg_risk"])), version=self.version)
+        if size is not None:
+            signed = self.builder.build_order(
+                lib["OrderArgsV2"](token_id=str(token), price=signing_price(cap, tick), size=float(size),
+                                   side=lib["BUY"]),
+                lib["CreateOrderOptions"](tick_size=tick, neg_risk=bool(rules["neg_risk"])), version=self.version)
+        else:
+            signed = self.builder.build_market_order(
+                lib["MarketOrderArgsV2"](token_id=str(token), amount=signing_amount(amount), side=lib["BUY"],
+                                         price=signing_price(cap, tick), order_type=lib[order_type]),
+                lib["CreateOrderOptions"](tick_size=tick, neg_risk=bool(rules["neg_risk"])), version=self.version)
         st["signed_pc"] = time.perf_counter_ns()
         if getattr(self.builder, "last_sign_ns", None):
             st["sign_start_pc"], st["sign_end_pc"] = self.builder.last_sign_ns     # T3, T4
@@ -1231,6 +1254,7 @@ class LeanSender:
         p = Prepared(side, str(token), str(condition), float(end), float(amount), float(cap),
                      float(exact), tick, str(salt), body, headers, dict(rules), st, order_type)
         p.order_hash = order_hash
+        p.shares = float(size) if size is not None else None
         return p
 
     # ------------------------------------------------------------ the write, synchronous
@@ -2326,8 +2350,8 @@ class LiveExecution:
         functions, on the book the decision used), then sign it. Raises
         Refused (this order not sent) or Halted (no orders until a human
         restarts the canary). No I/O."""
-        from paper_trade import (MIN_MARKETABLE_BUY_USD, PaperRejected, estimate_fok, estimate_fak, size_to_venue_minimum,
-                                 snapshot_from_book_view)
+        from paper_trade import (MIN_MARKETABLE_BUY_USD, PaperRejected, estimate_fok, estimate_fak, estimate_fak_shares,
+                                 size_to_venue_minimum, snapshot_from_book_view)
         self.kill.check()
         order_type = str(plan.get("order_type", "FOK")).upper()
         if order_type not in ("FOK", "FAK"):
@@ -2374,17 +2398,31 @@ class LiveExecution:
                 raise PaperRejected("one-sided book")
             if book.asks[0][0] - book.best_bid > Decimal(str(self.shim.max_spread)):
                 raise PaperRejected("spread exceeds the limit")
-            spend = size_to_venue_minimum(amount, book, rules, cap)
-            # The SDK signs BUY size at the limit, not the visible average.
-            # Reserve enough for the venue minimum at that exact limit even
-            # when slippage is wider than the generic sizing headroom.
             price = (Decimal(str(cap)) / rules.tick_size).to_integral_value(rounding=ROUND_FLOOR) * rules.tick_size
-            minimum_spend = (rules.min_order_size * price).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
-            spend = max(spend, minimum_spend)
-            if spend < MIN_MARKETABLE_BUY_USD:
-                raise PaperRejected(f"invalid amount for a marketable BUY order (${spend:.2f}), min size: $1")
-            quote_fn = estimate_fak if order_type == "FAK" else estimate_fok
-            quote = quote_fn(book, spend, float(price), rules, min_price=self.shim.min_buy_price)
+            size = None
+            if plan.get("shares") is not None and order_type == "FAK":
+                # F1: exactly these whole shares at the limit, never more
+                size = Decimal(str(plan["shares"]))
+                minimums = [v for v in (book.min_order_size, rules.min_order_size) if v is not None]
+                if minimums and size < max(minimums):
+                    raise PaperRejected(f"order size {size} shares is below venue minimum {max(minimums)}")
+                spend = size * price
+                if spend != spend.quantize(Decimal("0.01")):
+                    raise PaperRejected(f"{size} shares at {price} is not a whole-cent amount")
+                if spend < MIN_MARKETABLE_BUY_USD:
+                    raise PaperRejected(f"invalid amount for a marketable BUY order (${spend:.2f}), min size: $1")
+                quote = estimate_fak_shares(book, size, float(price), rules, min_price=self.shim.min_buy_price)
+            else:
+                spend = size_to_venue_minimum(amount, book, rules, cap)
+                # The SDK signs BUY size at the limit, not the visible average.
+                # Reserve enough for the venue minimum at that exact limit even
+                # when slippage is wider than the generic sizing headroom.
+                minimum_spend = (rules.min_order_size * price).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+                spend = max(spend, minimum_spend)
+                if spend < MIN_MARKETABLE_BUY_USD:
+                    raise PaperRejected(f"invalid amount for a marketable BUY order (${spend:.2f}), min size: $1")
+                quote_fn = estimate_fak if order_type == "FAK" else estimate_fok
+                quote = quote_fn(book, spend, float(price), rules, min_price=self.shim.min_buy_price)
         except PaperRejected as exc:
             raise Refused(f"pre-send check: {exc}") from exc
         except Exception as exc:  # noqa: BLE001 - e.g. a malformed book: do not send
@@ -2398,7 +2436,8 @@ class LiveExecution:
             raise Refused(f"collateral ${free:.2f} is below the order ${spend + reserve_fee:.2f} incl. fee")
         self._check_loss_budget(spend + reserve_fee)
         p = self.sender.prepare(side=side, token=token, up=str(up), down=str(down), condition=cond, end=end,
-                                amount=spend, cap=cap, decided_pc=decided_pc, order_type=order_type)
+                                amount=spend, cap=cap, decided_pc=decided_pc, order_type=order_type,
+                                shares=float(size) if size is not None else None)
         p.reserve = spend + reserve_fee
         p.estimate = {"shares": float(quote.shares), "price": float(quote.average_price), "fee": fee}
         def send_guard():
@@ -2429,7 +2468,9 @@ class LiveExecution:
         with self._risk_lock:
             self._risk_orders[p.client_order_id] = {"condition": str(cond), "token": str(token),
                                                    "reserve": p.reserve, "order_id": None,
-                                                   "shares": max(float(quote.shares), spend / float(book.asks[0][0]))}
+                                                   # share-sized: exactly what it can add (F1)
+                                                   "shares": (float(size) if size is not None else
+                                                              max(float(quote.shares), spend / float(book.asks[0][0])))}
         self.reserved += p.reserve
         self._balance_revision += 1
         return p

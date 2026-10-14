@@ -177,6 +177,21 @@ class Gate(I.PaperIOCBase):
         for i in range(70):                                     # a known minute: steps of exactly V
             self.sn.vol_model.observe(float(i), 60_000.0 * math.exp(self.V if i % 2 else 0.0))
 
+    def pin_time_left(self, seconds: float = 120.0) -> None:
+        """Fix the round's time left (tau). The fair value - and so Kelly's size -
+        depends on it; the current round's end left it anywhere in 20..300s by
+        when the suite ran, so a size-dependent test flaked (2026-10-14 repair)."""
+        self.m.window_end = time.time() + seconds
+
+    def kelly_wants_the_room(self, room: float) -> None:
+        """The premise of a room-trim test: unbounded, Kelly wants more than the
+        room. Asserted, so a model change fails here instead of flaking."""
+        bank = self.sn._bankroll_now()
+        tau = self.m.window_end - time.time()
+        fair = oracle_fair(0.40, 5.0, self.V, tau)
+        want, _f = oracle_kelly(fair, 0.41, bank, fraction=self.sn.s.kelly_fraction, cap=10_000)
+        self.assertGreater(want, room, f"premise: Kelly wants {want} > the {room} room at tau={tau:.0f}s")
+
     def order(self, side, ask_levels, mid, move_bp):
         token = self.m.up_token if side == "UP" else self.m.down_token
         self.mids[token] = mid
@@ -240,6 +255,7 @@ class Gate(I.PaperIOCBase):
         self.assertEqual(r["reason"], "kelly size unknown: no cash reading")
 
     def test_no_per_order_cap_only_the_sides_room_in_the_round(self):
+        self.pin_time_left(120.0)
         r = self.order("UP", [(0.41, 1000)], mid=0.40, move_bp=5.0)
         self.assertGreater(r["target_shares"], 20)                   # the old 20-share cap is gone
         self.assertLessEqual(r["target_shares"], 200)
@@ -263,31 +279,40 @@ class Gate(I.PaperIOCBase):
 
     def test_thin_best_ask_trims_stake_to_round_room_instead_of_missing_the_order(self):
         self.make(SNIPER_SLIP="0.02")
+        self.pin_time_left(120.0)
+        self.kelly_wants_the_room(20.0)
         rd = self.sn.rounds[self.m.window_end]
         rd["UP"] = 180.0
         # Kelly wants the 20 shares left. Their ladder cost is $8.58, but
         # the unchanged round guard conservatively counts $8.58/.41 > 20.
         r = self.order("UP", [(0.41, 1), (0.43, 1000)], mid=0.40, move_bp=5.0)
         self.assertEqual(r["result"], "filled")
-        self.assertEqual((r["target_shares"], r["amount"], r["cap"]), (20.0, 8.20, 0.43))
-        self.assertLessEqual(r["amount"] / r["ask_seen"], 20.0)
-        self.assertGreater(r["shares"], 18.0)
+        # the gate judges the dollar stake, as before; F1 then signs 20 whole shares
+        self.assertEqual((r["target_shares"], r["est_cost"], r["cap"]), (20.0, 8.20, 0.43))
+        self.assertLessEqual(r["est_cost"] / r["ask_seen"], 20.0)
+        self.assertEqual((r["order_shares"], r["amount"]), (20, 8.60))
+        self.assertEqual(r["shares"], 20.0)                                 # exactly the room, never past it
         self.assertLessEqual(rd["UP"], self.sn.s.max_side_shares)
         self.assertEqual(self.sn.carry["UP"], 0.0)
 
     def test_cent_rounding_floors_stake_to_fractional_round_room(self):
         self.make(SNIPER_SLIP="0.02")
+        self.pin_time_left(120.0)
+        self.kelly_wants_the_room(19.99)
         rd = self.sn.rounds[self.m.window_end]
         rd["UP"] = 180.01
         # 19.99 * .41 = $8.1959. Rounding UP to $8.20 would count
         # 20 shares and miss a valid smaller order; $8.19 stays within room.
         r = self.order("UP", [(0.41, 1000)], mid=0.40, move_bp=5.0)
-        self.assertEqual((r["result"], r["amount"]), ("filled", 8.19))
-        self.assertLessEqual(r["amount"] / r["ask_seen"], 19.99)
+        self.assertEqual((r["result"], r["est_cost"]), ("filled", 8.19))
+        self.assertLessEqual(r["est_cost"] / r["ask_seen"], 19.99)
+        self.assertEqual((r["order_shares"], r["amount"], r["shares"]), (19, 8.17, 19.0))   # F1: whole shares
         self.assertLessEqual(rd["UP"], self.sn.s.max_side_shares)
 
     def test_minimum_at_the_signed_limit_cannot_enlarge_stake_past_round_room(self):
         self.make(SNIPER_SLIP="0.02")
+        self.pin_time_left(120.0)
+        self.kelly_wants_the_room(5.0)
         rd = self.sn.rounds[self.m.window_end]
         rd["UP"] = 195.0
         # $2.05 buys five at .41, but the sender would need $2.15 to
@@ -307,8 +332,9 @@ class Gate(I.PaperIOCBase):
         self.m.set(self.m.up_token, [(0.41, 1), (0.43, 1000)])
         plan = self.sn._decide("UP", {"bp": 5.0, "window_ms": 250.0}, time.monotonic() * 1000.0)
         self.assertIsNotNone(plan)
-        self.assertEqual((plan["target"], plan["amount"]), (20.0, 8.20))
-        self.assertLessEqual(plan["amount"] / plan["view"].best_ask, 20.0)
+        self.assertEqual((plan["target"], plan["est_cost"]), (20.0, 8.20))
+        self.assertLessEqual(plan["est_cost"] / plan["view"].best_ask, 20.0)
+        self.assertEqual((plan["shares"], plan["amount"]), (20, 8.60))      # F1: <= the canary's 20 per order
 
     def anchored_order(self, then, now, move_bp=5.0, ask=0.41):
         """An UP order whose book stood at mid `then` when the move began
@@ -358,7 +384,8 @@ class Gate(I.PaperIOCBase):
         r1 = self.order("UP", [(0.41, 1000)], mid=0.40, move_bp=5.0)
         r2 = self.order("DOWN", [(0.41, 1000)], mid=0.40, move_bp=-5.0)   # before the next cash reading
         self.assertEqual(r1["bankroll"], 1000.0)
-        self.assertAlmostEqual(r2["bankroll"], 1000.0 - r1["amount"], places=2)
+        # Kelly's cash estimate takes the order's expected cost, as it did before F1
+        self.assertAlmostEqual(r2["bankroll"], 1000.0 - r1["est_cost"], places=2)
 
     def test_a_cap_at_the_price_floor_is_skipped_not_sent(self):
         """10-12 VPS run: 14 orders with ask 0.05 = MIN_BUY_PRICE and cap 0.05

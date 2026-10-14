@@ -51,7 +51,9 @@ from paper_trade import MarketRules, PaperBroker  # noqa: E402
 
 # =========================================================================== F1
 class F1DollarIOC(I.PaperIOCBase):
-    """Target 10 shares at a $0.50 ask: the stake is $5.00 whatever happens next."""
+    """Target 10 shares at a $0.50 ask: the stake is $5.00 whatever happens next.
+    The DOLLAR order - paper A/B only since 2026-10-14 (F1SharesIOC: the default)."""
+    extra_env = {"SNIPER_ORDER_SIZING": "dollars"}
 
     def test_the_ask_falls_to_049_040_030(self):
         for ask in (0.49, 0.40, 0.30):
@@ -99,7 +101,46 @@ class F1DollarIOC(I.PaperIOCBase):
         self.assertIn("hard caps", lines)
 
 
+class F1SharesIOC(I.PaperIOCBase):
+    """F1 fixed (2026-10-14): 10 whole shares at the $0.55 cap. Whatever the
+    ask does before the match, it buys at most 10 and pays only for those."""
+
+    def test_the_ask_falls_to_049_040_030(self):
+        for ask in (0.49, 0.40, 0.30):
+            self.sn.last_fire_by_side["UP"] = -1e18
+            before = self.broker.cash_balance()
+            r = self.fire("UP", [(0.50, 100)], [(ask, 100)])
+            self.assertEqual((r["target_shares"], r["order_shares"], r["amount"], r["est_cost"]),
+                             (10.0, 10, 5.5, 5.0))
+            self.assertAlmostEqual(r["shares"], 10.0, places=9)                 # exactly the order
+            self.assertNotIn("over_target", r)
+            self.assertAlmostEqual(before - self.broker.cash_balance(), 10 * ask, places=6)   # the saving is kept
+        self.assertEqual(self.sn.n["fills above target (ask fell)"], 0)
+
+    def test_the_ask_rises_inside_the_cap_and_past_it(self):
+        r = self.fire("UP", [(0.50, 100)], [(0.54, 4), (0.55, 3), (0.56, 100)])
+        self.assertAlmostEqual(r["shares"], 7.0, places=9)                      # 4 + 3 at or under 0.55
+        self.assertAlmostEqual(r["cost"], 4 * 0.54 + 3 * 0.55, places=6)
+        self.assertTrue(r.get("partial"))
+        self.assertAlmostEqual(self.sn.carry["UP"], 3.0, places=6)
+
+    def test_minimums_lift_the_order_never_past_the_side_cap(self):
+        import sniper_mode as S
+        self.sn = S.Sniper(self.m, self.broker, settings=I.settings(SNIPER_SHARES="5", SNIPER_MAX_SIDE_SHARES="20"))
+        self.sn._write = self.rows.append
+        r = self.fire("UP", [(0.10, 100)], [(0.10, 100)])                      # 5 sh x the 0.15 cap is under $1
+        self.assertEqual(r["order_shares"], 7)                                  # ceil($1 / 0.15): the $1 floor
+        self.assertAlmostEqual(r["amount"], 1.05, places=6)
+        self.assertAlmostEqual(r["shares"], 7.0, places=9)
+        self.sn.last_fire_by_side["UP"] = -1e18
+        self.sn.rounds[self.m.window_end]["UP"] = 14.0
+        r = self.fire("UP", [(0.10, 100)], [(0.10, 100)])
+        self.assertEqual((r["result"], r["reason"]), ("skipped", "round cap"))  # 14 + 7 > 20, exactly
+
+
 class F1Fees(I.PaperIOCBase):
+    extra_env = {"SNIPER_ORDER_SIZING": "dollars"}
+
     def setUp(self):
         super().setUp()
         m = self.m
@@ -113,6 +154,17 @@ class F1Fees(I.PaperIOCBase):
         fee = shares * F("0.07") * F("0.40") * F("0.60")
         self.assertAlmostEqual(r["fee"], float(fee), places=4)
         self.assertAlmostEqual(r["cost"], 5.0 + float(fee), places=4)
+
+
+class F1FeesShares(F1Fees):
+    extra_env = {}
+
+    def test_fees_follow_the_shares_actually_bought(self):
+        r = self.fire("UP", [(0.50, 100)], [(0.40, 100)])
+        fee = F(10) * F("0.07") * F("0.40") * F("0.60")                         # 10 shares, never 12.5
+        self.assertAlmostEqual(r["shares"], 10.0, places=9)
+        self.assertAlmostEqual(r["fee"], float(fee), places=4)
+        self.assertAlmostEqual(r["cost"], 4.0 + float(fee), places=4)
 
 
 # =========================================================================== F2

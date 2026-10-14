@@ -101,6 +101,7 @@ class Market:
 
 class PaperIOCBase(unittest.TestCase):
     order_type = "FAK"
+    extra_env: dict = {}       # e.g. {"SNIPER_ORDER_SIZING": "dollars"}: a test of the dollar order (F1)
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -116,7 +117,8 @@ class PaperIOCBase(unittest.TestCase):
             rules_fetch=lambda cid: MarketRules(cid, D("0"), 1, min_order_size=D("5"), tick_size=D("0.01"),
                                                 up_token_id=m.up_token, down_token_id=m.down_token),
             min_seconds_to_expiry=0, trade_window_seconds=300, own_fill_ttl_s=0)
-        self.sn = sniper_mode.Sniper(m, self.broker, settings=settings(SNIPER_ORDER_TYPE=self.order_type))
+        self.sn = sniper_mode.Sniper(m, self.broker, settings=settings(SNIPER_ORDER_TYPE=self.order_type,
+                                                                       **self.extra_env))
         self.rows = []
         self.sn._write = self.rows.append
 
@@ -145,11 +147,16 @@ class PaperIOCTests(PaperIOCBase):
         self.assertAlmostEqual(r["price"], 0.47, places=6)
         self.assertEqual(self.sn.carry, {"UP": 0.0, "DOWN": 0.0})
         self.assertAlmostEqual(self.held(UP), 10.0, places=6)
-        self.assertAlmostEqual(r["amount"], 4.70, places=6)
+        # F1: a share-sized order - its amount is the most it may spend (10 x
+        # the 0.52 cap); what the decision's book says it costs is est_cost.
+        self.assertEqual(r["order_shares"], 10)
+        self.assertAlmostEqual(r["amount"], 5.20, places=6)
+        self.assertAlmostEqual(r["est_cost"], 4.70, places=6)
 
     def test_full_fill_consumes_levels_from_the_ask_up_to_ask_plus_5c(self):
         r = self.fire("UP", [(0.47, 5), (0.50, 100)])
-        self.assertAlmostEqual(r["amount"], 4.85, places=6)                 # 5 x 0.47 + 5 x 0.50
+        self.assertAlmostEqual(r["est_cost"], 4.85, places=6)               # 5 x 0.47 + 5 x 0.50
+        self.assertAlmostEqual(r["amount"], 5.20, places=6)                 # F1: at most 10 x the 0.52 cap
         self.assertAlmostEqual(r["shares"], 10.0, places=6)
         self.assertAlmostEqual(r["price"], 0.485, places=6)
         self.assertEqual(self.sn.carry["UP"], 0.0)
