@@ -30,6 +30,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from decimal import Decimal as D
 
 ROOT = pathlib.Path(__file__).resolve().parent
@@ -197,6 +198,84 @@ class LiveShareSized(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(fill)
         self.assertEqual((fill["shares"], round(fill["cost"], 6)), (10.0, 4.5))
         self.assertFalse(ex.kill.tripped)
+
+    async def test_a_partial_fill_is_kept_with_the_venues_fee_curve(self):
+        T = self.T
+        ex = await self.canary()
+        self.fake.script.append(("json", 200, T.MATCHED_REPLY))
+        await ex.send(ex.prepare(self.plan(10)))
+        self.store.record_trade("trade-1", order_id="0xorder1", asset_id=T.UP, market=T.COND, side="BUY",
+                                price=0.50, size=6, status="MATCHED")
+        fill = ex.fill_for("0xorder1")
+        self.assertEqual((fill["shares"], round(fill["cost"], 6)), (6.0, 3.0))        # 6 of 10: kept, not refused
+        self.assertAlmostEqual(fill["fee"], 6 * 0.07 * 0.5 * 0.5, places=6)          # shares x rate x p(1-p)
+        self.assertFalse(ex.kill.tripped)
+
+    async def test_a_zero_fill_releases_its_reservation_and_risk(self):
+        ex = await self.canary()
+        self.fake.script.append(("json", 400, {"success": False, "errorMsg": "no orders found to match with FAK "
+                                               "order. FAK orders are partially filled or killed if no match "
+                                               "is found."}))
+        p = ex.prepare(self.plan(10))
+        res = await ex.send(p)
+        self.assertEqual(res["kind"], L.NO_MATCH)
+        self.assertEqual((ex.reserved, ex._risk_orders), (0.0, {}))
+        self.assertFalse(ex.kill.tripped)
+
+    async def test_a_delayed_reply_keeps_the_order_at_risk_until_its_outcome(self):
+        ex = await self.canary()
+        before = ex.balance
+        self.fake.script.append(("json", 200, {"success": True, "status": "delayed", "orderID": "0xdelayed",
+                                               "errorMsg": ""}))
+        p = ex.prepare(self.plan(10))
+        res = await ex.send(p)
+        self.assertEqual(res["kind"], L.PENDING)
+        self.assertIn(p.client_order_id, ex._risk_orders)                             # its worst case still counts
+        self.assertAlmostEqual(ex.balance, before - p.reserve, places=9)               # spent, or may be
+        self.assertFalse(ex.kill.tripped)
+
+    async def test_a_tenth_of_a_cent_tick_signs_whole_cents_or_refuses(self):
+        T = self.T
+        ex = await self.canary()
+        s = ex.sender
+        rules = dict(T.rules_fetch(T.COND, T.UP, T.DN, tick="0.001"))
+        kw = dict(side="UP", token=T.UP, up=T.UP, down=T.DN, condition=T.COND, end=T.round_end(),
+                  amount=0.0, cap=0.055, order_type="FAK")
+        with patch.object(s.rules, "get", lambda *a, **k: rules):
+            p = s.prepare(shares=10, **kw)                                             # 10 x 0.055 = $0.55
+            order = json.loads(p.body)["order"]
+            self.assertEqual((int(order["takerAmount"]), int(order["makerAmount"])), (10_000_000, 550_000))
+            with self.assertRaisesRegex(L.Refused, "whole-cent"):
+                s.prepare(shares=7, **kw)                                              # $0.385: never signed
+        self.assertEqual(self.fake.hits[("POST", "/order")], 0)
+
+    async def test_reservation_is_exactly_the_signed_worst_case_on_random_orders(self):
+        """Signed amounts and reservation, over many sizes and limits: the venue's
+        contract can take at most makerAmount (+ its fee) from a BUY - which is
+        exactly shares x limit, and the reservation covers it plus a fee bound."""
+        ex = await self.canary(limits=L.CanaryLimits(max_order_shares=200.0, max_exposure_usd=1e6, max_orders=10_000),
+                               balance=10_000.0)                 # caps out of the way: only the amounts
+        ex.sender.limits.max_daily_loss_usd = 10_000.0
+        rng = random.Random(20261014)
+        for i in range(60):
+            cap = rng.randint(6, 94) / 100
+            # the decision's floors: the venue's 5 shares and its $1 marketable minimum
+            shares = max(rng.randint(5, 60), int((D(1) / D(str(cap))).to_integral_value(rounding="ROUND_CEILING")))
+            ask = max(0.05, round(cap - 0.03, 2))
+            book = self.T.live_book(asks=((ask, 500),), bids=((round(ask - 0.01, 2), 500),))
+            p = ex.prepare(dict(self.T.live_plan(book.view(self.T.UP), side="UP", cap=cap, amount=shares * ask),
+                                order_type="FAK", shares=shares))
+            order = json.loads(p.body)["order"]
+            spend = D(shares) * D(str(cap))
+            self.assertEqual(int(order["takerAmount"]), shares * 1_000_000, i)
+            self.assertEqual(D(order["makerAmount"]) / D(1_000_000), spend, i)
+            fee_bound = max(D(str(p.estimate["fee"])), spend * D("0.07"))
+            self.assertAlmostEqual(p.reserve, float(spend + fee_bound), places=9)
+            # the venue's own fee on a BUY is rate x p(1-p) per share <= rate x p: inside the bound
+            self.assertLessEqual(D(shares) * D("0.07") * D(str(cap)) * (1 - D(str(cap))), fee_bound)
+            ex.reserved -= p.reserve                                    # next order from a clean slate
+            ex._risk_orders.pop(p.client_order_id, None)
+        self.assertEqual(self.fake.hits[("POST", "/order")], 0)
 
     async def test_up_and_down_in_flight_each_reserve_their_own_worst_case(self):
         ex = await self.canary(balance=12.0)
