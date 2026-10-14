@@ -597,6 +597,10 @@ class CanarySession:
         if spent is not None and (isinstance(spent, bool) or not isinstance(spent, (int, float))
                                   or not math.isfinite(spent) or not 0 <= spent <= intent["amount"] + 1e-6):
             raise ValueError("invalid resolved canary spend")
+        tids = intent.get("trade_ids")
+        if tids is not None and (not isinstance(tids, list)
+                                 or any(not isinstance(t, str) or not t for t in tids)):
+            raise ValueError("invalid canary intent trade ids")
 
     @staticmethod
     def _validate_counters(c) -> dict:
@@ -686,7 +690,7 @@ class CanarySession:
         elif op in ("outcome", "resolve"):
             intent = intents.get(rec.get("key"))
             if intent is not None:          # (else archived by a later compaction: nothing to update)
-                for k in ("status", "kind", "order_id", "spent"):
+                for k in ("status", "kind", "order_id", "spent", "trade_ids"):
                     if k in rec:
                         intent[k] = rec[k]
                 self._validate_intent(rec["key"], intent)
@@ -1000,8 +1004,15 @@ class CanarySession:
             kind = row["kind"]
             status = "ACCEPTED" if kind in (MATCHED, PENDING) else kind
             intent.update(status=status, kind=kind, order_id=row.get("order_id"))
-            line = self._line({"seq": self._next(), "op": "outcome", "key": p.client_order_id, "status": status,
-                               "kind": kind, "order_id": row.get("order_id"), "c": self._counters(limits)})
+            rec = {"seq": self._next(), "op": "outcome", "key": p.client_order_id, "status": status,
+                   "kind": kind, "order_id": row.get("order_id"), "c": self._counters(limits)}
+            # The reply's trade ids: a FAK's complete matching. A restart can settle
+            # the order from them when the venue keeps no record of its id.
+            resp = row.get("response") if isinstance(row.get("response"), dict) else {}
+            tids = resp.get("tradeIDs") or resp.get("trade_ids")
+            if isinstance(tids, list) and tids and all(isinstance(t, str) and t for t in tids):
+                intent["trade_ids"] = rec["trade_ids"] = list(tids)
+            line = self._line(rec)
         self._submit(line, "live send outcome", kill)
 
     def resolve(self, client_order_id: str | None, status: str, limits: "CanaryLimits", kill: KillSwitch,
@@ -2669,6 +2680,26 @@ class LiveExecution:
                                 f"{kind} ({size:g} shares)", "warn")
 
     # ------------------------------------------------------------ a previous run's orders (restart halt)
+    def _previous_run_by_trades(self, intent: dict) -> tuple | None:
+        """CONFIRMED when the venue has no record of the order but its accepted
+        reply named trades, and the ledger booked exactly those under the
+        order's authorization (the ledger books CONFIRMED trades only). None
+        otherwise: a missing record is never evidence of zero execution."""
+        tids = intent.get("trade_ids")
+        h = str(intent.get("order_hash") or intent.get("order_id") or "")
+        if not tids or not h or intent.get("kind") not in (MATCHED, PENDING):
+            return None
+        led = self.ledger
+        with led._lock:
+            if h not in led.authorized_orders or not set(tids) <= set(led.seen):
+                return None
+            lots = [lot for pos in led.positions.values() for lot in pos.lots
+                    if getattr(lot, "order_id", None) == h and str(lot.side).upper() == "BUY"]
+            if not lots or {str(lot.trade_id) for lot in lots} - set(tids):
+                return None
+            spent = sum(float(lot.shares) * float(lot.price) for lot in lots)
+        return "CONFIRMED", spent
+
     def _previous_run_verdict(self, intent: dict, order) -> tuple | None:
         """(status, spent) settling one of a previous run's unresolved send
         intents from the venue's record of its own order hash, or None while
@@ -2677,7 +2708,10 @@ class LiveExecution:
         booked there. An identity mismatch raises (it is never evidence)."""
         h = str(intent["order_hash"])
         if not isinstance(order, dict) or not order:
-            return None
+            # The CLOB answered null for the order's id (seen live for an executed
+            # FAK, 2026-10-15): settled only by the reply's own trade list - every
+            # one booked under the order's authorization, and no other trade.
+            return self._previous_run_by_trades(intent)
         if (str(order.get("id")) != h or str(order.get("asset_id")) != str(intent.get("token"))
                 or str(order.get("market")) != str(intent.get("condition")) or order.get("side") != "BUY"):
             raise RuntimeError(f"the venue's record of order hash ...{h[-10:]} does not match its intent")

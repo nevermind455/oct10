@@ -329,8 +329,169 @@ class ReconcileTool(unittest.TestCase):
             after = {p.name: p.stat().st_mtime_ns for p in pathlib.Path(tmp).iterdir()}
         self.assertEqual(code, 0, text)
         self.assertIn("VERDICT: consistent", text)
-        self.assertIn(f"venue total: {INCIDENT_SHARES} shares", text)
+        self.assertIn(f"1 trade(s), {INCIDENT_SHARES} shares", text)
         self.assertEqual(before, after)                                     # read-only
+
+    def incident_state(self, tmp, *, with_lot=True, reply_tids=("tr-1",), trades=None):
+        """A live ledger, journal and canary state as the halted VPS had them:
+        the order accepted (its canary intent ACCEPTED), its trade booked."""
+        import polymarket_trade as pt
+        from accounting.ledger import Ledger
+        from tests_sniper_live import COND, UP
+        oid = "0x" + "a1fa8479" + "0" * 56
+        led_path = os.path.join(tmp, "ledger.json")
+        led = Ledger(path=led_path)
+        end = (int(time.time()) // 300 + 1) * 300
+        receipt = pt._build_receipt({"tradeIDs": list(reply_tids)}, oid, "matched", condition_id=COND, token_id=UP,
+                                    window_end=end, amount=INCIDENT_AMOUNT, estimated_fee=0.0, fee_rate=0.07,
+                                    fee_exponent=1, validation="MATCHED_WITH_TRADE_EVIDENCE")
+        led.authorize_order(oid, receipt, venue_min_shares=5.0, price_cap=0.95)
+        if with_lot:
+            led.record_fill("tr-1", UP, shares=INCIDENT_SHARES, price=INCIDENT_PRICE, condition_id=COND,
+                            order_id=oid, status="CONFIRMED", source="user_ws")
+        led.save()
+        with open(os.path.join(tmp, "live_sniper.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"result": "live_send", "order_id": oid, "amount": INCIDENT_AMOUNT,
+                                 "cap": INCIDENT_CAP, "condition_id": COND, "token": UP,
+                                 "response": {"success": True, "status": "matched", "orderID": oid,
+                                              "tradeIDs": list(reply_tids)}}) + "\n")
+        holder = "0x" + "1" * 40
+        canary = os.path.join(tmp, "live_canary_state.json")
+        session = L.CanarySession(canary, L.CanarySession.wallet_key_for(holder))
+        limits, kill = L.CanaryLimits(), L.KillSwitch()
+        session.open(limits, kill, Ledger(path=os.path.join(tmp, "empty.json")))
+        p = L.Prepared("UP", UP, COND, float(end), INCIDENT_AMOUNT, INCIDENT_CAP, INCIDENT_CAP, "0.01", "key-1",
+                       json.dumps({"order": {"salt": "1", "signature": "throwaway"}}), {}, {}, {}, "FAK")
+        p.reserve, p.order_hash = INCIDENT_AMOUNT * 1.07, oid
+        session.before_send(p, limits, kill)
+        session.outcome(p, {"kind": L.MATCHED, "order_id": oid}, limits, kill)     # the old code kept no trade ids
+        kill.trip("FAK order " + oid + " filled above its signed size: reconcile")
+        session.persist(limits, kill)
+        session.close()
+        trade = {"id": "tr-1", "taker_order_id": oid, "asset_id": UP, "market": COND, "side": "BUY",
+                 "status": "CONFIRMED", "size": str(INCIDENT_SHARES), "price": str(INCIDENT_PRICE)}
+        client = types.SimpleNamespace(get_order=lambda o: None,              # the CLOB answered null
+                                       get_trades=lambda params: [trade] if trades is None else trades,
+                                       builder=types.SimpleNamespace(funder=None),
+                                       signer=types.SimpleNamespace(address=lambda: holder))
+        env = {"LIVE_SNIPER_JOURNAL": os.path.join(tmp, "live_sniper.jsonl"), "LEDGER_PATH": led_path,
+               "SNIPER_CANARY_STATE_PATH": canary}
+        return oid, canary, client, env
+
+    def run_tool(self, client, env, *argv):
+        import reconcile_order as R
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env), mock.patch("polymarket_trade._get_client", lambda: client), \
+                mock.patch.object(sys, "argv", ["reconcile_order.py", "0xa1fa8479", "--no-position", *argv]), \
+                contextlib.redirect_stdout(out):
+            code = R.main()
+        return code, out.getvalue()
+
+    def test_no_venue_order_record_settles_from_the_replys_booked_trades(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            oid, canary, client, env = self.incident_state(tmp)
+            code, text = self.run_tool(client, env)
+            self.assertEqual(code, 0, text)
+            self.assertIn("no order record", text)
+            self.assertIn("VERDICT: consistent", text)
+            self.assertIn("re-run with --settle", text)
+            self.assertEqual(L.CanarySession.durable_view(canary)["intents"]["key-1"]["status"], "ACCEPTED")
+            code, text = self.run_tool(client, env, "--settle")
+            self.assertEqual(code, 0, text)
+            data = L.CanarySession.durable_view(canary)
+            intent = data["intents"].get("key-1")
+            self.assertTrue(intent is None or intent["status"] == "CONFIRMED", intent)
+            self.assertEqual(len(data["kill_reasons"]), 1)                  # the halt stays until a new session
+            from accounting.ledger import Ledger
+            led = Ledger(path=env["LEDGER_PATH"])
+            led.load()
+            line = L.CanarySession(canary, data["wallet"]).open(L.CanaryLimits(), L.KillSwitch(), led,
+                                                                new_session=True)
+            self.assertIn("new canary session", line)                        # no unresolved intent left
+
+    def test_a_missing_record_without_trades_is_never_settled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            oid, canary, client, env = self.incident_state(tmp, with_lot=False, trades=[])
+            code, text = self.run_tool(client, env, "--settle")
+            self.assertEqual(code, 1, text)
+            self.assertIn("never proves a zero fill", text)
+            self.assertEqual(L.CanarySession.durable_view(canary)["intents"]["key-1"]["status"], "ACCEPTED")
+
+    def test_a_trade_the_reply_did_not_name_blocks_the_verdict(self):
+        from tests_sniper_live import COND, UP
+        oid = "0x" + "a1fa8479" + "0" * 56
+        base = {"id": "tr-1", "taker_order_id": oid, "asset_id": UP, "market": COND, "side": "BUY",
+                "status": "CONFIRMED", "size": str(INCIDENT_SHARES), "price": "0.29"}
+        extra = dict(base, id="tr-2", size="1")
+        with tempfile.TemporaryDirectory() as tmp:
+            _oid, canary, client, env = self.incident_state(tmp, trades=[base, extra])
+            code, text = self.run_tool(client, env, "--settle")
+            self.assertEqual(code, 1, text)
+            self.assertIn("are not the order's", text)
+            self.assertEqual(L.CanarySession.durable_view(canary)["intents"]["key-1"]["status"], "ACCEPTED")
+
+
+class RestartEvidence(unittest.IsolatedAsyncioTestCase):
+    """A restart settles an accepted order the venue keeps no record of only from
+    the reply's trade ids, each booked under the order's authorization."""
+
+    async def asyncSetUp(self):
+        import tests_sniper_live as T
+        self.T = T
+        self.tmp = tempfile.TemporaryDirectory()
+        self.fake = await T.FakeClob().start()
+        self.ex, self.ledger, self.store, _, _ = await T.make_canary(self.fake, self.tmp.name)
+
+    async def asyncTearDown(self):
+        await self.ex.sender.http.aclose()
+        await self.fake.stop()
+        self.tmp.cleanup()
+
+    def book(self, oid, tids, lots):
+        import polymarket_trade as pt
+        T = self.T
+        receipt = pt._build_receipt({"tradeIDs": list(tids)}, oid, "matched", condition_id=T.COND, token_id=T.UP,
+                                    window_end=(int(time.time()) // 300 + 1) * 300, amount=INCIDENT_AMOUNT,
+                                    estimated_fee=0.0, fee_rate=0.07, fee_exponent=1,
+                                    validation="MATCHED_WITH_TRADE_EVIDENCE")
+        self.ledger.authorize_order(oid, receipt, venue_min_shares=5.0, price_cap=0.95)
+        for tid, shares in lots:
+            self.ledger.record_fill(tid, T.UP, shares=shares, price=INCIDENT_PRICE, condition_id=T.COND,
+                                    order_id=oid, status="CONFIRMED", source="user_ws")
+
+    def intent(self, oid, tids):
+        T = self.T
+        return {"order_hash": oid, "order_id": oid, "kind": L.MATCHED, "status": "ACCEPTED", "token": T.UP,
+                "condition": T.COND, "amount": INCIDENT_AMOUNT, "trade_ids": list(tids)}
+
+    async def test_booked_reply_trades_settle_a_missing_record(self):
+        oid = "0x" + "ab" * 32
+        self.book(oid, ["t1"], [("t1", INCIDENT_SHARES)])
+        verdict = self.ex._previous_run_verdict(self.intent(oid, ["t1"]), None)
+        self.assertEqual(verdict[0], "CONFIRMED")
+        self.assertAlmostEqual(verdict[1], INCIDENT_AMOUNT, places=5)
+
+    async def test_no_trade_ids_an_unbooked_or_a_foreign_trade_is_not_evidence(self):
+        oid = "0x" + "cd" * 32
+        self.book(oid, ["t1"], [("t1", 6.0), ("t9", 1.0)])
+        self.assertIsNone(self.ex._previous_run_verdict(self.intent(oid, []), {}))             # nothing named
+        self.assertIsNone(self.ex._previous_run_verdict(self.intent(oid, ["t1", "t2"]), {}))  # t2 not booked
+        self.assertIsNone(self.ex._previous_run_verdict(self.intent(oid, ["t1"]), {}))        # t9 is foreign
+
+    async def test_the_canary_intent_keeps_the_replys_trade_ids(self):
+        from accounting.ledger import Ledger
+        T = self.T
+        path = os.path.join(self.tmp.name, "canary.json")
+        session, limits, kill = L.CanarySession(path, "w"), L.CanaryLimits(), L.KillSwitch()
+        session.open(limits, kill, Ledger(path=os.path.join(self.tmp.name, "e.json")))
+        p = L.Prepared("UP", T.UP, T.COND, time.time() + 120, 3.19, 0.34, 0.34, "0.01", "k",
+                       json.dumps({"order": {"salt": "1", "signature": "x"}}), {}, {}, {}, "FAK")
+        p.reserve, p.order_hash = 3.5, "0x" + "ef" * 32
+        session.before_send(p, limits, kill)
+        session.outcome(p, {"kind": L.MATCHED, "order_id": p.order_hash,
+                            "response": {"tradeIDs": ["t1", "t2"]}}, limits, kill)
+        session.close()
+        self.assertEqual(L.CanarySession.durable_view(path)["intents"]["k"]["trade_ids"], ["t1", "t2"])
 
 
 if __name__ == "__main__":
