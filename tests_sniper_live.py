@@ -512,6 +512,26 @@ def t_venue_guard_state_machine():
     g3.on_probe(False, "order connection: ConnectError")
     check("a pause that never checks healthy within 5 min -> HARD_HALTED", g3.state == "HARD_HALTED" and k3.tripped,
           g3.status())
+    # the live defaults (2026-10-15, the operator's choice): 3 slow replies within 5 minutes
+    m4, k4 = FakeMono(), L.KillSwitch(None)
+    g4 = L.VenueGuard(k4, mono=m4)
+    check("default window: 5 minutes, pause 5 minutes", (g4.strike_window_s, g4.long_pause_s) == (300.0, 300.0))
+    for gap in (0, 200, 200):                         # 13:12 / 13:14 / 13:38-like spacing, scaled: never 3 in 5 min
+        m4.t += gap
+        g4.on_reply(1700)
+        for _ in range(3):
+            g4.on_probe(True, "ok")
+    check("slow replies spread wider than 5 minutes: only short pauses, back to HEALTHY",
+          g4.state == "HEALTHY" and "paused 5 min" not in g4.reason and not k4.tripped, g4.status())
+    m5, k5 = FakeMono(), L.KillSwitch(None)
+    g5 = L.VenueGuard(k5, mono=m5)
+    for gap in (0, 60, 60):                           # 3 within 2 minutes
+        m5.t += gap
+        g5.on_reply(1700)
+        for _ in range(3):
+            g5.on_probe(True, "ok")
+    check("3 slow replies within 5 minutes: the 5-minute pause", g5.state == "PAUSED"
+          and "within 5 min" in g5.reason and "paused 5 min" in g5.reason and not k5.tripped, g5.status())
 
 
 def t_one_slow_reply_then_healthy_venue_recovers_and_orders_continue():

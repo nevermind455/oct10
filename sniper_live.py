@@ -135,9 +135,10 @@ class VenueGuard:
                           `healthy_checks` consecutive health probes pass:
                           PAUSED -> RECOVERED -> HEALTHY
       > extreme_ms        HARD_HALTED at once
-    `strikes_to_long_pause` strikes within `strike_window_s` (and each further
-    strike while that many are in the window) PAUSE for `long_pause_s` before the
-    healthy checks may resume orders - the operator's choice 2026-10-15: the
+    `strikes_to_long_pause` strikes within `strike_window_s` - 5 minutes, the
+    operator's choice (was 30) - and each further strike while that many are in
+    the window, PAUSE for `long_pause_s` before the healthy checks may resume
+    orders - the operator's choice 2026-10-15: the
     venue's slow replies are short one-offs (each pause recovered in ~6s), and a
     hard halt stopped trading until a manual restart. A pause not healthy within
     `max_pause_s` after its wait ends still HARD_HALTS - through the kill switch,
@@ -148,7 +149,7 @@ class VenueGuard:
     _LEVEL = {"HEALTHY": "good", "RECOVERED": "good", "DEGRADED": "warn", "PAUSED": "warn", "HARD_HALTED": "bad"}
 
     def __init__(self, kill: KillSwitch, *, slow_ms: float = 1500.0, extreme_ms: float = 5000.0,
-                 strikes_to_long_pause: int = 3, strike_window_s: float = 1800.0, healthy_checks: int = 3,
+                 strikes_to_long_pause: int = 3, strike_window_s: float = 300.0, healthy_checks: int = 3,
                  max_pause_s: float = 300.0, long_pause_s: float = 300.0, journal=None, on_event=None,
                  mono=time.monotonic) -> None:
         self.kill = kill

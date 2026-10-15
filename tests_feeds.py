@@ -1579,11 +1579,12 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # book cost (same signals); near a cap it spends at most the room at the ask.
     # 2026-10-15, the operator's choice: 3 slow venue replies within 30 min pause new orders 5 min
     # (then healthy checks) instead of hard-halting; >5s replies and unrecovered pauses still halt.
+    # ...and the strike window is 5 minutes (was 30), the operator's choice.
     # Re-approved 2026-10-14 (restart halt): a previous run's unresolved send intents are looked
     # up on the venue by their own order hash at start (_reconcile_previous_run, M7's evidence
     # rules); proven zero or fully booked resolves them and lifts the derived start-up halt
     # (CanarySession.PREVIOUS_RUN, never persisted). Nothing is ever resent.
-    "sniper_live.py": "7402821734ed873262ffe904acda2d08ec0407ed610d381af682775f05bc8b1a",
+    "sniper_live.py": "05660510ee9dadb7b88788a9aa7edd389e8da0c5bc272203b668b89e0076730c",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads
