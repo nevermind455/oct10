@@ -44,7 +44,9 @@ import tests_sniper_live as T  # noqa: E402  (FakeClob, make_canary, live_book, 
 
 AUDIT_ENV = {"SNIPER_ONLY": "1", "SNIPER_K_BP": "0.5", "SNIPER_WINDOW_MS": "250", "SNIPER_ORDER_TYPE": "FAK",
              "SNIPER_SLIP": "0.05", "SNIPER_SHARES": "10", "SNIPER_MAX_TARGET_SHARES": "20",
-             "SNIPER_COOLDOWN_MS": "300", "SNIPER_SHADOW_MS": "", "SNIPER_STALL_MS": "0"}
+             "SNIPER_COOLDOWN_MS": "300", "SNIPER_SHADOW_MS": "", "SNIPER_STALL_MS": "0",
+             # the book-cost order's amounts; share sizing (the default) has its own tests
+             "SNIPER_ORDER_SIZING": "dollars"}
 
 
 def say(msg: str) -> None:

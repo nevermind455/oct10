@@ -72,11 +72,10 @@ FROZEN_SPEC = (
     # 2026-10-13, the operator's choice: half Kelly (was 1.0) - about 3/4 of full Kelly's
     # long-run growth for about half its swings while the fair value is still unproven.
     ("kelly_fraction", "SNIPER_KELLY_FRACTION", 0.5, "kelly fraction", "{:g}"),
-    # 2026-10-14: a FAK's shares (Kelly's) are sent as their cost on the book.
-    # Share-sized orders (audit F1) were tried live that day and Polymarket
-    # filled one by its dollars - 12.9 shares on an 11-share order - so they
-    # are withdrawn (Settings refuses them), the operator's choice.
-    ("order_sizing", "SNIPER_ORDER_SIZING", "dollars", "order sizing", "{}"),
+    # 2026-10-15, the operator's choice: share sizing - a FAK spends its whole
+    # shares x the cap; Polymarket fills by dollars, so a cheaper fill buys extra
+    # shares (journalled, never a halt). "dollars" (the book cost) is paper A/B.
+    ("order_sizing", "SNIPER_ORDER_SIZING", "shares", "order sizing", "{}"),
 )
 
 # The second triggers LIVE accepts beside the primary feed. 2026-10-13, the

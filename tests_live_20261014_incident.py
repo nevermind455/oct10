@@ -463,6 +463,65 @@ class ReconcileTool(unittest.TestCase):
             self.assertIn("completeness unproven", text)
 
 
+class ShareSizing(I.PaperIOCBase):
+    """2026-10-15, the operator's choice: a FAK spends its whole shares x the cap,
+    sent as an ordinary dollar order. Polymarket fills by dollars, so a fill under
+    the cap buys extra shares - journalled (over_target), never a halt."""
+
+    def setUp(self):
+        super().setUp()
+        import sniper_mode as S
+        self.S = S
+        self.sn = S.Sniper(self.m, self.broker, settings=I.settings(SNIPER_ORDER_SIZING="shares"))
+        self.rows = []
+        self.sn._write = self.rows.append
+
+    def test_the_bet_is_whole_shares_times_the_cap(self):
+        r = self.fire("UP", [(0.47, 100)], [(0.47, 100)])
+        self.assertEqual((r["result"], r["order_shares"], r["amount"], r["book_cost"]), ("filled", 10, 5.2, 4.7))
+        self.assertAlmostEqual(r["shares"], 5.2 / 0.47, places=4)                # the whole $5.20 at the ask
+        self.assertIn("shares x the cap", self.sn.s.lines()[0])
+
+    def test_a_cheaper_fill_buys_extra_shares_and_never_halts(self):
+        r = self.fire("UP", [(0.50, 100)], [(0.30, 100)])
+        self.assertEqual((r["result"], r["amount"]), ("filled", 5.5))           # 10 x the 0.55 cap
+        self.assertAlmostEqual(r["shares"], 5.5 / 0.30, places=4)                # 18.33 shares for $5.50
+        self.assertGreater(r["over_target"], 0)                                  # journalled
+        self.assertEqual(self.sn.n["errors"], 0)
+
+    def test_near_the_side_cap_it_spends_at_most_the_room(self):
+        rd = self.sn.rounds[self.m.window_end]
+        rd["UP"] = 190.0                                                         # 10 shares of room left
+        r = self.fire("UP", [(0.47, 100)], [(0.47, 100)])
+        self.assertEqual(r["result"], "filled")
+        self.assertAlmostEqual(r["amount"], 4.70, places=6)                      # 10 x the ask, not 10 x the cap
+        self.assertLessEqual(rd["UP"], 200.0 + 1e-9)
+        self.sn.last_fire_by_side["UP"] = -1e18
+        rd["UP"] = 195.0
+        r = self.fire("UP", [(0.47, 100)], [(0.47, 100)])
+        self.assertEqual((r["result"], r["reason"]), ("skipped", "round cap"))  # as the book-cost order would
+
+    def test_the_same_signals_qualify_as_with_the_book_cost(self):
+        """Each case on a fresh round in both sizings: the same result and reason."""
+        cases = [([(0.47, 100)], None), ([(0.47, 5), (0.50, 100)], None), ([(0.08, 100)], None),
+                 ([(0.96, 100)], None), ([(0.47, 100)], [(0.60, 100)]), ([], None)]
+        got = {}
+        for sizing in ("shares", "dollars"):
+            out = []
+            for decision, match in cases:
+                self.sn = self.S.Sniper(self.m, self.broker, settings=I.settings(SNIPER_ORDER_SIZING=sizing))
+                self.sn._write = self.rows.append
+                self.m.window_end += 300                                         # a fresh round each time
+                self.m.condition_id = f"cond-{self.m.window_end}"
+                before = len(self.rows)
+                self.m.set(self.m.up_token, decision, match)
+                asyncio.run(self.sn._fire("UP", 1.0, time.monotonic() * 1000.0))
+                rows = [r for r in self.rows[before:] if r.get("result") in ("filled", "refused", "skipped", "error")]
+                out.append(tuple((r.get("result"), r.get("reason")) for r in rows))
+            got[sizing] = out
+        self.assertEqual(got["shares"], got["dollars"])
+
+
 class DashboardHalt(unittest.TestCase):
     """2026-10-15: a HALT line showed the order as <redacted-32-byte-value> (the
     dashboard hides any raw 32-byte hex) and broke words mid-way ("reconci" / "le")."""

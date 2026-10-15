@@ -1547,7 +1547,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # second trigger (exec_latency.spec_violations).
     # Re-approved 2026-10-13 (the operator's choice): SNIPER_KELLY_FRACTION defaults to the
     # frozen spec's 0.5 (half Kelly; was full).
-    "sniper_mode.py": "eb3f46dfc55aeec08c019599a878195cc9bffb64342f11114f33328c3f13af3b",
+    "sniper_mode.py": "516310b1722f4f894c4d6ccff582768dbc88427fc9ab8d054ce410e0ab7fdd83",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
@@ -1568,6 +1568,9 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # It also keeps the reply's totals (makingAmount, takingAmount): with no trade ids, the order's
     # booked lots must add up to them exactly.
     # Halt reasons show an order id short (short_id): the dashboard hides raw 32-byte hex.
+    # 2026-10-15, the operator's choice: SNIPER_ORDER_SIZING=shares again - a FAK spends its whole
+    # shares x the cap as a dollar order (cheaper fills buy more, never a halt); the gates judge the
+    # book cost (same signals); near a cap it spends at most the room at the ask.
     # Re-approved 2026-10-14 (restart halt): a previous run's unresolved send intents are looked
     # up on the venue by their own order hash at start (_reconcile_previous_run, M7's evidence
     # rules); proven zero or fully booked resolves them and lifts the derived start-up halt

@@ -43,7 +43,8 @@ import tests_sniper_cooldown as C  # noqa: E402  (the cooldown clock harness)
 import tests_sniper_live as T  # noqa: E402
 
 OLD_COMMIT = "5b36ea5"          # the strategy layer before the latency work
-SPEC_ENV = dict(B.BENCH_ENV, SNIPER_MAX_FILLS_ROUND="20", SNIPER_MAX_SIDE_SHARES="200")
+# the old layer (OLD_COMMIT) signs the book cost: compared as that order
+SPEC_ENV = dict(B.BENCH_ENV, SNIPER_MAX_FILLS_ROUND="20", SNIPER_MAX_SIDE_SHARES="200", SNIPER_ORDER_SIZING="dollars")
 NO_MATCH = B.NO_MATCH
 
 

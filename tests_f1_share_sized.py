@@ -401,14 +401,14 @@ class PaperShareSized(I.PaperIOCBase):
 
 
 class FrozenSpec(unittest.TestCase):
-    def test_share_sized_orders_are_withdrawn(self):
-        """2026-10-14 live: Polymarket filled an 11-share order ($3.74 at the 0.34 cap)
-        with 12.896552 shares at 0.29 - it fills a FAK BUY by its dollars."""
-        self.assertEqual(I.settings().order_sizing, "dollars")
-        self.assertEqual([v for v in X.spec_violations(I.settings()) if "order sizing" in v], [])
-        with self.assertRaises(ValueError) as cm:
-            I.settings(SNIPER_ORDER_SIZING="shares")
-        self.assertIn("withdrawn", str(cm.exception))
+    def test_live_requires_share_sizing(self):
+        """2026-10-15, the operator's choice: share sizing (whole shares x the cap, sent
+        as a dollar order - the venue fills by dollars, so a cheaper fill buys more)."""
+        self.assertEqual(I.settings(SNIPER_ORDER_SIZING="").order_sizing, "shares")      # the code default
+        self.assertEqual([v for v in X.spec_violations(I.settings(SNIPER_ORDER_SIZING="shares"))
+                          if "order sizing" in v], [])
+        dollars = [v for v in X.spec_violations(I.settings(SNIPER_ORDER_SIZING="dollars")) if "order sizing" in v]
+        self.assertEqual(len(dollars), 1, dollars)                                         # paper A/B only
 
     def test_an_unknown_sizing_is_refused_at_startup(self):
         with self.assertRaises(ValueError):

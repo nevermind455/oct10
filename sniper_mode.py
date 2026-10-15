@@ -1008,18 +1008,18 @@ class Settings:
         self.order_type = str(os.environ.get("SNIPER_ORDER_TYPE", default_type)).strip().upper() or default_type
         if self.order_type not in ("FOK", "FAK"):
             raise ValueError(f"invalid SNIPER_ORDER_TYPE {self.order_type!r}: FOK or FAK")
-        # How a FAK's share target (Kelly's, or the IOC clip + carry) reaches the
-        # venue: as DOLLARS, what those shares cost on the visible book up to the
-        # cap. Share-sized orders (audit F1, SNIPER_ORDER_SIZING=shares) were
-        # withdrawn on 2026-10-14 after a live fill: Polymarket fills a FAK BUY
-        # by its dollars - an 11-share order signed as $3.74 (11 x the 0.34 cap)
-        # bought 12.896552 shares at 0.29 - so it could not cap the shares and
-        # spent more than the Kelly shares cost.
-        self.order_sizing = str(os.environ.get("SNIPER_ORDER_SIZING", "dollars")).strip().lower() or "dollars"
-        if self.order_sizing != "dollars":
-            raise ValueError(f"SNIPER_ORDER_SIZING={self.order_sizing!r} is withdrawn: Polymarket fills a FAK BUY "
-                             "by its dollars (2026-10-14: an 11-share order bought 12.9 shares), so an order's "
-                             "shares are sent as their cost on the book. Remove the line from .env.")
+        # How much a FAK spends for its share target (Kelly's, or the IOC clip +
+        # carry). Polymarket fills a FAK BUY by its DOLLARS (2026-10-14: $3.74
+        # signed for 11 shares at the 0.34 cap bought 12.896552 at 0.29).
+        #   "shares" (default; the operator's choice 2026-10-15): the whole shares
+        #       x the cap's cent limit - under the cap the saving buys extra shares,
+        #       journalled as over_target, never a halt;
+        #   "dollars": what the shares cost on the visible book (paper A/B).
+        # Either is sent as an ordinary dollar order; the gates judge the book
+        # cost either way, so the same signals qualify.
+        self.order_sizing = str(os.environ.get("SNIPER_ORDER_SIZING", "shares")).strip().lower() or "shares"
+        if self.order_sizing not in ("shares", "dollars"):
+            raise ValueError(f"invalid SNIPER_ORDER_SIZING {self.order_sizing!r}: shares or dollars")
         self.binance_url = binance_url(os.environ.get("SNIPER_BINANCE_URL"))
         # Binance freshness gate (BinanceFreshness): on by default; 0 restores the
         # bare bookTicker socket with no exchange timestamps and no gate.
@@ -1127,9 +1127,11 @@ class Settings:
                 if self.order_type == "FAK" else "")
 
     def sizing_text(self) -> str:
-        """How a FAK's shares are sent: their cost on the book (the venue fills
-        a FAK BUY by its dollars)."""
-        return " (sent as their book cost: more shares only if the ask falls)" if self.order_type == "FAK" else ""
+        """How much a FAK spends for its shares (the venue fills a FAK BUY by its dollars)."""
+        if self.order_type != "FAK":
+            return ""
+        return (" (sized as whole shares x the cap: under the cap the saving buys extra shares)"
+                if self.order_sizing == "shares" else " (sent as their book cost: more shares only if the ask falls)")
 
     def fair_text(self) -> str:
         if not self.fair:
@@ -3183,6 +3185,22 @@ class Sniper:
             # The venue refuses a marketable BUY under $1, so under 10c the
             # 10-share clip becomes $1 - the smallest order live could place.
             amount = max(self.s.shares * ask, MIN_ORDER_USD)
+        # The gates below judge the book cost (`gate_amount`) whatever the sizing:
+        # the same signals qualify. Share sizing (the default) then spends the
+        # whole shares x the cap's cent limit - lifted to the venue's 5 shares
+        # and its $1 at the limit, as the book-cost order is.
+        gate_amount, order_shares = amount, None
+        if self.s.order_type == "FAK" and self.s.order_sizing == "shares":
+            tick = Decimal(str(getattr(view, "tick_size", None) or 0.01))
+            limit = (Decimal(str(min(cap, hi))) / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+            floor_shares = max(KELLY_MIN_SHARES, int((Decimal(str(MIN_ORDER_USD)) / limit).to_integral_value(
+                rounding="ROUND_CEILING")))
+            order_shares = max(int(math.floor(target + 1e-9)), floor_shares)
+            if kelly and order_shares > room + 1e-9:
+                row.update(ask_seen=ask, order_shares=order_shares, room_shares=round(room, 4))
+                return self._skip("kelly room under venue minimum at price cap", row)
+            amount = max(float((Decimal(order_shares) * limit).quantize(Decimal("0.01"), rounding=ROUND_FLOOR)),
+                         gate_amount)
         rd = self.rounds.get(end)
         if rd is None:
             # A new round: rounds that ended over an hour ago go (one entry per
@@ -3200,12 +3218,32 @@ class Sniper:
         # pass the round's fill cap.
         other = self.inflight.get("DOWN" if side == "UP" else "UP")
         in_flight = 1 if isinstance(other, dict) and other.get("end") == end else 0
+        if order_shares is not None:
+            # A share-sized order expects amount / ask shares at the ask: never more
+            # than the room - Kelly's (the side's cap and the canary's per-order cap
+            # in it), else the side's room this round and the canary's cap. Near a
+            # cap it spends less (never under the book cost the gates judged); more
+            # shares then come only from a fall below the ask, as with the book cost.
+            if kelly:
+                bound = room
+            else:
+                bound = self.s.max_side_shares - rd[side]
+                live_cap = getattr(getattr(getattr(self.live, "sender", None), "limits", None),
+                                   "max_order_shares", None)
+                if live_cap is not None:
+                    bound = min(bound, float(live_cap))
+            most = float((Decimal(str(max(bound, 0.0))) * Decimal(str(ask))).quantize(
+                Decimal("0.01"), rounding=ROUND_FLOOR))
+            if amount > most:
+                amount = max(gate_amount, most)
         if (rd["fills"] + in_flight >= self.s.max_fills_round
-                or rd[side] + amount / ask > self.s.max_side_shares):
+                or rd[side] + gate_amount / ask > self.s.max_side_shares):
             return self._skip("round cap", row)
         decided_pc = time.perf_counter_ns()     # every check passed: this signal trades
         self.inflight[side] = {"end": end, "amount": amount, "risk_shares": amount / ask}
         row.update(ask_seen=ask, cap=cap, shares=round(amount / ask, 4), amount=round(amount, 4))
+        if order_shares is not None:
+            row.update(order_shares=order_shares, book_cost=round(gate_amount, 4))
         if target is not None:
             row.update(target_shares=round(target, 4), carry_in=round(carry, 4))
         self.n["orders"] += 1
