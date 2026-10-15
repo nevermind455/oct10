@@ -1555,7 +1555,9 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # size, cap or gate changes (tests_guard_diag). SNIPER_GUARD_DIAG=0 / SNIPER_SHADOW_TIGHT=0 off.
     # 2026-10-15, the operator's choice: unresolved live fill quantities pause once for five
     # minutes; a lasting pending order no longer blocks later signals forever.
-    "sniper_mode.py": "fc01b9a0f3833d1719098549f428ca399f28222ff156dcd55d731dd44ef30198",
+    # 2026-10-15 bug fix: separate failed order tasks pause independently;
+    # reused Python object addresses must not suppress a later incident.
+    "sniper_mode.py": "6e563cc6d36d1870f1c3bc7273d84dd7c08c898c4ba33156b8dc5c410e63de6b",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
@@ -1590,7 +1592,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # causes pause once, caps gain one original increment after each completed wait, the
     # slow-reply guard never hard-stops, and prior-run reservations remain in the budget.
     # Pauses and cap steps survive restart; STOP_LIVE holds while its file exists.
-    "sniper_live.py": "07947fb5605f7f82857960fe3c8da2707611db57ab3e9b18e70ac32bb30a15a5",
+    # 2026-10-15 bug fixes: one order identity across restarts (including legacy
+    # pause keys); fresh venue incidents cannot be lost at expiry; reporting
+    # failures cannot interrupt the guard; monotonic zero is a valid start time.
+    # Fresh kill-switch incidents also expire old reasons before deduplication.
+    "sniper_live.py": "fc753efd4a365d63807220f0b33aa06db2276e091ca4391670dff12f399c91bf",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads

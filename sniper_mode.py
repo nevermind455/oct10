@@ -1964,7 +1964,9 @@ class Sniper:
         if task in self._order_tasks:
             kill = getattr(self.live, "kill", None)
             if kill is not None:
-                kill.trip_once(("order-task-error", id(task)), "order task failed: reconcile before trading")
+                # This callback runs once per completed task. Object addresses
+                # can be reused by later tasks, so they are not incident IDs.
+                kill.trip("order task failed: reconcile before trading")
             else:
                 self._closing = True
         detail = f"{task.get_name()}: {type(exc).__name__}: {exc}"[:240]

@@ -122,20 +122,28 @@ class KillSwitch:
         self._lock = threading.RLock()
         self._once: set[str] = set()
 
-    def trip(self, reason: str) -> None:
-        with self._lock:
-            if reason not in self.reasons:
-                self.reasons.append(reason)
-                self.since[reason] = self.mono()
-                self._deadlines[reason] = None if self.pause_s is None else time.time() + self.pause_s
+    def _add_locked(self, reason: str) -> None:
+        if reason not in self.reasons:
+            self.reasons.append(reason)
+            self.since[reason] = self.mono()
+            self._deadlines[reason] = None if self.pause_s is None else time.time() + self.pause_s
 
-    def trip_once(self, key, reason: str) -> None:
+    def trip(self, reason: str) -> None:
+        # A fresh incident must not be mistaken for an expired pause whose
+        # removal has not yet been observed by a check or status read.
+        self._expire()
+        with self._lock:
+            self._add_locked(reason)
+
+    def trip_once(self, key, reason: str, *, aliases=()) -> None:
+        """Pause once per incident, accepting its older durable identities."""
+        self._expire()
         with self._lock:
             identity = repr(key)
-            if identity in self._once:
-                return
+            seen = identity in self._once or any(repr(alias) in self._once for alias in aliases)
             self._once.add(identity)
-            self.trip(reason)
+            if not seen:
+                self._add_locked(reason)
 
     def clear(self, reason: str) -> None:
         with self._lock:
@@ -150,7 +158,7 @@ class KillSwitch:
             stop_reason = f"stop file present: {self.stop_file}"
             stopped = self.stop_file is not None and self.stop_file.exists()
             if stopped:
-                self.trip(stop_reason)
+                self._add_locked(stop_reason)
             else:
                 self.clear(stop_reason)
             for reason in list(self.reasons):
@@ -259,7 +267,10 @@ class VenueGuard:
             self.journal(row)
         except Exception:  # noqa: BLE001 - journalling must never break the guard
             pass
-        self.on_event("sniper", f"LIVE latency guard {old} -> {new}: {detail}"[:220], self._LEVEL[new])
+        try:
+            self.on_event("sniper", f"LIVE latency guard {old} -> {new}: {detail}"[:220], self._LEVEL[new])
+        except Exception:  # noqa: BLE001 - reporting must not interrupt order accounting or recovery
+            pass
 
     def on_reply(self, rtt_ms: float) -> str:
         """One definite order reply's send -> response time; returns the state."""
@@ -286,12 +297,14 @@ class VenueGuard:
         """The order path: refused (journalled by the caller) while PAUSED."""
         self._resume_if_due()
         if self.state == self.PAUSED:
-            raise Refused(f"latency guard PAUSED for {self.mono() - (self.paused_at or self.mono()):.0f}s "
+            started = self.paused_at if self.paused_at is not None else self.mono()
+            raise Refused(f"latency guard PAUSED for {self.mono() - started:.0f}s "
                           f"({self.reason}); {self.healthy_streak}/{self.healthy_checks} healthy checks")
 
     def pause_for(self, seconds: float, reason: str) -> None:
         """A definitive venue rejection: wait once, then allow new signals.
         This never resends the rejected order; only a new signal can trade."""
+        self._resume_if_due()
         if self.state == self.PAUSED:
             return
         now = self.mono()
@@ -1080,7 +1093,8 @@ class CanarySession:
             reason = (f"{self.PREVIOUS_RUN} ({len(unresolved)} send intents, "
                       f"{len(proof['unconfirmed'])} unconfirmed authorizations): reconciling in background")
             for key in unresolved:
-                kill.trip_once((self.PREVIOUS_RUN, key), reason)
+                kill.trip_once(("order-uncertain", str(key)), reason,
+                               aliases=((self.PREVIOUS_RUN, key),))
         self.restored = {"orders": limits.orders, "fills": limits.fills, "spend": round(limits.exposure_usd, 4),
                          "rounds": len(limits.rounds), "halts": list(kill.reasons)}
         self._marker = None

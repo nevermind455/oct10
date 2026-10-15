@@ -51,6 +51,16 @@ class PauseTiming(unittest.TestCase):
         self.kill.check()
         self.assertEqual(self.kill.resumed, [("venue down", 300)])
 
+    def test_fresh_incident_reusing_a_reason_after_expiry_is_not_dropped(self):
+        self.kill.trip("consecutive order errors")
+        self.clock.advance(300)                         # no status/check observed expiry
+        self.kill.trip("consecutive order errors")
+        with self.assertRaises(L.Halted):
+            self.kill.check()
+        self.assertEqual(self.kill.resumed, [("consecutive order errors", 300)])
+        self.clock.advance(300)
+        self.kill.check()
+
     def test_persistent_condition_pauses_once_but_a_distinct_order_can_pause(self):
         self.kill.trip_once(("unconfirmed", "order-1"), "unconfirmed order-1")
         self.clock.advance(300)
@@ -91,6 +101,71 @@ class PauseTiming(unittest.TestCase):
         self.kill.trip("disk")
         self.clock.advance(300)
         self.kill.check()
+
+
+class VenuePauseRegressions(unittest.TestCase):
+    def test_new_venue_incident_after_expiry_starts_a_fresh_pause(self):
+        clock = Clock()
+        guard = L.VenueGuard(L.KillSwitch(mono=clock), mono=clock)
+        guard.pause_for(300, "first incident")
+        clock.advance(300)                         # no check/probe observed expiry yet
+        guard.pause_for(300, "new incident")
+        with self.assertRaises(L.Refused):
+            guard.check()
+        clock.advance(299)
+        self.assertEqual(guard.on_probe(False), guard.PAUSED)
+        clock.advance(1)
+        guard.check()
+
+    def test_pause_at_monotonic_zero_reports_its_actual_age(self):
+        clock = Clock(0)
+        guard = L.VenueGuard(L.KillSwitch(mono=clock), mono=clock)
+        guard.pause_for(300, "incident")
+        clock.advance(20)
+        with self.assertRaisesRegex(L.Refused, "PAUSED for 20s"):
+            guard.check()
+
+    def test_announcement_failure_cannot_interrupt_pause_or_recovery(self):
+        clock = Clock()
+        def broken_event(*args):
+            raise OSError("event log unavailable")
+        guard = L.VenueGuard(L.KillSwitch(mono=clock), mono=clock, on_event=broken_event)
+        self.assertEqual(guard.on_reply(6000), guard.PAUSED)
+        with self.assertRaises(L.Refused):
+            guard.check()
+        clock.advance(300)
+        guard.check()
+        self.assertEqual(guard.state, guard.HEALTHY)
+
+
+class OrderTaskPauseRegressions(unittest.TestCase):
+    def test_distinct_failed_tasks_pause_even_when_their_object_ids_are_reused(self):
+        import sniper_mode as S
+        class FailedTask:
+            def cancelled(self):
+                return False
+            def exception(self):
+                return RuntimeError("order worker failed")
+            def get_name(self):
+                return "order-worker"
+        clock = Clock()
+        kill = L.KillSwitch(mono=clock)
+        sniper = S.Sniper.__new__(S.Sniper)
+        first, second = FailedTask(), FailedTask()
+        sniper._tasks = {first, second}
+        sniper._order_tasks = {first, second}
+        sniper._closing = False
+        sniper.n = collections.Counter()
+        sniper.live = types.SimpleNamespace(kill=kill)
+        sniper._write = sniper.on_event = lambda *args: None
+        with patch.object(S, "id", return_value=123, create=True):
+            sniper._task_done(first)
+            self.assertTrue(kill.tripped)
+            clock.advance(300)
+            kill.check()
+            sniper._task_done(second)
+            self.assertTrue(kill.tripped)
+        self.assertFalse(sniper._closing)
 
 
 class SteppedBudgets(unittest.TestCase):
@@ -200,6 +275,49 @@ class PersistentAccounting(unittest.TestCase):
 
 
 class DurablePauseState(unittest.TestCase):
+    def test_restart_does_not_start_a_second_pause_for_the_same_unknown_order(self):
+        for elapsed, legacy in ((60, False), (300, False), (60, True), (300, True)):
+            with self.subTest(elapsed=elapsed, legacy=legacy), tempfile.TemporaryDirectory() as tmp:
+                ledger = Ledger(path=str(Path(tmp) / "ledger.json"))
+                path = Path(tmp) / "session.json"
+                wall, mono = Clock(2_000_000_000.0), Clock()
+                sessions = []
+                try:
+                    with patch.object(L.time, "time", side_effect=wall):
+                        kill, limits = L.KillSwitch(mono=mono), L.CanaryLimits()
+                        first = L.CanarySession(path, "offline-wallet")
+                        sessions.append(first)
+                        first.open(limits, kill, ledger)
+                        p = prepared()
+                        first.before_send(p, limits, kill)
+                        key = ((first.PREVIOUS_RUN, p.client_order_id) if legacy else
+                               ("order-uncertain", str(p.client_order_id)))
+                        kill.trip_once(key, "outcome unknown")
+                        first.persist(limits, kill)
+                        first.flush()
+                        first.close()
+                        wall.advance(elapsed)
+                        mono2 = Clock(10)
+                        kill2, limits2 = L.KillSwitch(mono=mono2), L.CanaryLimits()
+                        second = L.CanarySession(path, "offline-wallet")
+                        sessions.append(second)
+                        second.open(limits2, kill2, ledger)
+                        if elapsed < 300:
+                            with self.assertRaises(L.Halted):
+                                kill2.check()
+                        mono2.advance(300 - elapsed)
+                        kill2.check()
+                        self.assertEqual(len(second.unresolved()), 1)
+                        self.assertEqual(second.unresolved()[0][1]["reserve"], p.reserve)
+                        kill2.trip_once(("order-uncertain", str(p.client_order_id)), "same order still unknown")
+                        kill2.check()
+                        kill2.trip_once(("order-uncertain", "different-order"), "new order unknown")
+                        with self.assertRaisesRegex(L.Halted, "new order unknown"):
+                            kill2.check()
+                finally:
+                    for session in sessions:
+                        session.close()
+
     def test_restart_keeps_remaining_wait_and_does_not_rearm_a_persistent_cause(self):
         with tempfile.TemporaryDirectory() as tmp:
             ledger = Ledger(path=str(Path(tmp) / "ledger.json"))
