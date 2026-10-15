@@ -94,9 +94,11 @@ def main() -> int:
     with led._lock:
         for pos in led.positions.values():
             for lot in pos.lots:
-                if str(lot.side).upper() != "BUY" or not getattr(lot, "order_id", None):
+                # live lots carry the venue order id; a paper fill's id is its lot's trade id
+                key = getattr(lot, "order_id", None) or (lot.trade_id if args.paper else None)
+                if str(lot.side).upper() != "BUY" or not key:
                     continue
-                t = trades.setdefault(lot.order_id, {"shares": 0.0, "notional": 0.0, "fee": 0.0, "wall": lot.wall,
+                t = trades.setdefault(key, {"shares": 0.0, "notional": 0.0, "fee": 0.0, "wall": lot.wall,
                                                      "settled": pos.settled, "payout": pos.payout_per_share,
                                                      "token": pos.token_id})
                 t["shares"] += float(lot.shares)
@@ -167,6 +169,20 @@ def main() -> int:
             avg_paid = statistics_mean([x["price"] for x in cal if x["price"]])
             print(f"  avg fair {exp / len(cal):.3f} vs avg price paid {avg_paid:.3f}: the model's claimed edge "
                   f"{statistics_mean([x['edge'] for x in cal if x['edge'] is not None]) * 100:+.1f}c/share")
+    if done:
+        breakdown("BY CLAIMED EDGE (fair - price - fee, c/share)", done,
+                  lambda x: None if x["edge"] is None else ("<2c" if x["edge"] < 0.02 else "2-5c" if x["edge"] < 0.05
+                                                            else "5-10c" if x["edge"] < 0.10 else "10c+"),
+                  ("<2c", "2-5c", "5-10c", "10c+"))
+        breakdown("BY BTC MOVE", done,
+                  lambda x: None if x["bp"] is None else ("<1bp" if abs(x["bp"]) < 1 else "1-2bp" if abs(x["bp"]) < 2
+                                                          else "2bp+"),
+                  ("<1bp", "1-2bp", "2bp+"))
+        breakdown("BY TIME LEFT IN THE ROUND", done,
+                  lambda x: None if x["left"] is None else ("<60s" if x["left"] < 60 else "60-150s" if x["left"] < 150
+                                                            else "150s+"),
+                  ("<60s", "60-150s", "150s+"))
+        print("  a group whose wins fall well under 'expected' (sigma <= -2) is where the fair value overrates its edge")
     m5 = [x["m5"] for x in out if x["m5"] is not None]
     if m5:
         print(f"\nMARKOUT 5s after the fill (market mid - price - fee, c/share): avg {statistics_mean(m5):+.1f}, "
@@ -191,6 +207,35 @@ def main() -> int:
               f"{f(x['price'], 3):>6s} {edge:>6s} {x['shares']:7.2f} {x['cost']:7.2f} {f(x['m5'], 1):>6s} "
               f"{res:>7s} {pnl_txt:>7s}")
     return 0
+
+
+def breakdown(title, done, key, order) -> None:
+    """Resolved trades grouped by `key`: wins vs the model's expected wins, PnL,
+    return per dollar and the 5s markout of each group."""
+    groups = collections.defaultdict(list)
+    for x in done:
+        k = key(x)
+        if k is not None:
+            groups[k].append(x)
+    if not groups:
+        return
+    print(f"\n{title}:")
+    print(f"  {'group':>8s} {'trades':>6s} {'won':>5s} {'expected':>8s} {'sigma':>6s} {'PnL $':>8s} "
+          f"{'per $1':>7s} {'5s mk c':>7s}")
+    for label in order:
+        xs = groups.get(label)
+        if not xs:
+            continue
+        fx = [x for x in xs if x["fair"] is not None]
+        exp = sum(x["fair"] for x in fx)
+        sd = math.sqrt(sum(x["fair"] * (1 - x["fair"]) for x in fx)) or 1.0
+        act = sum(1 for x in fx if x["won"])
+        pnl = sum(x["pnl"] for x in xs)
+        cost = sum(x["cost"] for x in xs) or 1.0
+        m5 = statistics_mean([x["m5"] for x in xs])
+        print(f"  {label:>8s} {len(xs):6d} {sum(1 for x in xs if x['won']):5d} {exp:8.1f} "
+              f"{(act - exp) / sd if fx else float('nan'):+6.1f} {pnl:+8.2f} {pnl / cost:+7.1%} "
+              f"{'-' if m5 != m5 else f'{m5:+.1f}':>7s}")
 
 
 def statistics_mean(xs):
