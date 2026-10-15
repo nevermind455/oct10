@@ -1553,7 +1553,9 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # netted fair when the market had not repriced) and the
     # shadow's tighter limit (ask + 3c under the cap, "tight"). Spawned after the send; no order,
     # size, cap or gate changes (tests_guard_diag). SNIPER_GUARD_DIAG=0 / SNIPER_SHADOW_TIGHT=0 off.
-    "sniper_mode.py": "7e66ac2fd96a245a79c81b9067099272980d8f196f22b2c52212d49dd7d74bac",
+    # 2026-10-15, the operator's choice: unresolved live fill quantities pause once for five
+    # minutes; a lasting pending order no longer blocks later signals forever.
+    "sniper_mode.py": "fc01b9a0f3833d1719098549f428ca399f28222ff156dcd55d731dd44ef30198",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
@@ -1584,7 +1586,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # up on the venue by their own order hash at start (_reconcile_previous_run, M7's evidence
     # rules); proven zero or fully booked resolves them and lifts the derived start-up halt
     # (CanarySession.PREVIOUS_RUN, never persisted). Nothing is ever resent.
-    "sniper_live.py": "05660510ee9dadb7b88788a9aa7edd389e8da0c5bc272203b668b89e0076730c",
+    # 2026-10-15, the operator's choice: every live halt pauses five minutes, persistent
+    # causes pause once, caps gain one original increment after each completed wait, the
+    # slow-reply guard never hard-stops, and prior-run reservations remain in the budget.
+    # Pauses and cap steps survive restart; STOP_LIVE holds while its file exists.
+    "sniper_live.py": "07947fb5605f7f82857960fe3c8da2707611db57ab3e9b18e70ac32bb30a15a5",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads

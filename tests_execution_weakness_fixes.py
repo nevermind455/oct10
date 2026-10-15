@@ -251,6 +251,7 @@ class PreviousRunReconciliation(unittest.IsolatedAsyncioTestCase):
         ex.sender = types.SimpleNamespace(limits=limits, kill=kill)          # LiveExecution.kill is the sender's
         ex.order_status = venue_order if callable(venue_order) else (lambda h: venue_order)
         ex.n = __import__("collections").Counter()
+        ex._risk_lock, ex._risk_orders = __import__("threading").RLock(), {}
         ex.events = []
         ex.on_event = lambda src, text, level: ex.events.append((text, level))
         ex.previous_run_delays_s = (0.0,)
@@ -335,6 +336,37 @@ class PreviousRunReconciliation(unittest.IsolatedAsyncioTestCase):
         await ex._reconcile_previous_run()
         self.assertEqual(len(self.venue.orders), before)
 
+    async def test_previous_order_can_reconcile_after_its_startup_pause_has_expired(self):
+        p, session, limits, kill = self.crashed_run()
+        mono = T.FakeMono()
+        kill.mono = mono
+        kill.since = {reason: mono.t for reason in kill.reasons}
+        mono.t += 300
+        kill.check()
+        ex = self.execution(session, limits, kill, self.record())
+        ex._risk_orders[p.client_order_id] = {"reserve": p.reserve}
+        await ex._reconcile_previous_run()
+        self.assertEqual(session.unresolved(), [])
+        self.assertEqual(ex._risk_orders, {})
+        self.assertFalse(kill.tripped)
+
+    async def test_previous_run_worker_never_treats_a_new_order_as_a_previous_order(self):
+        p, session, limits, kill = self.crashed_run()
+        mono = T.FakeMono()
+        kill.mono = mono
+        kill.since = {reason: mono.t for reason in kill.reasons}
+        mono.t += 300
+        kill.check()
+        ex = self.execution(session, limits, kill, self.record())
+        ex._previous_run_keys = {p.client_order_id}
+        newer = prepared("new-current-run", "DOWN")
+        newer.order_hash = "0x" + "cd" * 32
+        session.before_send(newer, limits, kill)
+        await ex._reconcile_previous_run()
+        self.assertEqual([key for key, _intent in session.unresolved()], [newer.client_order_id])
+        self.assertEqual(session.intents[p.client_order_id]["status"], L.NO_MATCH)
+        self.assertFalse(kill.tripped)
+
 
 class LiveVenueAndRisk(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -397,7 +429,7 @@ class LiveVenueAndRisk(unittest.IsolatedAsyncioTestCase):
     async def test_loss_budget_counts_fees_and_prepared_opposite_order(self):
         self.ex.sender.limits.max_daily_loss_usd = 10
         self.ex.prepare(self.plan())  # full all-in reservation is 5.35
-        with self.assertRaisesRegex(L.Refused, "worst-case loss"):
+        with self.assertRaisesRegex(L.Halted, "worst-case loss"):
             self.ex.prepare(self.plan(side="DOWN"))
         self.assertEqual(self.fake.orders, [])
 

@@ -24,6 +24,8 @@ class FAKTests(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.fake = await T.FakeClob().start()
         self.ex, self.ledger, self.store, self.receipts, _ = await T.make_canary(self.fake, self.tmp.name)
+        self.mono = T.FakeMono()
+        self.ex.kill.mono = self.mono
         self.sniper = None
 
     async def asyncTearDown(self):
@@ -100,7 +102,7 @@ class FAKTests(unittest.IsolatedAsyncioTestCase):
         self.ex.reconcile_once()
         self.assertIn("0xorder1", self.ex.awaiting)
         self.assertEqual(self.ex.sender.limits.exposure_usd, 5)
-        with self.assertRaisesRegex(L.Refused, "complete fill quantities"):
+        with self.assertRaisesRegex(L.Halted, "complete fill quantities"):
             self.ex.prepare(self.plan())
         self.trade(tid="trade-2", qty=1, px=0.52)
         self.ledger.ingest_fill_store(self.store)
@@ -151,11 +153,14 @@ class FAKTests(unittest.IsolatedAsyncioTestCase):
         _, row = await self.send(response=T.AMOUNTS_REPLY)
         self.assertIsNone(row["fill"])
         self.assertEqual(self.ex.sender.limits.exposure_usd, 5)
-        with self.assertRaisesRegex(L.Refused, "complete fill quantities"):
+        with self.assertRaisesRegex(L.Halted, "complete fill quantities"):
             self.ex.prepare(self.plan())
         self.assertEqual(len(self.fake.orders), 1)
         self.trade(qty=3, px=0.51)
         self.assertEqual(self.ex.fill_for("0xorder1")["shares"], 3)
+        self.assertTrue(self.ex.kill.tripped)
+        self.mono.t += 300
+        self.ex.kill.check()
         self.assertFalse(self.ex.kill.tripped)
 
     async def test_provisional_fill_does_not_release_spend_before_confirmation(self):
@@ -214,7 +219,8 @@ class FAKTests(unittest.IsolatedAsyncioTestCase):
                        dict(status="FAILED"), dict(status="CONFLICT")):
             with self.subTest(fields=fields):
                 self.store.fills.clear()
-                self.ex.kill.reasons.clear()
+                self.ex.sender.kill = L.KillSwitch(mono=self.mono)
+                self.ex._tripped_once.clear()              # each field is an independent incident
                 self.trade(**fields)
                 self.assertIsNone(self.ex.fill_for("0xorder1"))
                 self.assertTrue(self.ex.kill.tripped)

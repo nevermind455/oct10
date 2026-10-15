@@ -334,7 +334,7 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | `SNIPER_LIVE_CANARY` | 1 | `--live` sends real orders (with `SNIPER_ONLY=1`) |
 | `ASSUMED_MATCH_DELAY_SECONDS` | 5 | Polymarket's taker delay; live refuses to start without it |
 | `USER_WS` / `RECONCILE` | on / auto | live fills come from the private channel, with REST as backup |
-| `SNIPER_CANARY_MAX_*` | 25 sh, 40 orders, 20 fills, 3 rounds, $60 spend, $10 loss | hard canary caps; any breach halts new orders |
+| `SNIPER_CANARY_MAX_*` | 25 sh, 40 orders, 20 fills, 3 rounds, $60 spend, $10 loss | per-order share bound; cumulative budgets pause 5 minutes, then gain one original increment |
 | `SNIPER_KRAKEN_LIVE` | 0 | 1 = explicit opt-in to trade live on the Kraken trigger |
 | `LEDGER_PATH` / `LIVE_SNIPER_JOURNAL` | live_ledger.json / live_sniper.jsonl | live state files |
 | `PAPER_LEDGER_PATH` / `PAPER_ACCOUNT_PATH` / `PAPER_AUDIT_PATH` | paper_*.json(l) | paper state files; the sniper journal is `<audit>_sniper.jsonl` |
@@ -376,7 +376,7 @@ To stop any bot cleanly without a console (on Windows a background process canno
 
 - **Ledger.** A fill or settlement appends one fsynced line to `<ledger>.journal`. A full snapshot is written every 500 entries, every 2 minutes in paper (every 60 seconds live), and at shutdown. A restart replays the journal, and a damaged one refuses to start. Booking a fill costs the same at any ledger size (0.7 ms; it was 188 ms at 50,000 positions).
 - **One process per ledger and per wallet.** Two bots on one ledger file, or two live bots on one wallet on this machine, are refused. The wallet lock lives in `~/.sniperbtc/locks`. Locks cannot see another machine; there, live reconciliation is the safety net.
-- **The live canary's budget survives restarts.** Orders, fills, spend, rounds, the loss window and halts are kept in `live_canary_state.json`. At start they are reconciled with the ledger's order authorizations, and an unreadable or missing file refuses the live start. `--new-canary-session` starts a new budget deliberately and keeps the old file as `.bak`.
+- **The live canary's budget survives restarts.** Orders, fills, spend, rounds, the loss window, pause deadlines and budget increments are kept in `live_canary_state.json`. At start they are reconciled with the ledger's order authorizations, and an unreadable or missing file refuses the live start. Unresolved orders from earlier runs retain their worst-case loss reservations. `--new-canary-session` starts a new budget deliberately and keeps the old file as `.bak`.
 - **Paper.** Round caps are rebuilt from the ledger. The manager's per-market limits are rebuilt from its journal. The carry restarts at 0, which is smaller, never larger.
 
 **Share caps are estimates.** The sniper's IOC is signed in dollars (makerAmount, USDC). If the ask falls before the match, the same stake buys more shares than the target, so the share target, the round side cap and the canary's shares-per-order cap are checked at the decision's prices only. Dollar limits (stake, spend cap, cash) are hard. A fill above target is journalled as `over_target`.
@@ -461,23 +461,32 @@ tmux new -s live '.venv/bin/python -u run.py --live --dash'
 .venv/bin/python live_check.py           # afterwards: what the canary measured
 ```
 
-The canary refuses an order if it would exceed its caps. `SNIPER_CANARY_MAX_LOSS_USD=10`
-now checks settled losses plus the conservative cash basis of open positions and
-pending orders, including fees. It gives no hedge credit to uncertain fills and
-can refuse purchases that would improve a hedge. Session fill slots are reserved
-at dispatch, so overlapping UP/DOWN requests cannot bypass the fill cap.
+Reaching a cumulative order, fill, round, spend or loss budget pauses new orders
+for five minutes. When that pause ends, the reached budget gains one increment
+of its original configured size. For example, a $50 loss budget becomes $100,
+then $150 after another completed pause. Checks during a pause never grant extra
+increments. The per-order share bound and strategy sizing rules still apply.
+`SNIPER_CANARY_MAX_LOSS_USD` counts settled losses plus the conservative cash
+basis of open positions and pending orders, including fees. It gives no hedge
+credit to uncertain fills. Session fill slots are reserved at dispatch.
+
+Unknown order outcomes, accounting disagreements, unexplained fills, disk
+failures and venue trouble also pause new orders for five minutes. A continuing
+condition pauses once; reconciliation keeps running after trading resumes.
+The slow-reply guard resumes after five minutes even if its probes remain
+unhealthy and never hard-stops. Each new incident can start a fresh pause.
 
 Every signed order has a durable intent written before its first possible socket
-write. An unresolved intent or unconfirmed authorization on restart halts new
-orders until its outcome is reconciled. Never resubmit an uncertain order. At start the
-bot looks each one up on the venue by its own order hash (for up to ~4 minutes, while the
-reconciler books trades): proven zero execution, or a match whose trades are all in the
-ledger under its authorization, resolves it and the start-up halt lifts by itself. Anything
-else stays halted with what the venue said (an order sent by a version without order hashes
-needs reconciling by hand). This
+write. An unresolved intent or unconfirmed authorization on restart pauses new
+orders for five minutes while retaining its worst-case loss reservation. Never
+resubmit an uncertain order. The bot looks each one up by its own order hash
+while the reconciler books trades. Proven zero execution, or a match whose
+complete trades are booked under its authorization, releases the reservation.
+Orders without enough venue evidence remain reserved after trading resumes. This
 adds filesystem durability work to dispatch; the older latency measurements above
 must be remeasured on the deployment disk. `touch STOP_LIVE` stops new orders at
-once. From the first live run on, run LIVE only from `/opt/sniperbtc`: the old
+once and holds them while the file exists; removing it releases that stop.
+From the first live run on, run LIVE only from `/opt/sniperbtc`: the old
 bot's ledger copy is frozen.
 
 To run under systemd instead of tmux, copy `/etc/systemd/system/btcbot.service` to `sniperbtc.service`. In the copy, set `WorkingDirectory=/opt/sniperbtc`, set `ExecStart=/opt/sniperbtc/.venv/bin/python -u run.py --paper` (without `--dash`), and give it its own log file. `systemctl stop` sends SIGTERM, which is a clean shutdown.

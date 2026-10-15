@@ -372,28 +372,30 @@ def t_delayed_is_pending_and_journaled_with_its_order_id():
           r["kind"] == L.PENDING and rows and rows[-1]["order_id"] == "0xdelayed", str(r))
 
 
-def t_ambiguous_states_halt_and_block_duplicates():
+def t_ambiguous_states_pause_then_allow_a_fresh_order():
     async def go(action):
         fake = await FakeClob().start()
         fake.script.append(action)
         sender, rows = await make(fake, timeout_s=0.3)
+        mono = FakeMono()
+        sender.kill.mono = mono
         r = await sender.send(order(sender))
         after = []
-        for attempt in ("kill on", "kill cleared"):
+        for attempt in ("paused", "resumed"):
             try:
                 order(sender)
                 after.append("prepared")
             except (L.Halted, L.Refused) as exc:
                 after.append(type(exc).__name__)
-            sender.kill.reasons.clear()
+            mono.t += 300
         await fake.stop()
         return r, after
     for name, action in (("timeout after the request was sent", ("hang", 2.0)),
                          ("connection reset after the request was sent", ("reset",)),
                          ("HTTP 500", ("json", 500, {"error": "internal"}))):
         r, after = run(go(action))
-        check(f"{name}: AMBIGUOUS, new orders halted, and the same token stays blocked even after the "
-              f"kill switch is cleared", r["kind"] == L.AMBIGUOUS and after == ["Halted", "Refused"],
+        check(f"{name}: AMBIGUOUS pauses new orders for five minutes, then a fresh order can prepare",
+              r["kind"] == L.AMBIGUOUS and after == ["Halted", "prepared"],
               f"{r['kind']} {after} {r['error']}")
 
 
@@ -461,56 +463,44 @@ def t_venue_guard_state_machine():
     check("one 1650ms reply: HEALTHY -> DEGRADED -> PAUSED, new orders refused with the reason, NOT the kill switch",
           g.state == "PAUSED" and refused and "latency guard PAUSED" in refused and not kill.tripped
           and [(r["from"], r["to"]) for r in rows] == [("HEALTHY", "DEGRADED"), ("DEGRADED", "PAUSED")], str(rows))
-    g.on_probe(True, "ok")
+    for _ in range(5):
+        g.on_probe(True, "ok")
+    check("healthy checks do not shorten the five-minute pause", g.state == "PAUSED")
+    mono.t += 299
     g.on_probe(False, "channel not ready")
-    g.on_probe(True, "ok")
-    g.on_probe(True, "ok")
-    check("a failed check resets the healthy streak (ok, fail, ok, ok -> still PAUSED)", g.state == "PAUSED")
-    g.on_probe(True, "ok")
+    check("a failed probe before the deadline keeps orders paused", g.state == "PAUSED")
+    mono.t += 1
+    g.on_probe(False, "channel still not ready")
     ok = True
     try:
         g.check()
     except L.Refused:
         ok = False
-    check("3 healthy checks in a row: PAUSED -> RECOVERED -> HEALTHY, orders allowed again",
+    check("five minutes: PAUSED -> RECOVERED -> HEALTHY, even when probes fail",
           g.state == "HEALTHY" and ok and [(r["from"], r["to"]) for r in rows][-2:]
           == [("PAUSED", "RECOVERED"), ("RECOVERED", "HEALTHY")] and not kill.tripped, str(rows[-2:]))
-    mono.t += 1900                                  # the first strike leaves the 30-minute window
-    g.on_reply(1600)
-    for _ in range(3):
-        g.on_probe(True, "ok")
-    g.on_reply(1600)
-    check("strikes outside the window do not add up (2 in 30 min -> paused again, not halted)",
-          g.state == "PAUSED" and not kill.tripped, g.status())
-    for _ in range(3):
-        g.on_probe(True, "ok")
-    g.on_reply(1700)
-    check("3 slow replies within 30 min -> a 5-minute PAUSE, NOT the kill switch (2026-10-15)",
-          g.state == "PAUSED" and not kill.tripped and "paused 5 min" in rows[-1]["detail"], f"{g.status()} {rows[-1]}")
-    for _ in range(5):
-        g.on_probe(True, "ok")
-    check("...healthy checks during the 5 minutes do not resume orders", g.state == "PAUSED", g.status())
-    mono.t += 301
-    for _ in range(3):
-        g.on_probe(True, "ok")
-    check("...after 5 minutes, 3 healthy checks resume orders", g.state == "HEALTHY" and not kill.tripped, g.status())
     g.on_reply(1650)
-    check("...a 4th slow reply while 3 are in the window: another 5-minute pause", g.state == "PAUSED"
-          and "paused 5 min" in g.reason and not kill.tripped, g.status())
-    mono.t += 301 + 300
-    g.on_probe(False, "order connection: ConnectError")
-    check("...a long pause still not healthy 5 min after its wait -> HARD_HALTED",
-          g.state == "HARD_HALTED" and kill.tripped and any("latency guard" in r for r in kill.reasons), g.status())
+    mono.t += 299
+    g.on_reply(5200)                               # repeated trouble cannot push the deadline back
+    mono.t += 1
+    g.check()
+    check("another slow reply during the wait does not extend it or hard-stop",
+          g.state == "HEALTHY" and not kill.tripped, g.status())
     k2 = L.KillSwitch(None)
-    g2 = L.VenueGuard(k2, mono=FakeMono())
+    m2 = FakeMono()
+    g2 = L.VenueGuard(k2, mono=m2)
     g2.on_reply(5200)
-    check("one reply over 5s -> HARD_HALTED at once", g2.state == "HARD_HALTED" and k2.tripped, g2.status())
+    check("one reply over 5s starts a five-minute pause", g2.state == "PAUSED" and not k2.tripped, g2.status())
+    m2.t += 300
+    g2.check()
+    check("an extreme slow reply automatically resumes at five minutes", g2.state == "HEALTHY" and not k2.tripped,
+          g2.status())
     m3, k3 = FakeMono(), L.KillSwitch(None)
     g3 = L.VenueGuard(k3, max_pause_s=300, mono=m3)
     g3.on_reply(1600)
     m3.t += 301
     g3.on_probe(False, "order connection: ConnectError")
-    check("a pause that never checks healthy within 5 min -> HARD_HALTED", g3.state == "HARD_HALTED" and k3.tripped,
+    check("a venue that never checks healthy resumes after five minutes", g3.state == "HEALTHY" and not k3.tripped,
           g3.status())
     # the live defaults (2026-10-15, the operator's choice): 3 slow replies within 5 minutes
     m4, k4 = FakeMono(), L.KillSwitch(None)
@@ -519,19 +509,24 @@ def t_venue_guard_state_machine():
     for gap in (0, 200, 200):                         # 13:12 / 13:14 / 13:38-like spacing, scaled: never 3 in 5 min
         m4.t += gap
         g4.on_reply(1700)
+        m4.t += 300
         for _ in range(3):
             g4.on_probe(True, "ok")
-    check("slow replies spread wider than 5 minutes: only short pauses, back to HEALTHY",
-          g4.state == "HEALTHY" and "paused 5 min" not in g4.reason and not k4.tripped, g4.status())
+    check("separate slow replies each resume after their five-minute pause",
+          g4.state == "HEALTHY" and not k4.tripped, g4.status())
     m5, k5 = FakeMono(), L.KillSwitch(None)
     g5 = L.VenueGuard(k5, mono=m5)
-    for gap in (0, 60, 60):                           # 3 within 2 minutes
+    for gap in (0, 60, 60):                           # repeated replies inside one pause
         m5.t += gap
         g5.on_reply(1700)
         for _ in range(3):
             g5.on_probe(True, "ok")
-    check("3 slow replies within 5 minutes: the 5-minute pause", g5.state == "PAUSED"
-          and "within 5 min" in g5.reason and "paused 5 min" in g5.reason and not k5.tripped, g5.status())
+    check("repeated slow replies stay paused without tripping the kill switch", g5.state == "PAUSED"
+          and not k5.tripped, g5.status())
+    m5.t += 180
+    g5.check()
+    check("repeated replies still resume five minutes after the first one", g5.state == "HEALTHY" and not k5.tripped,
+          g5.status())
 
 
 def t_one_slow_reply_then_healthy_venue_recovers_and_orders_continue():
@@ -542,6 +537,8 @@ def t_one_slow_reply_then_healthy_venue_recovers_and_orders_continue():
             ex, ledger, store, receipts, rows = await make_canary(fake, tmp, limits=L.CanaryLimits(
                 max_orders=100, max_fills=100, max_exposure_usd=1e6))
             ex.sender.guard.slow_ms = 100.0
+            mono = FakeMono()
+            ex.sender.guard.mono = mono
             ex.hub = types.SimpleNamespace(condition_id=COND, up_token=UP, down_token=DN)
             journal = []
             ex.sender.guard.journal = journal.append
@@ -554,6 +551,7 @@ def t_one_slow_reply_then_healthy_venue_recovers_and_orders_continue():
             except L.Refused as exc:
                 refused = str(exc)
             probes = [await ex.health_probe() for _ in range(3)]
+            mono.t += 300
             for okp, det in probes:
                 ex.sender.guard.on_probe(okp, det)
             reset_ambiguity()
@@ -566,7 +564,7 @@ def t_one_slow_reply_then_healthy_venue_recovers_and_orders_continue():
     slow, state1, refused, probes, state, kind2, tripped, path, posts = run(go())
     check("slow reply flagged and PAUSED (not halted); the next order refused with the guard's reason",
           slow is True and state1 == "PAUSED" and refused and "latency guard PAUSED" in refused, f"{state1} {refused}")
-    check("recovery checks (order connection, clock, rules, collateral) pass 3x -> HEALTHY; the next order is SENT",
+    check("after five minutes the guard is HEALTHY and the next fresh signal sends",
           probes == [True, True, True] and state == "HEALTHY" and kind2 == "MATCHED" and posts == 2 and not tripped,
           f"{probes} {state} {kind2} posts={posts}")
     check("journalled HEALTHY -> DEGRADED -> PAUSED -> RECOVERED -> HEALTHY",
@@ -582,6 +580,8 @@ def t_repeated_slow_replies_pause_five_minutes_never_halt():
                                                                         max_exposure_usd=1e6,
                                                                         max_daily_loss_usd=1e6))
             ex.sender.guard.slow_ms = 100.0
+            mono = FakeMono()
+            ex.sender.guard.mono = mono
             ex.hub = types.SimpleNamespace(condition_id=COND, up_token=UP, down_token=DN)
             b = live_book()
             ex.hub.book = b
@@ -591,7 +591,8 @@ def t_repeated_slow_replies_pause_five_minutes_never_halt():
                 reset_ambiguity()
                 r = await ex.send(ex.prepare(live_plan(b.view(UP))))
                 states.append(r.get("guard"))
-                if ex.sender.guard.state == "PAUSED" and len(states) < 3:   # recover between the strikes
+                if ex.sender.guard.state == "PAUSED" and len(states) < 3:
+                    mono.t += 300
                     for _ in range(3):
                         ex.sender.guard.on_probe(*(await ex.health_probe()))
             refused = None
@@ -604,12 +605,12 @@ def t_repeated_slow_replies_pause_five_minutes_never_halt():
         await fake.stop()
         return states, refused, tripped
     states, refused, tripped = run(go())
-    check("slow, recover, slow, recover, slow (3 strikes in 30 min) -> a 5-minute PAUSE: orders refused, never Halted",
+    check("separate slow replies each cause a five-minute pause: orders refused, never Halted",
           states == ["PAUSED", "PAUSED", "PAUSED"] and refused and refused[0] == "Refused"
           and "latency guard PAUSED" in refused[1] and not tripped, f"{states} {refused}")
 
 
-def t_disconnected_venue_never_resumes_unsafely():
+def t_disconnected_venue_guard_resumes_after_five_minutes():
     async def go():
         fake = await FakeClob().start()
         fake.script.append(("sleep", 0.15, ("json", 200, MATCHED_REPLY)))
@@ -644,8 +645,8 @@ def t_disconnected_venue_never_resumes_unsafely():
     seen, final, det, posts, refused = run(go())
     check("venue down: every recovery check fails, it stays PAUSED (no order sent after the pause)",
           all(not okp and st == "PAUSED" for okp, st in seen) and posts == 1, f"{seen} posts={posts}")
-    check("...and HARD_HALTS once the pause outlives max_pause_s; orders refused (Halted)",
-          final == "HARD_HALTED" and refused == "Halted" and "order connection" in det, f"{final} {refused} {det}")
+    check("the latency guard resumes at five minutes even when the venue's health check fails",
+          final == "HEALTHY" and refused is None and "order connection" in det, f"{final} {refused} {det}")
 
 
 def t_normal_venue_orders_flow_with_no_guard_transition():

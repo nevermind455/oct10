@@ -98,7 +98,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(L.Halted):
             T.order(self.sender)
 
-    async def test_post_only_waits_for_deadline_and_health_then_fresh_signal(self):
+    async def test_post_only_waits_five_minutes_then_allows_a_fresh_signal(self):
         now = [100.0]
         self.sender.guard.mono = lambda: now[0]
         self.fake.script.append(("json", 503, {"code": "post_only_mode", "error": "post-only mode",
@@ -109,13 +109,13 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.sender.kill.tripped)
         self.assertEqual(self.sender.limits.exposure_usd, 0)
         self.assertEqual(self.sender.consecutive_errors, 0)
-        for stamp in (101, 140, 178.9):
+        for stamp in (101, 140, 178.9, 399.9):
             now[0] = stamp
             self.sender.guard.on_probe(True, "healthy")
             with self.assertRaises(L.Refused):
                 T.order(self.sender)
         self.assertEqual(self.fake.hits[("POST", "/order")], 1)
-        now[0] = 179
+        now[0] = 400
         for _ in range(self.sender.guard.healthy_checks):
             self.sender.guard.on_probe(True, "healthy")
         self.assertEqual((await self.sender.send(T.order(self.sender)))["kind"], L.MATCHED)
@@ -227,12 +227,17 @@ class ExecutionRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.ex.shim.cached_rules(T.COND).tick_size, D("0.001"))
         self.assertEqual(self.ex.sender.rules.get(T.COND, T.UP, T.DN)["tick"], D("0.001"))
 
-    async def test_changed_token_mapping_halts_instead_of_rebinding_orders(self):
+    async def test_changed_token_mapping_pauses_and_refreshes_for_the_current_mapping(self):
+        mono = T.FakeMono()
+        self.ex.kill.mono = mono
         self.hub.up_token = "wrong-token"
         self.task = asyncio.create_task(self.ex._rules_loop(self.hub))
-        await asyncio.sleep(0.02)
+        await self.wait_loaded(1)
         self.assertTrue(self.ex.kill.tripped)
-        self.assertEqual(self.ex.n["rules loaded"], 0)
+        self.assertEqual(self.ex.rules_ready, (T.COND, "wrong-token", T.DN))
+        mono.t += 300
+        self.ex.kill.check()
+        self.assertFalse(self.ex.kill.tripped)
 
     async def test_wide_slippage_small_order_meets_signed_minimum_and_cash_limit(self):
         view = T.live_book().view(T.UP)

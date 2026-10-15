@@ -1960,12 +1960,13 @@ class Sniper:
             return
         self.n["task errors"] += 1
         # An order worker that escaped its own error handling has an uncertain
-        # outcome. Keep existing reservations and prevent another decision.
+        # outcome. Keep reservations and pause live decisions for five minutes.
         if task in self._order_tasks:
-            self._closing = True
             kill = getattr(self.live, "kill", None)
             if kill is not None:
-                kill.trip("order task failed: reconcile before trading")
+                kill.trip_once(("order-task-error", id(task)), "order task failed: reconcile before trading")
+            else:
+                self._closing = True
         detail = f"{task.get_name()}: {type(exc).__name__}: {exc}"[:240]
         self._write({"wall": time.time(), "result": "task_error", "reason": detail})
         try:
@@ -3146,10 +3147,12 @@ class Sniper:
     def _decide(self, side: str, row: dict, t_ms: float):
         """Every check and every field of the order; None (skip journalled) if it must not trade."""
         self._sync_live_fak()
-        if any(r.get("side") == side for r, _plan in self._fak_pending.values()):
-            # this side's accepted FAK has no traded quantity yet: its carry
-            # is unknown. The other side's pending FAK does not hold this one.
-            return self._skip("awaiting FAK fill size", row)
+        pending_guard = getattr(self.live, "blocks_pending_fak", None)
+        for oid, (pending_row, _plan) in list(self._fak_pending.items()):
+            if pending_row.get("side") != side:
+                continue
+            if pending_guard is None or pending_guard(oid, client_order_id=pending_row.get("client_order_id")):
+                return self._skip("awaiting FAK fill size", row)
         hub = self.hub
         up, down, cond, end = hub.up_token, hub.down_token, hub.condition_id, hub.window_end
         if not (up and down and cond and end):

@@ -102,49 +102,131 @@ def reply_totals(resp) -> tuple[float, float] | None:
 
 
 class KillSwitch:
-    """Once tripped, every new order is refused until a human clears it."""
+    """Pause new orders for five minutes; reconciliation keeps running.
 
-    def __init__(self, stop_file: str | None = None) -> None:
+    Repeated reports do not extend an active pause. Persistent conditions use
+    trip_once so they cannot continually pause trading. STOP_LIVE is held only
+    while the operator's file exists. pause_s=None retains a manual latch.
+    """
+
+    def __init__(self, stop_file: str | None = None, *, pause_s: float | None = 300.0,
+                 mono=time.monotonic) -> None:
+        import threading
         self.stop_file = Path(stop_file) if stop_file else None
         self.reasons: list[str] = []
+        self.since: dict = {}                   # reason -> when it tripped (monotonic)
+        self._deadlines: dict[str, float | None] = {}
+        self.pause_s, self.mono = pause_s, mono
+        self.resumed: list = []                 # (reason, seconds paused): the history
+        self.on_resume = None                   # callback(reason, seconds) when a pause ends
+        self._lock = threading.RLock()
+        self._once: set[str] = set()
 
     def trip(self, reason: str) -> None:
-        if reason not in self.reasons:
-            self.reasons.append(reason)
+        with self._lock:
+            if reason not in self.reasons:
+                self.reasons.append(reason)
+                self.since[reason] = self.mono()
+                self._deadlines[reason] = None if self.pause_s is None else time.time() + self.pause_s
+
+    def trip_once(self, key, reason: str) -> None:
+        with self._lock:
+            identity = repr(key)
+            if identity in self._once:
+                return
+            self._once.add(identity)
+            self.trip(reason)
+
+    def clear(self, reason: str) -> None:
+        with self._lock:
+            if reason in self.reasons:
+                self.reasons.remove(reason)
+            self.since.pop(reason, None)
+            self._deadlines.pop(reason, None)
+
+    def _expire(self) -> None:
+        now, done = self.mono(), []
+        with self._lock:
+            stop_reason = f"stop file present: {self.stop_file}"
+            stopped = self.stop_file is not None and self.stop_file.exists()
+            if stopped:
+                self.trip(stop_reason)
+            else:
+                self.clear(stop_reason)
+            for reason in list(self.reasons):
+                started = self.since.setdefault(reason, now)   # set from outside: its pause starts now
+                if reason == stop_reason or self.pause_s is None:
+                    continue
+                if now - started >= self.pause_s:
+                    self.reasons.remove(reason)
+                    self.since.pop(reason, None)
+                    self._deadlines.pop(reason, None)
+                    done.append((reason, now - started))
+            self.resumed.extend(done)
+        for reason, seconds in done:
+            callback = self.on_resume
+            if callback is not None:
+                try:
+                    callback(reason, seconds)
+                except Exception:  # noqa: BLE001 - announcing must never block a resume
+                    pass
 
     def check(self) -> None:
-        if self.stop_file is not None and self.stop_file.exists():
-            self.trip(f"stop file present: {self.stop_file}")
-        if self.reasons:
-            raise Halted("; ".join(self.reasons))
+        reasons = self.active()
+        if reasons:
+            raise Halted("; ".join(reasons))
+
+    def active(self) -> list:
+        """The reasons pausing new orders now (expired ones dropped first)."""
+        self._expire()
+        with self._lock:
+            return list(self.reasons)
 
     @property
     def tripped(self) -> bool:
-        return bool(self.reasons)
+        return bool(self.active())
+
+    def snapshot(self) -> dict:
+        self._expire()
+        with self._lock:
+            return {"pauses": [{"reason": r, "deadline_wall": self._deadlines.setdefault(
+                                r, None if self.pause_s is None else
+                                time.time() + max(0.0, self.pause_s - (self.mono() - self.since[r])))}
+                               for r in self.reasons if not r.startswith("stop file present:")],
+                    "once": sorted(self._once)}
+
+    def restore(self, payload: dict) -> None:
+        if (not isinstance(payload, dict) or not isinstance(payload.get("pauses"), list)
+                or not isinstance(payload.get("once"), list)
+                or any(not isinstance(k, str) for k in payload["once"])):
+            raise ValueError("malformed live pause state")
+        for item in payload["pauses"]:
+            if (not isinstance(item, dict) or not isinstance(item.get("reason"), str) or not item["reason"]
+                    or "deadline_wall" not in item):
+                raise ValueError("malformed live pause record")
+            deadline = item["deadline_wall"]
+            if deadline is not None and (isinstance(deadline, bool) or not isinstance(deadline, (float, int))
+                                         or not math.isfinite(deadline)):
+                raise ValueError("invalid live pause deadline")
+        with self._lock:
+            now, wall = self.mono(), time.time()
+            self._once.update(payload.get("once", []))
+            for item in payload.get("pauses", []):
+                reason, deadline = item["reason"], item["deadline_wall"]
+                if deadline is not None and deadline <= wall:
+                    continue
+                self.trip(reason)
+                self._deadlines[reason] = deadline
+                if deadline is not None and self.pause_s is not None:
+                    self.since[reason] = now - self.pause_s + min(self.pause_s, deadline - wall)
 
 
 class VenueGuard:
-    """Venue latency guard with automatic recovery: it stops NEW orders while
-    the venue answers slowly and lets them resume once everything an order
-    needs checks healthy again - but repeated trouble still hard-halts.
+    """Slow replies pause new signals for five minutes and never hard-stop.
 
-    Each DEFINITE order reply reports its send -> response time:
-      <= slow_ms          healthy
-      slow_ms..extreme_ms a strike: HEALTHY -> DEGRADED (warning) -> PAUSED;
-                          new orders are refused (and journalled) until
-                          `healthy_checks` consecutive health probes pass:
-                          PAUSED -> RECOVERED -> HEALTHY
-      > extreme_ms        HARD_HALTED at once
-    `strikes_to_long_pause` strikes within `strike_window_s` - 5 minutes, the
-    operator's choice (was 30) - and each further strike while that many are in
-    the window, PAUSE for `long_pause_s` before the healthy checks may resume
-    orders - the operator's choice 2026-10-15: the
-    venue's slow replies are short one-offs (each pause recovered in ~6s), and a
-    hard halt stopped trading until a manual restart. A pause not healthy within
-    `max_pause_s` after its wait ends still HARD_HALTS - through the kill switch,
-    which only a new canary session clears. Unknown outcomes (timeouts, resets)
-    never come here: they still halt through the kill switch directly.
-    Every transition is journalled (result "guard") and announced."""
+    Health probes remain diagnostic. A continuing bad probe cannot extend a
+    pause; a fresh slow order reply after recovery can start another pause.
+    """
     HEALTHY, DEGRADED, PAUSED, RECOVERED, HARD_HALTED = "HEALTHY", "DEGRADED", "PAUSED", "RECOVERED", "HARD_HALTED"
     _LEVEL = {"HEALTHY": "good", "RECOVERED": "good", "DEGRADED": "warn", "PAUSED": "warn", "HARD_HALTED": "bad"}
 
@@ -181,45 +263,39 @@ class VenueGuard:
 
     def on_reply(self, rtt_ms: float) -> str:
         """One definite order reply's send -> response time; returns the state."""
-        if self.state == self.HARD_HALTED:
-            return self.state
-        if rtt_ms > self.extreme_ms:
-            self.hard_halt(f"send -> response {rtt_ms:.0f}ms exceeded {self.extreme_ms:.0f}ms")
-        elif rtt_ms > self.slow_ms:
+        self._resume_if_due()
+        if rtt_ms > self.slow_ms:
             now = self.mono()
             self.strikes.append(now)
             while self.strikes and now - self.strikes[0] > self.strike_window_s:
                 self.strikes.popleft()
-            if len(self.strikes) >= self.strikes_to_long_pause:
-                detail = (f"{len(self.strikes)} replies slower than {self.slow_ms:.0f}ms within "
-                          f"{self.strike_window_s / 60:.0f} min (last {rtt_ms:.0f}ms): new orders paused "
-                          f"{self.long_pause_s / 60:g} min, then healthy checks")
-                self.retry_not_before = max(self.retry_not_before, now + self.long_pause_s)
-                if self.state != self.PAUSED:
-                    self._to(self.DEGRADED, f"reply {rtt_ms:.0f}ms > {self.slow_ms:.0f}ms")
-                self._to(self.PAUSED, detail)
-            else:
-                detail = (f"reply {rtt_ms:.0f}ms > {self.slow_ms:.0f}ms "
-                          f"(strike {len(self.strikes)}/{self.strikes_to_long_pause})")
-                if self.state != self.PAUSED:
-                    self._to(self.DEGRADED, detail)
-                    self._to(self.PAUSED, "new orders paused until the venue checks healthy")
-            self.paused_at, self.healthy_streak, self.reason = now, 0, detail
+            detail = f"reply {rtt_ms:.0f}ms > {self.slow_ms:.0f}ms (strike {len(self.strikes)})"
+            if self.state != self.PAUSED:
+                self._to(self.DEGRADED, detail)
+                self.pause_for(self.long_pause_s, detail)
         return self.state
+
+    def _resume_if_due(self) -> None:
+        if self.state == self.PAUSED and self.mono() >= self.retry_not_before:
+            self._to(self.RECOVERED, f"pause completed; {self.healthy_streak} healthy probes")
+            self.paused_at, self.healthy_streak, self.reason = None, 0, ""
+            self.retry_not_before = 0.0
+            self._to(self.HEALTHY, "new orders resume")
 
     def check(self) -> None:
         """The order path: refused (journalled by the caller) while PAUSED."""
+        self._resume_if_due()
         if self.state == self.PAUSED:
             raise Refused(f"latency guard PAUSED for {self.mono() - (self.paused_at or self.mono()):.0f}s "
                           f"({self.reason}); {self.healthy_streak}/{self.healthy_checks} healthy checks")
 
     def pause_for(self, seconds: float, reason: str) -> None:
-        """A definitive venue rejection: wait, then require healthy probes.
+        """A definitive venue rejection: wait once, then allow new signals.
         This never resends the rejected order; only a new signal can trade."""
-        if self.state == self.HARD_HALTED:
+        if self.state == self.PAUSED:
             return
         now = self.mono()
-        self.retry_not_before = max(self.retry_not_before, now + seconds)
+        self.retry_not_before = now + seconds
         self.paused_at, self.healthy_streak, self.reason = now, 0, reason
         self._to(self.PAUSED, f"{reason}; retry no earlier than {seconds:g}s")
 
@@ -227,29 +303,16 @@ class VenueGuard:
         """One recovery health check while PAUSED; returns the state."""
         if self.state != self.PAUSED:
             return self.state
-        if self.mono() < self.retry_not_before:
-            self.healthy_streak = 0
-            return self.state
-        if ok:
-            self.healthy_streak += 1
-            if self.healthy_streak >= self.healthy_checks:
-                self._to(self.RECOVERED, f"{self.healthy_streak} healthy checks in a row ({detail})")
-                self.paused_at, self.healthy_streak, self.reason = None, 0, ""
-                self.retry_not_before = 0.0
-                self._to(self.HEALTHY, "new orders resume")
-                return self.state
-        else:
-            self.healthy_streak = 0
-        if self.paused_at is not None and self.mono() - max(self.paused_at, self.retry_not_before) > self.max_pause_s:
-            self.hard_halt(f"not healthy within {self.max_pause_s:.0f}s of the pause (last check: {detail})")
+        self.healthy_streak = self.healthy_streak + 1 if ok else 0
+        self._resume_if_due()
         return self.state
 
     def hard_halt(self, reason: str) -> None:
-        if self.state != self.HARD_HALTED:
-            self._to(self.HARD_HALTED, reason)
-        self.kill.trip(f"latency guard: {reason}")
+        # Compatibility for callers of the former hard-stop API.
+        self.pause_for(self.long_pause_s, reason)
 
     def status(self) -> dict:
+        self._resume_if_due()
         return {"state": self.state, "strikes": len(self.strikes), "healthy_streak": self.healthy_streak,
                 "paused_s": None if self.paused_at is None else round(self.mono() - self.paused_at, 1),
                 "reason": self.reason}
@@ -440,8 +503,10 @@ async def keep_warm(http, clock: ServerClock, url: str, every_s: float = 10.0, o
 
 @dataclass
 class CanaryLimits:
-    """Hard caps for a measurement canary. Exceeding one refuses the order;
-    the loss and exposure caps also trip the kill switch."""
+    """Cumulative budgets gain one original increment after each pause.
+
+    The per-order share bound remains an order sizing rule.
+    """
     max_order_shares: float = 10.0
     max_orders: int = 40
     max_fills: int = 20
@@ -457,24 +522,85 @@ class CanaryLimits:
     def __post_init__(self):
         import threading
         self._lock = threading.RLock()
+        # a cap reached pauses 5 minutes (the kill switch), then allows one more
+        # step of the same size - the operator's choice (2026-10-15)
+        self._step = {"max_orders": self.max_orders, "max_fills": self.max_fills, "max_rounds": self.max_rounds,
+                      "max_exposure_usd": self.max_exposure_usd, "max_daily_loss_usd": self.max_daily_loss_usd}
+        self._pending_caps: dict[str, str] = {}
+
+    def _advance(self, kill: KillSwitch) -> None:
+        kill.check()
+        for name, reason in list(self._pending_caps.items()):
+            if reason not in kill.reasons:
+                setattr(self, name, getattr(self, name) + self._step[name])
+                self._pending_caps.pop(name)
+
+    def _pause_cap(self, name: str, reason: str, kill: KillSwitch) -> None:
+        if name not in self._pending_caps:
+            self._pending_caps[name] = reason
+            kill.trip(reason)
+
+    def check_loss_budget(self, risk: float, kill: KillSwitch) -> None:
+        with self._lock:
+            self._advance(kill)
+            if not math.isfinite(risk) or risk < 0:
+                raise Refused("live worst-case loss cannot be calculated")
+            if risk > self.max_daily_loss_usd + 1e-9:
+                self._pause_cap("max_daily_loss_usd",
+                                f"worst-case loss ${risk:.6f} incl. fees exceeds the canary loss budget "
+                                f"${self.max_daily_loss_usd:.2f}", kill)
+            kill.check()
+
+    def budget_state(self) -> dict:
+        with self._lock:
+            return {"step": dict(self._step),
+                    "ceilings": {name: getattr(self, name) for name in self._step},
+                    "pending": dict(self._pending_caps)}
+
+    def restore_budget(self, payload: dict) -> None:
+        if not isinstance(payload, dict):
+            raise ValueError("malformed canary budget state")
+        steps, ceilings, pending = (payload.get(k) for k in ("step", "ceilings", "pending"))
+        names = set(self._step)
+        if (not isinstance(steps, dict) or not isinstance(ceilings, dict) or not isinstance(pending, dict)
+                or set(steps) != names or set(ceilings) != names or not set(pending) <= names):
+            raise ValueError("malformed canary budget fields")
+        for name in names:
+            values = (steps[name], ceilings[name])
+            if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0
+                   for v in values):
+                raise ValueError("invalid canary budget value")
+            if name in ("max_orders", "max_fills", "max_rounds") and any(int(v) != v for v in values):
+                raise ValueError("invalid canary count budget")
+            if ceilings[name] < steps[name]:
+                raise ValueError("canary budget smaller than its increment")
+        if any(not isinstance(r, str) or not r for r in pending.values()):
+            raise ValueError("invalid pending canary cap")
+        with self._lock:
+            self._step = dict(steps)
+            self._pending_caps = dict(pending)
+            for name, value in ceilings.items():
+                setattr(self, name, value)
 
     def check(self, amount: float, shares: float, condition: str, kill: KillSwitch, realized_loss_usd=None):
         with self._lock:
+            self._advance(kill)
             orders, potential_fills = self.orders, self.fills + self.pending_fills
             rounds, exposure = set(self.rounds), self.exposure_usd
-        if shares > self.max_order_shares + 1e-9:
-            raise Refused(f"order of {shares:.2f} shares exceeds the canary cap {self.max_order_shares}")
-        if orders >= self.max_orders:
-            kill.trip(f"canary order cap reached ({self.max_orders})")
-        if potential_fills >= self.max_fills:
-            kill.trip(f"canary fill cap reached ({self.max_fills})")
-        if condition not in rounds and len(rounds) >= self.max_rounds:
-            kill.trip(f"canary round cap reached ({self.max_rounds})")
-        if exposure + amount > self.max_exposure_usd + 1e-9:
-            kill.trip(f"canary exposure cap ${self.max_exposure_usd:.2f} would be exceeded")
-        if realized_loss_usd is not None and realized_loss_usd >= self.max_daily_loss_usd:
-            kill.trip(f"canary daily loss ${realized_loss_usd:.2f} >= ${self.max_daily_loss_usd:.2f}")
-        kill.check()
+            if shares > self.max_order_shares + 1e-9:
+                raise Refused(f"order of {shares:.2f} shares exceeds the canary cap {self.max_order_shares}")
+            if orders >= self.max_orders:
+                self._pause_cap("max_orders", f"canary order cap reached ({self.max_orders})", kill)
+            if potential_fills >= self.max_fills:
+                self._pause_cap("max_fills", f"canary fill cap reached ({self.max_fills})", kill)
+            if condition not in rounds and len(rounds) >= self.max_rounds:
+                self._pause_cap("max_rounds", f"canary round cap reached ({self.max_rounds})", kill)
+            if exposure + amount > self.max_exposure_usd + 1e-9:
+                self._pause_cap("max_exposure_usd", f"canary exposure cap ${self.max_exposure_usd:.2f} would be exceeded", kill)
+            if realized_loss_usd is not None and realized_loss_usd >= self.max_daily_loss_usd:
+                self._pause_cap("max_daily_loss_usd",
+                                f"canary daily loss ${realized_loss_usd:.2f} >= ${self.max_daily_loss_usd:.2f}", kill)
+            kill.check()
 
     def record_send(self, amount: float, condition: str) -> None:
         with self._lock:
@@ -509,8 +635,9 @@ class CanarySession:
     A signed order's intent and reservation are on disk BEFORE its first
     possible socket write: one appended, fsynced journal line - never a
     rewrite of the whole state, so the cost per order does not grow with the
-    session's history. A crash with an unresolved intent halts the next run;
-    neither a restart nor a new budget silently retries that order.
+    session's history. A crash with an unresolved intent pauses the next run;
+    its reservation remains counted after the pause, and neither a restart
+    nor a new budget silently retries that order.
     Definitive no-fill replies and complete ledger confirmations resolve
     intents; halts are recorded too.
 
@@ -532,17 +659,16 @@ class CanarySession:
 
     Only the pre-send intent is written in the caller's step. Outcomes and
     resolutions go to a writer thread (ordered by seq); a crash before one of
-    them reached the disk leaves its intent unresolved - the next start halts
+    them reached the disk leaves its intent unresolved - the next start pauses
     and reconciles, as a crash before the reply always did.
     """
     VERSION = 3
     UNRESOLVED = {"DISPATCHING", "ACCEPTED", "AMBIGUOUS"}
     FINAL = {NO_MATCH, REJECTED, NOT_SENT, "CONFIRMED"}
     RECENT_S = 86_400.0
-    # The start-up halt for a previous run's unresolved orders is DERIVED: open()
-    # works it out from the intents on every start, and LiveExecution lifts it
-    # once the venue proves each one (_reconcile_previous_run). Persisted, it
-    # would come back after the orders were long settled.
+    # Older snapshots store only reasons. Ignore their derived restart reason
+    # and derive it again; newer kill_state retains its deadline and once key
+    # so restarting cannot restart a pause that has already ended.
     PREVIOUS_RUN = "unresolved live orders from a previous run"
     TRANSIENT = ("shutting down", PREVIOUS_RUN)   # halts that are not persisted (see above)
 
@@ -645,6 +771,10 @@ class CanarySession:
         if spent is not None and (isinstance(spent, bool) or not isinstance(spent, (int, float))
                                   or not math.isfinite(spent) or not 0 <= spent <= intent["amount"] + 1e-6):
             raise ValueError("invalid resolved canary spend")
+        shares = intent.get("shares")
+        if shares is not None and (isinstance(shares, bool) or not isinstance(shares, (int, float))
+                                   or not math.isfinite(shares) or shares <= 0):
+            raise ValueError("invalid canary intent shares")
         tids = intent.get("trade_ids")
         if tids is not None and (not isinstance(tids, list)
                                  or any(not isinstance(t, str) or not t for t in tids)):
@@ -685,6 +815,9 @@ class CanarySession:
                     ok = False
         if not ok:
             raise ValueError("malformed canary session state")
+        for field_name in ("kill_state", "limit_state"):
+            if field_name in data and not isinstance(data[field_name], dict):
+                raise ValueError(f"malformed canary {field_name}")
         pending = data.get("pending_fills", 0)
         intents = data.get("intents", {})
         if data["version"] >= 2 and ("pending_fills" not in data or "intents" not in data):
@@ -752,6 +885,11 @@ class CanarySession:
             if not isinstance(reasons, list):
                 raise ValueError("malformed canary halt record")
             data["kill_reasons"] = [str(r) for r in reasons]
+            for field_name in ("kill_state", "limit_state"):
+                if field_name in rec:
+                    if not isinstance(rec[field_name], dict):
+                        raise ValueError(f"malformed canary {field_name}")
+                    data[field_name] = copy.deepcopy(rec[field_name])
         data["journal_seq"] = rec["seq"]
 
     def _load_durable(self) -> dict | None:
@@ -804,7 +942,8 @@ class CanarySession:
     def _ledger_view(ledger, since_wall: float, intents: dict | None = None) -> dict:
         """What the live ledger's durable authorizations prove since since_wall."""
         orders, spend, rounds, filled = 0, 0.0, set(), set()
-        by_order = {intent.get("order_id"): intent for intent in (intents or {}).values() if intent.get("order_id")}
+        by_order = {str(intent.get("order_id") or intent.get("order_hash")): intent
+                    for intent in (intents or {}).values() if intent.get("order_id") or intent.get("order_hash")}
         with ledger._lock:
             ids = set()
             for oid, meta in ledger.authorized_orders.items():
@@ -826,11 +965,40 @@ class CanarySession:
                 else:
                     spend += float(meta.get("requested_notional") or 0.0)
             ids -= no_fill
-            complete = {oid for oid in filled
-                        if not ledger.authorized_orders[oid].get("trade_ids")
-                        or set(ledger.authorized_orders[oid]["trade_ids"]) <= set(ledger.seen)}
+            complete = {oid for oid in ids
+                        if by_order.get(str(oid), {}).get("status") == "CONFIRMED"
+                        or (oid in filled and ledger.authorized_orders[oid].get("trade_ids")
+                            and set(ledger.authorized_orders[oid]["trade_ids"]) <= set(ledger.seen))}
         return {"orders": orders, "spend": spend, "rounds": rounds, "fills": len(filled),
                 "confirmed": complete, "unconfirmed": ids - complete}
+
+    def _recover_authorizations(self, ledger, unconfirmed: set, known: dict) -> None:
+        """Old state formats may have an authorization without a send intent.
+
+        Rebuild a durable, unresolved reservation rather than allowing that
+        accepted order to disappear from the loss budget after the pause. An
+        old authorization without fee data reserves the full possible fee
+        rate, so missing historical metadata cannot reduce its risk.
+        """
+        represented = {str(i.get("order_hash") or i.get("order_id")) for i in known.values()
+                       if i.get("order_hash") or i.get("order_id")}
+        with ledger._lock:
+            missing = [(str(oid), dict(ledger.authorized_orders[oid]))
+                       for oid in unconfirmed if str(oid) not in represented]
+        for oid, meta in missing:
+            amount = float(meta.get("requested_notional") or 0.0)
+            principal = max(amount, float(meta.get("venue_min_shares") or 0.0)
+                            * float(meta.get("price_cap") or 0.0))
+            rate = float(meta.get("fee_rate") if meta.get("fee_rate") is not None else 1.0)
+            reserve = max(principal * (1.0 + rate), amount + float(meta.get("estimated_fee") or 0.0),
+                          float(meta.get("reserved_total_cost") or 0.0))
+            key = f"recovered-authorization:{oid}"
+            intent = {"status": "DISPATCHING", "wall": self.started_wall, "end": float(meta["window_end"]),
+                      "condition": str(meta["condition_id"]), "token": str(meta["token_id"]), "side": "BUY",
+                      "amount": amount, "reserve": reserve, "order_hash": oid, "order_id": oid,
+                      "recovered_authorization": True}
+            self._validate_intent(key, intent)
+            self.intents[key] = intent
 
     def open(self, limits: "CanaryLimits", kill: KillSwitch, ledger, *, new_session: bool = False,
              now: float | None = None) -> str:
@@ -886,6 +1054,7 @@ class CanarySession:
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"canary archive {self.archive_path} is unreadable ({type(exc).__name__})") from None
         proof = self._ledger_view(ledger, self.started_wall, {**archived, **self.intents})
+        self._recover_authorizations(ledger, proof["unconfirmed"], {**archived, **self.intents})
         limits.orders = max(int(data["orders"]), proof["orders"])
         limits.fills = max(int(data["fills"]), proof["fills"])
         accepted_ids = {i.get("order_id") for i in self.intents.values() if i.get("kind") in (MATCHED, PENDING)}
@@ -895,13 +1064,23 @@ class CanarySession:
                                        for i in self.intents.values()))
         limits.exposure_usd = max(float(data["exposure_usd"]), proof["spend"])
         limits.rounds = set(map(str, data["rounds"])) | proof["rounds"]
-        for reason in data["kill_reasons"]:
-            if not str(reason).startswith(self.TRANSIENT):
-                kill.trip(str(reason))
+        try:
+            if "limit_state" in data:
+                limits.restore_budget(data["limit_state"])
+            if "kill_state" in data:
+                kill.restore(data["kill_state"])
+            else:
+                for reason in data["kill_reasons"]:
+                    if not str(reason).startswith(self.TRANSIENT):
+                        kill.trip(str(reason))
+        except (TypeError, ValueError, KeyError):
+            raise RuntimeError(f"canary session state {self.path} contains malformed pause or budget state") from None
         unresolved = [key for key, intent in self.intents.items() if intent["status"] in self.UNRESOLVED]
         if unresolved or proof["unconfirmed"]:
-            kill.trip(f"unresolved live orders from a previous run ({len(unresolved)} send intents, "
-                      f"{len(proof['unconfirmed'])} unconfirmed authorizations): reconcile before trading")
+            reason = (f"{self.PREVIOUS_RUN} ({len(unresolved)} send intents, "
+                      f"{len(proof['unconfirmed'])} unconfirmed authorizations): reconciling in background")
+            for key in unresolved:
+                kill.trip_once((self.PREVIOUS_RUN, key), reason)
         self.restored = {"orders": limits.orders, "fills": limits.fills, "spend": round(limits.exposure_usd, 4),
                          "rounds": len(limits.rounds), "halts": list(kill.reasons)}
         self._marker = None
@@ -921,6 +1100,19 @@ class CanarySession:
             return {"orders": int(limits.orders), "fills": int(limits.fills),
                     "pending_fills": int(limits.pending_fills), "exposure_usd": float(limits.exposure_usd)}
 
+    @staticmethod
+    def _controls(limits: "CanaryLimits", kill: KillSwitch) -> dict:
+        """Budget steps and pause deadlines survive a restart unchanged."""
+        kill_state = kill.snapshot()
+        kill_state["pauses"] = [p for p in kill_state["pauses"]
+                                 if not str(p["reason"]).startswith("shutting down")]
+        return {"kill_state": kill_state, "limit_state": limits.budget_state()}
+
+    @staticmethod
+    def _state_marker(counters: dict, reasons: list, rounds: int, controls: dict) -> tuple:
+        return (tuple(sorted(counters.items())), tuple(reasons), rounds,
+                json.dumps(controls, sort_keys=True, separators=(",", ":")))
+
     def state(self, limits: "CanaryLimits", kill: KillSwitch) -> dict:
         """The snapshot as it would be written now: counters, rounds, halts and
         every intent still in the hot state - the open ones, and finished ones
@@ -936,7 +1128,7 @@ class CanarySession:
         return {"version": self.VERSION, "session_id": self.session_id, "wallet": self.wallet_key,
                 "started_wall": self.started_wall, **counters, "rounds": rounds, "intents": intents,
                 "kill_reasons": [r for r in kill.reasons if not str(r).startswith(self.TRANSIENT)],
-                "journal_seq": seq, "segment": self._segment}
+                **self._controls(limits, kill), "journal_seq": seq, "segment": self._segment}
 
     def _next(self) -> int:
         self._seq += 1
@@ -970,11 +1162,14 @@ class CanarySession:
             order_hash = getattr(p, "order_hash", None)
             if order_hash:
                 intent["order_hash"] = str(order_hash)
+            if getattr(p, "shares", None) is not None:
+                intent["shares"] = float(p.shares)
             self.intents[key] = intent
             line = self._line({"seq": self._next(), "op": "intent", "key": key, "intent": intent,
                                "round": p.condition, "c": self._counters(limits)})
         if not self._durable_append(line):
-            kill.trip(f"live send intent cannot be persisted ({self.last_error})")
+            kill.trip_once(("session-disk", str(self.path)),
+                           f"live send intent cannot be persisted ({self.last_error})")
             raise Halted("live send intent cannot be persisted; order not sent")
 
     def _durable_append(self, line: bytes) -> bool:
@@ -1017,7 +1212,8 @@ class CanarySession:
                         return
                     line, why = item
                     if not self._durable_append(line):
-                        kill.trip(f"{why} cannot be persisted ({self.last_error})")
+                        kill.trip_once(("session-disk", str(self.path)),
+                                       f"{why} cannot be persisted ({self.last_error})")
                 finally:
                     q.task_done()
         t = threading.Thread(target=loop, name="canary-journal", daemon=True)
@@ -1027,7 +1223,8 @@ class CanarySession:
     def _submit(self, line: bytes, why: str, kill: KillSwitch) -> None:
         if self._writer is None:
             if not self._durable_append(line):
-                kill.trip(f"{why} cannot be persisted ({self.last_error})")
+                kill.trip_once(("session-disk", str(self.path)),
+                               f"{why} cannot be persisted ({self.last_error})")
             return
         self._writer[0].put((line, why))
 
@@ -1092,11 +1289,13 @@ class CanarySession:
         once the journal has grown. True when the disk holds the current state."""
         counters = self._counters(limits)
         reasons = [r for r in kill.reasons if not str(r).startswith(self.TRANSIENT)]
-        marker = (tuple(sorted(counters.items())), tuple(reasons), len(limits.rounds))
+        controls = self._controls(limits, kill)
+        marker = self._state_marker(counters, reasons, len(limits.rounds), controls)
         ok = True
         if marker != self._marker:
             with self._lock:
-                line = self._line({"seq": self._next(), "op": "state", "kill_reasons": reasons, "c": counters})
+                line = self._line({"seq": self._next(), "op": "state", "kill_reasons": reasons,
+                                   "c": counters, **controls})
             ok = self._durable_append(line)
             if ok:
                 self._marker = marker
@@ -1162,8 +1361,8 @@ class CanarySession:
                         self._segment_path(k).unlink()
                     except OSError:
                         pass                # replayed again at the next start: harmless, older than the snapshot
-            self._marker = (tuple(sorted(self._counters(limits).items())), tuple(state["kill_reasons"]),
-                            len(limits.rounds))
+            self._marker = self._state_marker(self._counters(limits), state["kill_reasons"], len(limits.rounds),
+                                              {k: state[k] for k in ("kill_state", "limit_state")})
             self.last_error = None
             return True
         except Exception as exc:  # noqa: BLE001 - reported; the caller halts on repeated failure
@@ -1265,12 +1464,18 @@ class LeanSender:
             raise Refused(f"unknown order type {order_type!r}")
         self.kill.check()
         self.guard.check()                            # Refused while the venue guard has new orders paused
-        if getattr(self, "unresolved", None):
-            raise Refused("an earlier order's outcome is being reconciled with the venue")
+        for client_id in list(getattr(self, "unresolved", {}) or {}):
+            self.kill.trip_once(("order-uncertain", str(client_id)),
+                                f"order {client_id} outcome unknown: reconciling with the venue")
+        self.kill.check()
         ts = self.clock.now_s()                       # Halted before any work if the time is not trusted
         rules = self.rules.get(condition, up, down)
         if self.pt._ambiguous_blocks(str(condition), str(token)):
-            raise Refused("an earlier submission on this token has an unknown outcome")
+            client_id = getattr(self, "_ambiguous_pauses", {}).get((str(condition), str(token)))
+            key = (("order-uncertain", str(client_id)) if client_id is not None else
+                   ("ambiguous-token", str(condition), str(token)))
+            self.kill.trip_once(key, "an earlier submission on this token has an unknown outcome")
+            self.kill.check()
         tick = f"{Decimal(str(rules['tick'])).normalize():f}"
         step = Decimal(tick)
         exact = (Decimal(str(cap)) / step).to_integral_value(rounding=ROUND_FLOOR) * step
@@ -1339,8 +1544,10 @@ class LeanSender:
     def _check_send(self, p: Prepared, *, budget: bool = True) -> None:
         self.kill.check()
         self.guard.check()
-        if getattr(self, "unresolved", None):
-            raise Refused("an earlier order's outcome is being reconciled with the venue")
+        for client_id in list(getattr(self, "unresolved", {}) or {}):
+            self.kill.trip_once(("order-uncertain", str(client_id)),
+                                f"order {client_id} outcome unknown: reconciling with the venue")
+        self.kill.check()
         self.clock.now_s()
         current_rules = self.rules.get(p.condition, p.rules["up_token"], p.rules["down_token"])
         if current_rules != p.rules:
@@ -1571,16 +1778,18 @@ class LeanSender:
             self.limits.record_outcome(kind, p.amount)
         if kind == AMBIGUOUS:
             self.pt._mark_ambiguous(p.condition, p.end, p.token)
+            self._ambiguous_pauses = getattr(self, "_ambiguous_pauses", {})
+            self._ambiguous_pauses[(str(p.condition), str(p.token))] = p.client_order_id
+            self.kill.trip_once(("order-uncertain", str(p.client_order_id)),
+                                f"order {p.client_order_id} outcome unknown ({row['error']}): reconciling with the venue")
             resolver = getattr(self, "ambiguity_resolver", None)
             if resolver is not None and getattr(p, "order_hash", None) and p.order_type == "FAK":
-                # Not sent again: looked up by its own hash. No new order until
-                # the venue's answer is known; none in time -> the kill switch.
+                # Keep reconciling its own hash throughout the one pause. The
+                # old order and its reservation remain after trading resumes.
                 self.unresolved = getattr(self, "unresolved", None) or {}
                 self.unresolved[p.client_order_id] = p
                 row["auto_reconcile"] = True
                 resolver(p, dict(row))
-            else:
-                self.kill.trip(f"order {p.client_order_id} outcome unknown ({row['error']}): reconcile before trading")
         text = str(row["error"]).lower()
         if kind == REJECTED:
             hit = next((why for w, why in self.HALT_ON.items() if w in text), None)
@@ -1601,7 +1810,7 @@ class LeanSender:
                 except (TypeError, ValueError):
                     pass
             delay = max(waits, default=30.0)
-            self.guard.pause_for(delay, "venue post-only mode")
+            self.guard.pause_for(300.0, "venue post-only mode")
             row["venue_retry_after_s"] = delay
         if row["new_connection"]:
             row["warning"] = "a new TCP/TLS connection was opened on the hot path"
@@ -1611,6 +1820,7 @@ class LeanSender:
             self.consecutive_errors += 1
             if self.consecutive_errors >= self.max_consecutive_errors:
                 self.kill.trip(f"{self.consecutive_errors} consecutive order errors")
+                self.consecutive_errors = 0         # after the 5-minute pause, count afresh
         if "net_send_start_pc" in st and "response_pc" in st and kind != AMBIGUOUS:
             rtt = (st["response_pc"] - st["net_send_start_pc"]) / 1e6
             row["reply_ms"] = round(rtt, 1)
@@ -1791,6 +2001,9 @@ class LiveExecution:
         self.n = collections.Counter()
         self._tasks: list = []
         self._announced: set = set()
+        self._tripped_once: set = set()     # a lasting condition pauses once, then trading resumes
+        if hasattr(self.sender, "kill") and hasattr(self.sender.kill, "on_resume"):
+            self.sender.kill.on_resume = self._on_resume
         self.hub = None
         self.guard_probe_s = 2.0
         self.session: CanarySession | None = None     # set by build_live_execution (audit F3)
@@ -1804,7 +2017,9 @@ class LiveExecution:
         self.ambiguity_delays_s = (0.5, 1.0, 2.0, 4.0, 8.0, 15.0, 30.0, 60.0)
         # A previous run's unresolved orders: looked up again after each delay
         # (the ledger books their trades as the reconciler catches up).
-        self.previous_run_delays_s = (0.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0)
+        # a previous run's unresolved orders: looked up for about an hour (the
+        # start-up pause ends after 5 minutes; their worst case stays reserved)
+        self.previous_run_delays_s = (0.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0) + (300.0,) * 12
         sender.ambiguity_resolver = self._schedule_ambiguity
 
     @property
@@ -1840,8 +2055,9 @@ class LiveExecution:
         # Recovery cannot distinguish a manual trade from an orphaned bot
         # write. Never silently exempt recovered unexplained fills.
         self.baseline_unexplained = set()
-        if await asyncio.to_thread(self._unexplained_now):
-            self._trip("unexplained recovered wallet fills: reconcile before trading")
+        for tid in await asyncio.to_thread(self._unexplained_now):
+            self._trip_once(("unexplained", tid),
+                            f"unexplained recovered wallet fill {short_id(tid)}: reconciling in background")
         self.hub = hub
         loop = asyncio.get_running_loop()
         self._tasks = [loop.create_task(keep_warm(self.sender.http, self.sender.clock, self.clock_url,
@@ -1850,11 +2066,24 @@ class LiveExecution:
                        loop.create_task(self._rules_loop(hub)), loop.create_task(self._guard_loop())]
         if self.session is not None:
             self._tasks.append(loop.create_task(self._session_loop()))
-            # A previous run's unresolved orders: proven by the venue, or still halted.
+            # A previous run's unresolved orders: their worst case counts against the loss
+            # budget until the venue proves them (the start-up pause ends after 5 minutes)
+            previous = self.session.unresolved()
+            self._previous_run_keys = {key for key, _intent in previous}
+            with self._risk_lock:
+                for key, intent in previous:
+                    self._risk_orders.setdefault(key, {
+                        "condition": str(intent.get("condition")), "token": str(intent.get("token")),
+                        "reserve": float(intent.get("reserve") or intent.get("amount") or 0.0),
+                        "order_id": intent.get("order_hash") or intent.get("order_id"),
+                        # A BUY cap is a maximum price, not a maximum quantity.
+                        # Share-sized intents carry their exact size; an old
+                        # amount-sized intent uses the venue's minimum tick.
+                        "shares": float(intent.get("shares") or float(intent.get("amount") or 0.0) / 0.0001)})
             self._tasks.append(loop.create_task(self._reconcile_previous_run()))
         if self.kill.stop_file is not None and self.kill.stop_file.exists():
             self.on_event("sniper", f"LIVE CANARY: stop file {self.kill.stop_file} present - no orders "
-                                    f"(remove it and restart to trade)", "bad")
+                                    f"(remove it to release this stop)", "bad")
         self.on_event("sniper", f"LIVE CANARY armed: collateral ${self.balance:.2f}; " + self.limits_line(), "warn")
 
     async def _session_loop(self) -> None:
@@ -1867,7 +2096,8 @@ class LiveExecution:
             ok = await asyncio.to_thread(self.session.persist, self.sender.limits, self.kill)
             self._persist_failures = 0 if ok else self._persist_failures + 1
             if self._persist_failures >= 3:
-                self._trip(f"canary session state cannot be written ({self.session.last_error})")
+                self._trip_once(("session-disk", str(self.session.path)),
+                                f"canary session state cannot be written ({self.session.last_error})")
 
     async def stop(self) -> None:
         for t in list(self._tasks) + list(self._order_tasks):
@@ -1937,9 +2167,9 @@ class LiveExecution:
                 except Refused:
                     missing = True
                 except Halted as exc:
-                    self._trip(str(exc))
-                    await asyncio.sleep(0.5)
-                    continue
+                    self._trip_once(("rules-mapping", *(str(x) for x in key)), str(exc))
+                    self.sender.rules.invalidate(str(key[0]))
+                    missing = True
                 missing = missing or self.shim.cached_rules(str(key[0])) is None
             if all(key) and not missing and key != done and key == prepared_done:
                 # Loaded before the boundary for exactly this round (audit M5):
@@ -2065,19 +2295,39 @@ class LiveExecution:
                 await asyncio.to_thread(self.reconcile_once)
                 self._sync_fak()
             except Exception as exc:  # noqa: BLE001 - an unexplained state stops new orders
-                self._trip(f"reconciliation failed: {type(exc).__name__}: {exc}")
+                self._trip_once(("reconciliation-error", type(exc).__name__),
+                                f"reconciliation failed: {type(exc).__name__}: {exc}")
 
     def _trip_fak(self, a: dict, reason: str) -> None:
         """A FAK's own evidence halts trading: the order keeps its reservation
         and stays awaiting, and is not timed out again for the same order."""
         a.setdefault("halted_for", reason)
-        self._trip(reason)
+        self._trip_once(("order-uncertain", str(a.get("client_order_id") or id(a))), reason)
 
     def _trip(self, reason: str) -> None:
         self.kill.trip(reason)
         if reason not in self._announced:
             self._announced.add(reason)
-            self.on_event("sniper", f"LIVE CANARY HALTED: {reason}", "bad")
+            pause = getattr(self.kill, "pause_s", None)
+            self.on_event("sniper", f"LIVE CANARY PAUSED{f' {pause / 60:g} min' if pause else ''}: {reason}", "bad")
+
+    def _trip_once(self, key, reason: str) -> None:
+        """A condition that stays true pauses once (its 5 minutes), not on every check."""
+        if key in self._tripped_once:
+            return
+        self._tripped_once.add(key)
+        self.kill.trip_once(key, reason)
+        if reason in self.kill.reasons and reason not in self._announced:
+            self._announced.add(reason)
+            self.on_event("sniper", f"LIVE CANARY PAUSED 5 min: {reason}", "bad")
+
+    def _on_resume(self, reason: str, seconds: float) -> None:
+        self._announced.discard(reason)
+        self.n["pauses ended"] += 1
+        self.on_event("sniper", f"LIVE CANARY resumes after a {seconds / 60:.0f}-minute pause ({reason[:120]})", "warn")
+        journal = getattr(self, "_journal", None)
+        if journal is not None:
+            journal({"wall": time.time(), "result": "resume", "reason": str(reason)[:200], "paused_s": round(seconds, 1)})
 
     # ------------------------------------------------------------ ledger views (worker thread)
     def _unexplained_now(self) -> set:
@@ -2148,25 +2398,23 @@ class LiveExecution:
         uncertain = sum(max(0.0, a["reserve"] - booked.get(a.get("order_id"), 0.0)) for a in reservations)
         value = max(0.0, -realized) + open_basis + uncertain
         if not math.isfinite(value) or value < 0:
-            self._trip("invalid live worst-case loss reservation")
+            self._trip_once("invalid reservation", "invalid live worst-case loss reservation")
             self.kill.check()
         return value
 
     def _check_loss_budget(self, additional: float = 0.0) -> None:
         self._check_accounting_integrity()
         risk = self._risk_budget_used() + additional
-        cap = self.sender.limits.max_daily_loss_usd
-        if risk > cap + 1e-9:
-            raise Refused(f"worst-case loss ${risk:.6f} incl. fees exceeds the canary loss budget ${cap:.2f}")
+        self.sender.limits.check_loss_budget(risk, self.kill)
 
     def _check_accounting_integrity(self) -> None:
         error = getattr(self.ledger, "integrity_error", None)
         if error:
-            self._trip(f"durable fill execution evidence conflicts with the ledger: {error}")
+            self._trip_once(("integrity", str(error)), f"durable fill execution evidence conflicts with the ledger: {error}")
             self.kill.check()
         halt = getattr(self.ledger, "persistence_halt", None)
         if halt:
-            self._trip(f"the live ledger could not make booked accounting durable: {halt}")
+            self._trip_once(("persistence", str(halt)), f"the live ledger could not make booked accounting durable: {halt}")
             self.kill.check()
 
     def own_risk_shares(self, token: str, condition: str) -> float:
@@ -2208,12 +2456,13 @@ class LiveExecution:
         for tid in unexplained:
             first = self._unexplained_since.setdefault(tid, now)
             if now - first > self.unexplained_grace_s:
-                self._trip(f"a confirmed fill on this wallet that no order of ours explains "
-                           f"(trade ...{str(tid)[-10:]}): reconcile by hand")
+                self._trip_once(("unexplained", tid), f"a confirmed fill on this wallet that no order of ours "
+                                                      f"explains (trade ...{str(tid)[-10:]}): reconcile by hand")
         for oid, a in list(self.awaiting.items()):
             if a.get("authorized") is False:
                 if now - a["wall"] > self.confirm_within_s:
-                    self._trip(f"order {short_id(oid)} authorization incomplete: reconcile")
+                    self._trip_once(("order-uncertain", str(a.get("client_order_id") or oid)),
+                                    f"order {short_id(oid)} authorization incomplete: reconcile")
                 continue
             if a.get("order_type") == "FAK":
                 self._reconcile_fak(oid, a, now)
@@ -2248,7 +2497,9 @@ class LiveExecution:
                         zero = False
                     if not zero:
                         if age > self.confirm_within_s:
-                            self._trip(f"FOK order {short_id(oid)} canceled without complete zero-fill proof: reconcile")
+                            self._trip_once(("order-uncertain", str(a.get("client_order_id") or oid)),
+                                            f"FOK order {short_id(oid)} canceled without "
+                                            f"complete zero-fill proof: reconcile")
                         continue
                     self.awaiting.pop(oid, None)
                     self.sender.limits.resolve_accepted(a["amount"], zero_fill=True)
@@ -2257,8 +2508,9 @@ class LiveExecution:
                     continue
                 a["venue_matched"] = status == "matched"
             if age > self.confirm_within_s:
-                self._trip(f"order {short_id(oid)} ({a['kind']}, venue status {a.get('venue_status') or 'unknown'}) not "
-                           f"confirmed in the ledger after {self.confirm_within_s:.0f}s: reconcile")
+                self._trip_once(("order-uncertain", str(a.get("client_order_id") or oid)),
+                                f"order {short_id(oid)} ({a['kind']}, venue status {a.get('venue_status') or 'unknown'}) "
+                                f"not confirmed in the ledger after {self.confirm_within_s:.0f}s: reconcile")
         self.session_loss = max(0.0, -self._session_realized())
 
     def _fak_status(self, oid, a, now) -> None:
@@ -2274,7 +2526,7 @@ class LiveExecution:
             return
         if (str(order.get("id")) != str(oid) or str(order.get("asset_id")) != a["token"]
                 or str(order.get("market")) != a["condition"] or order.get("side") != "BUY"):
-            self._trip(f"FAK order {short_id(oid)} status identity mismatch: reconcile")
+            self._trip_fak(a, f"FAK order {short_id(oid)} status identity mismatch: reconcile")
             return
         status = str(order.get("status") or "").lower()
         a["venue_status"] = status
@@ -2321,7 +2573,7 @@ class LiveExecution:
         if age > self.confirm_within_s and not a.get("halted_for"):
             # An order whose own evidence already halted trading is not timed out
             # a second time: one halt, with its real reason (2026-10-14).
-            self._trip(f"FAK order {short_id(oid)} not completely confirmed after {self.confirm_within_s:.0f}s: reconcile")
+            self._trip_fak(a, f"FAK order {short_id(oid)} not completely confirmed after {self.confirm_within_s:.0f}s: reconcile")
 
     def fill_for(self, order_id) -> dict | None:
         """Our fills of one order as the private channel reported them
@@ -2435,12 +2687,27 @@ class LiveExecution:
                 "statuses": sorted({str(f.status).upper() for f in rows}), "source": "user channel",
                 "seen_mono": seen or None}
 
+    def blocks_pending_fak(self, oid, *, client_order_id=None) -> bool:
+        """Pause once for an unknown quantity, keeping its evidence and risk.
+
+        The decision layer supplies the original client id for an ambiguous
+        order whose venue authorization is still being looked up.
+        """
+        a = self.fak_orders.get(oid)
+        if a is not None:
+            if a.get("quantity_resolved") or self.fill_for(oid) is not None:
+                return False
+            client_order_id = a.get("client_order_id") or client_order_id
+        identity = str(client_order_id or oid)
+        self._trip_once(("order-uncertain", identity),
+                        f"FAK order {short_id(oid)} is still awaiting complete fill quantities")
+        return self.kill.tripped
+
     # ------------------------------------------------------------ one order (event loop)
     def prepare(self, plan: dict, decided_pc: int | None = None) -> Prepared:
         """Size and check the order exactly as the paper broker does (same
         functions, on the book the decision used), then sign it. Raises
-        Refused (this order not sent) or Halted (no orders until a human
-        restarts the canary). No I/O."""
+        Refused (this order not sent) or Halted (new orders paused). No I/O."""
         from paper_trade import (MIN_MARKETABLE_BUY_USD, PaperRejected, estimate_fok, estimate_fak, estimate_fak_shares,
                                  size_to_venue_minimum, snapshot_from_book_view)
         self.kill.check()
@@ -2449,14 +2716,12 @@ class LiveExecution:
             raise Refused(f"unknown order type {order_type!r}")
         token, cond, end = plan["token"], plan["cond"], float(plan["end"])
         for oid, a in list(self.fak_orders.items()):
-            # Only this token's (this side's) unresolved FAK holds the order: the
-            # other side's fills are told apart by order id, and collateral is
-            # reserved per order (self.reserved), so the two may overlap.
+            # Its incomplete quantity pauses once, while its reservation and
+            # reconciliation remain even after that pause ends.
             if a.get("token") != token:
                 continue
-            if not a.get("quantity_resolved") and self.fill_for(oid) is None:
+            if self.blocks_pending_fak(oid, client_order_id=a.get("client_order_id")):
                 self.kill.check()
-                raise Refused("accepted FAK order on this side is still awaiting complete fill quantities")
         self.sender.guard.check()                       # Refused (journalled) while the venue guard has orders paused
         side, amount, up, down = plan["send"][:4]
         if self.balance_at is None or time.monotonic() - self.balance_at > self.balance_max_age_s:
@@ -2582,7 +2847,8 @@ class LiveExecution:
             # cash bound even though the waiter cannot return its outcome.
             if self.balance is not None:
                 self.balance -= reserve
-            self._trip("order waiter interrupted: reconcile before trading")
+            self._trip_once(("order-uncertain", str(p.client_order_id)),
+                            "order waiter interrupted: reconcile before trading")
             raise
         finally:
             self.reserved = max(0.0, self.reserved - reserve)
@@ -2598,11 +2864,15 @@ class LiveExecution:
                 # As the audited path: only a documented delayed placement may
                 # be followed; any other incomplete success blocks this token.
                 self.pt._mark_ambiguous(p.condition, p.end, p.token)
+                self.sender._ambiguous_pauses = getattr(self.sender, "_ambiguous_pauses", {})
+                self.sender._ambiguous_pauses[(str(p.condition), str(p.token))] = p.client_order_id
             await asyncio.to_thread(self._authorize, p, row)
         elif kind in (MATCHED, PENDING):
-            self._trip(f"accepted order with no order id ({row.get('venue_status')}): reconcile")
+            self._trip_once(("order-uncertain", str(p.client_order_id)),
+                            f"accepted order with no order id ({row.get('venue_status')}): reconcile")
         if kind == AMBIGUOUS and not row.get("auto_reconcile"):
-            self._trip(f"order outcome unknown ({row.get('error')}): check the venue and the ledger by hand")
+            self._trip_once(("order-uncertain", str(p.client_order_id)),
+                            f"order outcome unknown ({row.get('error')}): check the venue and the ledger by hand")
         if kind in (MATCHED, PENDING) and p.order_type == "FAK":
             # Do not infer response amount units. Private trade records give
             # decimal quantities and the complete trade set.
@@ -2638,8 +2908,8 @@ class LiveExecution:
     # ------------------------------------------------------------ unknown outcomes (audit M7)
     def _schedule_ambiguity(self, p, row) -> None:
         if self.order_status is None:
-            self.sender.unresolved.pop(p.client_order_id, None)
-            self._trip(f"order {p.client_order_id} outcome unknown ({row.get('error')}): reconcile before trading")
+            self._trip_once(("order-uncertain", str(p.client_order_id)),
+                            f"order {p.client_order_id} outcome unknown ({row.get('error')}): reconcile before trading")
             return
         self._track(asyncio.get_running_loop().create_task(self._resolve_ambiguity(p, row)))
 
@@ -2692,8 +2962,8 @@ class LiveExecution:
                 break
         limits = self.sender.limits
         if evidence is None:
-            self.sender.unresolved.pop(p.client_order_id, None)
-            self._trip(f"order {p.client_order_id} outcome unknown ({row.get('error')}); {why}: reconcile by hand")
+            self._trip_once(("order-uncertain", str(p.client_order_id)),
+                            f"order {p.client_order_id} outcome unknown ({row.get('error')}); {why}: reconcile by hand")
             return
         kind, size, tids = evidence
         oid = str(p.order_hash)
@@ -2759,9 +3029,11 @@ class LiveExecution:
             shares = sum(float(lot.shares) for lot in lots)
             spent = sum(float(lot.shares) * float(lot.price) for lot in lots)
             if tids:
-                if not set(tids) <= set(led.seen) or {str(lot.trade_id) for lot in lots} - set(tids):
+                if not set(tids) <= set(led.seen) or {str(lot.trade_id) for lot in lots} != set(tids):
                     return None
             elif abs(shares - float(totals[1])) > 1e-6 or abs(spent - float(totals[0])) > 1e-4:
+                return None
+            if not math.isfinite(spent) or spent > float(intent.get("amount") or 0.0) + 1e-6:
                 return None
         return "CONFIRMED", spent
 
@@ -2784,33 +3056,45 @@ class LiveExecution:
         evidence = self._ambiguity_evidence(order, p)
         if evidence is None:
             return None
-        kind, _size, tids = evidence
+        kind, size, tids = evidence
         if kind == NO_MATCH:
             return NO_MATCH, 0.0
         led = self.ledger
         with led._lock:
             if h not in led.authorized_orders or not set(tids) <= set(led.seen):
                 return None                         # matched, but not (yet) booked under its authorization
-            spent = sum(float(lot.shares) * float(lot.price) for pos in led.positions.values()
-                        for lot in pos.lots if getattr(lot, "order_id", None) == h
-                        and str(lot.side).upper() == "BUY")
+            lots = [lot for pos in led.positions.values() for lot in pos.lots
+                    if getattr(lot, "order_id", None) == h and str(lot.side).upper() == "BUY"]
+            if (abs(sum(float(lot.shares) for lot in lots) - size) > 1e-6
+                    or (tids and {str(lot.trade_id) for lot in lots} != set(tids))):
+                return None
+            spent = sum(float(lot.shares) * float(lot.price) for lot in lots)
+            if not math.isfinite(spent) or spent > float(intent.get("amount") or 0.0) + 1e-6:
+                return None
         return "CONFIRMED", spent
 
     async def _reconcile_previous_run(self) -> None:
-        """The restart halt (audit follow-up): every send intent a previous run
+        """Every send intent a previous run
         left unresolved is looked up on the venue by its own order hash - the
         same evidence rules as an unknown outcome in this run (M7). Proven zero
         execution, or a match fully booked under its authorization, resolves
-        it; nothing is ever sent again. When none is left and no authorization
-        lacks its trades, the start-up halt is lifted. Otherwise it stays, with
-        what the venue said about each order."""
+        it; nothing is ever sent again. Reconciliation continues independently
+        of the five-minute start-up pause. New intents from this run are never
+        mistaken for prior-run intents after the bot resumes."""
         session = self.session
-        if session is None or not any(str(r).startswith(session.PREVIOUS_RUN) for r in self.kill.reasons):
+        if session is None:
+            return
+        previous_keys = getattr(self, "_previous_run_keys", None)
+        if previous_keys is None:
+            previous_keys = self._previous_run_keys = {key for key, _intent in session.unresolved()}
+        if not previous_keys:
             return
         limits, notes = self.sender.limits, {}
         for delay in self.previous_run_delays_s:
             await asyncio.sleep(delay)
             for key, intent in session.unresolved():
+                if key not in previous_keys:
+                    continue
                 if not intent.get("order_hash") or self.order_status is None:
                     notes[key] = "no order hash recorded (sent by an older version): reconcile by hand"
                     continue
@@ -2840,21 +3124,22 @@ class LiveExecution:
                         limits.record_outcome(MATCHED, amount)
                     limits.resolve_accepted(max(0.0, amount - spent))
                 session.resolve(key, status, limits, self.kill, spent=spent)
+                with self._risk_lock:
+                    self._risk_orders.pop(key, None)
                 notes.pop(key, None)
                 self.n[f"previous run order resolved {status}"] += 1
                 self.on_event("sniper", f"LIVE previous run's order {key[-8:]} reconciled with the venue: "
                                         f"{status}" + (f" (${spent:.2f})" if spent else ""), "warn")
-            if not session.unresolved():
-                proof = session._ledger_view(self.ledger, session.started_wall, session.intents)
-                if not proof["unconfirmed"]:
-                    self.kill.reasons[:] = [r for r in self.kill.reasons
-                                            if not str(r).startswith(session.PREVIOUS_RUN)]
-                    session.persist(limits, self.kill)
-                    self.on_event("sniper", "LIVE previous run's orders all reconciled with the venue: start-up "
-                                            "halt lifted" + ("" if not self.kill.reasons else
-                                                             f" (still halted: {'; '.join(self.kill.reasons)})"),
-                                  "good" if not self.kill.reasons else "warn")
-                    return
+            if not any(key in previous_keys for key, _intent in session.unresolved()):
+                for reason in list(self.kill.reasons):
+                    if str(reason).startswith(session.PREVIOUS_RUN):
+                        self.kill.clear(reason)
+                session.persist(limits, self.kill)
+                self.on_event("sniper", "LIVE previous run's orders all reconciled with the venue: start-up "
+                                        "halt lifted" + ("" if not self.kill.reasons else
+                                                         f" (still halted: {'; '.join(self.kill.reasons)})"),
+                              "good" if not self.kill.reasons else "warn")
+                return
         for key, why in notes.items():
             self.on_event("sniper", f"LIVE previous run's order {key[-8:]} still unresolved: {why}", "bad")
 
@@ -2907,11 +3192,13 @@ class LiveExecution:
         if not ok:
             row.setdefault("authorize_error", getattr(self.ledger, "last_persistence_error", None)
                            or "receipt sink refused authorization")
-            self._trip(f"order {short_id(oid)} could not be authorized in the live ledger: reconcile")
+            self._trip_once(("order-uncertain", str(p.client_order_id)),
+                            f"order {short_id(oid)} could not be authorized in the live ledger: reconcile")
 
     def status(self) -> dict:
         lim = self.sender.limits
-        return {"halted": list(self.kill.reasons), "balance": None if self.balance is None else round(self.balance, 2),
+        active = self.kill.active() if hasattr(self.kill, "active") else list(self.kill.reasons)
+        return {"halted": active, "balance": None if self.balance is None else round(self.balance, 2),
                 "orders": lim.orders, "fills": lim.fills, "potential_fills": lim.pending_fills,
                 "spend_usd": round(lim.exposure_usd, 2), "worst_case_loss_usd": round(self._risk_budget_used(), 6),
                 "rounds": len(lim.rounds), "awaiting_confirmation": len(self.awaiting),

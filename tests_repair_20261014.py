@@ -419,8 +419,10 @@ class C2Indexes(unittest.TestCase):
                 led.record_fill_durable("t1", "11", shares=5, price=0.5, condition_id=COND, fee=0.0)
         self.assertNotIn("t1", led.seen)
         self.assertTrue(led.persistence_halt)
-        ex = types.SimpleNamespace(ledger=led, kill=L.KillSwitch(), _announced=set(), on_event=lambda *a: None)
+        ex = types.SimpleNamespace(ledger=led, kill=L.KillSwitch(), _announced=set(), _tripped_once=set(),
+                                   on_event=lambda *a: None)
         ex._trip = lambda reason: L.LiveExecution._trip(ex, reason)
+        ex._trip_once = lambda key, reason: L.LiveExecution._trip_once(ex, key, reason)
         with self.assertRaises(L.Halted):
             L.LiveExecution._check_accounting_integrity(ex)
 
@@ -688,6 +690,8 @@ class M6M7Live(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.fake = await T.FakeClob().start()
         self.ex, self.ledger, self.store, _, _ = await T.make_canary(self.fake, self.tmp.name)
+        self.mono = T.FakeMono()
+        self.ex.kill.mono = self.mono
         self.ex.fast_fak_delays_s = (0.05, 0.1, 0.2)
         self.ex.ambiguity_delays_s = (0.05, 0.1, 0.2, 0.4)
 
@@ -730,14 +734,17 @@ class M6M7Live(unittest.IsolatedAsyncioTestCase):
         self.assertLess(took, 1.0)
         self.assertEqual(self.ex.fill_for("0xorder1")["shares"], 10.0)
 
-    async def test_m6_unknown_venue_status_keeps_the_side_blocked(self):
+    async def test_m6_unknown_venue_status_pauses_once_then_allows_a_fresh_order(self):
         self.fake.script.append(("json", 200, {"success": True, "status": "matched", "orderID": "0xorder1"}))
         self.ex.order_status = lambda oid: {}
         await self.ex.send(self.ex.prepare(self.plan()))
         await asyncio.sleep(0.5)
         self.assertIsNone(self.ex.fill_for("0xorder1"))
-        with self.assertRaisesRegex(L.Refused, "awaiting complete fill quantities"):
+        with self.assertRaisesRegex(L.Halted, "awaiting complete fill quantities"):
             self.ex.prepare(self.plan())
+        self.mono.t += 300
+        self.ex.prepare(self.plan())
+        self.assertIn("0xorder1", self.ex.fak_orders)
 
     async def test_m7_a_reset_after_the_write_is_reconciled_as_matched_without_resending(self):
         self.fake.script.append(("reset",))
@@ -751,11 +758,13 @@ class M6M7Live(unittest.IsolatedAsyncioTestCase):
         res = await self.ex.send(p)
         self.assertEqual(res["kind"], L.AMBIGUOUS)
         self.assertTrue(self.ex.sender.unresolved, "no new order while it is unknown")
-        with self.assertRaisesRegex(L.Refused, "reconciled with the venue"):
+        with self.assertRaises(L.Halted):
             self.ex.sender._check_send(self.ex.prepare(self.plan(side="DOWN")))
         took = await self.wait_for(lambda: not self.ex.sender.unresolved)
         self.assertIsNotNone(took)
-        self.assertFalse(self.ex.kill.tripped)
+        self.assertTrue(self.ex.kill.tripped)
+        self.mono.t += 300
+        self.ex.kill.check()
         self.assertEqual(seen[0], p.order_hash, "looked up by its own hash")
         self.assertIn(p.order_hash, self.ledger.authorized_orders)
         self.assertEqual(len(self.fake.orders), 1, "never sent again")
@@ -767,17 +776,24 @@ class M6M7Live(unittest.IsolatedAsyncioTestCase):
         p = self.ex.prepare(self.plan())
         await self.ex.send(p)
         self.assertIsNotNone(await self.wait_for(lambda: not self.ex.sender.unresolved))
-        self.assertFalse(self.ex.kill.tripped)
+        self.assertTrue(self.ex.kill.tripped)
+        self.mono.t += 300
+        self.ex.kill.check()
         self.assertEqual(self.ex._risk_orders, {})
         self.assertEqual(self.ex.fill_for(p.order_hash)["shares"], 0.0)
         self.assertEqual(len(self.fake.orders), 1)
 
-    async def test_m7_no_venue_record_in_time_trips_the_kill_switch_as_before(self):
+    async def test_m7_no_venue_record_keeps_its_reservation_and_pauses_only_once(self):
         self.fake.script.append(("reset",))
         self.ex.order_status = lambda oid: {}
         await self.ex.send(self.ex.prepare(self.plan()))
         self.assertIsNotNone(await self.wait_for(lambda: self.ex.kill.tripped))
-        self.assertTrue(any("reconcile by hand" in r for r in self.ex.kill.reasons))
+        self.assertIsNotNone(await self.wait_for(lambda: not self.ex._order_tasks))
+        self.assertTrue(self.ex.sender.unresolved)
+        self.assertTrue(self.ex._risk_orders)
+        self.mono.t += 300
+        self.ex.prepare(self.plan(side="DOWN"))
+        self.assertFalse(self.ex.kill.tripped)
         self.assertEqual(len(self.fake.orders), 1)
 
     async def test_m7_a_record_that_does_not_match_the_order_halts(self):
