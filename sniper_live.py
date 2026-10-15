@@ -135,20 +135,26 @@ class VenueGuard:
                           `healthy_checks` consecutive health probes pass:
                           PAUSED -> RECOVERED -> HEALTHY
       > extreme_ms        HARD_HALTED at once
-    `strikes_to_halt` strikes within `strike_window_s`, or a pause that has not
-    recovered within `max_pause_s`, also HARD_HALT - through the kill switch,
-    which only a restart clears. Unknown outcomes (timeouts, resets) never come
-    here: they still halt through the kill switch directly, as before.
+    `strikes_to_long_pause` strikes within `strike_window_s` (and each further
+    strike while that many are in the window) PAUSE for `long_pause_s` before the
+    healthy checks may resume orders - the operator's choice 2026-10-15: the
+    venue's slow replies are short one-offs (each pause recovered in ~6s), and a
+    hard halt stopped trading until a manual restart. A pause not healthy within
+    `max_pause_s` after its wait ends still HARD_HALTS - through the kill switch,
+    which only a new canary session clears. Unknown outcomes (timeouts, resets)
+    never come here: they still halt through the kill switch directly.
     Every transition is journalled (result "guard") and announced."""
     HEALTHY, DEGRADED, PAUSED, RECOVERED, HARD_HALTED = "HEALTHY", "DEGRADED", "PAUSED", "RECOVERED", "HARD_HALTED"
     _LEVEL = {"HEALTHY": "good", "RECOVERED": "good", "DEGRADED": "warn", "PAUSED": "warn", "HARD_HALTED": "bad"}
 
     def __init__(self, kill: KillSwitch, *, slow_ms: float = 1500.0, extreme_ms: float = 5000.0,
-                 strikes_to_halt: int = 3, strike_window_s: float = 1800.0, healthy_checks: int = 3,
-                 max_pause_s: float = 300.0, journal=None, on_event=None, mono=time.monotonic) -> None:
+                 strikes_to_long_pause: int = 3, strike_window_s: float = 1800.0, healthy_checks: int = 3,
+                 max_pause_s: float = 300.0, long_pause_s: float = 300.0, journal=None, on_event=None,
+                 mono=time.monotonic) -> None:
         self.kill = kill
         self.slow_ms, self.extreme_ms = slow_ms, extreme_ms
-        self.strikes_to_halt, self.strike_window_s = strikes_to_halt, strike_window_s
+        self.strikes_to_long_pause, self.strike_window_s = strikes_to_long_pause, strike_window_s
+        self.long_pause_s = long_pause_s
         self.healthy_checks, self.max_pause_s = healthy_checks, max_pause_s
         self.journal = journal or (lambda row: None)
         self.on_event = on_event or (lambda *a, **k: None)
@@ -183,15 +189,21 @@ class VenueGuard:
             self.strikes.append(now)
             while self.strikes and now - self.strikes[0] > self.strike_window_s:
                 self.strikes.popleft()
-            if len(self.strikes) >= self.strikes_to_halt:
-                self.hard_halt(f"{len(self.strikes)} replies slower than {self.slow_ms:.0f}ms within "
-                               f"{self.strike_window_s / 60:.0f} min (last {rtt_ms:.0f}ms)")
+            if len(self.strikes) >= self.strikes_to_long_pause:
+                detail = (f"{len(self.strikes)} replies slower than {self.slow_ms:.0f}ms within "
+                          f"{self.strike_window_s / 60:.0f} min (last {rtt_ms:.0f}ms): new orders paused "
+                          f"{self.long_pause_s / 60:g} min, then healthy checks")
+                self.retry_not_before = max(self.retry_not_before, now + self.long_pause_s)
+                if self.state != self.PAUSED:
+                    self._to(self.DEGRADED, f"reply {rtt_ms:.0f}ms > {self.slow_ms:.0f}ms")
+                self._to(self.PAUSED, detail)
             else:
-                detail = f"reply {rtt_ms:.0f}ms > {self.slow_ms:.0f}ms (strike {len(self.strikes)}/{self.strikes_to_halt})"
+                detail = (f"reply {rtt_ms:.0f}ms > {self.slow_ms:.0f}ms "
+                          f"(strike {len(self.strikes)}/{self.strikes_to_long_pause})")
                 if self.state != self.PAUSED:
                     self._to(self.DEGRADED, detail)
                     self._to(self.PAUSED, "new orders paused until the venue checks healthy")
-                self.paused_at, self.healthy_streak, self.reason = now, 0, detail
+            self.paused_at, self.healthy_streak, self.reason = now, 0, detail
         return self.state
 
     def check(self) -> None:

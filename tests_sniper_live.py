@@ -449,8 +449,8 @@ def t_venue_guard_state_machine():
     rows = []
     mono = FakeMono()
     kill = L.KillSwitch(None)
-    g = L.VenueGuard(kill, slow_ms=1500, extreme_ms=5000, strikes_to_halt=3, strike_window_s=1800,
-                     healthy_checks=3, max_pause_s=300, journal=rows.append, mono=mono)
+    g = L.VenueGuard(kill, slow_ms=1500, extreme_ms=5000, strikes_to_long_pause=3, strike_window_s=1800,
+                     healthy_checks=3, max_pause_s=300, long_pause_s=300, journal=rows.append, mono=mono)
     check("normal replies leave it HEALTHY (no transition)", g.on_reply(265) == "HEALTHY" and not rows, str(rows))
     g.on_reply(1650)
     refused = None
@@ -485,9 +485,22 @@ def t_venue_guard_state_machine():
     for _ in range(3):
         g.on_probe(True, "ok")
     g.on_reply(1700)
-    check("3 slow replies within 30 min -> HARD_HALTED through the kill switch (only a restart clears it)",
-          g.state == "HARD_HALTED" and kill.tripped and any("latency guard" in r for r in kill.reasons)
-          and rows[-1]["to"] == "HARD_HALTED", f"{g.status()} {kill.reasons}")
+    check("3 slow replies within 30 min -> a 5-minute PAUSE, NOT the kill switch (2026-10-15)",
+          g.state == "PAUSED" and not kill.tripped and "paused 5 min" in rows[-1]["detail"], f"{g.status()} {rows[-1]}")
+    for _ in range(5):
+        g.on_probe(True, "ok")
+    check("...healthy checks during the 5 minutes do not resume orders", g.state == "PAUSED", g.status())
+    mono.t += 301
+    for _ in range(3):
+        g.on_probe(True, "ok")
+    check("...after 5 minutes, 3 healthy checks resume orders", g.state == "HEALTHY" and not kill.tripped, g.status())
+    g.on_reply(1650)
+    check("...a 4th slow reply while 3 are in the window: another 5-minute pause", g.state == "PAUSED"
+          and "paused 5 min" in g.reason and not kill.tripped, g.status())
+    mono.t += 301 + 300
+    g.on_probe(False, "order connection: ConnectError")
+    check("...a long pause still not healthy 5 min after its wait -> HARD_HALTED",
+          g.state == "HARD_HALTED" and kill.tripped and any("latency guard" in r for r in kill.reasons), g.status())
     k2 = L.KillSwitch(None)
     g2 = L.VenueGuard(k2, mono=FakeMono())
     g2.on_reply(5200)
@@ -541,7 +554,7 @@ def t_one_slow_reply_then_healthy_venue_recovers_and_orders_continue():
           str(path))
 
 
-def t_repeated_slow_replies_hard_halt():
+def t_repeated_slow_replies_pause_five_minutes_never_halt():
     async def go():
         fake = await FakeClob().start()
         with tempfile.TemporaryDirectory() as tmp:
@@ -558,20 +571,22 @@ def t_repeated_slow_replies_hard_halt():
                 reset_ambiguity()
                 r = await ex.send(ex.prepare(live_plan(b.view(UP))))
                 states.append(r.get("guard"))
-                if ex.sender.guard.state == "PAUSED":          # let it recover between the strikes
+                if ex.sender.guard.state == "PAUSED" and len(states) < 3:   # recover between the strikes
                     for _ in range(3):
                         ex.sender.guard.on_probe(*(await ex.health_probe()))
-            halted = None
+            refused = None
             try:
                 ex.prepare(live_plan(b.view(UP)))
-            except L.Halted as exc:
-                halted = str(exc)
+            except (L.Refused, L.Halted) as exc:
+                refused = (type(exc).__name__, str(exc))
+            tripped = ex.kill.tripped
             await ex.sender.http.aclose()
         await fake.stop()
-        return states, halted
-    states, halted = run(go())
-    check("slow, recover, slow, recover, slow (3 strikes in 30 min) -> HARD_HALTED; orders refused as Halted",
-          states == ["PAUSED", "PAUSED", "HARD_HALTED"] and halted and "latency guard" in halted, f"{states} {halted}")
+        return states, refused, tripped
+    states, refused, tripped = run(go())
+    check("slow, recover, slow, recover, slow (3 strikes in 30 min) -> a 5-minute PAUSE: orders refused, never Halted",
+          states == ["PAUSED", "PAUSED", "PAUSED"] and refused and refused[0] == "Refused"
+          and "latency guard PAUSED" in refused[1] and not tripped, f"{states} {refused}")
 
 
 def t_disconnected_venue_never_resumes_unsafely():
