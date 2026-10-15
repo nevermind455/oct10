@@ -350,15 +350,17 @@ class CollateralAudit(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((ex.balance, ex.balance_at), (100, at))
             self.assertEqual(ex.n["balance read errors"], 1)
 
-    async def test_cancelled_order_keeps_cash_debit_and_halts(self):
+    async def test_cancelled_order_keeps_cash_debit_and_pauses_five_minutes(self):
         ex = execution(lambda: {})
+        mono = types.SimpleNamespace(now=1000.0)
+        ex.kill.mono = lambda: mono.now
 
         async def send(*args):
             await asyncio.Event().wait()
 
         ex.sender.send = send
         ex.reserved = 5
-        p = types.SimpleNamespace(amount=5, reserve=5)
+        p = types.SimpleNamespace(amount=5, reserve=5, client_order_id="cancelled-order")
         task = asyncio.create_task(ex.send(p))
         await asyncio.sleep(0)
         task.cancel()
@@ -367,6 +369,9 @@ class CollateralAudit(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ex.balance, 95)
         self.assertEqual(ex.reserved, 0)
         self.assertTrue(ex.kill.tripped)
+        mono.now += 300
+        ex.kill.check()
+        self.assertEqual(ex.balance, 95)
 
 
 class DataAudit(unittest.TestCase):
