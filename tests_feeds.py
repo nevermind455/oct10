@@ -1567,11 +1567,12 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # the CLOB has no record of from exactly those trades booked under its authorization.
     # It also keeps the reply's totals (makingAmount, takingAmount): with no trade ids, the order's
     # booked lots must add up to them exactly.
+    # Halt reasons show an order id short (short_id): the dashboard hides raw 32-byte hex.
     # Re-approved 2026-10-14 (restart halt): a previous run's unresolved send intents are looked
     # up on the venue by their own order hash at start (_reconcile_previous_run, M7's evidence
     # rules); proven zero or fully booked resolves them and lifts the derived start-up halt
     # (CanarySession.PREVIOUS_RUN, never persisted). Nothing is ever resent.
-    "sniper_live.py": "b14232b9f12c9fd9f3c619de2b122e6a3fe345bd2a6f7f1943846841bc2ccd3a",
+    "sniper_live.py": "658e2be91ebfef9963f4dcc953328ad8adf6a87dd4eceb007eeb05f683728fd2",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads

@@ -463,6 +463,47 @@ class ReconcileTool(unittest.TestCase):
             self.assertIn("completeness unproven", text)
 
 
+class DashboardHalt(unittest.TestCase):
+    """2026-10-15: a HALT line showed the order as <redacted-32-byte-value> (the
+    dashboard hides any raw 32-byte hex) and broke words mid-way ("reconci" / "le")."""
+
+    def test_the_halted_order_is_named_and_words_are_never_split(self):
+        import time as _t
+        from dashboard import sniper_layout as SL
+        from dashboard.theme import UNICODE
+        oid = "0xa1fa84797f3b6b97814af0ac94a58358a1170dd9ef2243b08105611f1572449d"
+        self.assertEqual(L.short_id(oid), "0xa1fa8479...72449d")
+        self.assertEqual(L.short_id("0xorder1"), "0xorder1")                  # anything else unchanged
+        reasons = [f"FAK order {L.short_id(oid)} filled above its signed size: reconcile",
+                   f"FAK order {L.short_id(oid)} not completely confirmed after 180s: reconcile"]
+        snap = {"mode": "live", "canary": {"halted": reasons, "guard": "OK"}, "health": [], "orders": [],
+                "events": [(_t.time(), "sniper", "LIVE CANARY HALTED: " + reasons[0], "bad")],
+                "account": {"kind": "LIVE"}, "trigger": {}, "market": {}}
+        for cols in (209, 150, 120):
+            lines = ["".join(t for t, _ in r) for r in SL.build(snap, cols, 51, UNICODE)]
+            self.assertTrue(all(len(x) == cols for x in lines), cols)
+            text = " ".join(lines)
+            self.assertIn("0xa1fa8479...72449d", text, cols)
+            self.assertNotIn("redacted", text, cols)
+            # the side panel's HALT block, rebuilt from its wrapped lines: joined with
+            # single spaces it must read exactly as the reasons (a mid-word break fails)
+            side = [x.split("││", 1)[1].rstrip("│ ") for x in lines if "││" in x]
+            got, cur = [], None
+            for seg in side:
+                if seg.startswith("HALT"):
+                    if cur is not None:
+                        got.append(cur)
+                    cur = seg[4:].strip()
+                elif cur is not None and seg.startswith(" " * 10) and seg.strip():
+                    cur += " " + seg.strip()
+                elif cur is not None:
+                    got.append(cur)
+                    cur = None
+            if cur is not None:
+                got.append(cur)
+            self.assertEqual(got, reasons, cols)
+
+
 class ReplyTotals(unittest.TestCase):
     def test_decimal_and_base_unit_replies(self):
         self.assertEqual(L.reply_totals({"makingAmount": "3.74", "takingAmount": "12.896552"}), (3.74, 12.896552))

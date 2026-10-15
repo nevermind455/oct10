@@ -42,6 +42,7 @@ import copy
 import json
 import math
 import os
+import re
 import statistics
 import time
 import types
@@ -64,6 +65,15 @@ class Halted(Exception):
 
 class Refused(Exception):
     """This one order must not be sent; trading may continue."""
+
+
+def short_id(oid) -> str:
+    """An order id as halt and event text shows it: 0x + 64 hex becomes
+    0xa1fa8479...72449d. The dashboard hides any raw 32-byte hex (a private key
+    looks the same), which left a halted order unidentifiable; the prefix is
+    what reconcile_order.py takes. Anything else is returned unchanged."""
+    s = str(oid or "")
+    return f"{s[:10]}...{s[-6:]}" if re.fullmatch(r"0x[0-9a-fA-F]{64}", s) else s
 
 
 def reply_totals(resp) -> tuple[float, float] | None:
@@ -2190,7 +2200,7 @@ class LiveExecution:
         for oid, a in list(self.awaiting.items()):
             if a.get("authorized") is False:
                 if now - a["wall"] > self.confirm_within_s:
-                    self._trip(f"order {oid} authorization incomplete: reconcile")
+                    self._trip(f"order {short_id(oid)} authorization incomplete: reconcile")
                 continue
             if a.get("order_type") == "FAK":
                 self._reconcile_fak(oid, a, now)
@@ -2225,7 +2235,7 @@ class LiveExecution:
                         zero = False
                     if not zero:
                         if age > self.confirm_within_s:
-                            self._trip(f"FOK order {oid} canceled without complete zero-fill proof: reconcile")
+                            self._trip(f"FOK order {short_id(oid)} canceled without complete zero-fill proof: reconcile")
                         continue
                     self.awaiting.pop(oid, None)
                     self.sender.limits.resolve_accepted(a["amount"], zero_fill=True)
@@ -2234,7 +2244,7 @@ class LiveExecution:
                     continue
                 a["venue_matched"] = status == "matched"
             if age > self.confirm_within_s:
-                self._trip(f"order {oid} ({a['kind']}, venue status {a.get('venue_status') or 'unknown'}) not "
+                self._trip(f"order {short_id(oid)} ({a['kind']}, venue status {a.get('venue_status') or 'unknown'}) not "
                            f"confirmed in the ledger after {self.confirm_within_s:.0f}s: reconcile")
         self.session_loss = max(0.0, -self._session_realized())
 
@@ -2251,7 +2261,7 @@ class LiveExecution:
             return
         if (str(order.get("id")) != str(oid) or str(order.get("asset_id")) != a["token"]
                 or str(order.get("market")) != a["condition"] or order.get("side") != "BUY"):
-            self._trip(f"FAK order {oid} status identity mismatch: reconcile")
+            self._trip(f"FAK order {short_id(oid)} status identity mismatch: reconcile")
             return
         status = str(order.get("status") or "").lower()
         a["venue_status"] = status
@@ -2298,7 +2308,7 @@ class LiveExecution:
         if age > self.confirm_within_s and not a.get("halted_for"):
             # An order whose own evidence already halted trading is not timed out
             # a second time: one halt, with its real reason (2026-10-14).
-            self._trip(f"FAK order {oid} not completely confirmed after {self.confirm_within_s:.0f}s: reconcile")
+            self._trip(f"FAK order {short_id(oid)} not completely confirmed after {self.confirm_within_s:.0f}s: reconcile")
 
     def fill_for(self, order_id) -> dict | None:
         """Our fills of one order as the private channel reported them
@@ -2338,7 +2348,7 @@ class LiveExecution:
         expected = a.get("trade_ids") or set()
         if a.get("final_size") == 0:
             if rows or expected or a["kind"] == MATCHED:
-                self._trip_fak(a, f"FAK order {oid} has contradictory zero-fill evidence: reconcile")
+                self._trip_fak(a, f"FAK order {short_id(oid)} has contradictory zero-fill evidence: reconcile")
                 return None
             a["quantity_resolved"] = True
             return {"shares": 0.0, "cost": 0.0, "fee": 0.0, "price": None,
@@ -2346,7 +2356,7 @@ class LiveExecution:
                     "seen_mono": a.get("final_mono")}
         actual_ids = {str(f.trade_id) for f in rows}
         if expected and actual_ids - expected:
-            self._trip_fak(a, f"FAK order {oid} has unexpected trades: reconcile")
+            self._trip_fak(a, f"FAK order {short_id(oid)} has unexpected trades: reconcile")
             return None
         if not rows or (expected and actual_ids != expected):
             return None
@@ -2357,7 +2367,7 @@ class LiveExecution:
         for f in rows:
             status = str(f.status or "").upper()
             if status in ("FAILED", "CONFLICT"):
-                self._trip_fak(a, f"FAK order {oid} has a {status} trade: reconcile")
+                self._trip_fak(a, f"FAK order {short_id(oid)} has a {status} trade: reconcile")
                 return None
             if status not in ("MATCHED", "MATCHED_NOT_BROADCASTED", "MINED", "CONFIRMED"):
                 return None
@@ -2368,7 +2378,7 @@ class LiveExecution:
                 if not valid:
                     raise ValueError("identity, price or quantity")
             except (ArithmeticError, TypeError, ValueError):
-                self._trip_fak(a, f"FAK order {oid} has an invalid fill: reconcile")
+                self._trip_fak(a, f"FAK order {short_id(oid)} has an invalid fill: reconcile")
                 return None
             shares += qty
             paid = getattr(f, "paid", None)
@@ -2384,17 +2394,17 @@ class LiveExecution:
                             or abs(sum(q * price for q, price in parsed_legs) - trade_cost) > Decimal("0.000001")):
                         raise ValueError("invalid maker execution legs")
                 except (ArithmeticError, TypeError, ValueError):
-                    self._trip_fak(a, f"FAK order {oid} has invalid maker execution legs: reconcile")
+                    self._trip_fak(a, f"FAK order {short_id(oid)} has invalid maker execution legs: reconcile")
                     return None
                 fee += sum(curve_fee(q, price, rules) for q, price in parsed_legs)
             else:
                 fee += curve_fee(qty, trade_cost / qty, rules)
             cost += trade_cost
         if cost > Decimal(str(a["amount"])) + Decimal("0.000001"):
-            self._trip_fak(a, f"FAK order {oid} filled above its budget: reconcile")
+            self._trip_fak(a, f"FAK order {short_id(oid)} filled above its budget: reconcile")
             return None
         if a.get("size") is not None and shares > Decimal(str(a["size"])) + Decimal("0.000001"):
-            self._trip_fak(a, f"FAK order {oid} filled above its signed size: reconcile")
+            self._trip_fak(a, f"FAK order {short_id(oid)} filled above its signed size: reconcile")
             return None
         if a.get("final_size") is not None and abs(float(shares) - a["final_size"]) > 1e-6:
             return None                            # not all final fills have arrived yet
@@ -2884,7 +2894,7 @@ class LiveExecution:
         if not ok:
             row.setdefault("authorize_error", getattr(self.ledger, "last_persistence_error", None)
                            or "receipt sink refused authorization")
-            self._trip(f"order {oid} could not be authorized in the live ledger: reconcile")
+            self._trip(f"order {short_id(oid)} could not be authorized in the live ledger: reconcile")
 
     def status(self) -> dict:
         lim = self.sender.limits

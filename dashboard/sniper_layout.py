@@ -50,11 +50,12 @@ is optional: a missing value is drawn as "--", never invented.
 from __future__ import annotations
 
 import math
+import textwrap
 import time
 
 from .safety import terminal_text
 from .theme import Glyphs, Style, pnl_style, state_fg, state_style
-from .widgets import DIM, FAINT, PAPER, Row, bar, blank, fit, hsplit, join, pad, panel
+from .widgets import DIM, FAINT, PAPER, Row, bar, blank, fit, hsplit, join, pad, panel, trunc
 
 MISSING = "--"
 PENDING_S = "PENDING SETTLEMENT"
@@ -394,15 +395,15 @@ def _side_body(snap: dict, w: int, h: int) -> list[Row]:
         out.append(_runs([(fit("latency", 9), DIM), (" ", PAPER), (guard, state_fg("OK" if guard == "OK" else "WARN")),
                           (f" {_text(c.get('guard_reason'), '')}", FAINT)], w))
         for reason in halted[:3]:
-            # Wrapped, never cut: the reason says how to clear the halt (e.g. the stop file's path).
-            text, first = _text(reason), True
+            # Wrapped at word boundaries, up to three lines: the reason says how to
+            # clear the halt (e.g. the stop file's path); a longer one ends in an ellipsis.
             cw = max(1, w - 10)
-            for _ in range(3):
-                if not text:
-                    break
-                out.append(_runs([(fit("HALT" if first else "", 9), Style("red", bold=True)), (" ", PAPER),
-                                  (text[:cw], Style("red"))], w))
-                text, first = text[cw:], False
+            lines = textwrap.wrap(_text(reason), cw, break_long_words=True, break_on_hyphens=False) or [""]
+            if len(lines) > 3:
+                lines = lines[:2] + [trunc(lines[2] + " " + " ".join(lines[3:]), cw)]
+            for i, text in enumerate(lines):
+                out.append(_runs([(fit("HALT" if i == 0 else "", 9), Style("red", bold=True)), (" ", PAPER),
+                                  (text, Style("red"))], w))
     net = snap.get("net")
     if isinstance(net, dict):
         out.append(_net_row(net, w))
