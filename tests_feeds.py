@@ -1547,7 +1547,13 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # second trigger (exec_latency.spec_violations).
     # Re-approved 2026-10-13 (the operator's choice): SNIPER_KELLY_FRACTION defaults to the
     # frozen spec's 0.5 (half Kelly; was full).
-    "sniper_mode.py": "516310b1722f4f894c4d6ccff582768dbc88427fc9ab8d054ce410e0ab7fdd83",
+    # Re-approved 2026-10-15 (the operator asked for it): DIAGNOSTICS ONLY - a guard_diag row per
+    # sent order (whipsaw_diag: paired cost vs this round's confirmed fills, worst-case round loss,
+    # 500/1000ms opposite-fill and opposite-order cooldowns, opposite orders still in flight, the
+    # netted fair when the market had not repriced) and the
+    # shadow's tighter limit (ask + 3c under the cap, "tight"). Spawned after the send; no order,
+    # size, cap or gate changes (tests_guard_diag). SNIPER_GUARD_DIAG=0 / SNIPER_SHADOW_TIGHT=0 off.
+    "sniper_mode.py": "7e66ac2fd96a245a79c81b9067099272980d8f196f22b2c52212d49dd7d74bac",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.

@@ -573,6 +573,92 @@ def anchored_fair(market_mid: float, move_bp: float, sigma: float, tau: float) -
     return _NORMAL.cdf(_NORMAL.inv_cdf(m) + dz)
 
 
+def signed_anchored_fair(market_mid: float, move_bp: float, sigma: float, tau: float) -> float:
+    """anchored_fair with a SIGNED move: positive moves toward the side, negative
+    against it (a reversal netted against an earlier move can leave either)."""
+    m = min(max(float(market_mid), FAIR_MID_CLAMP), 1.0 - FAIR_MID_CLAMP)
+    dz = (float(move_bp) / 1e4) / (float(sigma) * math.sqrt(float(tau)))
+    return _NORMAL.cdf(_NORMAL.inv_cdf(m) + dz)
+
+
+UNREPRICED_TOL = 0.02     # this side's anchor within 2c of 1 - the opposite decision's anchor
+
+
+def whipsaw_diag(*, side: str, ask: float, shares: float, fee_rate: float, fee_exponent: int, now_wall: float,
+                 mine: dict | None, opp: dict | None, prev_opp: dict | None, market_mid: float | None,
+                 sigma: float | None, tau: float | None, bp: float, tick: float, margin: float,
+                 opp_pending: dict | None = None) -> dict:
+    """What opposite-side guards would have said about one order - DIAGNOSTICS ONLY.
+
+    mine / opp: this round's confirmed fills per side, {"shares", "cost" (incl.
+    fees), "last_wall"}; opp_pending: the opposite side's orders still in flight
+    or awaiting their fill size, {"shares", "cost" (the order amount)} - a
+    whipsaw inside one reply time pairs with an order not yet confirmed;
+    prev_opp: the opposite side's last sent decision in this round, {"wall",
+    "bp", "market_mid", "feed"}. The order is assumed to fill its shares at the
+    ask seen (the decision's own estimate).
+
+    - pair cost C = the opposite side's average cost + ask + the fee per share:
+      shares this order would pair with C >= 1 settle at a sure loss;
+    - worst-case round loss before / after (cost - the smaller payout);
+    - cooldowns since the last opposite FILL (cd500 / cd1000) and since the last
+      opposite ORDER was sent (cdo500 / cdo1000);
+    - netted fair: when this side's market anchor still equals 1 - the opposite
+      decision's anchor (the market has not repriced between the two), the BTC
+      moves are netted (prior + this, signed) instead of counting only this one.
+    """
+    fee_ps = fee_rate * (ask * (1.0 - ask)) ** fee_exponent
+    m_sh, m_cost = (float(mine["shares"]), float(mine["cost"])) if mine else (0.0, 0.0)
+    o_sh, o_cost = (float(opp["shares"]), float(opp["cost"])) if opp else (0.0, 0.0)
+    paired = min(float(shares), max(0.0, o_sh - m_sh)) if o_sh > 0 else 0.0
+    out = {"held_same": round(m_sh, 4), "held_opp": round(o_sh, 4), "paired_shares": round(paired, 4)}
+    guards = {"c1": False, "c1_pending": False, "cd500": False, "cd1000": False, "cdo500": False,
+              "cdo1000": False, "net": False}
+    if paired > 0:
+        c = o_cost / o_sh + ask + fee_ps
+        out.update(pair_cost=round(c, 4), locked_loss=round(max(0.0, c - 1.0) * paired, 4))
+        guards["c1"] = c >= 1.0
+    p_sh, p_cost = (float(opp_pending["shares"]), float(opp_pending["cost"])) if opp_pending else (0.0, 0.0)
+    if p_sh > 0:
+        pp = p_cost / p_sh
+        p_cost += p_sh * fee_rate * (pp * (1.0 - pp)) ** fee_exponent if 0 < pp < 1 else 0.0
+        out["opp_pending"] = round(p_sh, 4)
+    tot_sh = o_sh + p_sh
+    paired_all = min(float(shares), max(0.0, tot_sh - m_sh)) if tot_sh > 0 else 0.0
+    if paired_all > 0:
+        c_all = (o_cost + p_cost) / tot_sh + ask + fee_ps
+        out.update(paired_incl_pending=round(paired_all, 4), pair_cost_incl_pending=round(c_all, 4))
+        guards["c1_pending"] = c_all >= 1.0
+    new_cost = float(shares) * (ask + fee_ps)
+    pos = {side: (m_sh, m_cost), ("DOWN" if side == "UP" else "UP"): (o_sh, o_cost)}
+    before = sum(cst for _s, cst in pos.values()) - min(s for s, _c in pos.values())
+    pos[side] = (m_sh + float(shares), m_cost + new_cost)
+    after = sum(cst for _s, cst in pos.values()) - min(s for s, _c in pos.values())
+    out.update(wc_before=round(before, 4), wc_after=round(after, 4))
+    if opp and opp.get("last_wall") is not None:
+        dt = (now_wall - float(opp["last_wall"])) * 1000.0
+        out["dt_opp_fill_ms"] = round(dt, 1)
+        guards["cd500"], guards["cd1000"] = dt < 500.0, dt < 1000.0
+    if prev_opp is not None:
+        dto = (now_wall - float(prev_opp["wall"])) * 1000.0
+        out["dt_opp_decision_ms"] = round(dto, 1)
+        guards["cdo500"], guards["cdo1000"] = dto < 500.0, dto < 1000.0
+        out["prev_opp"] = {k: prev_opp.get(k) for k in ("bp", "market_mid", "feed")}
+        pm = prev_opp.get("market_mid")
+        if market_mid is not None and pm is not None:
+            unrepriced = abs(float(market_mid) - (1.0 - float(pm))) <= UNREPRICED_TOL
+            out["unrepriced"] = unrepriced
+            if unrepriced and sigma and tau and sigma > 0 and tau > 0:
+                net = float(prev_opp.get("bp") or 0.0) + float(bp)        # signed BTC bp: up +, down -
+                toward = net if side == "UP" else -net
+                nf = signed_anchored_fair(float(market_mid), toward, sigma, tau)
+                lim = fair_limit(nf, margin, tick, fee_rate, fee_exponent)
+                out.update(netted_fair=round(nf, 4), netted_limit=lim)
+                guards["net"] = ask > lim + 1e-9
+    out["guards"] = guards
+    return out
+
+
 def fair_limit(fair: float, margin: float, tick: float, fee_rate: float, fee_exponent: int = 1) -> float:
     """The highest tick price p that still leaves the margin after its fee:
     p + fee(p) + margin <= fair. 0.0 when none does."""
@@ -1002,6 +1088,13 @@ class Settings:
         except ValueError:
             self.shadow_slips = ()
         self.shadow_slips = tuple(x for x in self.shadow_slips if 0 < x < 0.5)
+        # The shadow also prices a TIGHTER limit, ask + this, kept under the real
+        # cap (fair value included): is the room above it worth having? 0 = off.
+        tight = _env_float("SNIPER_SHADOW_TIGHT", 0.03)
+        self.shadow_tight = tight if 0 < tight < 0.5 else 0.0
+        # Diagnostics only (guard_diag rows): what a whipsaw / opposite-side
+        # guard would have done with each sent order. Never changes an order.
+        self.guard_diag = str(os.environ.get("SNIPER_GUARD_DIAG", "1")).strip().lower() not in ("0", "false", "no", "off")
         # Sniper-only defaults to keeping partial fills inside the same cap.
         # An explicit .env/shell choice still wins; legacy combined mode is FOK.
         default_type = "FAK" if only() else "FOK"
@@ -1491,6 +1584,10 @@ class Sniper:
         # cleared when the market changes (carry_market).
         self.carry = {"UP": 0.0, "DOWN": 0.0}
         self.carry_market = None            # (condition id, round end) the carry belongs to
+        # Guard diagnostics (guard_diag rows, never the order path): this round's
+        # confirmed fills and last sent decision per side, keyed (round end, side).
+        self._round_fills: dict = {}
+        self._round_decisions: dict = {}
         self.n = collections.Counter()
         # T0..T7 per order (exec_latency) and the outcome counts: filled after
         # the send, read by the dashboard and the summary.
@@ -2744,6 +2841,7 @@ class Sniper:
                 # After the send: the shadow sleeps until absolute times anyway.
                 self._spawn(self._shadow(row, plan["token"], plan["other"], plan["cond"],
                                          plan["amount"], plan["cap"], plan["t0"]))
+            self._guard_diag_after_send(side, row, plan)
             return self._spawn(self._finish(side, r_bp, row, plan, fut, t_pc, start_pc, st["sign_pc"]), order=True)
         except Exception as exc:  # noqa: BLE001 - a sniper fault must never stop the bot
             self.n["errors"] += 1
@@ -2785,6 +2883,7 @@ class Sniper:
         if self.s.shadow_ms:
             self._spawn(self._shadow(row, plan["token"], plan["other"], plan["cond"],
                                      plan["amount"], plan["cap"], plan["t0"]))
+        self._guard_diag_after_send(side, row, plan)
         return task
 
     def _check_dispatch_age(self, plan, gate, original_excess) -> None:
@@ -2960,6 +3059,7 @@ class Sniper:
                                  "ORDER_STATUS" if fill.get("source") == "terminal order status" else "PRIVATE_WS")
         if shares > 0:
             rd[side] += shares
+            self._note_fill(plan["end"], side, shares, float(fill["cost"]) + float(fill.get("fee", 0) or 0))
             self._note_over_target(row, plan, shares)
             self.n["filled"] += 1
             row.update(result="filled", outcome="FILLED")
@@ -3306,6 +3406,7 @@ class Sniper:
                     row["carry_out"] = self.carry[side]
                 row.update(result="filled", order_id=fill.get("order_id"), shares=fill.get("shares"),
                            price=fill.get("average_price"), fee=fill.get("fee"), cost=fill.get("total_cost"))
+                self._note_fill(end, side, fill.get("shares"), fill.get("total_cost"))
                 if fill.get("partial"):
                     row.update(partial=True, stake=fill.get("stake"))
                 if fill.get("matched_wall"):
@@ -3409,6 +3510,87 @@ class Sniper:
             pass
 
     # ---------------------------------------------------------------- shadow fills
+    # ------------------------------------------------------------ guard diagnostics
+    def _note_fill(self, end, side: str, shares, cost) -> None:
+        """A confirmed fill (paper: the broker's; live: the private channel's
+        complete quantity) into this round's per-side tally, for guard_diag."""
+        try:
+            sh, c = float(shares or 0.0), float(cost or 0.0)
+        except (TypeError, ValueError):
+            return
+        if sh <= 0:
+            return
+        cur = self._round_fills.setdefault((end, side), {"shares": 0.0, "cost": 0.0, "last_wall": None})
+        cur["shares"] += sh
+        cur["cost"] += c
+        cur["last_wall"] = time.time()
+
+    def _guard_diag_after_send(self, side: str, row: dict, plan: dict) -> None:
+        """Snapshot what an opposite-side guard would see for this SENT order and
+        journal it off the order path (a guard_diag row, joined by id).
+        Diagnostics only: nothing here can refuse, delay or change an order."""
+        if not self.s.guard_diag:
+            return
+        try:
+            end = plan.get("end")
+            opp = "DOWN" if side == "UP" else "UP"
+            ask = float(row.get("ask_seen") or 0.0)
+            shares = plan.get("shares")
+            shares = float(shares) if shares else (float(plan.get("amount") or 0.0) / ask if ask > 0 else 0.0)
+            vol = row.get("vol_bp")
+            fee_rate = row.get("fee_rate") if row.get("fee_rate") is not None else plan.get("fair_fee_rate")
+            fee_exp = row.get("fee_exponent") or plan.get("fair_fee_exponent")
+            if fee_rate is None:
+                try:                     # the market's cached rules (no I/O); fair value off leaves them unread
+                    fees = self._fair_fee_parameters(plan.get("cond"), getattr(self.hub, "up_token", None),
+                                                     getattr(self.hub, "down_token", None))
+                except Exception:  # noqa: BLE001
+                    fees = None
+                if fees is not None:
+                    fee_rate, fee_exp = fees
+            p_sh = p_cost = 0.0
+            inf = self.inflight.get(opp)
+            if isinstance(inf, dict) and inf.get("end") == end and inf.get("risk_shares"):
+                p_sh, p_cost = float(inf["risk_shares"]), float(inf.get("amount") or 0.0)
+            f_sh = f_cost = 0.0
+            for prow, pplan in list(self._fak_pending.values()):
+                if pplan.get("end") == end and prow.get("side") == opp:
+                    f_sh += float(pplan.get("risk_shares") or 0.0)
+                    f_cost += float(pplan.get("amount") or 0.0)
+            if f_sh > p_sh:                      # never both counted: the larger of the two views
+                p_sh, p_cost = f_sh, f_cost
+            snap = {"side": side, "ask": ask, "shares": shares, "now_wall": float(row.get("wall") or time.time()),
+                    "opp_pending": {"shares": p_sh, "cost": p_cost} if p_sh > 0 else None,
+                    "fee_rate": float(fee_rate or 0.0), "fee_exponent": int(fee_exp or 1),
+                    "mine": dict(self._round_fills[(end, side)]) if (end, side) in self._round_fills else None,
+                    "opp": dict(self._round_fills[(end, opp)]) if (end, opp) in self._round_fills else None,
+                    "prev_opp": (dict(self._round_decisions[(end, opp)])
+                                 if (end, opp) in self._round_decisions else None),
+                    "market_mid": row.get("market_mid"), "sigma": float(vol) / 1e4 if vol else None,
+                    "tau": row.get("tau_s"), "bp": float(row.get("bp") or 0.0),
+                    "tick": float(plan.get("tick") or 0.01), "margin": float(self.s.fair_margin)}
+            self._round_decisions[(end, side)] = {"wall": snap["now_wall"], "bp": row.get("bp"),
+                                                  "market_mid": row.get("market_mid"), "feed": row.get("feed")}
+            if len(self._round_decisions) + len(self._round_fills) > 32 and end is not None:
+                for store in (self._round_decisions, self._round_fills):
+                    for key in [k for k in store if k[0] is not None and float(k[0]) < float(end) - 900]:
+                        store.pop(key, None)
+            self._spawn(self._guard_diag(row.get("id"), row.get("condition_id"), end, snap, fee_rate is not None))
+        except Exception:  # noqa: BLE001 - diagnostics only, never the order path
+            self.n["guard diag errors"] += 1
+
+    async def _guard_diag(self, oid, cond, end, snap: dict, fee_known: bool = True) -> None:
+        try:
+            out = whipsaw_diag(**snap)
+            self._write({"wall": time.time(), "result": "guard_diag", "id": oid, "side": snap["side"],
+                         "round_end": end, "condition_id": cond, "ask_seen": snap["ask"],
+                         "order_shares": round(snap["shares"], 4), "fee_known": fee_known, **out})
+            for name, hit in out["guards"].items():
+                if hit:
+                    self.n[f"guard diag would reject: {name}"] += 1
+        except Exception:  # noqa: BLE001 - diagnostics only
+            self.n["guard diag errors"] += 1
+
     async def _shadow(self, ref: dict, token: str, other: str, cond: str,
                       spend: float, cap: float, t0: float) -> None:
         """Price the same order at other latencies - arithmetic only.
@@ -3440,7 +3622,13 @@ class Sniper:
             ask = float(ref.get("ask_seen") or 0)
             alt = {f"{x * 100:g}": min(0.99, round(ask + x, 4)) for x in self.s.shadow_slips
                    if ask and ask + x > cap + 1e-9}
-            out = {str(L): self._shadow_fill(views[L], token, spend, cap, rules, mids[L], late[L], alt)
+            tight = None
+            if self.s.shadow_tight and ask and cap > 0:
+                tc = round(ask + self.s.shadow_tight, 4)
+                if tc < cap - 1e-9:
+                    # the same whole shares at the tighter limit (amount = shares x limit)
+                    tight = (tc, spend * tc / cap)
+            out = {str(L): self._shadow_fill(views[L], token, spend, cap, rules, mids[L], late[L], alt, tight)
                    for L in self.s.shadow_ms}
             self._write({"wall": time.time(), "result": "shadow", "id": ref.get("id"),
                          "side": ref.get("side"), "round_end": ref.get("round_end"),
@@ -3450,10 +3638,12 @@ class Sniper:
             self._write({"wall": time.time(), "result": "shadow_error", "id": ref.get("id"),
                          "reason": f"{type(exc).__name__}: {exc}"[:200]})
 
-    def _shadow_fill(self, view, token, spend, cap, rules, mid5, late_ms, alt_caps=None) -> dict:
+    def _shadow_fill(self, view, token, spend, cap, rules, mid5, late_ms, alt_caps=None, tight=None) -> dict:
         """The paper broker's own FOK arithmetic against one captured book:
         the real cap, plus each wider cap in alt_caps ({"3": cap, ...}) -
-        would paying up to ask+3c/4c/6c have turned misses into good fills?"""
+        would paying up to ask+3c/4c/6c have turned misses into good fills? -
+        and, with tight=(limit, spend), a TIGHTER limit under the real cap
+        (FOK, else what FAK keeps): is the room above it worth having?"""
         from paper_trade import PaperRejected, snapshot_from_book_view
         row = {"late_ms": late_ms}
         if view is None:
@@ -3477,6 +3667,12 @@ class Sniper:
             row["fak"] = self._shadow_quote(book, spend, cap, rules, mid5, fak=True)
         if alt_caps:
             row["alt"] = {k: self._shadow_quote(book, spend, c, rules, mid5) for k, c in alt_caps.items()}
+        if tight:
+            tc, tspend = tight
+            t = self._shadow_quote(book, tspend, tc, rules, mid5)
+            if "miss" in t:
+                t["fak"] = self._shadow_quote(book, tspend, tc, rules, mid5, fak=True)
+            row["tight"] = {"cap": tc, **t}
         return row
 
     def _shadow_quote(self, book, spend, cap, rules, mid5, fak: bool = False) -> dict:
