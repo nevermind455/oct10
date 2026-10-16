@@ -1557,7 +1557,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # minutes; a lasting pending order no longer blocks later signals forever.
     # 2026-10-15 bug fix: separate failed order tasks pause independently;
     # reused Python object addresses must not suppress a later incident.
-    "sniper_mode.py": "5fed90129ba6a638cd31fda5a584262d872e247e56a10e110ccebf5630662623",
+    "sniper_mode.py": "42431965b272d69b6376cb4e543423c2f56cfaac3f31418557c6a1ab8230b182",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
@@ -1592,6 +1592,8 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Kelly, share sizing; off, FOK keeps its fixed clip. FAK and live are unchanged.
     # 2026-10-16: SNIPER_KELLY_BUY_MIN=1 (paper test, default off; live refuses it) buys the venue's
     # 5-share minimum when Kelly wants to add fewer, while room and cash take it.
+    # 2026-10-16: SNIPER_FAIR_CAP=0 (paper test, default on; live refuses it off): the fair value
+    # gates and sizes, but the price limit is ask + SNIPER_SLIP alone (past the fair value).
     # Re-approved 2026-10-14 (restart halt): a previous run's unresolved send intents are looked
     # up on the venue by their own order hash at start (_reconcile_previous_run, M7's evidence
     # rules); proven zero or fully booked resolves them and lifts the derived start-up halt

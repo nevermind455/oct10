@@ -1060,6 +1060,11 @@ class Settings:
         # SNIPER_FAIR_MARGIN; the limit is capped there too. Under a minute of price
         # history, or no market mid, skips: never guessed.
         self.fair = _env_bool("SNIPER_FAIR", True)
+        # Paper experiment (2026-10-16, the operator's): SNIPER_FAIR_CAP=0 - the fair value
+        # still decides whether to trade and sizes Kelly, but no longer caps the price: the
+        # order pays up to ask + SNIPER_SLIP, so fewer orders miss when the book runs to or
+        # past fair (and some pay more than the fair value). Live refuses it (frozen spec).
+        self.fair_cap = _env_bool("SNIPER_FAIR_CAP", True)
         self.fair_margin = _env_float("SNIPER_FAIR_MARGIN", 0.01)
         self.fair_vol_s = _env_float("SNIPER_FAIR_VOL_S", 300)
         # Retained for environment compatibility; decisions use the prefetched
@@ -1256,8 +1261,10 @@ class Settings:
     def fair_text(self) -> str:
         if not self.fair:
             return ""
-        return (f"; every buy at or under the market-anchored fair value - fee - ${self.fair_margin:.2f} "
+        what = "every buy at or under" if self.fair_cap else "buys only with the ask under"
+        return (f"; {what} the market-anchored fair value - fee - ${self.fair_margin:.2f} "
                 f"(the market's mid moved by the BTC move over {self.fair_vol_s:.0f}s volatility and the time left)"
+                + ("" if self.fair_cap else f", then pays up to ask + {self.slip:.2f} (past the fair value)")
                 + (f"; size {self.kelly_fraction:g} Kelly "
                    + (f"(under {KELLY_MIN_SHARES} sh: buys {KELLY_MIN_SHARES})" if self.kelly_buy_min
                       else f"from {KELLY_MIN_SHARES} sh") + ", no per-order cap "
@@ -3253,7 +3260,10 @@ class Sniper:
             if ask > limit + 1e-9:
                 row.update(ask_seen=ask)
                 return self._skip("ask not below fair value", row)
-            cap = min(cap, limit)
+            if getattr(self.s, "fair_cap", True):
+                cap = min(cap, limit)
+            else:
+                row["fair_cap"] = False             # SNIPER_FAIR_CAP=0 (paper): ask + slip alone caps it
         if lo > 0 and cap <= lo + 1e-9:
             # An ask at MIN_BUY_PRICE whose ceiling is that same price: the paper
             # broker refuses a cap at or below the floor ("order price cap ... is at

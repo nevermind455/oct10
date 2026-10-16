@@ -2,7 +2,8 @@
 """SNIPER_FOK_KELLY (2026-10-16, the operator's paper experiment): a FOK sized
 as a FAK is - fair value, half Kelly, share sizing - so the two differ in the
 order type only. SNIPER_KELLY_BUY_MIN (same day): Kelly under the venue's
-5-share minimum buys the minimum instead of skipping. No network.
+5-share minimum buys the minimum instead of skipping; SNIPER_FAIR_CAP=0 lets
+the price limit be ask + SNIPER_SLIP past the fair value. No network.
 
     python tests_fok_kelly.py
 """
@@ -146,6 +147,42 @@ class KellyBuyMin(unittest.TestCase):
             sh, _f = S.kelly_shares(0.62, 0.41, 0.07, 0.5, 40.0, 1000.0, held_shares=held, opposite_shares=opp)
             self.assertEqual(sh, max(0.0, math.floor(w + 1e-9)))
         self.assertEqual(S.kelly_wanted(0.40, 0.41, 0.07, 0.5, 40.0), 0.0)        # no edge: nothing
+
+
+class FairCapOff(unittest.TestCase):
+    """SNIPER_FAIR_CAP=0 (2026-10-16, paper): the fair value still gates and sizes,
+    but the price limit is ask + SNIPER_SLIP alone (the operator's ask + 0.10).
+    Here fair is 0.5805, so the fair limit is 0.55; the ask seen is 0.50."""
+    ENV = dict(SNIPER_ORDER_TYPE="FOK", SNIPER_FOK_KELLY="1", SNIPER_ORDER_SIZING="shares",
+               SNIPER_KELLY_BUY_MIN="1", SNIPER_SLIP="0.10")
+    gate, fire = FokKelly.gate, FokKelly.fire
+
+    def test_the_book_runs_past_fair_and_it_still_fills(self):
+        on = self.fire(self.gate(**self.ENV), [(0.50, 1000)], [(0.58, 1000)])
+        self.assertEqual(on["cap"], 0.55)                                        # fair caps it: a miss
+        self.assertEqual(on["result"], "refused")
+        self.assertIn("FOK no-fill", on["reason"])
+        off = self.fire(self.gate(SNIPER_FAIR_CAP="0", **self.ENV), [(0.50, 1000)], [(0.58, 1000)])
+        self.assertEqual(off["cap"], 0.60)                                       # ask + 0.10
+        self.assertFalse(off["fair_cap"])
+        self.assertEqual(off["fair_limit"], 0.55)
+        self.assertEqual(off["result"], "filled", off.get("reason"))
+        self.assertAlmostEqual(off["price"], 0.58, places=6)                     # past the fair value
+
+    def test_fair_still_decides_whether_to_trade(self):
+        r = self.fire(self.gate(SNIPER_FAIR_CAP="0", **self.ENV), [(0.56, 1000)], [(0.56, 1000)])
+        self.assertEqual(r["result"], "skipped")
+        self.assertEqual(r["reason"], "ask not below fair value")
+
+    def test_live_refuses_it_and_the_config_says_so(self):
+        import exec_latency
+        s = self.gate(SNIPER_FAIR_CAP="0", **self.ENV).sn.s
+        self.assertTrue(any("SNIPER_FAIR_CAP" in v for v in exec_latency.spec_violations(s)))
+        self.assertTrue(any("no: ask + slip" in ln for ln in exec_latency.effective_config_lines(s, live=False)))
+        self.assertIn("pays up to ask + 0.10", s.lines()[0])
+        default = self.gate().sn.s
+        self.assertTrue(default.fair_cap)
+        self.assertFalse(any("SNIPER_FAIR_CAP" in v for v in exec_latency.spec_violations(default)))
 
 
 if __name__ == "__main__":
