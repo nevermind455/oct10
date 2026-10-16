@@ -750,11 +750,28 @@ def t_balance_reconciliation_catches_a_wrong_ledger():
         check("resolution without redemption reconciles", r["status"] == "OK", str(r))
         check("difference is ~0", abs(r["difference"]) < 0.02, str(r))
 
-        led.mark_balance(100.0 - cost + 4.0)    # an external redemption occurred
+        # 2026-10-16: winnings come back as cash within a minute of settlement here
+        # (redeemed automatically) - our own payout is explained, not a MISMATCH
+        led.mark_balance(100.0 - cost + 4.0)    # the 4 winning shares paid out
         r = led.reconcile_balance()
-        check("untracked redemption is surfaced", r["status"] == "MISMATCH", str(r))
+        check("our own payout reconciles", r["status"] == "OK", str(r))
+        check("its payout is reported", approx(r["payouts_possible_in_window"], 4.0), str(r))
+
+        led.mark_balance(100.0 - cost + 4.0 + 200.0)   # a deposit: no fill or payout explains it
+        r = led.reconcile_balance()
+        check("a deposit is surfaced", r["status"] == "MISMATCH", str(r))
         check("mismatch names external activity",
-              "redemption" in r["detail"], r["detail"])
+              "deposit" in r["detail"] and "redemption" in r["detail"], r["detail"])
+
+        led.mark_balance(100.0 - cost + 4.0 + 200.0 - 7.0)   # money left that no fill explains
+        r = led.reconcile_balance(window_s=1e-9)        # just the last two reads
+        check("missing money is surfaced", r["status"] == "MISMATCH" and "fell" in r["detail"], str(r))
+
+        # once the window has passed the deposit, the check is quiet again
+        t = led.balance_marks[-1][0]
+        led.balance_marks = [(t - 2000.0, 100.0), (t - 1.0, 300.0), (t, 300.0)]
+        r = led.reconcile_balance()
+        check("an old deposit drops out of the window", r["status"] == "OK", str(r))
     finally:
         os.path.exists(path) and os.unlink(path)
 

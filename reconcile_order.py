@@ -19,6 +19,10 @@ record's) trades, all CONFIRMED, booked by the ledger under the order's
 authorization and nothing else, the spend is within the signed dollars,
 and the wallet holds at least what the order bought.
 
+A zero fill (2026-10-16, order 0x0d0ce8b4) when every one of those trades is
+FAILED - Polymarket settled none of it - and the ledger booked nothing of the
+order: nothing was bought, and --settle records the intent as NO_MATCH.
+
 --settle (only after a consistent check, with the bot stopped - it takes the
 ledger's process lock): records the order's canary intent as CONFIRMED with
 its real spend, through the canary session's own code. Nothing is sent to
@@ -231,17 +235,23 @@ def main() -> int:
     if order is not None and d(order.get("size_matched")) is not None \
             and abs(d(order.get("size_matched")) - v_shares) > TOL:
         problems.append(f"size_matched {order.get('size_matched')} != the trades' {v_shares}")
-    if statuses - {"CONFIRMED"}:
+    failed = bool(trades) and statuses == {"FAILED"}
+    if statuses - {"CONFIRMED"} and not failed:
         problems.append(f"not every trade is CONFIRMED yet ({sorted(statuses)})")
     if amount is not None and v_paid > amount + TOL:
         problems.append(f"spent ${v_paid} above the signed ${amount}")
     if not authorized:
         problems.append("the ledger has no authorization for this order")
-    if booked != set(trades) or abs(l_shares - v_shares) > TOL:
+    if failed:
+        if lots:
+            problems.append(f"the ledger booked {l_shares} shares of an order whose every trade FAILED")
+    elif booked != set(trades) or abs(l_shares - v_shares) > TOL:
         problems.append(f"the ledger booked {l_shares} shares ({len(booked)} trade(s)); the venue filled {v_shares}")
-    if pos_size is not None and held > 0 and pos_size + TOL < v_shares:
+    if not failed and pos_size is not None and held > 0 and pos_size + TOL < v_shares:
         problems.append(f"the wallet holds {pos_size}, less than this order bought ({v_shares})")
-    print("VERDICT: " + ("consistent - what Polymarket filled is what the ledger booked and the wallet holds"
+    print("VERDICT: " + (("consistent - every trade FAILED: Polymarket settled none of it, nothing was bought "
+                          "and the ledger booked nothing (a zero fill)") if failed and not problems else
+                         "consistent - what Polymarket filled is what the ledger booked and the wallet holds"
                          if not problems else "NOT YET:\n  - " + "\n  - ".join(problems)))
     if problems:
         return 1
@@ -249,17 +259,19 @@ def main() -> int:
         print("canary: nothing to settle; start with --new-canary-session to clear the halt")
         return 0
     if not args.settle:
-        print(f"canary: the send intent is {intent.get('status')}; re-run with --settle to record it CONFIRMED "
-              f"(${l_cost:.6f}), then start with --new-canary-session")
+        what = "as a zero fill (NO_MATCH)" if failed else f"CONFIRMED (${l_cost:.6f})"
+        print(f"canary: the send intent is {intent.get('status')}; stop the bot, re-run with --settle to "
+              f"record it {what}, then start live again")
         return 0
-    return settle(canary, data, key, intent, led, led_path, float(l_cost), client)
+    return settle(canary, data, key, intent, led, led_path, float(l_cost), client, zero_fill=failed)
 
 
-def settle(canary, data, key, intent, led, led_path, spent: float, client) -> int:
-    """The canary intent -> CONFIRMED with its real spend, as a restart that
-    found this proof would record it. Takes the ledger's process lock."""
+def settle(canary, data, key, intent, led, led_path, spent: float, client, *, zero_fill: bool = False) -> int:
+    """The canary intent -> CONFIRMED with its real spend (or NO_MATCH: every
+    trade FAILED), as a restart that found this proof would record it. Takes
+    the ledger's process lock."""
     import run
-    from sniper_live import MATCHED, PENDING, CanarySession, KillSwitch, limits_from_env
+    from sniper_live import MATCHED, NO_MATCH, PENDING, CanarySession, KillSwitch, limits_from_env
     holder = getattr(client.builder, "funder", None) or client.signer.address()
     wallet = CanarySession.wallet_key_for(holder)
     if data.get("wallet") != wallet:
@@ -275,10 +287,18 @@ def settle(canary, data, key, intent, led, led_path, spent: float, client) -> in
         session, limits, kill = CanarySession(canary, wallet), limits_from_env(), KillSwitch()
         session.open(limits, kill, led)
         amount = float(intent.get("amount") or 0.0)
-        if intent.get("kind") not in (MATCHED, PENDING):
-            limits.record_outcome(MATCHED, amount)
-        limits.resolve_accepted(max(0.0, amount - spent))
-        session.resolve(key, "CONFIRMED", limits, kill, spent=min(spent, amount))
+        accepted = intent.get("kind") in (MATCHED, PENDING)
+        if zero_fill:                       # as _reconcile_previous_run records a proven zero execution
+            if accepted:
+                limits.resolve_accepted(amount, zero_fill=True)
+            else:
+                limits.record_outcome(NO_MATCH, amount)
+            session.resolve(key, NO_MATCH, limits, kill, spent=0.0)
+        else:
+            if not accepted:
+                limits.record_outcome(MATCHED, amount)
+            limits.resolve_accepted(max(0.0, amount - spent))
+            session.resolve(key, "CONFIRMED", limits, kill, spent=min(spent, amount))
         ok = session.flush() and session.save(limits, kill)
         session.close()
     finally:
@@ -286,7 +306,8 @@ def settle(canary, data, key, intent, led, led_path, spent: float, client) -> in
     after = CanarySession.durable_view(canary) or {}
     status = ((after.get("intents") or {}).get(key) or {}).get("status", "archived (finished)")
     print(f"settle: canary intent -> {status}" + ("" if ok else " (NOT durable - check the disk)"))
-    print("next: start live with --new-canary-session")
+    print("next: start live with --new-canary-session" if after.get("kill_reasons") else
+          "next: start live again (no halt is left)")
     return 0 if ok else 1
 
 

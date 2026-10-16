@@ -67,6 +67,22 @@ class Refused(Exception):
     """This one order must not be sent; trading may continue."""
 
 
+def fills_of_order(store, order_id) -> list:
+    """Copies of one order's fills in a FillStore, any status ([] without one)."""
+    if store is None or not order_id:
+        return []
+    for_order = getattr(store, "fills_for_order", None)
+    if callable(for_order):
+        return list(for_order(order_id))             # copies of this order's fills only
+    lock = getattr(store, "_lock", None)
+    if lock is None:
+        rows = [copy.copy(f) for f in store.fills.values()]
+    else:
+        with lock:
+            rows = [copy.copy(f) for f in store.fills.values()]
+    return [f for f in rows if str(getattr(f, "order_id", "") or "") == str(order_id)]
+
+
 def short_id(oid) -> str:
     """An order id as halt and event text shows it: 0x + 64 hex becomes
     0xa1fa8479...72449d. The dashboard hides any raw 32-byte hex (a private key
@@ -2036,6 +2052,9 @@ class LiveExecution:
         self.previous_run_delays_s = (0.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0) + (300.0,) * 12
         sender.ambiguity_resolver = self._schedule_ambiguity
 
+    FAILED_RELEASE_S = 120.0        # every trade FAILED, unchanged this long: a zero fill
+    UNRESOLVED_WARN_S = 300.0       # an order past its deadline: warned this often
+
     @property
     def kill(self) -> KillSwitch:
         return self.sender.kill
@@ -2136,6 +2155,14 @@ class LiveExecution:
 
     async def _read_balance(self) -> None:
         revision = self._balance_revision
+        # Taken BEFORE the reading: later bookings only shrink it, so it can only
+        # overstate, never understate, what an unconfirmed order may still take.
+        held, hold = bool(self.awaiting), None
+        if held:
+            try:
+                hold = await asyncio.to_thread(self._awaiting_hold)
+            except Exception:  # noqa: BLE001 - no hold known: the strict rule below
+                self.n["balance hold errors"] += 1
         bal = await asyncio.to_thread(self.balance_fetch)
         if isinstance(bal, dict) and bal.get("balance") is not None and bal.get("allowance") is not None:
             # Spendable is the smaller of what we hold and what the exchange may move.
@@ -2147,15 +2174,50 @@ class LiveExecution:
                 self.n["balance read errors"] += 1
                 return
             available = min(values)
-            if (self.balance is not None and (revision != self._balance_revision or self.reserved > 0
-                                              or self.awaiting)):
-                # A read concurrent with an order can return its pre-fill cash.
-                # Until confirmation, it may lower our bound but never refund it.
+            if self.balance is not None and (revision != self._balance_revision or self.reserved > 0):
+                # A send started or ended during this read (or is on the wire): the
+                # reading can predate its debit. It may lower our bound, never raise it.
                 available = min(available, self.balance)
+            elif self.balance is not None and (held or self.awaiting):
+                # Accepted orders not confirmed yet. Min() with our own figure here froze
+                # the cash for an hour on 2026-10-16 (one order's only trade FAILED and it
+                # stayed awaiting; every payout after it stayed invisible). The reading less
+                # what they could still take is never counted twice and lets payouts and
+                # unused budget show. Without a hold (unknown, or its lookup failed): the strict rule.
+                available = min(available, self.balance) if hold is None else max(0.0, available - hold)
             self.balance = available
             self.balance_at = time.monotonic()
         else:
             self.n["balance read errors"] += 1
+
+    def _awaiting_hold(self) -> float | None:
+        """What this run's accepted, unconfirmed orders could still take from the
+        wallet: each one's reservation (its spend plus the fee bound) less the cost
+        the ledger has booked for it - booked trades are CONFIRMED, settled, so a
+        reading already shows them. None when any of them has no known reservation:
+        what it may take is unknown, so no reading may refund it (the strict rule).
+        Worker thread (the ledger lock)."""
+        live = set(self.awaiting)
+        with self._risk_lock:
+            reservations = [dict(a) for a in self._risk_orders.values() if a.get("order_id") in live]
+        if not live <= {a.get("order_id") for a in reservations if a.get("reserve") is not None}:
+            return None
+        if not reservations:
+            return 0.0
+        view = getattr(self.ledger, "risk_view", None)
+        if callable(view):
+            _realized, _open, booked = view(self.session_start,
+                                            [(a.get("order_id"), a.get("token")) for a in reservations])
+        else:
+            booked = {}
+            with self.ledger._lock:
+                for a in reservations:
+                    pos = self.ledger.positions.get(str(a.get("token")))
+                    booked[a.get("order_id")] = sum(float(lot.cost) for lot in (pos.lots if pos is not None else ())
+                                                    if lot.order_id == a.get("order_id")
+                                                    and str(lot.side).upper() == "BUY")
+        return sum(max(0.0, float(a.get("reserve") or 0.0) - float(booked.get(a.get("order_id"), 0.0)))
+                   for a in reservations)
 
     async def _balance_loop(self) -> None:
         while True:
@@ -2525,7 +2587,26 @@ class LiveExecution:
                 self._trip_once(("order-uncertain", str(a.get("client_order_id") or oid)),
                                 f"order {short_id(oid)} ({a['kind']}, venue status {a.get('venue_status') or 'unknown'}) "
                                 f"not confirmed in the ledger after {self.confirm_within_s:.0f}s: reconcile")
+        self._warn_unresolved(now)
         self.session_loss = max(0.0, -self._session_realized())
+
+    def _warn_unresolved(self, now: float) -> None:
+        """An accepted order still unresolved past its deadline holds its
+        reservation back from the cash: say so every UNRESOLVED_WARN_S (one
+        dashboard line and one journal row), not once and then silence."""
+        for oid, a in list(self.awaiting.items()):
+            age = now - float(a.get("wall") or now)
+            if age <= self.confirm_within_s or now - float(a.get("warned_at") or 0.0) < self.UNRESOLVED_WARN_S:
+                continue
+            a["warned_at"] = now
+            why = str(a.get("halted_for") or "not confirmed yet")[:120]
+            self.n["unresolved order warnings"] += 1
+            journal = getattr(self, "_journal", None)
+            if journal is not None:
+                journal({"wall": time.time(), "result": "live_unresolved", "order_id": oid,
+                         "age_s": round(age), "amount": a.get("amount"), "reason": why})
+            self.on_event("sniper", f"LIVE order {short_id(oid)} still unresolved after {age / 60:.0f} min ({why}); "
+                                    f"its budget stays held back - reconcile_order.py {str(oid)[:10]}", "warn")
 
     def _fak_status(self, oid, a, now) -> None:
         """Ask the venue for an accepted FAK's final size and trade ids (its
@@ -2560,9 +2641,54 @@ class LiveExecution:
             except (KeyError, ArithmeticError, TypeError, ValueError):
                 pass                          # incomplete evidence keeps the full reservation
 
+    def _release_failed_fak(self, oid, a, now) -> bool:
+        """A FAK whose every trade FAILED bought nothing (2026-10-16, order
+        0x0d0ce8b4: matched, its only trade FAILED on settlement; the ledger
+        booked nothing and the wallet held no share of it). Released as a zero
+        fill when: every one of its trades is FAILED - terminal, Polymarket will
+        not settle it - with this order's token, market and side; they are
+        exactly the reply's trades, or add up to the reply's whole reported fill;
+        the ledger booked nothing of the order; and all that has held for
+        FAILED_RELEASE_S. Anything less stays awaiting (and is warned about)."""
+        rows = self._order_fills(oid)
+        ok = bool(rows) and all(str(getattr(f, "status", "") or "").upper() == "FAILED"
+                                and str(f.asset_id) == a["token"] and str(f.market) == a["condition"]
+                                and f.side == "BUY" for f in rows)
+        if ok:
+            expected = {str(t) for t in (a.get("trade_ids") or ())}
+            if expected:
+                ok = {str(f.trade_id) for f in rows} == expected
+            else:
+                try:
+                    ok = (a.get("final_size") is not None
+                          and abs(sum(float(f.size or 0) for f in rows) - float(a["final_size"])) <= 1e-6)
+                except (TypeError, ValueError):
+                    ok = False
+        if ok:
+            ok = not self._order_booked(oid, a["token"])
+        if not ok:
+            a.pop("failed_since", None)
+            return False
+        if now - a.setdefault("failed_since", now) < self.FAILED_RELEASE_S:
+            return False
+        self.sender.limits.resolve_accepted(a["amount"], zero_fill=True)
+        self._resolve_risk(a, filled=False)
+        self.awaiting.pop(oid, None)
+        self.n["failed trades released"] += 1
+        journal = getattr(self, "_journal", None)
+        if journal is not None:
+            journal({"wall": time.time(), "result": "live_failed_release", "order_id": oid,
+                     "trades": len(rows), "amount": a["amount"],
+                     "reason": "every trade FAILED: nothing bought, its budget released"})
+        self.on_event("sniper", f"LIVE FAK {short_id(oid)}: every trade FAILED - nothing was bought; "
+                                f"its ${float(a['amount']):.2f} released", "warn")
+        return True
+
     def _reconcile_fak(self, oid, a, now):
         """A canceled FAK can still have fills. Resolve all trades before
         releasing unused spend; never treat cancellation alone as zero."""
+        if self._release_failed_fak(oid, a, now):
+            return
         age = now - a["wall"]
         if (not a.get("trade_ids") and a.get("final_size") is None and self.order_status is not None and age > 1
                 and now - a.get("checked_at", 0) > self.reconcile_every_s):
@@ -2589,24 +2715,17 @@ class LiveExecution:
             # a second time: one halt, with its real reason (2026-10-14).
             self._trip_fak(a, f"FAK order {short_id(oid)} not completely confirmed after {self.confirm_within_s:.0f}s: reconcile")
 
+    def _order_fills(self, order_id) -> list:
+        """Copies of one order's fills in the fill store, any status."""
+        return fills_of_order(self.fills, order_id)
+
     def fill_for(self, order_id) -> dict | None:
         """Our fills of one order as the private channel reported them
         (MATCHED is provisional; only CONFIRMED is booked by the ledger).
         For FAK, require the complete trade set and validate its quantities."""
-        store = self.fills
-        if store is None or not order_id:
+        if self.fills is None or not order_id:
             return None
-        for_order = getattr(store, "fills_for_order", None)
-        if callable(for_order):
-            rows = for_order(order_id)               # copies of this order's fills only
-        else:
-            lock = getattr(store, "_lock", None)
-            if lock is None:
-                rows = [copy.copy(f) for f in store.fills.values()]
-            else:
-                with lock:
-                    rows = [copy.copy(f) for f in store.fills.values()]
-            rows = [f for f in rows if str(getattr(f, "order_id", "") or "") == str(order_id)]
+        rows = fills_of_order(self.fills, order_id)
         a = self.fak_orders.get(order_id)
         if a is not None:
             return self._fak_fill(order_id, a, rows)
@@ -3051,6 +3170,37 @@ class LiveExecution:
                 return None
         return "CONFIRMED", spent
 
+    def _previous_run_failed(self, intent: dict) -> tuple | None:
+        """NO_MATCH for a previous run's FAK whose every trade FAILED - as
+        _release_failed_fak within a run (2026-10-16: 0x0d0ce8b4's intent stayed
+        ACCEPTED across restarts, its worst case counted in the loss budget). The
+        start-up REST audit puts the order's trades in the fill store with their
+        status: every one FAILED, on the intent's token, market and BUY side,
+        exactly the reply's trades or adding up to its totals, and nothing of the
+        order booked. None otherwise."""
+        h = str(intent.get("order_hash") or intent.get("order_id") or "")
+        if not h or intent.get("kind") not in (MATCHED, PENDING):
+            return None
+        rows = self._order_fills(h)
+        if not rows or not all(str(getattr(f, "status", "") or "").upper() == "FAILED"
+                               and str(f.asset_id) == str(intent.get("token"))
+                               and str(f.market) == str(intent.get("condition")) and f.side == "BUY"
+                               for f in rows):
+            return None
+        tids, totals = intent.get("trade_ids"), intent.get("reply_totals")
+        try:
+            if tids:
+                ok = {str(f.trade_id) for f in rows} == {str(t) for t in tids}
+            elif totals:
+                ok = abs(sum(float(f.size or 0) for f in rows) - float(totals[1])) <= 1e-6
+            else:
+                return None
+        except (TypeError, ValueError, IndexError):
+            return None
+        if not ok or self._order_booked(h, intent.get("token")):
+            return None
+        return NO_MATCH, 0.0
+
     def _previous_run_verdict(self, intent: dict, order) -> tuple | None:
         """(status, spent) settling one of a previous run's unresolved send
         intents from the venue's record of its own order hash, or None while
@@ -3061,8 +3211,9 @@ class LiveExecution:
         if not isinstance(order, dict) or not order:
             # The CLOB answered null for the order's id (seen live for an executed
             # FAK, 2026-10-15): settled only by the reply's own trade list - every
-            # one booked under the order's authorization, and no other trade.
-            return self._previous_run_by_trades(intent)
+            # one booked under the order's authorization, and no other trade - or,
+            # every one of its trades FAILED (the start-up REST audit stores them).
+            return self._previous_run_by_trades(intent) or self._previous_run_failed(intent)
         if (str(order.get("id")) != h or str(order.get("asset_id")) != str(intent.get("token"))
                 or str(order.get("market")) != str(intent.get("condition")) or order.get("side") != "BUY"):
             raise RuntimeError(f"the venue's record of order hash ...{h[-10:]} does not match its intent")

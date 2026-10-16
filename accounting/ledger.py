@@ -1317,29 +1317,43 @@ class Ledger:
             if len(self.balance_marks) > 500:
                 del self.balance_marks[:250]
 
-    def reconcile_balance(self, tolerance: float = 0.02) -> dict:
+    BALANCE_CHECK_WINDOW_S = 900.0   # the wallet movement checked: the last 15 minutes of reads
+    REDEEM_LAG_S = 600.0             # a payout may reach the wallet this long after its settlement
+
+    def reconcile_balance(self, tolerance: float = 0.02, window_s: float | None = None) -> dict:
         """Compare our books against the venue's own USDC movement.
 
-        Resolution changes the value of outcome tokens but does not itself
-        redeem them into pUSD. Therefore the only deterministic wallet movement
-        this ledger can predict is the cost of confirmed BUY fills, less net
-        SELL proceeds, between the two balance observations. Redemptions, deposits, manual
-        activity, or missing fills correctly appear as a mismatch.
+        Over the balance reads of the last window_s: the wallet's change must lie
+        between what confirmed BUY fills less net SELL proceeds explain, and that
+        plus every payout that may have landed in it - positions this ledger
+        settled from REDEEM_LAG_S before the window to its end. Resolution alone
+        moves no cash, but this account's winnings come back as cash within about
+        a minute of settlement (redeemed automatically, seen live 2026-10-16): the
+        old check, over every read since start and without payouts, showed each
+        payout - and any deposit, for the rest of the run - as a MISMATCH. Missing
+        fills (the wallet fell more) and deposits, manual or unrelated activity
+        (it rose more) still are; a deposit drops out once the window passes it.
         """
         try:
             tolerance = float(tolerance)
+            window = self.BALANCE_CHECK_WINDOW_S if window_s is None else float(window_s)
         except (TypeError, ValueError) as exc:
             raise ValueError("balance reconciliation tolerance is invalid") from exc
-        if not math.isfinite(tolerance) or tolerance < 0:
+        if not math.isfinite(tolerance) or tolerance < 0 or not math.isfinite(window) or window <= 0:
             raise ValueError("balance reconciliation tolerance is invalid")
         with self._lock:
             if len(self.balance_marks) < 2:
                 return {"status": "NO_DATA",
                         "detail": "need at least two balance reads"}
-            (t0, b0), (t1, b1) = self.balance_marks[0], self.balance_marks[-1]
+            t1, b1 = self.balance_marks[-1]
+            inside = [m for m in self.balance_marks[:-1] if m[0] >= t1 - window]
+            t0, b0 = inside[0] if inside else self.balance_marks[-2]
             # lots are append-only and never change once booked: walk them
             # outside the lock, over reference copies taken inside it
             lots = [list(position.lots) for position in self.positions.values()]
+            payouts = [(float(p.settled_wall), float(p.shares) * float(p.payout_per_share))
+                       for p in self.positions.values()
+                       if p.settled and p.settled_wall is not None and p.payout_per_share and p.shares > 0]
         if True:
             observed = b1 - b0
             purchased = sum(
@@ -1351,8 +1365,11 @@ class Ledger:
                 for lot in group if lot.side == "SELL" and t0 <= lot.wall <= t1
             )
             expected = sold - purchased
+            payout_room = sum(amount for wall, amount in payouts if t0 - self.REDEEM_LAG_S <= wall <= t1)
+            tol = max(tolerance, abs(expected) * 0.01)
             diff = observed - expected
-            ok = abs(diff) <= max(tolerance, abs(expected) * 0.01)
+            low, high = observed < expected - tol, observed > expected + payout_room + tol
+            ok = not (low or high)
             return {
                 "status": "OK" if ok else "MISMATCH",
                 "window_s": t1 - t0,
@@ -1360,10 +1377,13 @@ class Ledger:
                 "expected_delta": expected,
                 "confirmed_buy_cost_in_window": purchased,
                 "confirmed_sell_proceeds_in_window": sold,
+                "payouts_possible_in_window": payout_room,
                 "difference": diff,
                 "detail": "" if ok else
-                          "wallet movement includes missing fills, redemption, "
-                          "deposit/withdrawal, or unrelated activity; investigate",
+                          ("the wallet fell more than our confirmed fills explain: missing fills, a withdrawal "
+                           "or unrelated activity; investigate" if low else
+                           "the wallet rose more than our fills and payouts explain: a deposit, a redemption "
+                           "the ledger does not know, or unrelated activity; investigate"),
             }
 
     # ---------------------------------------------------------- persistence

@@ -1606,7 +1606,15 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # pause keys); fresh venue incidents cannot be lost at expiry; reporting
     # failures cannot interrupt the guard; monotonic zero is a valid start time.
     # Fresh kill-switch incidents also expire old reasons before deduplication.
-    "sniper_live.py": "dc26d33a1791cc6a0a893d6f6101e177f4651d74799c0d2d42edd544c88cf563",
+    # Re-approved 2026-10-16 (live cash freeze, order 0x0d0ce8b4 - its only trade FAILED and it
+    # stayed awaiting; the cash read could only fall for an hour): with orders unconfirmed the
+    # cash is the reading less what they could still take (reserve - booked cost); a FAK whose
+    # every trade FAILED, covering its whole reply, nothing booked, for 120s, is released as a
+    # zero fill; an order past its deadline is warned about every 5 minutes. A failed hold
+    # lookup keeps the strict rule. A previous run's FAK whose every trade FAILED (start-up
+    # REST audit) and nothing booked resolves NO_MATCH at restart. An unconfirmed order with no
+    # known reservation still blocks any refund (CollateralAudit).
+    "sniper_live.py": "9a216da94756130516f032c521bb820c023ac52ad83b35e66b6b5672bfc50242",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads
@@ -1640,7 +1648,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Reviewed 2026-10-12: user-requested recovery, accounting and portfolio safety fixes.
     # Re-approved 2026-10-12 (audit 20261012): durable-fill rollback keeps an undo record instead
     # of deep-copying the position history
-    "accounting/ledger.py": "c435b293872f0d5ad8202d1091ecb28ce7dd1ad68f112dcc266db3a25d766951",
+    # Re-approved 2026-10-16: reconcile_balance checks the last 15 minutes of reads, and the wallet
+    # may rise by the payouts of positions settled from 10 minutes before them (this account's
+    # winnings come back as cash automatically); every payout and any deposit were a MISMATCH for
+    # the rest of the run. Missing fills (it fell) and deposits (it rose more) still are.
+    "accounting/ledger.py": "479f6c0b3f6322b4df024b820d712961eb5d0b675fce12cee79c82e4c7e0068d",
     "accounting/fees.py": "44e45be00c7c3b330ef0ff11950fa42944029ba83a61ec8066af3494c0956dc7",
     # Re-approved (settlement audit): one record per market (condition id), checked from
     # expiry, concurrently, on the worker's own pool; explicit lifecycle events and a journal;
