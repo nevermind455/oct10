@@ -1058,6 +1058,11 @@ class Settings:
         # SNIPER_MAX_SIDE_SHARES in the round (live: also the canary's per-order cap);
         # under the venue's 5-share minimum it skips. Replaces the fixed SNIPER_SHARES + carry.
         self.kelly = _env_bool("SNIPER_KELLY", True)
+        # Paper experiment (2026-10-16, the operator's): a FOK sized as a FAK is -
+        # fair value, Kelly, share sizing - so FOK vs FAK differs in the order type
+        # only. Off: FOK keeps the fixed SNIPER_SHARES clip. Live trades FAK (the
+        # frozen spec), so it has no effect there.
+        self.fok_kelly = _env_bool("SNIPER_FOK_KELLY", False)
         self.kelly_fraction = _env_float("SNIPER_KELLY_FRACTION", 0.5)       # half Kelly since 2026-10-13 (full before; 0.25 earlier on 10-11)
         self.stale_ms = _env_float("SNIPER_STALE_MS", 2000)
         # Which book a paper order fills against. "exchange": the book as it
@@ -1219,9 +1224,13 @@ class Settings:
         return (f" (+ same-side unfilled carry, <= {self.max_target_shares:g} sh)"
                 if self.order_type == "FAK" else "")
 
+    def kelly_sized(self) -> bool:
+        """This order type is sized by the fair value and Kelly (FAK always; FOK with SNIPER_FOK_KELLY)."""
+        return self.order_type == "FAK" or (self.order_type == "FOK" and self.fok_kelly and self.fair and self.kelly)
+
     def sizing_text(self) -> str:
         """How much a FAK spends for its shares (the venue fills a FAK BUY by its dollars)."""
-        if self.order_type != "FAK":
+        if not self.kelly_sized():
             return ""
         return (" (sized as whole shares x the cap: under the cap the saving buys extra shares)"
                 if self.order_sizing == "shares" else " (sent as their book cost: more shares only if the ask falls)")
@@ -1233,7 +1242,7 @@ class Settings:
                 f"(the market's mid moved by the BTC move over {self.fair_vol_s:.0f}s volatility and the time left)"
                 + (f"; size {self.kelly_fraction:g} Kelly from {KELLY_MIN_SHARES} sh, no per-order cap "
                    f"(<= {self.max_side_shares:.0f} sh/side per round)"
-                   if self.kelly and self.order_type == "FAK" else ""))
+                   if self.kelly and self.kelly_sized() else ""))
 
     def lines(self, live: bool = False) -> list[str]:
         if live:
@@ -3233,7 +3242,8 @@ class Sniper:
             return self._skip("price cap at the price floor", row)
         target = carry = None
         kelly = False
-        if self.s.order_type == "FAK":
+        sized = getattr(self.s, "kelly_sized", lambda: self.s.order_type == "FAK")()
+        if sized:
             if fair is not None and self.s.kelly:
                 # Incremental portfolio Kelly: cash and current outcome payouts
                 # determine how much to add. Existing inventory is not a fresh bet.
@@ -3295,7 +3305,7 @@ class Sniper:
         # whole shares x the cap's cent limit - lifted to the venue's 5 shares
         # and its $1 at the limit, as the book-cost order is.
         gate_amount, order_shares = amount, None
-        if self.s.order_type == "FAK" and self.s.order_sizing == "shares":
+        if sized and self.s.order_sizing == "shares":
             tick = Decimal(str(getattr(view, "tick_size", None) or 0.01))
             limit = (Decimal(str(min(cap, hi))) / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
             floor_shares = max(KELLY_MIN_SHARES, int((Decimal(str(MIN_ORDER_USD)) / limit).to_integral_value(
