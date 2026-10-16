@@ -668,20 +668,6 @@ def fair_limit(fair: float, margin: float, tick: float, fee_rate: float, fee_exp
     return round(max(p, 0.0), 4)
 
 
-def kelly_wanted(fair: float, ask: float, fee_rate: float, fraction: float, bankroll: float, *,
-                 held_shares: float = 0.0, opposite_shares: float = 0.0, fee_exponent: int = 1) -> float:
-    """kelly_shares' target before rounding and bounds: the shares fractional
-    Kelly wants to ADD to what is held (<= 0: none; 0 without an edge)."""
-    p = float(ask) + taker_fee(float(ask), fee_rate, fee_exponent)
-    if not 0.0 < p < 1.0 or not bankroll or bankroll <= 0 or float(fair) <= p:
-        return 0.0
-    held, opposite = float(held_shares), float(opposite_shares)
-    if not all(math.isfinite(v) and v >= 0 for v in (held, opposite)):
-        return 0.0
-    wealth = bankroll + p * held + (1.0 - p) * opposite
-    return fraction * (float(fair) - p) * wealth / (p * (1.0 - p)) - (held - opposite)
-
-
 def kelly_shares(fair: float, ask: float, fee_rate: float, fraction: float, bankroll: float,
                  max_shares: float, *, held_shares: float = 0.0, opposite_shares: float = 0.0,
                  fee_exponent: int = 1) -> tuple[float, float]:
@@ -703,8 +689,8 @@ def kelly_shares(fair: float, ask: float, fee_rate: float, fraction: float, bank
     held, opposite = float(held_shares), float(opposite_shares)
     if not all(math.isfinite(v) and v >= 0 for v in (held, opposite, float(max_shares))):
         return 0.0, f
-    wanted = kelly_wanted(fair, ask, fee_rate, fraction, bankroll, held_shares=held,
-                          opposite_shares=opposite, fee_exponent=fee_exponent)
+    wealth = bankroll + p * held + (1.0 - p) * opposite
+    wanted = fraction * (float(fair) - p) * wealth / (p * (1.0 - p)) - (held - opposite)
     # A hedge may increase the optimum, but it cannot spend unavailable cash.
     return float(max(0, min(math.floor(wanted + 1e-9), math.floor(bankroll / p + 1e-9), max_shares))), f
 
@@ -1068,11 +1054,6 @@ class Settings:
         # SNIPER_FAIR_MARGIN; the limit is capped there too. Under a minute of price
         # history, or no market mid, skips: never guessed.
         self.fair = _env_bool("SNIPER_FAIR", True)
-        # Paper experiment (2026-10-16, the operator's): SNIPER_FAIR_CAP=0 - the fair value
-        # still decides whether to trade and sizes Kelly, but no longer caps the price: the
-        # order pays up to ask + SNIPER_SLIP, so fewer orders miss when the book runs to or
-        # past fair (and some pay more than the fair value). Live refuses it (frozen spec).
-        self.fair_cap = _env_bool("SNIPER_FAIR_CAP", True)
         self.fair_margin = _env_float("SNIPER_FAIR_MARGIN", 0.01)
         self.fair_vol_s = _env_float("SNIPER_FAIR_VOL_S", 300)
         # Retained for environment compatibility; decisions use the prefetched
@@ -1085,15 +1066,6 @@ class Settings:
         # SNIPER_MAX_SIDE_SHARES in the round (live: also the canary's per-order cap);
         # under the venue's 5-share minimum it skips. Replaces the fixed SNIPER_SHARES + carry.
         self.kelly = _env_bool("SNIPER_KELLY", True)
-        # Paper experiment (2026-10-16, the operator's): a FOK sized as a FAK is -
-        # fair value, Kelly, share sizing - so FOK vs FAK differs in the order type
-        # only. Off: FOK keeps the fixed SNIPER_SHARES clip. Live trades FAK (the
-        # frozen spec), so it has no effect there.
-        self.fok_kelly = _env_bool("SNIPER_FOK_KELLY", False)
-        # Paper experiment (2026-10-16, the operator's): when Kelly wants to add fewer
-        # shares than the venue's 5-share minimum, buy the minimum instead of skipping -
-        # more than Kelly at a small bankroll. Off: it skips. Live refuses it (frozen spec).
-        self.kelly_buy_min = _env_bool("SNIPER_KELLY_BUY_MIN", False)
         self.kelly_fraction = _env_float("SNIPER_KELLY_FRACTION", 0.5)       # half Kelly since 2026-10-13 (full before; 0.25 earlier on 10-11)
         self.stale_ms = _env_float("SNIPER_STALE_MS", 2000)
         # Which book a paper order fills against. "exchange": the book as it
@@ -1255,13 +1227,9 @@ class Settings:
         return (f" (+ same-side unfilled carry, <= {self.max_target_shares:g} sh)"
                 if self.order_type == "FAK" else "")
 
-    def kelly_sized(self) -> bool:
-        """This order type is sized by the fair value and Kelly (FAK always; FOK with SNIPER_FOK_KELLY)."""
-        return self.order_type == "FAK" or (self.order_type == "FOK" and self.fok_kelly and self.fair and self.kelly)
-
     def sizing_text(self) -> str:
         """How much a FAK spends for its shares (the venue fills a FAK BUY by its dollars)."""
-        if not self.kelly_sized():
+        if self.order_type != "FAK":
             return ""
         return (" (sized as whole shares x the cap: under the cap the saving buys extra shares)"
                 if self.order_sizing == "shares" else " (sent as their book cost: more shares only if the ask falls)")
@@ -1273,15 +1241,11 @@ class Settings:
     def fair_text(self) -> str:
         if not self.fair:
             return ""
-        what = "every buy at or under" if self.fair_cap else "buys only with the ask under"
-        return (f"; {what} the market-anchored fair value - fee - ${self.fair_margin:.2f} "
+        return (f"; every buy at or under the market-anchored fair value - fee - ${self.fair_margin:.2f} "
                 f"(the market's mid moved by the BTC move over {self.fair_vol_s:.0f}s volatility and the time left)"
-                + ("" if self.fair_cap else f", then pays up to ask + {self.slip:.2f} (past the fair value)")
-                + (f"; size {self.kelly_fraction:g} Kelly "
-                   + (f"(under {KELLY_MIN_SHARES} sh: buys {KELLY_MIN_SHARES})" if self.kelly_buy_min
-                      else f"from {KELLY_MIN_SHARES} sh") + ", no per-order cap "
+                + (f"; size {self.kelly_fraction:g} Kelly from {KELLY_MIN_SHARES} sh, no per-order cap "
                    f"(<= {self.max_side_shares:.0f} sh/side per round)"
-                   if self.kelly and self.kelly_sized() else ""))
+                   if self.kelly and self.order_type == "FAK" else ""))
 
     def lines(self, live: bool = False) -> list[str]:
         if live:
@@ -3276,10 +3240,7 @@ class Sniper:
             if ask > limit + 1e-9:
                 row.update(ask_seen=ask)
                 return self._skip("ask not below fair value", row)
-            if getattr(self.s, "fair_cap", True):
-                cap = min(cap, limit)
-            else:
-                row["fair_cap"] = False             # SNIPER_FAIR_CAP=0 (paper): ask + slip alone caps it
+            cap = min(cap, limit)
         if lo > 0 and cap <= lo + 1e-9:
             # An ask at MIN_BUY_PRICE whose ceiling is that same price: the paper
             # broker refuses a cap at or below the floor ("order price cap ... is at
@@ -3288,8 +3249,7 @@ class Sniper:
             return self._skip("price cap at the price floor", row)
         target = carry = None
         kelly = False
-        sized = getattr(self.s, "kelly_sized", lambda: self.s.order_type == "FAK")()
-        if sized:
+        if self.s.order_type == "FAK":
             if fair is not None and self.s.kelly:
                 # Incremental portfolio Kelly: cash and current outcome payouts
                 # determine how much to add. Existing inventory is not a fresh bet.
@@ -3313,18 +3273,7 @@ class Sniper:
                 self.last_fair["shares"] = shares
                 if shares < KELLY_MIN_SHARES:
                     row.update(ask_seen=ask)
-                    # SNIPER_KELLY_BUY_MIN (paper): the venue's minimum instead of the skip,
-                    # only while Kelly wants to ADD shares (once held, its target is under the
-                    # holding: one minimum order per side, not one per signal) and cash pays
-                    # it. The room checks below still apply.
-                    px = min(cap, hi)
-                    need = max(KELLY_MIN_SHARES, math.ceil(MIN_ORDER_USD / px - 1e-9)) * px
-                    if not (getattr(self.s, "kelly_buy_min", False) and need <= bank + 1e-9
-                            and kelly_wanted(fair, ask, fee_rate, self.s.kelly_fraction, bank, held_shares=held,
-                                             opposite_shares=opposite, fee_exponent=fee_exponent) > 0):
-                        return self._skip(f"kelly size under the {KELLY_MIN_SHARES}-share minimum", row)
-                    shares = float(KELLY_MIN_SHARES)
-                    row["kelly_buy_min"] = True
+                    return self._skip(f"kelly size under the {KELLY_MIN_SHARES}-share minimum", row)
                 target, carry, kelly = shares, 0.0, True
             else:
                 # IOC: a share target - the base clip plus what this side's last
@@ -3350,16 +3299,9 @@ class Sniper:
                 limit = (Decimal(str(min(cap, hi))) / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
                 minimum = (Decimal(str(KELLY_MIN_SHARES)) * limit).quantize(
                     Decimal("0.01"), rounding="ROUND_CEILING")
-                floor_usd = max(MIN_ORDER_USD, float(minimum))
-                if amount < floor_usd:
-                    # SNIPER_KELLY_BUY_MIN (paper): the venue's minimum at the limit when the
-                    # room and cash take it - Kelly's stake alone is under it, not the room.
-                    if not (getattr(self.s, "kelly_buy_min", False) and float(max_spend) >= floor_usd
-                            and floor_usd <= bank + 1e-9):
-                        row.update(ask_seen=ask, amount=round(amount, 4), room_shares=round(room, 4))
-                        return self._skip("kelly room under venue minimum at price cap", row)
-                    amount = floor_usd
-                    row["kelly_buy_min"] = True
+                if amount < max(MIN_ORDER_USD, float(minimum)):
+                    row.update(ask_seen=ask, amount=round(amount, 4), room_shares=round(room, 4))
+                    return self._skip("kelly room under venue minimum at price cap", row)
         else:
             # The venue refuses a marketable BUY under $1, so under 10c the
             # 10-share clip becomes $1 - the smallest order live could place.
@@ -3369,7 +3311,7 @@ class Sniper:
         # whole shares x the cap's cent limit - lifted to the venue's 5 shares
         # and its $1 at the limit, as the book-cost order is.
         gate_amount, order_shares = amount, None
-        if sized and self.s.order_sizing == "shares":
+        if self.s.order_type == "FAK" and self.s.order_sizing == "shares":
             tick = Decimal(str(getattr(view, "tick_size", None) or 0.01))
             limit = (Decimal(str(min(cap, hi))) / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
             floor_shares = max(KELLY_MIN_SHARES, int((Decimal(str(MIN_ORDER_USD)) / limit).to_integral_value(

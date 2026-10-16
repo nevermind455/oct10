@@ -114,14 +114,6 @@ def spec_violations(settings, canary_max_shares=None) -> list[str]:
                    f"until the age gate is approved")
     if getattr(settings, "feed_coalesce", False):
         out.append("feed coalescing: SNIPER_FEED_COALESCE=1 - live evaluates every tick until coalescing is approved")
-    # 2026-10-16, the operator's paper test: the price limit past the fair value.
-    if not getattr(settings, "fair_cap", True):
-        out.append("fair cap: SNIPER_FAIR_CAP=0 lets an order pay past the fair value - live caps it there "
-                   "until its paper results are approved")
-    # 2026-10-16, the operator's paper test: the 5-share minimum when Kelly wants fewer.
-    if getattr(settings, "kelly_buy_min", False):
-        out.append("kelly minimum: SNIPER_KELLY_BUY_MIN=1 buys 5 shares when Kelly wants fewer - live skips "
-                   "them until its paper results are approved")
     target = float(getattr(settings, "max_target_shares", 0) or 0)
     # `not >=` rather than `<`: a NaN cap compares false both ways and must fail here too.
     if canary_max_shares is not None and not float(canary_max_shares) + 1e-9 >= target:
@@ -142,14 +134,6 @@ def effective_config_lines(settings, *, live: bool, canary_max_shares=None) -> l
     extra = tuple(getattr(settings, "extra_feeds", ()) or ())
     lines.append(f"  {'2nd trigger':13s} {','.join(extra) or 'none':16s} (SNIPER_EXTRA_FEEDS; whichever feed "
                  f"signals first)" + ("" if extra in LIVE_EXTRA_FEEDS else "   <- not accepted live"))
-    fair_cap = bool(getattr(settings, "fair_cap", True))
-    lines.append(f"  {'fair caps px':13s} {'yes' if fair_cap else 'no: ask + slip':16s} (SNIPER_FAIR_CAP, "
-                 f"{'env' if os.environ.get('SNIPER_FAIR_CAP') not in (None, '') else 'default'})"
-                 + ("" if fair_cap else "   <- not accepted live"))
-    buy_min = bool(getattr(settings, "kelly_buy_min", False))
-    lines.append(f"  {'kelly < 5 sh':13s} {'buy 5' if buy_min else 'skip':16s} (SNIPER_KELLY_BUY_MIN, "
-                 f"{'env' if os.environ.get('SNIPER_KELLY_BUY_MIN') not in (None, '') else 'default'})"
-                 + ("   <- not accepted live" if buy_min else ""))
     if canary_max_shares is not None:
         target = float(getattr(settings, "max_target_shares", 0) or 0)
         ok = float(canary_max_shares) + 1e-9 >= target

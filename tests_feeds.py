@@ -1557,7 +1557,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # minutes; a lasting pending order no longer blocks later signals forever.
     # 2026-10-15 bug fix: separate failed order tasks pause independently;
     # reused Python object addresses must not suppress a later incident.
-    "sniper_mode.py": "aba38fa07adeca26477509a4bb375cf4c641366101cfc844b123568e05949add",
+    "sniper_mode.py": "e97d06af9374011bc200c22cf196c0ed254498aca8f3708318beafed83387f16",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
@@ -1588,12 +1588,8 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # takingAmount) when it names no trade ids - no order-status wait, no 5-minute pause meanwhile.
     # 2026-10-16: the shadow also prices an order at the fair-value cap (fv: FOK + FAK, same dollars and
     # whole shares x that cap) where ask + slip bound the real cap - diagnostics for exec_eval.py only.
-    # 2026-10-16: SNIPER_FOK_KELLY=1 (paper experiment, default off) sizes a FOK as a FAK is - fair value,
-    # Kelly, share sizing; off, FOK keeps its fixed clip. FAK and live are unchanged.
-    # 2026-10-16: SNIPER_KELLY_BUY_MIN=1 (paper test, default off; live refuses it) buys the venue's
-    # 5-share minimum when Kelly wants to add fewer, while room and cash take it.
-    # 2026-10-16: SNIPER_FAIR_CAP=0 (paper test, default on; live refuses it off): the fair value
-    # gates and sizes, but the price limit is ask + SNIPER_SLIP alone (past the fair value).
+    # 2026-10-16: the FOK paper bot's switches (SNIPER_FOK_KELLY, SNIPER_KELLY_BUY_MIN, SNIPER_FAIR_CAP,
+    # 7e2b214/33fb5b7/eade7a2) removed at the operator's request - the code as before them.
     # 2026-10-16: SNIPER_PAPER_EXTRA_MS (paper only, default 0): paper meets the book that much later
     # than each order's delay - the book's lag behind the venue; +200ms matched 1,154 live orders.
     # Re-approved 2026-10-14 (restart halt): a previous run's unresolved send intents are looked
