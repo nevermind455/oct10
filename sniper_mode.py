@@ -1090,6 +1090,16 @@ class Settings:
         except ValueError:
             self.shadow_ms = ()
         self.shadow_ms = tuple(x for x in self.shadow_ms if 0 <= x <= 5000)
+        # Book trace (diagnostics only): the executable asks and depth at these
+        # ms after the BTC tick, and at the venue's reply, for every order sent.
+        # Empty turns it off. Read from the book history; nothing is sent.
+        raw = os.environ.get("SNIPER_BOOK_TRACE_MS", "0,50,100,150,250")
+        try:
+            self.book_trace_ms = tuple(sorted({int(float(x)) for x in raw.split(",") if x.strip()}))
+        except ValueError:
+            self.book_trace_ms = ()
+        self.book_trace_ms = tuple(x for x in self.book_trace_ms if 0 <= x <= 5000)
+        self.book_trace_levels = max(1, min(20, int(_env_float("SNIPER_BOOK_TRACE_LEVELS", 5))))
         raw = os.environ.get("SNIPER_SHADOW_SLIPS", "0.03,0.04,0.06")
         try:
             self.shadow_slips = tuple(sorted({round(float(x), 4) for x in raw.split(",") if x.strip()}))
@@ -2860,6 +2870,8 @@ class Sniper:
                 # After the send: the shadow sleeps until absolute times anyway.
                 self._spawn(self._shadow(row, plan["token"], plan["other"], plan["cond"],
                                          plan["amount"], plan["cap"], plan["t0"]))
+            if not sign_err:
+                self._start_trace(row, plan)
             self._guard_diag_after_send(side, row, plan)
             return self._spawn(self._finish(side, r_bp, row, plan, fut, t_pc, start_pc, st["sign_pc"]), order=True)
         except Exception as exc:  # noqa: BLE001 - a sniper fault must never stop the bot
@@ -2898,6 +2910,8 @@ class Sniper:
         # event-loop turn between the decision and the wire (None: no warm
         # HTTP/2 connection - the task below then connects and sends).
         started = self.live.start_send(p)
+        plan["order_type"] = p.order_type
+        self._start_trace(row, plan)
         task = self._spawn(self._finish_live(side, r_bp, row, plan, p, t_pc, started), order=True)
         if self.s.shadow_ms:
             self._spawn(self._shadow(row, plan["token"], plan["other"], plan["cond"],
@@ -2954,6 +2968,17 @@ class Sniper:
                        taker_delay=(getattr(p, "rules", None) or {}).get("taker_delay"),
                        live_ts_us=ts, t_tick_to_decided_ms=round((plan["decided_pc"] - t_pc) / 1e6, 2))
             self._latency_live(row, plan, res)
+            reply = res.get("response") if isinstance(res.get("response"), dict) else {}
+            tids = reply.get("tradeIDs") or reply.get("trade_ids")
+            if isinstance(tids, list) and tids:
+                row["reply_trade_ids"] = [str(t) for t in tids]
+            self._trace_response(
+                plan, mono=self._pc_to_mono(plan["decided_pc"] + int(ts["response"]) * 1000)
+                if ts.get("response") is not None else time.monotonic(),
+                source="CLOB" if ts.get("response") is not None else "CLOB (reply handled)",
+                order_type=p.order_type, order_id=res.get("order_id"), kind=kind,
+                venue_status=res.get("venue_status"), http_status=res.get("http_status"), error=res.get("error"),
+                reply={k: reply[k] for k in self.TRACE_REPLY_KEYS if k in reply} or None)
             if "net_send_start" in ts:
                 row["t_decided_to_wire_ms"] = round(ts["net_send_start"] / 1000.0, 2)
                 row["t_signal_to_send_ms"] = round(row["t_tick_to_decided_ms"] + ts["net_send_start"] / 1000.0, 2)
@@ -2963,7 +2988,7 @@ class Sniper:
                     row["t_signal_to_response_ms"] = round(row["t_tick_to_decided_ms"] + ts["response"] / 1000.0, 2)
             if kind == NO_MATCH:
                 self._stamp_fill_confirmed(row, plan)            # the reply says nothing filled
-                self._latency_fill(row, plan, None, "ACK")
+                self._latency_fill(row, plan, None, "ACK", filled=False)
             if p.order_type == "FAK" and row.get("live_send_auto_reconcile"):
                 # Outcome unknown, being reconciled with the venue by the order's
                 # hash (audit M7): held exactly like an accepted FAK whose size is
@@ -3042,6 +3067,7 @@ class Sniper:
             self._observe_live(row)
             self._write(row)
         finally:
+            self._trace_response(plan, mono=None, source="no reply")
             self._release(side)
 
     def _observe_live(self, row: dict) -> None:
@@ -3070,12 +3096,15 @@ class Sniper:
         row.update(shares=shares, price=fill.get("price"), cost=fill["cost"], fee=fill.get("fee", 0),
                    partial=fill.get("partial", False), price_source=fill["source"],
                    fill_statuses=fill.get("statuses", []), reason=None)
+        if fill.get("trade_ids"):
+            row["trade_ids"] = list(fill["trade_ids"])
         self._settle_carry(plan, side, shares)
         if plan.get("target") is not None:
             row["carry_out"] = self.carry[side]
         self._stamp_fill_confirmed(row, plan, fill.get("seen_mono"))
         lat = self._latency_fill(row, plan, fill.get("seen_mono"),
-                                 "ORDER_STATUS" if fill.get("source") == "terminal order status" else "PRIVATE_WS")
+                                 "ORDER_STATUS" if fill.get("source") == "terminal order status" else "PRIVATE_WS",
+                                 filled=shares > 0)
         if shares > 0:
             rd[side] += shares
             self._note_fill(plan["end"], side, shares, float(fill["cost"]) + float(fill.get("fee", 0) or 0))
@@ -3399,7 +3428,11 @@ class Sniper:
                                             "error": getattr(self.broker, "last_error", None)}
             fill = result["fill"] or {}
             filled = bool(ok and fill.get("tag") == "sniper")
-            self._latency_paper(row, plan, st)
+            self._latency_paper(row, plan, st, filled=filled and float(fill.get("shares") or 0) > 0)
+            self._trace_response(plan, mono=self._pc_to_mono(st.get("matched_pc")), source="SIMULATED",
+                                 order_type=plan.get("order_type"), order_id=fill.get("order_id") if filled else None,
+                                 kind="FILLED" if filled else "NO_FILL",
+                                 error=None if filled else str(sign_err or result["error"] or "")[:200] or None)
             row["outcome"] = self._outcome(filled, None if filled else (sign_err or result["error"]),
                                            row, history=self._history_book() is not None)
             arrival = row.get("arrival")
@@ -3462,14 +3495,16 @@ class Sniper:
             self.quality.observe(row)
             self._write(row)
         finally:
+            self._trace_response(plan, mono=None, source="no reply")
             self._release(side)
 
     # ---------------------------------------------------------------- T0..T7 (after the send)
     SIMULATED = ("send_to_ack", "trigger_to_ack", "ack_to_fill", "trigger_to_fill")
 
-    def _latency_paper(self, row: dict, plan: dict, st: dict) -> None:
+    def _latency_paper(self, row: dict, plan: dict, st: dict, filled: bool = True) -> None:
         """Paper: T0..T5 are measured here; the venue's ACK and the fill are
-        the modelled match (row lat_*_source SIMULATED)."""
+        the modelled match (row lat_*_source SIMULATED). A zero-fill order
+        has an ACK but no fill time."""
         if st.get("sent_pc") is None:
             return
         lat = exec_latency.stages(t0=plan.get("t_pc"), t1=plan.get("trig_pc"), t2=plan.get("decided_pc"),
@@ -3477,8 +3512,9 @@ class Sniper:
                                   t5=st.get("sent_pc"), t6=st.get("matched_pc"))
         if st.get("matched_pc") is not None:
             lat = exec_latency.with_fill(lat, t_ms=plan["t_ms"], t0=plan.get("t_pc"), t1=plan.get("trig_pc"),
-                                         seen_mono=None)
-            row["lat_fill_source"] = "SIMULATED"
+                                         seen_mono=None, filled=filled)
+            if filled:
+                row["lat_fill_source"] = "SIMULATED"
         row.update(lat=lat, lat_ack_source="SIMULATED")
         self.latency.add(lat, simulated=self.SIMULATED)
 
@@ -3493,10 +3529,11 @@ class Sniper:
         if lat.get("trigger_to_ack") is not None:
             row["lat_ack_source"] = "CLOB"
 
-    def _latency_fill(self, row: dict, plan: dict, seen_mono, source: str) -> dict:
-        """T7: the first authoritative observation of the fill quantity."""
+    def _latency_fill(self, row: dict, plan: dict, seen_mono, source: str, filled: bool = True) -> dict:
+        """T7: the first authoritative observation of the fill quantity (none
+        for a zero fill: no shares, no fill time)."""
         lat = exec_latency.with_fill(dict(row.get("lat") or {}), t_ms=plan["t_ms"] if "t_ms" in plan else plan["t0"] * 1000.0,
-                                     t0=plan.get("t_pc"), t1=plan.get("trig_pc"), seen_mono=seen_mono)
+                                     t0=plan.get("t_pc"), t1=plan.get("trig_pc"), seen_mono=seen_mono, filled=filled)
         row["lat"] = lat
         if lat.get("trigger_to_fill") is not None:
             row["lat_fill_source"] = source
@@ -3730,6 +3767,134 @@ class Sniper:
         if mid5 is not None and sh > 0:
             out["mk5"] = round((float(mid5) - px - fee / sh) * 100, 3)
         return out
+
+    # ---------------------------------------------------------------- book trace (diagnostics only)
+    TRACE_RESP_WAIT_S = 15.0       # the longest the trace waits for the venue's reply
+    USER_TRADES_WAIT_S = 90.0      # an accepted order's trades: until all are terminal, at most this
+    NO_MATCH_TRADES_WAIT_S = 5.0   # an order the reply says matched nothing: proof that no trade came
+    TRACE_REPLY_KEYS = ("success", "status", "errorMsg", "orderID", "tradeIDs", "makingAmount", "takingAmount",
+                        "transactionsHashes")
+    TRADE_TERMINAL = ("CONFIRMED", "FAILED", "CONFLICT")
+
+    @staticmethod
+    def _pc_to_mono(pc):
+        """A perf_counter_ns stamp on the time.monotonic clock (the ticks' clock)."""
+        if pc is None:
+            return None
+        return time.monotonic() - (time.perf_counter_ns() - int(pc)) / 1e9
+
+    def _start_trace(self, row: dict, plan: dict) -> None:
+        """After the send: record the book around this order (_book_trace).
+        The finish handler resolves plan["trace_resp"] with the reply."""
+        if not self.s.book_trace_ms or self._closing:
+            return
+        fut = asyncio.get_running_loop().create_future()
+        plan["trace_resp"] = fut
+        ref = {k: row.get(k) for k in ("id", "side", "wall", "loop_lag_ms", "round_end", "ask_seen", "bp", "feed")}
+        self._spawn(self._book_trace(ref, plan, fut))
+
+    @staticmethod
+    def _trace_response(plan: dict, *, mono, source: str, **ident) -> None:
+        fut = plan.get("trace_resp")
+        if fut is not None and not fut.done():
+            fut.set_result(dict(ident, mono=mono, source=source))
+
+    def _book_point(self, view, cap: float) -> dict:
+        """What a BUY could take at one instant: the best levels, the best bid,
+        and the shares / dollars offered at or under our cap."""
+        if view is None:
+            return {"status": "UNKNOWN"}
+        n = self.s.book_trace_levels
+        asks = [(float(p), float(q)) for p, q in (getattr(view, "asks", ()) or ())]
+        bids = [(float(p), float(q)) for p, q in (getattr(view, "bids", ()) or ())]
+        under = [(p, q) for p, q in asks if p <= float(cap) + 1e-9]
+        out = {"status": str(getattr(view, "status", "")),
+               "bid": bids[0][0] if bids else None, "bid_size": bids[0][1] if bids else None,
+               "asks": [[p, round(q, 4)] for p, q in asks[:n]],
+               "depth_cap_sh": round(sum(q for _p, q in under), 4),
+               "depth_cap_usd": round(sum(p * q for p, q in under), 4)}
+        ts = getattr(view, "exchange_ts_ms", None)
+        if ts is not None:
+            out["book_ts"] = ts
+        return out
+
+    async def _book_trace(self, ref: dict, plan: dict, resp_fut) -> None:
+        """book_trace row: the book at the tick + each SNIPER_BOOK_TRACE_MS and
+        at the venue's reply, with the order's identity and the reply's status.
+        Then, live, the order's trades as the authenticated user channel saw
+        them (user_trades row). Diagnostics only: never the order path."""
+        try:
+            token, cap = plan["token"], float(plan["cap"])
+            t0 = float(plan["t0"])                              # the BTC tick, time.monotonic seconds
+            tick_ms = (float(ref["wall"]) - float(ref.get("loop_lag_ms") or 0) / 1000.0) * 1000.0 \
+                + self.s.venue_offset_ms
+            hist = self._history_book() is not None
+            points = {}
+            for L in self.s.book_trace_ms:
+                view = await self._book_at(token, tick_ms + L, t0 + L / 1000.0)
+                points[str(L)] = self._book_point(view, cap)
+                if not hist:                                    # the book at wake-up: how late it woke
+                    points[str(L)]["late_ms"] = round((time.monotonic() - t0) * 1000.0 - L, 1)
+            try:
+                resp = await asyncio.wait_for(asyncio.shield(resp_fut), self.TRACE_RESP_WAIT_S)
+            except asyncio.TimeoutError:
+                resp = {"source": "no reply in time", "mono": None}
+            resp = dict(resp or {})
+            mono = resp.pop("mono", None)
+            if mono is not None:
+                at = (float(mono) - t0) * 1000.0
+                view = await self._book_at(token, tick_ms + at, float(mono))
+                points["response"] = dict(self._book_point(view, cap), at_ms=round(at, 1))
+            if resp.get("order_type") is None:
+                resp["order_type"] = plan.get("order_type")
+            self._write({"wall": time.time(), "result": "book_trace", "id": ref.get("id"), "side": ref.get("side"),
+                         "round_end": ref.get("round_end"), "condition_id": plan.get("cond"), "token": token,
+                         "live": self.live is not None, "cap": cap, "amount": round(float(plan["amount"]), 4),
+                         "ask_seen": ref.get("ask_seen"), "bp": ref.get("bp"), "feed": ref.get("feed"),
+                         "points": points, **{k: v for k, v in resp.items() if v is not None}})
+            if self.live is not None and resp.get("order_id") and resp.get("kind") is not None:
+                await self._user_trades(ref, resp, t0)
+        except Exception as exc:  # noqa: BLE001 - diagnostics only, never the order path
+            self.n["book trace errors"] += 1
+            self._write({"wall": time.time(), "result": "book_trace_error", "id": ref.get("id"),
+                         "reason": f"{type(exc).__name__}: {exc}"[:200]})
+
+    async def _user_trades(self, ref: dict, resp: dict, t0: float) -> None:
+        """user_trades row: this order's trades from the authenticated user
+        channel (feeds.poly_user) - each trade id with its status, price, size,
+        maker legs, and when we first / last heard of it (ms after the tick).
+        Waits until every trade is terminal and the reply's trade ids are all
+        in, at most USER_TRADES_WAIT_S (no match: NO_MATCH_TRADES_WAIT_S)."""
+        from sniper_live import fills_of_order
+        oid = str(resp["order_id"])
+        expected = {str(t) for t in ((resp.get("reply") or {}).get("tradeIDs") or ())}
+        accepted = resp.get("kind") in ("MATCHED", "PENDING")
+        limit = time.monotonic() + (self.USER_TRADES_WAIT_S if accepted else self.NO_MATCH_TRADES_WAIT_S)
+        while True:
+            rows = fills_of_order(getattr(self.live, "fills", None), oid)
+            ids = {str(f.trade_id) for f in rows}
+            complete = (bool(rows) and expected <= ids
+                        and all(str(f.status or "").upper() in self.TRADE_TERMINAL for f in rows))
+            if complete or self._closing or time.monotonic() >= limit:
+                break
+            await asyncio.sleep(1.0)
+
+        def rel(m):
+            return None if not m else round((float(m) - t0) * 1000.0, 1)
+        trades = [{"trade_id": str(f.trade_id), "status": f.status, "side": f.side, "price": f.price,
+                   "size": f.size, "paid": getattr(f, "paid", None),
+                   "maker_legs": [list(x) for x in (getattr(f, "maker_legs", None) or ())] or None,
+                   "sources": sorted(map(str, getattr(f, "sources", ()) or ())),
+                   "revisions": getattr(f, "revisions", None),
+                   "first_seen_ms": rel(getattr(f, "first_seen", None)),
+                   "last_seen_ms": rel(getattr(f, "last_seen", None))} for f in rows]
+        got = {t["trade_id"] for t in trades}
+        self._write({"wall": time.time(), "result": "user_trades", "id": ref.get("id"), "order_id": oid,
+                     "order_type": resp.get("order_type"), "kind": resp.get("kind"),
+                     "reply_trade_ids": sorted(expected) or None, "trades": trades, "complete": complete,
+                     "missing_reply_ids": sorted(expected - got) or None,
+                     "shares": round(sum(float(f.size or 0) for f in rows
+                                         if str(f.status or "").upper() not in ("FAILED", "CONFLICT")), 6)})
 
     async def _extra_feed(self, name: str) -> None:
         """A second-trigger feed's socket (SNIPER_EXTRA_FEEDS), reconnecting

@@ -643,10 +643,15 @@ def _ms_short(v) -> str:
     return "N/A" if f is None else f"{f:.1f}ms" if f < 10 else f"{f:.0f}ms"
 
 
+UNATTRIBUTED = "Unattributed response delay"
+
+
 def _budget_body(b: dict, w: int, g: Glyphs) -> list[Row]:
-    """LATENCY BUDGET: BTC trade -> our order matched, p50 parts with their
-    share of the trigger feed's total. N/A where not measured yet; 'sim' marks
-    paper's modelled venue time."""
+    """LATENCY BUDGET: BTC trade -> the venue's ACK (its reply to our order),
+    p50 parts with their share of the trigger feed's total. N/A where not
+    measured yet; 'sim' marks paper's modelled venue time. The last part is the
+    reply time no measured part explains (unattributed): matching, queueing
+    and anything else inside the venue - not proof that anything filled."""
     b = b if isinstance(b, dict) else {}
     feeds = b.get("feeds") if isinstance(b.get("feeds"), dict) else {}
     totals = b.get("totals") if isinstance(b.get("totals"), dict) else {}
@@ -655,11 +660,15 @@ def _budget_body(b: dict, w: int, g: Glyphs) -> list[Row]:
              ("Bot in-process", b.get("bot_ms"), Style("green")),
              ("Network > CLOB", b.get("one_way_ms"), Style("amber")),
              ("Polymarket hold", b.get("hold_ms"), Style("dim")),
-             ("Venue match" + (" sim" if b.get("venue_simulated") else ""), b.get("venue_ms"), Style("purple"))]
+             ("", b.get("venue_ms"), Style("purple"))]
+    vw, pw = 6, 4
+    sim = " sim" if b.get("venue_simulated") else ""
+    full = UNATTRIBUTED + sim
+    lw = min(len(full), max(16, w - vw - pw - 3 - 12))          # keep at least a 12-cell bar
+    parts[-1] = ((full if len(full) <= lw else "Unattrib. delay" + sim),) + parts[-1][1:]
     total = _num(totals.get(primary))
     known = sum(_num(v) or 0.0 for _, v, _ in parts)
     base = total if total else known
-    lw, vw, pw = 16, 6, 4
     bw = max(4, w - lw - vw - pw - 3)
     rows = []
     for label, v, style in parts:
@@ -675,7 +684,7 @@ def _budget_body(b: dict, w: int, g: Glyphs) -> list[Row]:
     for k in feeds:
         if k != primary:
             tail += [(f"  via {FEED_SHORT.get(k, k)} ", FAINT), (_ms_short(totals.get(k)), Style("ink"))]
-    rows.append(_runs([(fit("BTC > MATCHED", lw), Style("ink", bold=True)), (" ", PAPER),
+    rows.append(_runs([(fit("BTC > ACK", lw), Style("ink", bold=True)), (" ", PAPER),
                        (head, Style("ink", bold=True))] + tail, w))
     return rows
 
@@ -690,7 +699,7 @@ def _latency_band(snap: dict, cols: int, h: int, g: Glyphs) -> list[Row]:
     if budget is not None and cols >= 150:
         w = hsplit(cols, (1.4, 1.15, 0.85), (66, 46, 34))
         return join([panel(title, _latency_body(ex.get("latency"), w[0] - 2)[:body_h], w[0], h, g),
-                     panel("LATENCY BUDGET  BTC trade > matched (p50)", _budget_body(budget, w[1] - 2, g)[:body_h],
+                     panel("LATENCY BUDGET  BTC trade > ACK (p50)", _budget_body(budget, w[1] - 2, g)[:body_h],
                            w[1], h, g),
                      panel("EXECUTION QUALITY", _quality_body(ex.get("quality"), w[2] - 2)[:body_h], w[2], h, g)],
                     w, h)

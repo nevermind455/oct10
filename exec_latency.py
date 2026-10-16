@@ -177,16 +177,17 @@ def _p50(lat: dict, key: str):
 
 
 def latency_budget(feeds: dict, primary: str, lat: dict, clob_rtt_ms, hold_ms: float = VENUE_HOLD_MS) -> dict:
-    """BTC trade -> our order matched at Polymarket, as p50 parts in ms (None
+    """BTC trade -> the venue's ACK of our order, as p50 parts in ms (None
     where not measured yet - never a guess):
 
       feed     the trigger feed's delay, per feed (receipt - the trade's own time)
       bot      feed message in -> bytes on the wire (feed_to_trigger + trigger_to_send)
       network  one way to the CLOB: half the measured round trip
       hold     the venue's documented taker hold
-      venue    the rest of send -> match. LIVE measures send -> reply, and the reply
-               comes one leg after the match, so match = reply - one way. PAPER's
-               send -> ACK is its modelled match itself (venue_simulated).
+      venue    the unattributed response delay: what is left of send -> ACK after
+               the network legs and the hold (matching, queueing, anything else
+               inside the venue). LIVE measures send -> reply; PAPER's send -> ACK
+               is its modelled match itself (venue_simulated). An ACK is not a fill.
 
     totals: per feed, the sum when every part is known."""
     lat = lat if isinstance(lat, dict) else {}
@@ -238,11 +239,16 @@ def live_stamps(decided_pc: int, ts_us: dict) -> dict:
             "t6": at("response")}
 
 
-def with_fill(lat: dict, *, t_ms: float, t0: int | None, t1: int | None, seen_mono: float | None) -> dict:
+def with_fill(lat: dict, *, t_ms: float, t0: int | None, t1: int | None, seen_mono: float | None,
+              filled: bool = True) -> dict:
     """Add T7: trigger -> fill known and ACK -> fill known. seen_mono is
     time.monotonic seconds (the tick's clock); None means the reply itself
     settled the quantity (T7 = T6). Never earlier than the ACK: the order id
-    the fill is matched by comes in the reply."""
+    the fill is matched by comes in the reply. filled=False (zero shares):
+    there is no fill to time, so no T7 - the dashboard shows N/A, never the
+    ACK passed off as a fill."""
+    if not filled:
+        return {k: v for k, v in lat.items() if k not in ("trigger_to_fill", "ack_to_fill")}
     ack = lat.get("trigger_to_ack")
     if seen_mono is None:
         fill = ack

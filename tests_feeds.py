@@ -1557,7 +1557,14 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # minutes; a lasting pending order no longer blocks later signals forever.
     # 2026-10-15 bug fix: separate failed order tasks pause independently;
     # reused Python object addresses must not suppress a later incident.
-    "sniper_mode.py": "e97d06af9374011bc200c22cf196c0ed254498aca8f3708318beafed83387f16",
+    # 2026-10-16, the operator's request (measurement only; no decision, size, cap or gate
+    # changes - tests_book_trace): a zero-fill order records no trigger->fill time (the
+    # dashboard's TRIG>FILL reads N/A instead of the ACK); every order sent gets a book_trace
+    # row (asks and depth at or under its cap at tick +0/50/100/150/250ms and at the reply,
+    # order type, reply status, order id) and, live, a user_trades row (its trades from the
+    # authenticated user channel). Live order/fill rows carry the reply's / fill's trade ids.
+    # SNIPER_BOOK_TRACE_MS="" turns the trace off.
+    "sniper_mode.py": "f622e84dc8dc687c1288b705407a242616999745dd8e944aaa5d5e5966f278f5",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.

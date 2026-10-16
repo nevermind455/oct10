@@ -287,24 +287,89 @@ class LiveFast(unittest.TestCase):
                 self.sn._sync_live_fak()
                 miss = self.rows("refused")[-1]
                 upd = self.rows("live_fill_update")[-1]
-                for r, fill_src in ((miss, "ACK"), (upd, "PRIVATE_WS")):
+                for r, fill_src in ((miss, None), (upd, "PRIVATE_WS")):
                     lat = r["lat"]
+                    no_fill = ("ack_to_fill", "trigger_to_fill") if fill_src is None else ()
                     for k in X.STAGES + X.TOTALS:
-                        self.assertIn(k, lat, (k, lat))
+                        if k in no_fill:
+                            self.assertNotIn(k, lat, (k, lat))             # zero shares: no fill to time
+                        else:
+                            self.assertIn(k, lat, (k, lat))
                     parts = lat["trigger_to_decision"] + lat["build"] + lat["sign"] + lat["dispatch"]
                     self.assertAlmostEqual(parts, lat["trigger_to_send"], delta=0.002)
                     self.assertGreaterEqual(lat["trigger_to_ack"], lat["trigger_to_send"])
-                    self.assertGreaterEqual(lat["trigger_to_fill"], lat["trigger_to_ack"])
+                    if fill_src is not None:
+                        self.assertGreaterEqual(lat["trigger_to_fill"], lat["trigger_to_ack"])
                     self.assertEqual(r["lat_ack_source"], "CLOB")
-                    self.assertEqual(r["lat_fill_source"], fill_src)
-                self.assertEqual(miss["lat"]["ack_to_fill"], 0.0)              # the reply said: nothing filled
+                    self.assertEqual(r.get("lat_fill_source"), fill_src)
                 q = self.sn.summary()["exec_quality"]
                 self.assertTrue(upd["partial"])                              # 5 of a 10+ share target
                 self.assertEqual((q["attempted"], q["sent"], q["acked"], q["zero_fill"], q["partial"], q["pending"]),
                                  (2, 2, 2, 1, 1, 0))
                 lat = self.sn.summary()["exec_latency"]
                 self.assertEqual(lat["trigger_to_send"]["n"], 2)
+                self.assertEqual(lat["trigger_to_fill"]["n"], 1)             # only the order that filled
                 self.assertFalse(lat["trigger_to_send"]["simulated"])
+            finally:
+                await self.teardown_live()
+        self.run_async(go())
+
+    # ---- the book around each live order, and its trades from the authenticated user channel
+    def test_book_trace_and_user_trades_on_the_live_path(self):
+        async def go():
+            # the local clock: this test book is quiet, so the exchange clock could never
+            # prove a later instant (a live book updates many times a second)
+            await self.setup_live(env={"SNIPER_BOOK_CLOCK": "local"})
+            try:
+                self.sn.USER_TRADES_WAIT_S = 3.0
+                self.sn.NO_MATCH_TRADES_WAIT_S = 0.1
+                self.script("no_match")
+                self.arm()
+                self.tick(self.raw("UP"))
+                await self.settle("UP")
+                oid, tid = self.script("matched")
+                self.arm()
+                self.tick(self.raw("DOWN"))
+                await self.settle("DOWN")
+                self.store.record_trade(tid, order_id=oid, asset_id=T.DN, market=T.COND, side="BUY", price=0.45,
+                                        size=5.0, status="CONFIRMED")
+                self.sn._sync_live_fak()
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline and (len(self.rows("book_trace")) < 2 or not self.rows("user_trades")):
+                    await asyncio.sleep(0.02)
+                traces = self.rows("book_trace")
+                self.assertEqual(len(traces), 2, traces)
+                miss, hit = traces
+                for t in traces:
+                    self.assertEqual(list(t["points"]), ["0", "50", "100", "150", "250", "response"])
+                    self.assertTrue(t["live"])
+                    self.assertEqual(t["order_type"], "FAK")
+                    self.assertEqual(t["source"], "CLOB")
+                    self.assertGreater(t["points"]["response"]["at_ms"], 0)
+                    for pt in t["points"].values():
+                        self.assertEqual(pt["status"], "LIVE", json.dumps(t["points"]))
+                        self.assertTrue(pt["asks"])
+                        self.assertGreater(pt["depth_cap_sh"], 0)
+                self.assertEqual(miss["kind"], "NO_MATCH")
+                self.assertEqual((hit["kind"], hit["order_id"]), ("MATCHED", oid))
+                self.assertEqual(hit["reply"]["tradeIDs"], [tid])
+                self.assertEqual(hit["points"]["0"]["asks"][0], [0.45, 500.0])
+                order = [r for r in self.rows() if r.get("order_id") == oid]
+                self.assertEqual([r["reply_trade_ids"] for r in order if r.get("result") in ("pending", "filled")],
+                                 [[tid]], [(r.get("result"), r.get("reply_trade_ids")) for r in order])
+                upd = self.rows("live_fill_update")[-1]
+                self.assertEqual(upd["trade_ids"], [tid])
+                ut = self.rows("user_trades")
+                self.assertEqual(len(ut), 1, ut)                       # NO_MATCH had no order id to follow
+                ut = ut[0]
+                self.assertEqual((ut["order_id"], ut["order_type"], ut["kind"]), (oid, "FAK", "MATCHED"))
+                self.assertTrue(ut["complete"])
+                self.assertEqual(ut["reply_trade_ids"], [tid])
+                self.assertIsNone(ut["missing_reply_ids"])
+                self.assertEqual(ut["shares"], 5.0)
+                (tr,) = ut["trades"]
+                self.assertEqual((tr["trade_id"], tr["status"], tr["price"], tr["size"]), (tid, "CONFIRMED", 0.45, 5.0))
+                self.assertGreater(tr["first_seen_ms"], 0)
             finally:
                 await self.teardown_live()
         self.run_async(go())
