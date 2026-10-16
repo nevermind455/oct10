@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """SNIPER_FOK_KELLY (2026-10-16, the operator's paper experiment): a FOK sized
 as a FAK is - fair value, half Kelly, share sizing - so the two differ in the
-order type only. No network.
+order type only. SNIPER_KELLY_BUY_MIN (same day): Kelly under the venue's
+5-share minimum buys the minimum instead of skipping. No network.
 
     python tests_fok_kelly.py
 """
@@ -77,6 +78,74 @@ class FokKelly(unittest.TestCase):
         b = self.fire(self.gate(SNIPER_ORDER_SIZING="shares", SNIPER_FOK_KELLY="1"), [(0.41, 1000)], [(0.41, 1000)])
         for k in ("kelly_shares", "target_shares", "order_shares", "amount", "cap"):
             self.assertEqual(a[k], b[k], k)
+
+
+class KellyBuyMin(unittest.TestCase):
+    """SNIPER_KELLY_BUY_MIN (2026-10-16, paper): Kelly under the venue's 5-share
+    minimum buys the minimum instead of skipping - while Kelly wants to add
+    shares and cash pays for them."""
+    FOK = dict(SNIPER_ORDER_TYPE="FOK", SNIPER_FOK_KELLY="1", SNIPER_ORDER_SIZING="shares")
+    gate, fire = FokKelly.gate, FokKelly.fire
+    SMALL = 2.5                     # Kelly ~1 share here; 5 sh x the cap is about $2.30
+
+    def test_kelly_under_five_buys_five(self):
+        g = self.gate(self.SMALL, SNIPER_KELLY_BUY_MIN="1", **self.FOK)
+        self.assertIn("under 5 sh: buys 5", g.sn.s.lines()[0])
+        r = self.fire(g, [(0.41, 1000)], [(0.41, 1000)])
+        self.assertEqual(r["result"], "filled", r.get("reason"))
+        self.assertLess(r["kelly_shares"], 5)                                   # what Kelly said
+        self.assertTrue(r["kelly_buy_min"])
+        self.assertEqual(r["target_shares"], 5)
+        self.assertEqual(r["order_shares"], 5)
+        limit = math.floor(r["cap"] * 100 + 1e-9) / 100
+        self.assertAlmostEqual(r["amount"], 5 * limit, places=6)
+
+    def test_without_the_switch_it_still_skips(self):
+        r = self.fire(self.gate(self.SMALL, **self.FOK), [(0.41, 1000)], [(0.41, 1000)])
+        self.assertEqual(r["result"], "skipped")
+        self.assertEqual(r["reason"], "kelly size under the 5-share minimum")
+        self.assertNotIn("kelly_buy_min", r)
+
+    def test_cash_under_the_minimum_skips(self):
+        r = self.fire(self.gate(1.5, SNIPER_KELLY_BUY_MIN="1", **self.FOK), [(0.41, 1000)], [(0.41, 1000)])
+        self.assertEqual(r["result"], "skipped")
+        self.assertEqual(r["reason"], "kelly size under the 5-share minimum")
+
+    def test_no_second_minimum_once_kelly_is_held(self):
+        g = self.gate(self.SMALL, SNIPER_KELLY_BUY_MIN="1", **self.FOK)
+        g.sn._kelly_inventory = lambda *a, **k: (5.0, 0.0)                      # the first minimum, held
+        r = self.fire(g, [(0.41, 1000)], [(0.41, 1000)])
+        self.assertEqual(r["result"], "skipped")
+        self.assertEqual(r["reason"], "kelly size under the 5-share minimum")
+
+    def test_the_room_still_bounds_it(self):
+        g = self.gate(self.SMALL, SNIPER_KELLY_BUY_MIN="1", SNIPER_MAX_SIDE_SHARES="5", **self.FOK)
+        self.assertEqual(g.sn.s.max_side_shares, 5)                              # 5 sh of room: 5.6 at the ask won't fit
+        r = self.fire(g, [(0.41, 1000)], [(0.41, 1000)])
+        self.assertEqual(r["result"], "skipped")
+        self.assertEqual(r["reason"], "kelly room under venue minimum at price cap")
+
+    def test_fak_takes_the_switch_too(self):
+        r = self.fire(self.gate(self.SMALL, SNIPER_KELLY_BUY_MIN="1", SNIPER_ORDER_SIZING="shares"),
+                      [(0.41, 1000)], [(0.41, 1000)])
+        self.assertEqual(r["result"], "filled", r.get("reason"))
+        self.assertEqual(r["order_shares"], 5)
+
+    def test_live_refuses_it(self):
+        import exec_latency
+        on = self.gate(SNIPER_KELLY_BUY_MIN="1").sn.s
+        off = self.gate().sn.s
+        self.assertTrue(any("SNIPER_KELLY_BUY_MIN" in v for v in exec_latency.spec_violations(on)))
+        self.assertFalse(any("SNIPER_KELLY_BUY_MIN" in v for v in exec_latency.spec_violations(off)))
+        self.assertTrue(any("buy 5" in ln for ln in exec_latency.effective_config_lines(on, live=False)))
+
+    def test_kelly_wanted_is_kelly_shares_before_rounding(self):
+        import sniper_mode as S
+        for held, opp in ((0.0, 0.0), (3.0, 0.0), (0.0, 4.0)):
+            w = S.kelly_wanted(0.62, 0.41, 0.07, 0.5, 40.0, held_shares=held, opposite_shares=opp)
+            sh, _f = S.kelly_shares(0.62, 0.41, 0.07, 0.5, 40.0, 1000.0, held_shares=held, opposite_shares=opp)
+            self.assertEqual(sh, max(0.0, math.floor(w + 1e-9)))
+        self.assertEqual(S.kelly_wanted(0.40, 0.41, 0.07, 0.5, 40.0), 0.0)        # no edge: nothing
 
 
 if __name__ == "__main__":
