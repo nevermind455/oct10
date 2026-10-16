@@ -1044,6 +1044,14 @@ class Settings:
             raise ValueError("SNIPER_DELAY_SOURCE=live and SNIPER_LATENCY_MS are exclusive: unset SNIPER_LATENCY_MS")
         self.delay_journal = (os.environ.get("SNIPER_DELAY_JOURNAL") or os.environ.get("LIVE_SNIPER_JOURNAL")
                               or "live_sniper.jsonl")
+        # Paper realism (2026-10-16, calibrated on 1,154 live orders): the recorded book lags what
+        # the venue matched - faster takers ahead of us in the hold are not in it yet - so paper
+        # filled 31% of live's own orders (live 21%) for +$210.68 (live +$1.42), +$202 of it on
+        # fills live never got. Meeting the book 200ms later than each order's measured delay
+        # matched live: 21% vs 21%, +$7.00 vs +$1.42. Paper only (live's orders meet the real venue).
+        self.paper_extra_ms = _env_float("SNIPER_PAPER_EXTRA_MS", 0.0)
+        if not math.isfinite(self.paper_extra_ms) or not 0.0 <= self.paper_extra_ms <= 5000.0:
+            raise ValueError(f"invalid SNIPER_PAPER_EXTRA_MS {self.paper_extra_ms!r}: 0..5000 ms")
         self.delay_note = ""                   # set by a paper Sniper once the live delays are loaded
         # Per side: an order on one side starts that side's cooldown only.
         self.cooldown_ms = _env_float("SNIPER_COOLDOWN_MS", 300)
@@ -1258,6 +1266,10 @@ class Settings:
         return (" (sized as whole shares x the cap: under the cap the saving buys extra shares)"
                 if self.order_sizing == "shares" else " (sent as their book cost: more shares only if the ask falls)")
 
+    def extra_text(self) -> str:
+        return (f" + {self.paper_extra_ms:.0f}ms calibration (the book's lag behind the venue, from live)"
+                if self.paper_extra_ms else "")
+
     def fair_text(self) -> str:
         if not self.fair:
             return ""
@@ -1283,9 +1295,9 @@ class Settings:
         return [f"SNIPER paper-only{self.lead_text()}: spot mid >= {self.k_bp}bp within {self.window_ms:.0f}ms -> {self.order_type} "
                 f"{self.shares:.0f} sh{self.carry_text()} at ask+{self.slip:.2f}{self.sizing_text()}, "
                 + (f"matched {self.latency_ms:.0f}ms after deciding (fixed); " if self.fixed_latency else
-                   f"real order signing + {self.delay_note}; " if self.delay_note else
+                   f"real order signing + {self.delay_note}{self.extra_text()}; " if self.delay_note else
                    f"live-like: real order signing + measured one-way to the CLOB + {self.hold_ms:.0f}ms hold "
-                   f"+ {self.server_ms:.0f}ms server allowance; ")
+                   f"+ {self.server_ms:.0f}ms server allowance{self.extra_text()}; ")
                 + f"cooldown {self.cooldown_ms:.0f}ms per side, >= {self.min_left_s:.0f}s left, "
                 f"<= {self.max_fills_round} fills and {self.max_side_shares:.0f} sh/side per round"
                 + self.fair_text()
@@ -2367,14 +2379,18 @@ class Sniper:
         """
         if self.s.fixed_latency:
             return self.s.latency_ms, {"latency_mode": "fixed"}
+        # SNIPER_PAPER_EXTRA_MS: paper only - a live order meets the real venue
+        extra = float(getattr(self.s, "paper_extra_ms", 0.0) or 0.0) if self.live is None else 0.0
+        tag = {"extra_ms": extra} if extra else {}
         if self._live_delays:
             d = self._rng.choice(self._live_delays)
-            return d, {"latency_mode": "live-sampled", "delay_ms": round(d, 1), "delay_n": len(self._live_delays)}
+            return d + extra, {"latency_mode": "live-sampled", "delay_ms": round(d, 1),
+                               "delay_n": len(self._live_delays), **tag}
         measured = bool(self.net_rtt)
         net = sorted(self.net_rtt)[len(self.net_rtt) // 2] / 2.0 if measured else self.s.net_default_ms
         parts = {"latency_mode": "live-like", "net_ms": round(net, 1), "net_measured": measured,
-                 "hold_ms": self.s.hold_ms, "server_ms": self.s.server_ms}
-        return net + self.s.hold_ms + self.s.server_ms, parts
+                 "hold_ms": self.s.hold_ms, "server_ms": self.s.server_ms, **tag}
+        return net + self.s.hold_ms + self.s.server_ms + extra, parts
 
     def _sign_now(self, plan):
         """(sign_ms, error or None, signed order) - signs on the calling thread, as live would."""
