@@ -3853,13 +3853,15 @@ class Sniper:
                          "ask_seen": ref.get("ask_seen"), "bp": ref.get("bp"), "feed": ref.get("feed"),
                          "points": points, **{k: v for k, v in resp.items() if v is not None}})
             if self.live is not None and resp.get("order_id") and resp.get("kind") is not None:
-                await self._user_trades(ref, resp, t0)
+                await self._user_trades(ref, resp, t0, token=token, tick_ms=tick_ms,
+                                        reply_ms=None if mono is None else tick_ms + (float(mono) - t0) * 1000.0)
         except Exception as exc:  # noqa: BLE001 - diagnostics only, never the order path
             self.n["book trace errors"] += 1
             self._write({"wall": time.time(), "result": "book_trace_error", "id": ref.get("id"),
                          "reason": f"{type(exc).__name__}: {exc}"[:200]})
 
-    async def _user_trades(self, ref: dict, resp: dict, t0: float) -> None:
+    async def _user_trades(self, ref: dict, resp: dict, t0: float, *, token=None, tick_ms=None,
+                           reply_ms=None) -> None:
         """user_trades row: this order's trades from the authenticated user
         channel (feeds.poly_user) - each trade id with its status, price, size,
         maker legs, and when we first / last heard of it (ms after the tick).
@@ -3889,12 +3891,52 @@ class Sniper:
                    "first_seen_ms": rel(getattr(f, "first_seen", None)),
                    "last_seen_ms": rel(getattr(f, "last_seen", None))} for f in rows]
         got = {t["trade_id"] for t in trades}
-        self._write({"wall": time.time(), "result": "user_trades", "id": ref.get("id"), "order_id": oid,
+        match = self._venue_match(token, trades, tick_ms, reply_ms)
+        if match.get("match_after_tick_ms") is not None:
+            self.latency.add({"trigger_to_match": match["match_after_tick_ms"]})
+        self._write({"wall": time.time(), "result": "user_trades", "id": ref.get("id"), "order_id": oid, **match,
                      "order_type": resp.get("order_type"), "kind": resp.get("kind"),
                      "reply_trade_ids": sorted(expected) or None, "trades": trades, "complete": complete,
                      "missing_reply_ids": sorted(expected - got) or None,
                      "shares": round(sum(float(f.size or 0) for f in rows
                                          if str(f.status or "").upper() not in ("FAILED", "CONFLICT")), 6)})
+
+    MATCH_LOOKBACK_MS = 1000.0     # trade prints this long before the tick still count (clock skew)
+    MATCH_LOOKAHEAD_MS = 2000.0    # and this long after the reply
+
+    def _venue_match(self, token, trades: list, tick_ms, reply_ms) -> dict:
+        """The venue's own match time for our trades, from the public market
+        channel's trade prints (millisecond venue stamps): a BUY print on our
+        token at one of our trades' prices whose size is that trade's size or
+        one of its maker legs. The earliest such print is the match.
+        match_after_tick_ms: tick -> match on the venue's clock (our tick wall
+        time shifted by SNIPER_VENUE_CLOCK_OFFSET_MS); ack_after_match_ms:
+        match -> the reply. {} when there is nothing to look in."""
+        market = getattr(self.hub, "market", None)
+        look = getattr(market, "trades_between", None)
+        mine = [t for t in trades if str(t.get("status") or "").upper() not in ("FAILED", "CONFLICT")
+                and t.get("size") and t.get("price")]
+        if look is None or not token or tick_ms is None or not mine:
+            return {}
+        hi = (reply_ms if reply_ms is not None else tick_ms + 5000.0) + self.MATCH_LOOKAHEAD_MS
+        prints = look(token, tick_ms - self.MATCH_LOOKBACK_MS, hi)
+        sizes = set()
+        prices = set()
+        for t in mine:
+            sizes.add(round(float(t["size"]), 4))
+            prices.add(round(float(t["price"]), 4))
+            for q, px in (t.get("maker_legs") or ()):
+                sizes.add(round(float(q), 4))
+                prices.add(round(float(px), 4))
+        hits = [p for p in prints if p.get("side") in (None, "BUY") and p.get("size") is not None
+                and round(float(p["size"]), 4) in sizes and round(float(p["price"]), 4) in prices]
+        out = {"match_prints_seen": len(prints), "match_prints_hit": len(hits)}
+        if hits:
+            first = min(float(p["ts"]) for p in hits)
+            out.update(venue_match_ms=int(first), match_after_tick_ms=round(first - tick_ms, 1))
+            if reply_ms is not None:
+                out["ack_after_match_ms"] = round(reply_ms - first, 1)
+        return out
 
     async def _extra_feed(self, name: str) -> None:
         """A second-trigger feed's socket (SNIPER_EXTRA_FEEDS), reconnecting

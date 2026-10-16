@@ -165,5 +165,87 @@ class FillLatencyMath(unittest.TestCase):
         self.assertIn("N/A", line, text)
 
 
+
+class TradePrints(unittest.TestCase):
+    """feeds.poly_market keeps each token's trade prints (venue ms, price, size, side)."""
+
+    def feed(self):
+        from feeds.book import BookState
+        from feeds.poly_market import PolyMarketFeed
+        book = BookState()
+        book.connected = True
+        book.set_active(["A", "B"])
+        now = int(time.time() * 1000)
+        for token in book.active:
+            book.apply_snapshot(token, [(0.4, 10)], [(0.6, 10)], ts_ms=now)
+        feed = PolyMarketFeed(book=book)
+        feed.set_tokens(["A", "B"])
+        return feed, now
+
+    def test_prints_are_kept_with_size_and_side_and_pruned_with_their_token(self):
+        feed, now = self.feed()
+        for dt_, price, size, side in ((1, ".45", "5", "BUY"), (2, ".46", "3.5", "SELL"), (3, ".47", None, "BUY")):
+            feed._handle(json.dumps({"event_type": "last_trade_price", "asset_id": "A", "timestamp": now + dt_,
+                                     "price": price, "size": size, "side": side}))
+        got = feed.trades_between("A", now, now + 10)
+        self.assertEqual([(t["ts"], t["price"], t["size"], t["side"]) for t in got],
+                         [(now + 1, .45, 5.0, "BUY"), (now + 2, .46, 3.5, "SELL"), (now + 3, .47, None, "BUY")])
+        self.assertEqual(feed.trades_between("A", now + 2, now + 2)[0]["side"], "SELL")
+        self.assertEqual(feed.trades_between("B", now, now + 10), [])
+        feed.set_tokens(["B", "C"])
+        self.assertEqual(feed.trades_between("A", now, now + 10), [])
+
+    def test_a_rejected_print_is_not_kept(self):
+        feed, now = self.feed()
+        feed._handle(json.dumps({"event_type": "last_trade_price", "asset_id": "A", "timestamp": now + 5,
+                                 "price": ".5", "size": "5", "side": "BUY"}))
+        feed._handle(json.dumps({"event_type": "last_trade_price", "asset_id": "A", "timestamp": now + 1,
+                                 "price": ".5", "size": "7", "side": "BUY"}))      # out of order: rejected
+        self.assertEqual([t["size"] for t in feed.trades_between("A", now, now + 10)], [5.0])
+
+
+class VenueMatch(unittest.TestCase):
+    """Sniper._venue_match: our trade found among the market's prints."""
+
+    def sniper(self, prints):
+        hub = Hub()
+        hub.market = types.SimpleNamespace(
+            trades_between=lambda token, lo, hi: [p for p in prints if lo <= p["ts"] <= hi])
+        return S.Sniper(hub, Broker(), settings=_settings(), journal_path=None)
+
+    MINE = [{"trade_id": "t1", "status": "CONFIRMED", "price": 0.45, "size": 5.0, "maker_legs": [[3.0, 0.45], [2.0, 0.44]]}]
+
+    def test_the_earliest_print_of_our_size_or_a_leg_is_the_match(self):
+        prints = [{"ts": 10_050, "price": 0.45, "size": 7.0, "side": "BUY"},     # someone else's size
+                  {"ts": 10_080, "price": 0.45, "size": 5.0, "side": "SELL"},    # wrong side
+                  {"ts": 10_120, "price": 0.44, "size": 2.0, "side": "BUY"},     # our second leg
+                  {"ts": 10_121, "price": 0.45, "size": 3.0, "side": "BUY"},     # our first leg
+                  {"ts": 9_000 - 1, "price": 0.45, "size": 5.0, "side": "BUY"}]  # before the window
+        out = self.sniper(prints)._venue_match("tok", self.MINE, tick_ms=10_000.0, reply_ms=10_300.0)
+        self.assertEqual(out["venue_match_ms"], 10_120)
+        self.assertEqual(out["match_after_tick_ms"], 120.0)
+        self.assertEqual(out["ack_after_match_ms"], 180.0)
+        self.assertEqual((out["match_prints_seen"], out["match_prints_hit"]), (4, 2))
+
+    def test_no_print_no_match_and_failed_trades_are_ignored(self):
+        sn = self.sniper([{"ts": 10_100, "price": 0.45, "size": 5.0, "side": "BUY"}])
+        failed = [dict(self.MINE[0], status="FAILED")]
+        self.assertEqual(sn._venue_match("tok", failed, 10_000.0, 10_300.0), {})
+        self.assertEqual(self.sniper([])._venue_match("tok", self.MINE, 10_000.0, 10_300.0),
+                         {"match_prints_seen": 0, "match_prints_hit": 0})
+        no_feed = S.Sniper(Hub(), Broker(), settings=_settings(), journal_path=None)
+        self.assertEqual(no_feed._venue_match("tok", self.MINE, 10_000.0, 10_300.0), {})
+
+    def test_the_dashboard_shows_trig_match_and_keeps_trig_fill_in_eight_rows(self):
+        from dashboard.sniper_layout import _latency_body
+        lat = {k: {"n": 2, "p50": v, "last": v} for k, v in
+               (("trigger_to_send", 1.1), ("trigger_to_match", 120.0), ("trigger_to_ack", 300.0),
+                ("trigger_to_fill", 310.0), ("feed_to_trigger", 0.02), ("send_to_ack", 299.0))}
+        rows = _latency_body(lat, 60, max_rows=6)[:6]
+        text = "\n".join("".join(r[0] if isinstance(r, tuple) else getattr(r, "text", str(r)) for r in row)
+                         if isinstance(row, list) else str(row) for row in rows)
+        for label in ("TRIG>SEND", "TRIG>MATCH", "TRIG>ACK", "TRIG>FILL"):
+            self.assertIn(label, text, text)
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

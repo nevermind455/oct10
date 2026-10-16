@@ -18,6 +18,7 @@ reconnect (and therefore does not cost a resync of the other token).
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import math
 import threading
@@ -32,6 +33,17 @@ from .tls import ws_ssl
 
 MARKET_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 PING_EVERY = 10.0
+
+
+TRADE_PRINTS_KEPT = 2000          # per token: minutes of prints even in a busy round
+
+
+def _finite(v) -> float | None:
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return f if math.isfinite(f) else None
 
 
 class PolyMarketFeed(SupervisedFeed):
@@ -60,6 +72,15 @@ class PolyMarketFeed(SupervisedFeed):
         self._pong_event = asyncio.Event()
         self.invalid_messages = 0
         self.last_trade_ts: dict[str, int] = {}
+        # Every accepted trade print per token (venue ms, price, size, taker side),
+        # newest last: lets the sniper find its own trade's venue match time.
+        self.trades: dict[str, collections.deque] = {}
+
+    def trades_between(self, token, lo_ms: float, hi_ms: float) -> list[dict]:
+        """Copies of this token's trade prints stamped lo_ms..hi_ms (venue ms)."""
+        with self._sub_lock:
+            q = list(self.trades.get(str(token)) or ())
+        return [{"ts": t, "price": p, "size": s, "side": side} for t, p, s, side in q if lo_ms <= t <= hi_ms]
 
     # ----------------------------------------------------------- rotation
     def set_tokens(self, tokens) -> None:
@@ -77,6 +98,7 @@ class PolyMarketFeed(SupervisedFeed):
                     token: price for token, price in self.last_trade_price.items()
                     if token in keep
                 }
+                self.trades = {token: q for token, q in self.trades.items() if token in keep}
                 self.last_trade_ts = {
                     token: timestamp for token, timestamp in self.last_trade_ts.items()
                     if token in keep
@@ -366,6 +388,9 @@ class PolyMarketFeed(SupervisedFeed):
                 self.last_trade_price[token] = price
                 if timestamp is not None:
                     self.last_trade_ts[token] = timestamp
+                size = _finite(m.get("size"))
+                self.trades.setdefault(token, collections.deque(maxlen=TRADE_PRINTS_KEPT)).append(
+                    (timestamp, price, size, str(m.get("side") or "").upper() or None))
         elif et == "best_bid_ask":
             # top-of-book only; the full book is authoritative here - but its
             # time still shows how far the feed has got

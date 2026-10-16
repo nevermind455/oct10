@@ -320,6 +320,10 @@ class LiveFast(unittest.TestCase):
             # the local clock: this test book is quiet, so the exchange clock could never
             # prove a later instant (a live book updates many times a second)
             await self.setup_live(env={"SNIPER_BOOK_CLOCK": "local"})
+            # the public market channel's print of our trade, 120ms after the tick on the venue's clock
+            self.hub.market = types.SimpleNamespace(trades_between=lambda token, lo, hi: [
+                {"ts": lo + self.sn.MATCH_LOOKBACK_MS + 120.0, "price": 0.45, "size": 5.0, "side": "BUY"}]
+                if token == T.DN else [])
             try:
                 self.sn.USER_TRADES_WAIT_S = 3.0
                 self.sn.NO_MATCH_TRADES_WAIT_S = 0.1
@@ -370,6 +374,10 @@ class LiveFast(unittest.TestCase):
                 (tr,) = ut["trades"]
                 self.assertEqual((tr["trade_id"], tr["status"], tr["price"], tr["size"]), (tid, "CONFIRMED", 0.45, 5.0))
                 self.assertGreater(tr["first_seen_ms"], 0)
+                self.assertEqual(ut["match_after_tick_ms"], 120.0)            # the venue's own match stamp
+                self.assertAlmostEqual(ut["ack_after_match_ms"],
+                                       hit["points"]["response"]["at_ms"] - 120.0, delta=0.2)
+                self.assertEqual(self.sn.summary()["exec_latency"]["trigger_to_match"]["n"], 1)
             finally:
                 await self.teardown_live()
         self.run_async(go())

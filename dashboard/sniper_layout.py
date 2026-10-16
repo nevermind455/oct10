@@ -449,13 +449,15 @@ def _lat(v) -> str:
 
 LAT_STAGES = (("feed_to_trigger", "feed>trig"), ("trigger_to_decision", "decide"), ("build", "build"),
               ("sign", "sign"), ("dispatch", "dispatch"), ("send_to_ack", "net>ACK"), ("ack_to_fill", "ACK>fill"))
-LAT_TOTALS = (("trigger_to_send", "TRIG>SEND"), ("trigger_to_ack", "TRIG>ACK"), ("trigger_to_fill", "TRIG>FILL"))
+LAT_TOTALS = (("trigger_to_send", "TRIG>SEND"), ("trigger_to_match", "TRIG>MATCH"), ("trigger_to_ack", "TRIG>ACK"),
+              ("trigger_to_fill", "TRIG>FILL"))
 
 
-def _latency_body(lat: dict, w: int) -> list[Row]:
+def _latency_body(lat: dict, w: int, max_rows: int | None = None) -> list[Row]:
     """SNIPER EXECUTION LATENCY: every stage (p50), then LAST / AVG / P50 /
-    P95 / P99 / MAX for trigger -> send, -> ACK, -> fill known. 'sim': the
-    paper model's venue answer, not a measurement."""
+    P95 / P99 / MAX for trigger -> send, -> the venue's match (its own trade
+    print, live only), -> ACK, -> fill known. 'sim': the paper model's venue
+    answer, not a measurement. max_rows: the stage list shrinks to fit."""
     lat = lat if isinstance(lat, dict) else {}
 
     def p50(key):
@@ -471,11 +473,14 @@ def _latency_body(lat: dict, w: int) -> list[Row]:
             line = f"{line}  {part}" if line else part
     if line:
         rows.append(_runs([(line, Style("ink"))], w))
-    rows = rows[:2]
+    # TRIG>MATCH only once the venue's own match stamps exist (live); paper never has them
+    totals = [(k, label) for k, label in LAT_TOTALS
+              if k != "trigger_to_match" or isinstance(lat.get(k), dict)]
+    rows = rows[:2 if max_rows is None else max(0, min(2, max_rows - 1 - len(totals)))]
     cw = max(6, min(9, (w - 11) // 7))
     rows.append(_runs([(fit("ms", 10), FAINT)] + [(fit(h, cw, ">"), Style("dim", bold=True))
                                                         for h in ("LAST", "AVG", "P50", "P95", "P99", "MAX", "n")], w))
-    for key, label in LAT_TOTALS:
+    for key, label in totals:
         d = lat.get(key) if isinstance(lat.get(key), dict) else {}
         vals = [_lat(d.get(k)).replace("ms", "") for k in ("last", "avg", "p50", "p95", "p99", "max")]
         vals.append(count(d.get("n")) if d else "N/A")
@@ -694,17 +699,17 @@ def _latency_band(snap: dict, cols: int, h: int, g: Glyphs) -> list[Row]:
     title = "SNIPER EXECUTION LATENCY" + (" (paper: ACK/fill simulated)" if ex.get("paper") else "")
     body_h = max(0, h - 2)
     if cols < 100:
-        return panel(title, _latency_body(ex.get("latency"), cols - 2)[:body_h], cols, h, g)
+        return panel(title, _latency_body(ex.get("latency"), cols - 2, body_h)[:body_h], cols, h, g)
     budget = snap.get("budget") if isinstance(snap.get("budget"), dict) else None
     if budget is not None and cols >= 150:
         w = hsplit(cols, (1.4, 1.15, 0.85), (66, 46, 34))
-        return join([panel(title, _latency_body(ex.get("latency"), w[0] - 2)[:body_h], w[0], h, g),
+        return join([panel(title, _latency_body(ex.get("latency"), w[0] - 2, body_h)[:body_h], w[0], h, g),
                      panel("LATENCY BUDGET  BTC trade > ACK (p50)", _budget_body(budget, w[1] - 2, g)[:body_h],
                            w[1], h, g),
                      panel("EXECUTION QUALITY", _quality_body(ex.get("quality"), w[2] - 2)[:body_h], w[2], h, g)],
                     w, h)
     w = hsplit(cols, (1.6, 1.0), (66, 34))
-    return join([panel(title, _latency_body(ex.get("latency"), w[0] - 2)[:body_h], w[0], h, g),
+    return join([panel(title, _latency_body(ex.get("latency"), w[0] - 2, body_h)[:body_h], w[0], h, g),
                  panel("EXECUTION QUALITY", _quality_body(ex.get("quality"), w[1] - 2)[:body_h], w[1], h, g)], w, h)
 
 
@@ -926,7 +931,8 @@ def _build(snap: dict, cols: int, rows: int, g: Glyphs) -> list[Row]:
     pnl_h = (8 if str(acct_now.get("kind") or "").upper() == "PAPER" and isinstance(acct_now.get("attribution"), dict)
              and room >= 8 + 8 + 3 else 0)
     room -= pnl_h
-    lat_h = 8 if room >= 8 + 8 + 5 else 0
+    # 9 rows: the stage list (2) + header + four totals; at 8 the stage list takes one line
+    lat_h = 9 if room >= 9 + 8 + 5 else 8 if room >= 8 + 8 + 5 else 0
     room -= lat_h
     mid_h = min(room, max(8, len(side_rows) + 2))
     if room - mid_h < 5:                          # not enough for events below: take it all

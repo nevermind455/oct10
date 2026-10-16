@@ -1564,7 +1564,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # order type, reply status, order id) and, live, a user_trades row (its trades from the
     # authenticated user channel). Live order/fill rows carry the reply's / fill's trade ids.
     # SNIPER_BOOK_TRACE_MS="" turns the trace off.
-    "sniper_mode.py": "f622e84dc8dc687c1288b705407a242616999745dd8e944aaa5d5e5966f278f5",
+    # 2026-10-16 (item 4, measurement only): user_trades rows carry the venue's own match time,
+    # found among the public market channel's trade prints (our token, BUY, our size or a maker
+    # leg's): match_after_tick_ms / ack_after_match_ms, and a trigger_to_match latency sample.
+    "sniper_mode.py": "8bfc448e1beaac955906570db06ac45c0a48a4579f5a7650e200e35acff97eec",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
