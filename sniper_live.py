@@ -3197,6 +3197,16 @@ class LiveExecution:
             a.update(order_type="FAK", cap=p.price, fee_rate=float(rules.get("fee_rate") or 0),
                      fee_exponent=int(rules.get("fee_exponent") or 1),
                      size=getattr(p, "shares", None))
+            totals = reply_totals(resp) if row["kind"] == MATCHED else None
+            if totals is not None and not a["trade_ids"]:
+                # 2026-10-16: the CLOB V2 reply names no trade ids, but its own totals
+                # (makingAmount USDC, takingAmount shares) ARE the FAK's whole execution
+                # - it matched at submission. Its fill is complete once the private
+                # channel's trades add up to that size: no wait for an order-status poll,
+                # during which a new signal paused all trading 5 minutes (~21 times a day).
+                a["final_size"] = float(totals[1])
+                a["final_mono"] = time.monotonic()
+                a["reply_totals"] = totals
             self.fak_orders[oid] = a
         try:
             ok = self.receipt_sink(receipt)

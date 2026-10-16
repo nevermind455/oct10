@@ -1584,6 +1584,8 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # 2026-10-15, the operator's choice: 3 slow venue replies within 30 min pause new orders 5 min
     # (then healthy checks) instead of hard-halting; >5s replies and unrecovered pauses still halt.
     # ...and the strike window is 5 minutes (was 30), the operator's choice.
+    # 2026-10-16: an accepted FAK's final size comes from the reply's own totals (makingAmount /
+    # takingAmount) when it names no trade ids - no order-status wait, no 5-minute pause meanwhile.
     # Re-approved 2026-10-14 (restart halt): a previous run's unresolved send intents are looked
     # up on the venue by their own order hash at start (_reconcile_previous_run, M7's evidence
     # rules); proven zero or fully booked resolves them and lifts the derived start-up halt
@@ -1596,7 +1598,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # pause keys); fresh venue incidents cannot be lost at expiry; reporting
     # failures cannot interrupt the guard; monotonic zero is a valid start time.
     # Fresh kill-switch incidents also expire old reasons before deduplication.
-    "sniper_live.py": "fc753efd4a365d63807220f0b33aa06db2276e091ca4391670dff12f399c91bf",
+    "sniper_live.py": "dc26d33a1791cc6a0a893d6f6101e177f4651d74799c0d2d42edd544c88cf563",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads

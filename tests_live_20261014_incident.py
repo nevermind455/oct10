@@ -202,6 +202,59 @@ class Live(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.ex.kill.tripped)
 
 
+class ReplyFillSize(unittest.IsolatedAsyncioTestCase):
+    """2026-10-16: a new same-side signal paused ALL trading 5 minutes whenever an
+    earlier FAK's size was unknown - the CLOB V2 reply names no trade ids, so the
+    bot waited for an order-status poll. The reply's own totals give the size."""
+
+    # the Live fixture, not its tests
+    asyncSetUp, asyncTearDown, plan, reply, trade = (Live.asyncSetUp, Live.asyncTearDown, Live.plan, Live.reply,
+                                                     Live.trade)
+
+    def matched(self, oid, making, taking):
+        # as the CLOB V2 answers a matched FAK: amounts and a transaction hash, no trade ids
+        self.fake.script.append(("json", 200, {"success": True, "status": "matched", "orderID": oid,
+                                               "makingAmount": making, "takingAmount": taking,
+                                               "transactionsHashes": ["0x" + "ab" * 32], "errorMsg": ""}))
+
+    async def test_the_replys_total_resolves_the_fill_with_no_poll_and_no_pause(self):
+        self.ex.order_status = None                                       # nothing to poll: the reply is enough
+        self.matched("0xr1", "3.74", "12.896552")                         # the incident's own reply
+        await self.ex.send(self.ex.prepare(self.plan(INCIDENT_AMOUNT)))
+        self.assertAlmostEqual(self.ex.fak_orders["0xr1"]["final_size"], INCIDENT_SHARES, places=9)
+        self.trade("t1", "0xr1", INCIDENT_SHARES, INCIDENT_PRICE)
+        fill = self.ex.fill_for("0xr1")
+        self.assertIsNotNone(fill)
+        self.assertAlmostEqual(fill["shares"], INCIDENT_SHARES, places=6)
+        self.assertFalse(self.ex.blocks_pending_fak("0xr1"))              # a new signal is not paused
+        self.assertFalse(self.ex.kill.tripped, self.ex.kill.reasons)
+
+    async def test_trades_short_of_the_replys_total_keep_waiting(self):
+        self.ex.order_status = None
+        self.matched("0xr1", "3.74", "12.896552")
+        await self.ex.send(self.ex.prepare(self.plan(INCIDENT_AMOUNT)))
+        self.trade("t1", "0xr1", 6, INCIDENT_PRICE)
+        self.assertIsNone(self.ex.fill_for("0xr1"))                       # 6 of 12.896552: not complete
+        self.trade("t2", "0xr1", 6.896552, INCIDENT_PRICE)
+        self.assertAlmostEqual(self.ex.fill_for("0xr1")["shares"], INCIDENT_SHARES, places=6)
+
+    async def test_base_unit_totals_are_read_too(self):
+        self.ex.order_status = None
+        self.matched("0xr1", "3740000", "12896552")
+        await self.ex.send(self.ex.prepare(self.plan(INCIDENT_AMOUNT)))
+        self.assertAlmostEqual(self.ex.fak_orders["0xr1"]["final_size"], INCIDENT_SHARES, places=9)
+
+    async def test_without_totals_the_careful_path_remains(self):
+        self.ex.order_status = None
+        self.fake.script.append(("json", 200, {"success": True, "status": "matched", "orderID": "0xr1",
+                                               "transactionsHashes": ["0x" + "ab" * 32], "errorMsg": ""}))  # no totals
+        await self.ex.send(self.ex.prepare(self.plan(INCIDENT_AMOUNT)))
+        self.assertIsNone(self.ex.fak_orders["0xr1"].get("final_size"))
+        self.trade("t1", "0xr1", 11, INCIDENT_PRICE)
+        self.assertIsNone(self.ex.fill_for("0xr1"))                       # one trade need not be the whole fill
+        self.assertTrue(self.ex.blocks_pending_fak("0xr1"))               # so a new signal still waits
+
+
 # ---------------------------------------------------------------------------- 1, 2: the decision
 class Decision(unittest.TestCase):
     def gate(self, bankroll=None):
