@@ -1557,7 +1557,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # minutes; a lasting pending order no longer blocks later signals forever.
     # 2026-10-15 bug fix: separate failed order tasks pause independently;
     # reused Python object addresses must not suppress a later incident.
-    "sniper_mode.py": "6e563cc6d36d1870f1c3bc7273d84dd7c08c898c4ba33156b8dc5c410e63de6b",
+    "sniper_mode.py": "18271197df66e2727fb01fd1be0559abb923033b21133e0306fbcce06137b83b",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
@@ -1586,6 +1586,8 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # ...and the strike window is 5 minutes (was 30), the operator's choice.
     # 2026-10-16: an accepted FAK's final size comes from the reply's own totals (makingAmount /
     # takingAmount) when it names no trade ids - no order-status wait, no 5-minute pause meanwhile.
+    # 2026-10-16: the shadow also prices an order at the fair-value cap (fv: FOK + FAK, same dollars and
+    # whole shares x that cap) where ask + slip bound the real cap - diagnostics for exec_eval.py only.
     # Re-approved 2026-10-14 (restart halt): a previous run's unresolved send intents are looked
     # up on the venue by their own order hash at start (_reconcile_previous_run, M7's evidence
     # rules); proven zero or fully booked resolves them and lifts the derived start-up halt

@@ -3633,7 +3633,15 @@ class Sniper:
                 if tc < cap - 1e-9:
                     # the same whole shares at the tighter limit (amount = shares x limit)
                     tight = (tc, spend * tc / cap)
-            out = {str(L): self._shadow_fill(views[L], token, spend, cap, rules, mids[L], late[L], alt, tight)
+            fv = None
+            if ref.get("fair_limit") is not None and cap > 0:
+                # The fair-value cap alone (policies C/D of the execution comparison):
+                # different from the real cap only where ask + slip bound it.
+                cap_fv = min(float(ref["fair_limit"]), float(getattr(self.broker, "max_buy_price", 1.0) or 1.0))
+                if cap_fv > cap + 1e-9:
+                    shares = ref.get("order_shares") or ref.get("target_shares")
+                    fv = (round(cap_fv, 4), round(float(shares) * cap_fv, 2) if shares else None)
+            out = {str(L): self._shadow_fill(views[L], token, spend, cap, rules, mids[L], late[L], alt, tight, fv)
                    for L in self.s.shadow_ms}
             self._write({"wall": time.time(), "result": "shadow", "id": ref.get("id"),
                          "side": ref.get("side"), "round_end": ref.get("round_end"),
@@ -3643,7 +3651,8 @@ class Sniper:
             self._write({"wall": time.time(), "result": "shadow_error", "id": ref.get("id"),
                          "reason": f"{type(exc).__name__}: {exc}"[:200]})
 
-    def _shadow_fill(self, view, token, spend, cap, rules, mid5, late_ms, alt_caps=None, tight=None) -> dict:
+    def _shadow_fill(self, view, token, spend, cap, rules, mid5, late_ms, alt_caps=None, tight=None,
+                     fv=None) -> dict:
         """The paper broker's own FOK arithmetic against one captured book:
         the real cap, plus each wider cap in alt_caps ({"3": cap, ...}) -
         would paying up to ask+3c/4c/6c have turned misses into good fills? -
@@ -3678,6 +3687,18 @@ class Sniper:
             if "miss" in t:
                 t["fak"] = self._shadow_quote(book, tspend, tc, rules, mid5, fak=True)
             row["tight"] = {"cap": tc, **t}
+        if fv:
+            # at the fair-value cap: "same" = the order's dollars (sizing held fixed),
+            # "own" = whole shares x the fair cap (share sizing at that cap)
+            fc, own = fv
+            f = {"cap": fc}
+            for name, s_ in (("same", spend), ("own", own)):
+                if s_:
+                    q = self._shadow_quote(book, s_, fc, rules, mid5)
+                    if "miss" in q:
+                        q["fak"] = self._shadow_quote(book, s_, fc, rules, mid5, fak=True)
+                    f[name] = {"spend": s_, **q}
+            row["fv"] = f
         return row
 
     def _shadow_quote(self, book, spend, cap, rules, mid5, fak: bool = False) -> dict:
