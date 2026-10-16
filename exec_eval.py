@@ -28,6 +28,11 @@ different fill): the comparison isolates execution.
 
 Metric: settled P&L, fees included, per eligible signal (an order the bot sent),
 plus fills, cost, P&L per dollar, 5s markout and the worst-case loss of a round.
+Detail (same dollars): full vs partial fills, slippage against the ask the bot
+saw, the model's edge at the actual fill price, UP/DOWN and latency bands,
+added / lost / changed fills against A, max drawdown and peak open exposure
+(each round settles at its end), and a 95% bootstrap range of the difference
+against A (resampling whole rounds: orders in one round are not independent).
 Signals rejected before submission are counted apart from submitted orders that
 did not fill. PASS (vs A) needs a positive difference in EVERY UTC day and every
 6-hour block with at least --min-n signals; fewer is INSUFFICIENT.
@@ -49,15 +54,108 @@ LABEL = {"A": "FAK  min(ask+5c, fair limit)  (now)", "B": "FOK  min(ask+5c, fair
 
 
 def _fill(q, fok: bool):
-    """(shares, price, fee, mk5) of a shadow quote; FAK falls back to what it keeps."""
+    """(shares, price, fee, mk5, partial) of a shadow quote; FAK falls back to
+    what it keeps (a partial fill: the whole order was not there)."""
     if q and q.get("sh"):
-        return float(q["sh"]), float(q["px"]), float(q["fee"]), q.get("mk5")
+        return float(q["sh"]), float(q["px"]), float(q["fee"]), q.get("mk5"), False
     if fok:
         return None
     k = (q or {}).get("fak") or {}
     if k.get("sh"):
-        return float(k["sh"]), float(k["px"]), float(k["fee"]), k.get("mk5")
+        return float(k["sh"]), float(k["px"]), float(k["fee"]), k.get("mk5"), True
     return None
+
+
+BANDS = ((0, 250, "<250ms"), (250, 400, "250-400ms"), (400, 800, "400-800ms"), (800, 1e12, "800ms+"))
+
+
+def _band(ms: float) -> str:
+    return next(lbl for lo, hi, lbl in BANDS if lo <= ms < hi)
+
+
+def drawdown_and_exposure(items, p: str) -> tuple[float, float]:
+    """Max drawdown of settled P&L (each round settles at its end) and the peak
+    cost of positions open at once (bought, round not yet over)."""
+    by_end, events = collections.defaultdict(float), []
+    for it in items:
+        d, f = it["o"]["d"], it["fills"][p]
+        end = float(d.get("round_end") or d.get("wall") or 0)
+        by_end[end] += it["pnl"][p]
+        if f:
+            cost = f[0] * f[1] + f[2]
+            events += [(float(d.get("wall") or end), cost), (end, -cost)]
+    peak = cum = dd = 0.0
+    for end in sorted(by_end):
+        cum += by_end[end]
+        peak = max(peak, cum)
+        dd = max(dd, peak - cum)
+    open_cost = top = 0.0
+    for _t, c in sorted(events, key=lambda e: (e[0], e[1])):
+        open_cost += c
+        top = max(top, open_cost)
+    return dd, top
+
+
+def bootstrap(items, p: str, draws: int = 2000, seed: int = 20261016) -> tuple[float, float]:
+    """95% range of (p - A) cents per signal, resampling whole rounds."""
+    import random
+    rounds = collections.defaultdict(list)
+    for it in items:
+        rounds[it["o"]["cond"]].append(it["pnl"][p] - it["pnl"]["A"])
+    groups = list(rounds.values())
+    if len(groups) < 2:
+        return float("nan"), float("nan")
+    rnd, out = random.Random(seed), []
+    for _ in range(draws):
+        pick = [groups[rnd.randrange(len(groups))] for _ in groups]
+        n = sum(len(g) for g in pick)
+        out.append(100 * sum(sum(g) for g in pick) / n)
+    out.sort()
+    return out[int(0.025 * draws)], out[int(0.975 * draws) - 1]
+
+
+def details(items) -> None:
+    n = len(items)
+    print(f"  {'policy':6s} {'full':>5s} {'partial':>7s} {'slip c':>7s} {'edge@fill c':>11s} "
+          f"{'max DD $':>9s} {'peak open $':>11s}")
+    for p in POLICIES:
+        f = [(i, i["fills"][p]) for i in items if i["fills"][p]]
+        slip = [100 * (x[1] - float(i["o"]["d"]["ask_seen"])) for i, x in f if i["o"]["d"].get("ask_seen") is not None]
+        edge = [100 * (float(i["o"]["d"]["fair"]) - x[1] - x[2] / x[0]) for i, x in f
+                if i["o"]["d"].get("fair") is not None and x[0] > 0]
+        dd, top = drawdown_and_exposure(items, p)
+        avg = lambda xs: sum(xs) / len(xs) if xs else float("nan")  # noqa: E731
+        num = lambda v, w: f"{v:+{w}.2f}" if v == v else f"{'-':>{w}s}"  # noqa: E731 - nan -> "-"
+        print(f"  {p:6s} {sum(1 for _i, x in f if not x[4]):5d} {sum(1 for _i, x in f if x[4]):7d} "
+              f"{num(avg(slip), 7)} {num(avg(edge), 11)} {dd:9.2f} {top:11.2f}")
+    for title, key in (("by side", lambda i: i["o"]["d"]["side"]),
+                       ("by latency band", lambda i: _band(G.delay_of(i["o"]["d"])))):
+        groups = collections.defaultdict(list)
+        for i in items:
+            groups[key(i)].append(i)
+        cells = []
+        for k in sorted(groups, key=lambda k: [lbl for _lo, _hi, lbl in BANDS].index(k)
+                        if k in [lbl for _lo, _hi, lbl in BANDS] else k):
+            g = groups[k]
+            cells.append(f"{k} n={len(g)} " + " ".join(
+                f"{p} {100 * sum(i['pnl'][p] for i in g) / len(g):+.1f}c/{sum(1 for i in g if i['fills'][p]) / len(g):.0%}"
+                for p in POLICIES))
+        print(f"  {title} (P&L c/signal / fill%): " + " | ".join(cells))
+    for p in ("B", "C", "D"):
+        added = lost = changed = 0
+        for i in items:
+            a, x = i["fills"]["A"], i["fills"][p]
+            if x and not a:
+                added += 1
+            elif a and not x:
+                lost += 1
+            elif a and x and (abs(a[0] - x[0]) > 1e-9 or abs(a[1] - x[1]) > 1e-9):
+                changed += 1
+        lo, hi = bootstrap(items, p)
+        diff = 100 * sum(i["pnl"][p] - i["pnl"]["A"] for i in items) / n
+        print(f"  {p} vs A: added {added}, lost {lost}, changed price/size {changed}; "
+              f"{diff:+.2f}c per signal, 95% range [{lo:+.2f}, {hi:+.2f}]"
+              + ("  (the range spans 0: not shown to differ)" if lo <= 0 <= hi else ""))
 
 
 def miss_reason(text) -> str:
@@ -207,6 +305,8 @@ def report(orders, rows, since, min_n: int) -> int:
                 a_miss[miss_reason((e.get("fak") or {}).get("miss") or e.get("miss"))] += 1
         if a_miss:
             print("  submitted but not filled under A: " + ", ".join(f"{k} {v}" for k, v in a_miss.most_common()))
+        if sizing == "same":
+            details(items)
         print("  effects:  order type = B-A (cap held), D-C | cap = C-A (type held), D-B")
         for p in ("B", "C", "D"):
             verdicts = []

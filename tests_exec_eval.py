@@ -54,12 +54,14 @@ def journal_rows(now):
     # 1: the caps coincide (fair limit under ask + 5c): FOK fills - A = B = C = D
     rows += [{"wall": now - 500, "id": "o1", "result": "filled", "side": "UP", "bp": 1.0, "cap": 0.52,
               "fair_limit": 0.52, "amount": 5.2, "condition_id": "c1", "latency_ms": 300, "shares": 10.0,
+              "ask_seen": 0.49, "fair": 0.57, "round_end": now - 450,
               "price": 0.50, "fee": 0.0},
              {"wall": now - 499, "id": "o1", "result": "shadow", "side": "UP", "token": "u1", "other_token": "d1",
               "L": {"300": {"sh": 10.4, "px": 0.5, "fee": 0.0, "mk5": 2.0}}}]
     # 2: ask + 5c bound the cap; FOK misses at 0.52, FAK keeps 4; at the fair cap FOK fills
     rows += [{"wall": now - 400, "id": "o2", "result": "refused", "side": "UP", "bp": 2.0, "cap": 0.52,
-              "fair_limit": 0.58, "amount": 5.2, "condition_id": "c2", "latency_ms": 300},
+              "fair_limit": 0.58, "amount": 5.2, "condition_id": "c2", "latency_ms": 300,
+              "ask_seen": 0.47, "fair": 0.63, "round_end": now - 350},
              {"wall": now - 399, "id": "o2", "result": "shadow", "side": "UP", "token": "u2", "other_token": "d2",
               "L": {"300": {"miss": "FOK no-fill: only $2.000000 available at or below 0.52",
                             "fak": {"sh": 4.0, "px": 0.5, "fee": 0.0, "mk5": 1.0},
@@ -93,7 +95,8 @@ class Report(unittest.TestCase):
         self.assertIn("SUBMITTED ORDERS (eligible signals): 3", text)
         self.assertIn("2 identical eligible signals (1 left out", text)
         same = text[text.index("SAME DOLLARS"):text.index("AS SIZED")]
-        table = {ln[2]: ln for ln in same.splitlines() if ln[:3] in ("  A", "  B", "  C", "  D") and "vs A" not in ln}
+        table = {ln[2]: ln for ln in same.splitlines() if ln[:3] in ("  A", "  B", "  C", "  D")
+                 and ("FAK  " in ln or "FOK  " in ln)}
         # A: o1 full (10.4 sh at 0.50, won) + o2's FAK 4 at 0.50 (won); B (FOK): o1 only
         self.assertIn(f"{10.4 * 0.5 + 4 * 0.5:+8.2f}", table["A"])
         self.assertIn(f"{10.4 * 0.5:+8.2f}", table["B"])
@@ -102,6 +105,18 @@ class Report(unittest.TestCase):
         self.assertIn(f"{c_pnl:+8.2f}", table["C"])
         self.assertIn(f"{c_pnl:+8.2f}", table["D"])
         self.assertIn("B vs A: -100.00c per signal", same)                        # (5.20 - 7.20) / 2 signals
+        rows = {ln.split()[0]: ln.split() for ln in same.splitlines()
+                if ln[:3] in ("  A", "  B", "  C", "  D") and len(ln.split()) == 7}
+        self.assertEqual(rows["A"][1:3], ["1", "1"])                              # o1 full, o2 FAK partial
+        self.assertEqual(rows["B"][1:3], ["1", "0"])
+        # slippage: A fills at 0.50 vs asks seen 0.49 / 0.47 -> +1c and +3c, mean +2c
+        self.assertEqual(rows["A"][3], "+2.00")
+        # edge at the fill price: fair 0.57 - 0.50 = 7c, 0.63 - 0.50 = 13c -> +10c
+        self.assertEqual(rows["A"][4], "+10.00")
+        self.assertEqual(rows["A"][6], "5.20")                                    # o1 open alone at the peak
+        self.assertIn("B vs A: added 0, lost 1, changed price/size 0", same)
+        self.assertIn("C vs A: added 0, lost 0, changed price/size 1", same)
+        self.assertIn("250-400ms n=2", same)
 
     def test_as_sized_uses_whole_shares_at_the_fair_cap(self):
         text = self.run_eval()
