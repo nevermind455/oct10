@@ -2870,6 +2870,7 @@ class Sniper:
                 # After the send: the shadow sleeps until absolute times anyway.
                 self._spawn(self._shadow(row, plan["token"], plan["other"], plan["cond"],
                                          plan["amount"], plan["cap"], plan["t0"]))
+            self._decision_book(row, plan)
             if not sign_err:
                 self._start_trace(row, plan)
             self._guard_diag_after_send(side, row, plan)
@@ -2911,6 +2912,8 @@ class Sniper:
         # HTTP/2 connection - the task below then connects and sends).
         started = self.live.start_send(p)
         plan["order_type"] = p.order_type
+        plan["client_order_id"] = p.client_order_id
+        self._decision_book(row, plan)
         self._start_trace(row, plan)
         task = self._spawn(self._finish_live(side, r_bp, row, plan, p, t_pc, started), order=True)
         if self.s.shadow_ms:
@@ -3406,7 +3409,7 @@ class Sniper:
                 "target": target, "carry_market": self.carry_market if target is not None and not kelly else None,
                 "order_type": self.s.order_type, "tick": f"{float(tick):g}" if tick else "0.01",
                 "other": str(down if side == "UP" else up), "cond": str(cond), "t0": t_ms / 1000.0,
-                "decided_pc": decided_pc, "built_pc": time.perf_counter_ns(),
+                "decided_pc": decided_pc, "decided_mono": time.monotonic(), "built_pc": time.perf_counter_ns(),
                 "send": (side, amount, up, down, cond, end, cap, str(token),
                          f"{float(tick):g}" if tick else "0.01", lat)}
 
@@ -3768,6 +3771,43 @@ class Sniper:
             out["mk5"] = round((float(mid5) - px - fee / sh) * 100, 3)
         return out
 
+    # ---------------------------------------------------------------- decision book (diagnostics only)
+    def _decision_book(self, row: dict, plan: dict) -> None:
+        """What the decision's own book showed, on the order row: best bid and
+        ask, spread, quote age (local receipt; and against the venue's own
+        stamp), the effective cap (the account ceiling applied) and the shares
+        / dollars offered at or under it. Computed after the hand-off from the
+        immutable view the decision used - the values are the decision's and
+        signal -> send pays nothing. Measurement only: no gate reads them."""
+        try:
+            view = plan.get("view")
+            if view is None:
+                return
+            bids, asks = tuple(getattr(view, "bids", ()) or ()), tuple(getattr(view, "asks", ()) or ())
+            bid = getattr(view, "best_bid", None) or (float(bids[0][0]) if bids else None)
+            ask = getattr(view, "best_ask", None) or (float(asks[0][0]) if asks else None)
+            hi = float(getattr(self.broker, "max_buy_price", 1.0) or 1.0)
+            cap = min(float(plan["cap"]), hi)
+            levels = self._visible_levels(str(plan["token"]), view)
+            under = [(px, q) for px, q in levels if px <= cap + 1e-9]
+            out = {"dec_bid": bid, "dec_ask": ask,
+                   "dec_spread": None if bid is None or ask is None else round(float(ask) - float(bid), 4),
+                   "dec_cap": round(cap, 4), "dec_levels_under_cap": len(under),
+                   "dec_depth_sh": round(sum(q for _px, q in under), 4),
+                   "dec_depth_usd": round(sum(px * q for px, q in under), 4)}
+            upd, at = getattr(view, "updated_mono", None), plan.get("decided_mono")
+            if upd is not None and at is not None:
+                out["dec_quote_age_ms"] = round((float(at) - float(upd)) * 1000.0, 1)
+            ts = getattr(view, "exchange_ts_ms", None)
+            if ts is not None:
+                # our wall clock at the decision less the venue's stamp: includes any clock offset
+                out["dec_venue_age_ms"] = round(float(row.get("wall") or time.time()) * 1000.0
+                                                + self.s.venue_offset_ms - float(ts), 1)
+            row.update(out)
+        except Exception as exc:  # noqa: BLE001 - diagnostics only, never the order path
+            self.n["decision book errors"] += 1
+            row["dec_error"] = f"{type(exc).__name__}: {exc}"[:120]
+
     # ---------------------------------------------------------------- book trace (diagnostics only)
     TRACE_RESP_WAIT_S = 15.0       # the longest the trace waits for the venue's reply
     USER_TRADES_WAIT_S = 90.0      # an accepted order's trades: until all are terminal, at most this
@@ -3851,7 +3891,7 @@ class Sniper:
                          "round_end": ref.get("round_end"), "condition_id": plan.get("cond"), "token": token,
                          "live": self.live is not None, "cap": cap, "amount": round(float(plan["amount"]), 4),
                          "ask_seen": ref.get("ask_seen"), "bp": ref.get("bp"), "feed": ref.get("feed"),
-                         "points": points, **{k: v for k, v in resp.items() if v is not None}})
+                         "client_order_id": plan.get("client_order_id"), "points": points, **{k: v for k, v in resp.items() if v is not None}})
             if self.live is not None and resp.get("order_id") and resp.get("kind") is not None:
                 await self._user_trades(ref, resp, t0, token=token, tick_ms=tick_ms,
                                         reply_ms=None if mono is None else tick_ms + (float(mono) - t0) * 1000.0)

@@ -1570,7 +1570,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Reviewed 2026-10-17 execution audit: Public price/size coincidences are unverified candidates, not measured matches; require paired legs and BUY side.
     # 2026-10-17, the operator's change: the trigger default follows the frozen spec,
     # SNIPER_K_BP 0.5 -> 1.0 (exec_latency.FROZEN_SPEC); the fair margin stays $0.01.
-    "sniper_mode.py": "0f5512852f95f7865014c271bc2e2b57fd0f45aedc1ebc943c54ecca19cf7af7",
+    # 2026-10-17 (measurement only; no decision reads them - tests_book_trace DecisionBook): order
+    # rows carry dec_bid/ask/spread/cap/levels_under_cap/depth_sh/depth_usd/quote_age_ms/venue_age_ms
+    # from the decision's own book, computed after the hand-off; book_trace rows carry the
+    # client order id for exact joins.
+    "sniper_mode.py": "f0c64b33fbdb72d2688add14e76394b3a187ea610170c30788ed59fee4f2d502",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.

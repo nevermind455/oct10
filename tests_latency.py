@@ -357,6 +357,10 @@ class LiveFast(unittest.TestCase):
                 self.assertEqual(miss["kind"], "NO_MATCH")
                 self.assertEqual((hit["kind"], hit["order_id"]), ("MATCHED", oid))
                 self.assertEqual(hit["reply"]["tradeIDs"], [tid])
+                order_row = [r for r in self.rows() if r.get("order_id") == oid and r.get("result") in ("pending", "filled")][0]
+                self.assertEqual(hit["client_order_id"], order_row["client_order_id"])   # exact join
+                self.assertEqual(order_row["dec_cap"], order_row["cap"])
+                self.assertIn("dec_quote_age_ms", order_row)
                 self.assertEqual(hit["points"]["0"]["asks"][0], [0.45, 500.0])
                 order = [r for r in self.rows() if r.get("order_id") == oid]
                 self.assertEqual([r["reply_trade_ids"] for r in order if r.get("result") in ("pending", "filled")],

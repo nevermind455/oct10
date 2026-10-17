@@ -256,5 +256,61 @@ class VenueMatch(unittest.TestCase):
         for label in ("TRIG>SEND", "TRIG>MATCH", "TRIG>ACK", "TRIG>FILL"):
             self.assertIn(label, text, text)
 
+
+class DecisionBook(unittest.TestCase):
+    """dec_* on every order row: the decision's own book, measurement only."""
+
+    def test_paper_order_rows_carry_the_decision_book(self):
+        rows, _ = run_two()
+        for o in [r for r in rows if r.get("result") in ("filled", "refused")]:
+            self.assertEqual((o["dec_bid"], o["dec_ask"], o["dec_spread"]), (0.50, 0.52, 0.02))
+            self.assertEqual(o["dec_cap"], o["cap"])
+            under = [(px, q) for px, q in ASKS if px <= o["cap"] + 1e-9]
+            self.assertEqual(o["dec_levels_under_cap"], len(under))
+            self.assertAlmostEqual(o["dec_depth_sh"], sum(q for _px, q in under))
+            self.assertAlmostEqual(o["dec_depth_usd"], sum(px * q for px, q in under), places=4)
+            self.assertGreaterEqual(o["dec_quote_age_ms"], 0.0)
+            self.assertIn("dec_venue_age_ms", o)
+            self.assertNotIn("dec_error", o)
+
+    REPLY_BOOK = ((0.25, 5.82), (0.27, 23.51), (0.28, 25.25))     # the 2026-10-17 reply snapshot
+
+    def decide(self, cap, max_buy=0.95):
+        sn = S.Sniper(Hub(), Broker(), settings=_settings(), journal_path=None)
+        sn.broker.max_buy_price = max_buy
+        view = types.SimpleNamespace(asks=self.REPLY_BOOK, bids=((0.24, 10.0),), best_bid=0.24, best_ask=0.25,
+                                     updated_mono=time.monotonic(), exchange_ts_ms=None)
+        row = {"wall": time.time()}
+        sn._decision_book(row, {"view": view, "cap": cap, "token": "up", "decided_mono": time.monotonic()})
+        return row
+
+    def test_a_level_exactly_at_the_cap_counts_even_with_float_noise(self):
+        row = self.decide(round(0.23 + 0.05, 4))                       # how _decide builds ask + slip
+        self.assertEqual((row["dec_cap"], row["dec_levels_under_cap"]), (0.28, 3))
+        self.assertAlmostEqual(row["dec_depth_sh"], 54.58, places=6)
+        noisy = 0.04 + 0.24                                            # 0.27999999999999997: just under
+        self.assertNotEqual(noisy, 0.28)
+        for cap in (noisy, 0.28 - 1e-12):                              # noise either side still counts
+            self.assertEqual(self.decide(cap)["dec_levels_under_cap"], 3)
+
+    def test_a_lower_cap_or_account_ceiling_leaves_the_028_level_out(self):
+        for row in (self.decide(0.27), self.decide(0.2799), self.decide(0.28, max_buy=0.27)):
+            self.assertAlmostEqual(row["dec_depth_sh"], 29.33, places=6)   # 5.82 + 23.51: the report's figure
+            self.assertEqual(row["dec_levels_under_cap"], 2)
+        self.assertEqual(self.decide(0.28, max_buy=0.27)["dec_cap"], 0.27)
+
+    def test_book_trace_points_use_the_same_inclusive_boundary(self):
+        sn = S.Sniper(Hub(), Broker(), settings=_settings(), journal_path=None)
+        view = types.SimpleNamespace(asks=self.REPLY_BOOK, bids=((0.24, 10.0),), status="LIVE", exchange_ts_ms=None)
+        self.assertAlmostEqual(sn._book_point(view, round(0.23 + 0.05, 4))["depth_cap_sh"], 54.58, places=6)
+        self.assertAlmostEqual(sn._book_point(view, 0.27)["depth_cap_sh"], 29.33, places=6)
+
+    def test_a_broken_view_is_reported_never_raised(self):
+        sn = S.Sniper(Hub(), Broker(), settings=_settings(), journal_path=None)
+        row = {}
+        sn._decision_book(row, {"view": types.SimpleNamespace(asks=(("x", 1),)), "cap": 0.3, "token": "up"})
+        self.assertIn("dec_error", row)
+        self.assertEqual(sn.n["decision book errors"], 1)
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
