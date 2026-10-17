@@ -2016,6 +2016,11 @@ class LiveExecution:
         self.balance: float | None = None
         self.balance_at: float | None = None
         self.reserved = 0.0
+        # the last reading: the wallet's own figure, the cash applied and the rule
+        # that set it (wallet / in_flight / held / strict) - balance_read rows, the alarm
+        self.last_balance_read: dict = {}
+        self._stuck_since: float | None = None
+        self._stuck_warned: float | None = None
         import threading
         self._risk_lock = threading.RLock()
         self._risk_orders: dict = {}        # client id -> full all-in reservation until fully reconciled
@@ -2095,7 +2100,8 @@ class LiveExecution:
         loop = asyncio.get_running_loop()
         self._tasks = [loop.create_task(keep_warm(self.sender.http, self.sender.clock, self.clock_url,
                                                   self.keep_warm_s, self._warm_event)),
-                       loop.create_task(self._balance_loop()), loop.create_task(self._reconcile_loop()),
+                       loop.create_task(self._balance_loop()), loop.create_task(self._settle_read_loop(hub)),
+                       loop.create_task(self._reconcile_loop()),
                        loop.create_task(self._rules_loop(hub)), loop.create_task(self._guard_loop())]
         if self.session is not None:
             self._tasks.append(loop.create_task(self._session_loop()))
@@ -2174,7 +2180,9 @@ class LiveExecution:
                 self.n["balance read errors"] += 1
                 return
             available = min(values)
+            wallet, rule = available, "wallet"
             if self.balance is not None and (revision != self._balance_revision or self.reserved > 0):
+                rule = "in_flight"
                 # A send started or ended during this read (or is on the wire): the
                 # reading can predate its debit. It may lower our bound, never raise it.
                 available = min(available, self.balance)
@@ -2185,10 +2193,47 @@ class LiveExecution:
                 # what they could still take is never counted twice and lets payouts and
                 # unused budget show. Without a hold (unknown, or its lookup failed): the strict rule.
                 available = min(available, self.balance) if hold is None else max(0.0, available - hold)
+                rule = "strict" if hold is None else "held"
             self.balance = available
             self.balance_at = time.monotonic()
+            self.last_balance_read = {"wallet": round(wallet, 6), "applied": round(available, 6), "rule": rule,
+                                      "hold": None if hold is None else round(hold, 6),
+                                      "awaiting": len(self.awaiting)}
+            self._check_stuck(wallet, available, rule)
         else:
             self.n["balance read errors"] += 1
+
+    # The cash reading may run below the wallet while orders are unconfirmed (held /
+    # strict) or a send is on the wire. That is right for a minute or two; for longer
+    # it is the 2026-10-15/16 freeze (Kelly sized from $14-18 while ~$45-65 was there,
+    # until a restart). Say so - nothing about the money changes here.
+    STUCK_GAP_USD = 1.0
+    STUCK_AFTER_S = 600.0
+
+    def _check_stuck(self, wallet: float, applied: float, rule: str) -> None:
+        now = time.monotonic()
+        if wallet - applied <= self.STUCK_GAP_USD:
+            self._stuck_since = self._stuck_warned = None
+            return
+        if self._stuck_since is None:
+            self._stuck_since = now
+            return
+        held_for = now - self._stuck_since
+        if held_for < self.STUCK_AFTER_S or (self._stuck_warned is not None
+                                              and now - self._stuck_warned < self.STUCK_AFTER_S):
+            return
+        self._stuck_warned = now
+        self.n["stuck cash alarms"] += 1
+        orders = list(self.awaiting)
+        ids = ", ".join(short_id(o) for o in orders[:5]) + (" ..." if len(orders) > 5 else "")
+        self.on_event("sniper", f"LIVE cash held ${wallet - applied:.2f} below the wallet (${wallet:.2f}) for "
+                                f"{held_for / 60:.0f} min ({rule}; {len(orders)} unconfirmed: {ids or 'none'}) - "
+                                f"Kelly sizes from ${applied:.2f}; check the orders with reconcile_order.py", "bad")
+        journal = getattr(self, "_journal", None)
+        if journal is not None:
+            journal({"wall": time.time(), "result": "cash_stuck", "wallet": round(wallet, 6),
+                     "applied": round(applied, 6), "held_s": round(held_for, 1), "rule": rule,
+                     "awaiting": [str(o) for o in orders]})
 
     def _awaiting_hold(self) -> float | None:
         """What this run's accepted, unconfirmed orders could still take from the
@@ -2218,6 +2263,39 @@ class LiveExecution:
                                                     and str(lot.side).upper() == "BUY")
         return sum(max(0.0, float(a.get("reserve") or 0.0) - float(booked.get(a.get("order_id"), 0.0)))
                    for a in reservations)
+
+    # This account's winnings come back as cash about a minute after a round settles
+    # (on chain ~1-1.5 min after it ends): read then, not only on the 30s loop.
+    SETTLE_READ_AFTER_S = (90.0, 180.0)
+
+    async def _settle_read_loop(self, hub) -> None:
+        """A balance read SETTLE_READ_AFTER_S after every round ends, each with a
+        balance_read row: the wallet's figure, what unconfirmed orders hold, the
+        cash Kelly sizes from and the rule that set it."""
+        pending, last_end = [], None
+        while True:
+            end = getattr(hub, "window_end", None)
+            if end and end != last_end:
+                if last_end is not None:
+                    pending += [(float(last_end) + d, float(last_end), d) for d in self.SETTLE_READ_AFTER_S]
+                last_end = end
+            now = time.time()
+            due = [x for x in pending if x[0] <= now]
+            pending = [x for x in pending if x[0] > now]
+            for _at, ended, after in due:
+                before = self.balance
+                try:
+                    await self._read_balance()
+                except Exception:  # noqa: BLE001 - the 30s loop and the age check still apply
+                    self.n["balance read errors"] += 1
+                    continue
+                self.n["settlement balance reads"] += 1
+                journal = getattr(self, "_journal", None)
+                if journal is not None and self.balance is not None:
+                    journal({"wall": time.time(), "result": "balance_read", "round_end": ended, "after_end_s": after,
+                             "before": None if before is None else round(before, 6),
+                             "kelly_cash": round(self.balance - self.reserved, 6), **self.last_balance_read})
+            await asyncio.sleep(1.0)
 
     async def _balance_loop(self) -> None:
         while True:

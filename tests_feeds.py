@@ -1625,7 +1625,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # lookup keeps the strict rule. A previous run's FAK whose every trade FAILED (start-up
     # REST audit) and nothing booked resolves NO_MATCH at restart. An unconfirmed order with no
     # known reservation still blocks any refund (CollateralAudit).
-    "sniper_live.py": "9a216da94756130516f032c521bb820c023ac52ad83b35e66b6b5672bfc50242",
+    # 2026-10-17 (the operator's request; no order, size or cash-rule change - tests_balance_reads):
+    # a balance read 90s and 180s after every round ends (balance_read rows: wallet, applied,
+    # rule, hold, Kelly cash) and a cash_stuck alarm when the cash stays > $1 under the wallet
+    # for 10 minutes (repeated every 10 minutes until it clears).
+    "sniper_live.py": "a18a4ebc8e025752089318a94ee592906bf906d50cb99ae172c082014cf15310",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads
