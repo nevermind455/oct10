@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""SNIPER_PAPER_EXTRA_MS (2026-10-16): paper meets the book later than each
-order's measured delay, by the recorded book's lag behind the venue. Calibrated
-on 1,154 live orders: at their own delays paper filled 31% (live 21%) for
-+$210.68 (live +$1.42); +200ms matched live (21% vs 21%, +$7.00 vs +$1.42).
+"""SNIPER_PAPER_EXTRA_MS: optional paper arrival-delay sensitivity.
+An extra delay is an assumption; matching aggregate fill rates is not proof
+of a measured feed lag or correct per-order fills. See EXECUTION_AUDIT.md.
 Paper only. No network.
 
     python tests_paper_realism.py

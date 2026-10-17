@@ -1567,7 +1567,8 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # 2026-10-16 (item 4, measurement only): user_trades rows carry the venue's own match time,
     # found among the public market channel's trade prints (our token, BUY, our size or a maker
     # leg's): match_after_tick_ms / ack_after_match_ms, and a trigger_to_match latency sample.
-    "sniper_mode.py": "8bfc448e1beaac955906570db06ac45c0a48a4579f5a7650e200e35acff97eec",
+    # Reviewed 2026-10-17 execution audit: Public price/size coincidences are unverified candidates, not measured matches; require paired legs and BUY side.
+    "sniper_mode.py": "eba0b8231dde84e8cb73de9ef9779b1916ac6cb4ae6bb92b69bcb52ae185d5eb",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
@@ -1639,7 +1640,8 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # (paper_live_book/sniper, /manager) - per-source P/L from actual fills.
     # Re-approved 2026-10-12 (audit 20261012): a failing event observer cannot change a committed
     # paper fill or rejection
-    "paper_trade.py": "74de9530f5b66469f54f4a8eb18400342289a482610dfd2c557d80af0ad48f4e",
+    # Reviewed 2026-10-17 execution audit: Arrival comparison quotes use the submitted FAK/FOK semantics, including FAK partial fills.
+    "paper_trade.py": "c551358b1b75de3448fda9e0f436827c113d02d4e799ba60337ec1981c770049",
     # Re-approved 2026-10-12 (audit 20261012): a rejection that also carries acceptance evidence
     # is not definitive
     "polymarket_trade.py": "398c55b670843db6f978e76c4848005cacfdaf46ab31a27bbae8b4dd50e89362",

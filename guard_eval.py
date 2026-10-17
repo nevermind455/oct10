@@ -40,6 +40,7 @@ import argparse
 import collections
 import glob
 import json
+import math
 import os
 import time
 
@@ -51,11 +52,16 @@ def _rows(path):
     out = []
     if path and os.path.exists(path):
         with open(path, encoding="utf-8") as fh:
-            for line in fh:
+            for number, line in enumerate(fh, 1):
+                if not line.strip():
+                    continue
                 try:
-                    out.append(json.loads(line))
-                except ValueError:
-                    pass
+                    row = json.loads(line)
+                except ValueError as exc:
+                    raise ValueError(f"malformed journal record at {path}:{number}") from exc
+                if not isinstance(row, dict):
+                    raise ValueError(f"non-object journal record at {path}:{number}")
+                out.append(row)
     return out
 
 
@@ -77,16 +83,24 @@ def winners(directory: str, ledger_path: str | None, token_side: dict) -> dict:
             tok, cond, pay = str(pos.get("token_id")), pos.get("condition_id"), pos.get("payout_per_share")
             if tok in token_side and cond and pay is not None:
                 side = token_side[tok]
-                win.setdefault(cond, side if float(pay) >= 0.5 else ("DOWN" if side == "UP" else "UP"))
+                other = "DOWN" if side == "UP" else "UP"
+                value = float(pay)
+                if math.isfinite(value) and 0 <= value <= 1:
+                    # The ledger's payout vector also covers split/void results.
+                    win[cond] = {side: value, other: 1.0 - value}
     return win
 
 
-def entry_at(shadow: dict, L: float) -> dict:
-    keys = sorted(int(k) for k in shadow.get("L", {}))
-    if not keys:
+def entry_at(shadow: dict, L: float | None) -> dict:
+    """An exact recorded grid instant, or unknown. Never round latency down.
+
+    Adjacent books are not bounds: liquidity can disappear and replenish
+    between them. Use execution_audit for explicitly labelled sensitivities.
+    """
+    if L is None or not math.isfinite(float(L)):
         return {}
-    use = [k for k in keys if k <= L] or keys[:1]
-    return shadow["L"][str(use[-1])]
+    return next((v for k, v in shadow.get("L", {}).items()
+                 if abs(float(k) - float(L)) < 1e-9), {})
 
 
 def quote_fill(q: dict | None):
@@ -101,13 +115,47 @@ def quote_fill(q: dict | None):
     return None
 
 
+def quote_known(q: dict | None, *, fok=False) -> bool:
+    """Explicit executable quote/no-match evidence; unknown books stay unknown.
+
+    FOK failure alone does not prove a FAK zero: partial liquidity may exist.
+    """
+    if not q:
+        return False
+    if q.get("sh"):
+        return True
+    why = str(q.get("miss", "")).lower()
+    if fok:
+        return why.startswith(("fok no-fill", "fak no-fill"))
+    partial = q.get("fak") or {}
+    return bool(partial.get("sh") or str(partial.get("miss", "")).lower().startswith("fak no-fill")
+                or why.startswith("fak no-fill"))
+
+
 def pnl(fill, side, win):
     sh, px, fee = fill
-    return sh * ((1.0 if side == win else 0.0) - px) - fee
+    pay = win.get(side) if isinstance(win, dict) else (
+        0.5 if win == "50/50" else 1.0 if side == win else 0.0)
+    if pay is None or not math.isfinite(float(pay)) or not 0 <= float(pay) <= 1:
+        raise ValueError("unknown settlement payout")
+    return sh * (float(pay) - px) - fee
 
 
 def load(directory, journal, ledger, since):
     rows = _rows(journal)
+    ledger_present = bool(ledger and os.path.exists(ledger))
+    confirmed = collections.defaultdict(list)
+    if ledger_present:
+        # A matched receipt / MINED trade can subsequently fail. Reconcile
+        # actual executions to the durable confirmed lots, never HTTP success.
+        with open(ledger, encoding="utf-8") as fh:
+            positions = json.load(fh).get("positions", {})
+        for p in positions.values():
+            for lot in p.get("lots", []):
+                if lot.get("status") == "CONFIRMED" and lot.get("side") == "BUY":
+                    key = lot.get("order_id") or lot.get("trade_id")
+                    if key:
+                        confirmed[str(key)].append(lot)
     dec, final, shadow, diag = {}, {}, {}, {}
     for r in rows:
         rid, res = r.get("id"), r.get("result")
@@ -137,18 +185,28 @@ def load(directory, journal, ledger, since):
             continue
         f = final.get(rid, {})
         actual = None
-        if f.get("result") == "filled" and f.get("shares") and f.get("price") is not None:
+        oid = str(f.get("order_id") or d.get("order_id") or "")
+        lots = confirmed.get(oid, [])
+        known = f.get("kind", d.get("kind")) == "NO_MATCH" or (
+            not d.get("live") and f.get("result") == "refused")
+        if lots:
+            sh = sum(float(l["shares"]) for l in lots)
+            actual = (sh, sum(float(l["shares"]) * float(l["price"]) for l in lots) / sh,
+                      sum(float(l.get("fee") or 0) for l in lots))
+            known = True
+        elif not ledger_present and not d.get("live") and f.get("result") == "filled" and f.get("shares") and f.get("price") is not None:
             actual = (float(f["shares"]), float(f["price"]), float(f.get("fee") or 0.0))
+            known = True
         orders.append({"id": rid, "d": d, "actual": actual, "shadow": shadow.get(rid), "diag": diag.get(rid),
-                       "cond": d.get("condition_id"), "win": win.get(d.get("condition_id"))})
+                       "actual_known": known, "cond": d.get("condition_id"), "win": win.get(d.get("condition_id"))})
     return orders
 
 
-def delay_of(d: dict) -> float:
+def delay_of(d: dict) -> float | None:
     for k in ("t_signal_to_response_ms", "latency_ms", "delay_ms"):
         if d.get(k) is not None:
             return float(d[k])
-    return 300.0
+    return None  # absent timing is unknown, never an invented 300 ms match
 
 
 def periods(wall: float) -> tuple[str, str]:
@@ -167,7 +225,7 @@ def compare(orders, name):
             continue
         d, side = o["d"], o["d"]["side"]
         if name in GUARDS:
-            if not o["diag"]:
+            if not o["diag"] or not o.get("actual_known", True):
                 continue
             base = pnl(o["actual"], side, o["win"]) if o["actual"] else 0.0
             blocked = bool((o["diag"].get("guards") or {}).get(name))
@@ -178,15 +236,20 @@ def compare(orders, name):
             if not s:
                 continue
             e = entry_at(s, delay_of(d))
-            if not e:
+            if not quote_known(e):
                 continue
             bf = quote_fill(e if (e.get("sh") or e.get("fak")) else None)
             base = pnl(bf, side, o["win"]) if bf else 0.0
             if name == "tight":
                 t = e.get("tight")
+                if t and not quote_known(t):
+                    continue
                 af = quote_fill(t) if t else bf                  # no tighter limit: the same policy
             else:
-                af = bf if bf else quote_fill((e.get("alt") or {}).get("3"))
+                wider = (e.get("alt") or {}).get("3")
+                if bf is None and not quote_known(wider):
+                    continue
+                af = bf if bf else quote_fill(wider)
             alt = pnl(af, side, o["win"]) if af else 0.0
             out.append({"o": o, "base": base, "alt": alt, "blocked": False, "bfill": bf is not None,
                         "afill": af is not None})
@@ -207,6 +270,7 @@ def worst_case(items, use_alt: bool) -> list[float]:
 
 
 def report(orders, min_n: int) -> int:
+    print("Shadow comparisons require an exact grid instant; ACK latency is a proxy, not match time.")
     print(f"orders with a known round winner: {sum(1 for o in orders if o['win'])} of {len(orders)} sent")
     for name in GUARDS + LIMITS:
         items = compare(orders, name)

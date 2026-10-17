@@ -215,17 +215,26 @@ class VenueMatch(unittest.TestCase):
 
     MINE = [{"trade_id": "t1", "status": "CONFIRMED", "price": 0.45, "size": 5.0, "maker_legs": [[3.0, 0.45], [2.0, 0.44]]}]
 
-    def test_the_earliest_print_of_our_size_or_a_leg_is_the_match(self):
+    def test_the_earliest_print_is_only_an_unverified_candidate(self):
         prints = [{"ts": 10_050, "price": 0.45, "size": 7.0, "side": "BUY"},     # someone else's size
                   {"ts": 10_080, "price": 0.45, "size": 5.0, "side": "SELL"},    # wrong side
                   {"ts": 10_120, "price": 0.44, "size": 2.0, "side": "BUY"},     # our second leg
                   {"ts": 10_121, "price": 0.45, "size": 3.0, "side": "BUY"},     # our first leg
                   {"ts": 9_000 - 1, "price": 0.45, "size": 5.0, "side": "BUY"}]  # before the window
         out = self.sniper(prints)._venue_match("tok", self.MINE, tick_ms=10_000.0, reply_ms=10_300.0)
-        self.assertEqual(out["venue_match_ms"], 10_120)
-        self.assertEqual(out["match_after_tick_ms"], 120.0)
-        self.assertEqual(out["ack_after_match_ms"], 180.0)
+        self.assertEqual(out["candidate_first_venue_ms"], 10_120)
+        self.assertEqual(out["candidate_after_tick_ms"], 120.0)
+        self.assertEqual(out["ack_after_candidate_ms"], 180.0)
+        self.assertEqual(out["match_identity"], "UNVERIFIED_PRICE_SIZE")
+        self.assertNotIn("match_after_tick_ms", out)
         self.assertEqual((out["match_prints_seen"], out["match_prints_hit"]), (4, 2))
+
+    def test_a_size_and_price_from_different_legs_do_not_match(self):
+        prints = [{"ts": 10_100, "price": .44, "size": 3, "side": "BUY"},
+                  {"ts": 10_120, "price": .45, "size": 5, "side": None}]
+        out = self.sniper(prints)._venue_match("tok", self.MINE, 10_000., 10_300.)
+        self.assertEqual(out["match_prints_hit"], 0)
+        self.assertNotIn("venue_match_ms", out)
 
     def test_no_print_no_match_and_failed_trades_are_ignored(self):
         sn = self.sniper([{"ts": 10_100, "price": 0.45, "size": 5.0, "side": "BUY"}])

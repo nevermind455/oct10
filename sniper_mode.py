@@ -3892,8 +3892,8 @@ class Sniper:
                    "last_seen_ms": rel(getattr(f, "last_seen", None))} for f in rows]
         got = {t["trade_id"] for t in trades}
         match = self._venue_match(token, trades, tick_ms, reply_ms)
-        if match.get("match_after_tick_ms") is not None:
-            self.latency.add({"trigger_to_match": match["match_after_tick_ms"]})
+        # Price/size coincidences on the public feed do not identify an order.
+        # Keep candidates for investigation; never add them to measured latency.
         self._write({"wall": time.time(), "result": "user_trades", "id": ref.get("id"), "order_id": oid, **match,
                      "order_type": resp.get("order_type"), "kind": resp.get("kind"),
                      "reply_trade_ids": sorted(expected) or None, "trades": trades, "complete": complete,
@@ -3905,13 +3905,13 @@ class Sniper:
     MATCH_LOOKAHEAD_MS = 2000.0    # and this long after the reply
 
     def _venue_match(self, token, trades: list, tick_ms, reply_ms) -> dict:
-        """The venue's own match time for our trades, from the public market
-        channel's trade prints (millisecond venue stamps): a BUY print on our
-        token at one of our trades' prices whose size is that trade's size or
-        one of its maker legs. The earliest such print is the match.
-        match_after_tick_ms: tick -> match on the venue's clock (our tick wall
-        time shifted by SNIPER_VENUE_CLOCK_OFFSET_MS); ack_after_match_ms:
-        match -> the reply. {} when there is nothing to look in."""
+        """Unverified public-print candidates, never an identified match time.
+
+        Other takers can trade the same price and size. The public print has
+        no order ID, and these private rows carry no shared identity proof.
+        Even a single candidate is ambiguous. Match price/size PAIRS so a
+        size from one maker leg cannot match the price of another.
+        """
         market = getattr(self.hub, "market", None)
         look = getattr(market, "trades_between", None)
         mine = [t for t in trades if str(t.get("status") or "").upper() not in ("FAILED", "CONFLICT")
@@ -3920,22 +3920,20 @@ class Sniper:
             return {}
         hi = (reply_ms if reply_ms is not None else tick_ms + 5000.0) + self.MATCH_LOOKAHEAD_MS
         prints = look(token, tick_ms - self.MATCH_LOOKBACK_MS, hi)
-        sizes = set()
-        prices = set()
+        pairs = set()
         for t in mine:
-            sizes.add(round(float(t["size"]), 4))
-            prices.add(round(float(t["price"]), 4))
+            pairs.add((round(float(t["size"]), 4), round(float(t["price"]), 4)))
             for q, px in (t.get("maker_legs") or ()):
-                sizes.add(round(float(q), 4))
-                prices.add(round(float(px), 4))
-        hits = [p for p in prints if p.get("side") in (None, "BUY") and p.get("size") is not None
-                and round(float(p["size"]), 4) in sizes and round(float(p["price"]), 4) in prices]
+                pairs.add((round(float(q), 4), round(float(px), 4)))
+        hits = [p for p in prints if p.get("side") == "BUY" and p.get("size") is not None
+                and (round(float(p["size"]), 4), round(float(p["price"]), 4)) in pairs]
         out = {"match_prints_seen": len(prints), "match_prints_hit": len(hits)}
         if hits:
             first = min(float(p["ts"]) for p in hits)
-            out.update(venue_match_ms=int(first), match_after_tick_ms=round(first - tick_ms, 1))
+            out.update(match_identity="UNVERIFIED_PRICE_SIZE", candidate_first_venue_ms=int(first),
+                       candidate_after_tick_ms=round(first - tick_ms, 1))
             if reply_ms is not None:
-                out["ack_after_match_ms"] = round(reply_ms - first, 1)
+                out["ack_after_candidate_ms"] = round(reply_ms - first, 1)
         return out
 
     async def _extra_feed(self, name: str) -> None:

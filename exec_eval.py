@@ -179,7 +179,7 @@ def policies_for(o: dict, sizing: str):
     if not s:
         return None
     e = G.entry_at(s, G.delay_of(d))
-    if not e or ("sh" not in e and "miss" not in e):
+    if not G.quote_known(e) or not G.quote_known(e, fok=True):
         return None
     out = {"A": _fill(e, False), "B": _fill(e, True)}
     fl, cap = d.get("fair_limit"), d.get("cap")
@@ -189,7 +189,7 @@ def policies_for(o: dict, sizing: str):
         return out
     fv = e.get("fv") or {}
     q = fv.get("same" if sizing == "same" else "own") or (fv.get("same") if sizing != "same" else None)
-    if not q:
+    if not G.quote_known(q) or not G.quote_known(q, fok=True):
         return None                                      # differs, but this build did not price it
     out["C"], out["D"] = _fill(q, False), _fill(q, True)
     return out
@@ -260,6 +260,7 @@ def fetch_winners(orders, cache_path):
 
 
 def report(orders, rows, since, min_n: int) -> int:
+    print("SHADOW MODEL ONLY: exact grid instants; ACK is not match time. Unknown instants are excluded.")
     skips = pre_submission(rows, since)
     sent = len(orders)
     print(f"SIGNALS REJECTED BEFORE SUBMISSION (exact counters): {sum(skips.values())}")
@@ -283,7 +284,7 @@ def report(orders, rows, since, min_n: int) -> int:
             items.append({"o": o, "fills": fills,
                           "pnl": {p: G.pnl(f[:3], o["d"]["side"], o["win"]) if f else 0.0 for p, f in fills.items()}})
         n = len(items)
-        print(f"\n{title}: {n} identical eligible signals" + (f" ({unpriced} left out: C/D not priced by this build)"
+        print(f"\n{title}: {n} identical eligible signals" + (f" ({unpriced} left out: exact instant or C/D quote unavailable)"
                                                             if unpriced else ""))
         if not n:
             continue

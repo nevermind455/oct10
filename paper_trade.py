@@ -1402,12 +1402,12 @@ class PaperBroker:
                     woke = self._book_fetch(str(token_id))
                 except PaperRejected:
                     woke = None
-                woke = self._quote_outcome(woke, side, spend, cap, rules, floor, shares=size)
+                woke = self._quote_outcome(woke, side, spend, cap, rules, floor, shares=size, fak=fak)
                 arrived, info = arrival_book(str(token_id))
                 info = dict(info or {})
                 info["wake"] = woke
                 for name, alt in (info.pop("alternatives", None) or {}).items():
-                    info[name] = self._quote_outcome(alt, side, spend, cap, rules, floor, shares=size)
+                    info[name] = self._quote_outcome(alt, side, spend, cap, rules, floor, shares=size, fak=fak)
                 if timing is not None:
                     timing["book_ready_pc"] = time.perf_counter_ns()
                     timing["arrival"] = info
@@ -1714,7 +1714,7 @@ class PaperBroker:
             return estimate_fak_shares(book, size, cap, rules, min_price=floor)
         return (estimate_fak if fak else estimate_fok)(book, spend, cap, rules, min_price=floor)
 
-    def _quote_outcome(self, book, side, spend, cap, rules, floor, shares=None) -> dict:
+    def _quote_outcome(self, book, side, spend, cap, rules, floor, shares=None, fak=False) -> dict:
         """Would this book have filled the order? A counterfactual only:
         {"fill": True, "px": ...} or {"fill": False, "why": ...}; fill None
         when there was no book to ask."""
@@ -1727,8 +1727,7 @@ class PaperBroker:
                 raise PaperRejected("public order book has no bid")
             if book.asks[0][0] - book.best_bid > Decimal(str(self.max_spread)):
                 raise PaperRejected("spread exceeds paper limit")
-            q = (estimate_fak_shares(book, shares, cap, rules, min_price=floor) if shares is not None
-                 else estimate_fok(book, spend, cap, rules, min_price=floor))
+            q = self._quote(book, spend, cap, rules, floor, fak, shares)
         except PaperRejected as exc:
             return {"fill": False, "why": str(exc)[:80],
                     "ask": float(book.asks[0][0]) if getattr(book, "asks", None) else None}

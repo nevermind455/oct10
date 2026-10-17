@@ -374,10 +374,12 @@ class LiveFast(unittest.TestCase):
                 (tr,) = ut["trades"]
                 self.assertEqual((tr["trade_id"], tr["status"], tr["price"], tr["size"]), (tid, "CONFIRMED", 0.45, 5.0))
                 self.assertGreater(tr["first_seen_ms"], 0)
-                self.assertEqual(ut["match_after_tick_ms"], 120.0)            # the venue's own match stamp
-                self.assertAlmostEqual(ut["ack_after_match_ms"],
+                self.assertEqual(ut["candidate_after_tick_ms"], 120.0)
+                self.assertEqual(ut["match_identity"], "UNVERIFIED_PRICE_SIZE")
+                self.assertNotIn("match_after_tick_ms", ut)
+                self.assertAlmostEqual(ut["ack_after_candidate_ms"],
                                        hit["points"]["response"]["at_ms"] - 120.0, delta=0.2)
-                self.assertEqual(self.sn.summary()["exec_latency"]["trigger_to_match"]["n"], 1)
+                self.assertNotIn("trigger_to_match", self.sn.summary()["exec_latency"])
             finally:
                 await self.teardown_live()
         self.run_async(go())

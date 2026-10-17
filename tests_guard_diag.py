@@ -266,17 +266,22 @@ class Evaluator(unittest.TestCase):
         rows = [{"wall": NOW, "id": rid, "side": "UP", "bp": 1.0, "condition_id": "c", "result": "refused",
                  "latency_ms": 260},
                 {"wall": NOW, "result": "shadow", "id": rid, "side": "UP", "token": "tu", "other_token": "td",
-                 "L": {"200": {"sh": 10, "px": 0.5, "fee": 0.1, "tight": {"cap": 0.53, "miss": "x"}},
-                       "300": {"miss": "gone", "alt": {"3": {"sh": 9, "px": 0.6, "fee": 0.1}},
-                               "tight": {"cap": 0.53, "miss": "x", "fak": {"sh": 4, "px": 0.52, "fee": 0.05}}}}}]
+                 "L": {"200": {"sh": 10, "px": 0.5, "fee": 0.1,
+                               "tight": {"cap": 0.53, "miss": "FOK no-fill", "fak": {"miss": "FAK no-fill"}}},
+                       "300": {"miss": "FOK no-fill", "fak": {"miss": "FAK no-fill"},
+                               "alt": {"3": {"sh": 9, "px": 0.6, "fee": 0.1}},
+                               "tight": {"cap": 0.53, "miss": "FOK no-fill", "fak": {"sh": 4, "px": 0.52, "fee": 0.05}}}}}]
         d = self.write(rows, {"c": "UP"})
         orders = G.load(d, os.path.join(d, "paper_orders_sniper.jsonl"), None, None)
-        tight = G.compare(orders, "tight")[0]                    # 260ms -> the 200ms entry
+        self.assertEqual(G.compare(orders, "tight"), [])         # 260ms is not recorded
+        self.assertEqual(G.compare(orders, "wide3"), [])
+        orders[0]["d"]["latency_ms"] = 200
+        tight = G.compare(orders, "tight")[0]
         self.assertAlmostEqual(tight["base"], 10 * 0.5 - 0.1)
         self.assertEqual(tight["alt"], 0.0)                      # the tighter limit misses there
         wide = G.compare(orders, "wide3")[0]
         self.assertAlmostEqual(wide["alt"], wide["base"])        # the real limit filled: nothing to add
-        orders[0]["d"]["latency_ms"] = 320                       # now the 300ms entry: the real limit missed
+        orders[0]["d"]["latency_ms"] = 300                       # exact recorded instant; the real limit missed
         wide = G.compare(orders, "wide3")[0]
         self.assertEqual(wide["base"], 0.0)
         self.assertAlmostEqual(wide["alt"], 9 * (1 - 0.6) - 0.1)
