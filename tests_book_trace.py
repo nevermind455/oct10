@@ -312,5 +312,64 @@ class DecisionBook(unittest.TestCase):
         self.assertIn("dec_error", row)
         self.assertEqual(sn.n["decision book errors"], 1)
 
+
+class TraceFlow(unittest.TestCase):
+    """book_trace flow: depth under the cap that was traded vs at least cancelled."""
+    TICK = 1_000_000.0
+    # the 2026-10-17 0.61 order's depth path under its 0.66 cap
+    POINTS = {"0": {"depth_cap_sh": 433.21}, "50": {"depth_cap_sh": 319.69}, "100": {"depth_cap_sh": 215.9},
+              "150": {"status": "UNKNOWN"}, "response": {"depth_cap_sh": 0.0, "at_ms": 498.2}}
+
+    def sniper(self, prints):
+        hub = Hub()
+        hub.market = types.SimpleNamespace(
+            trades_between=lambda token, lo, hi: [x for x in prints if lo <= x["ts"] <= hi])
+        return S.Sniper(hub, Broker(), settings=_settings(), journal_path=None)
+
+    def test_traded_and_at_least_cancelled_per_step(self):
+        T = self.TICK
+        prints = [{"ts": T + 20, "price": 0.61, "size": 50.0, "side": "BUY"},     # took asks under the cap
+                  {"ts": T + 30, "price": 0.61, "size": 9.0, "side": "SELL"},     # hit a bid: not our asks
+                  {"ts": T + 40, "price": 0.70, "size": 7.0, "side": "BUY"},      # above the cap
+                  {"ts": T + 300, "price": 0.63, "size": 20.0, "side": "BUY"},
+                  {"ts": T + 600, "price": 0.62, "size": 99.0, "side": "BUY"}]    # after the reply
+        out = self.sniper(prints)._trace_flow("up", 0.66, T, self.POINTS)
+        steps = out["flow"]
+        self.assertEqual([(x["from"], x["to"]) for x in steps], [("0", "50"), ("50", "100"), ("100", "response")])
+        self.assertEqual([x["traded_sh"] for x in steps], [50.0, 0.0, 20.0])
+        self.assertEqual([x["cancel_min_sh"] for x in steps], [63.52, 103.79, 195.9])
+        self.assertEqual((out["flow_traded_sh"], out["flow_drop_sh"], out["flow_cancel_min_sh"]),
+                         (70.0, 433.21, 363.21))
+        self.assertEqual(out["flow_prints"], 4)                       # the print after the reply is outside
+
+    def test_a_print_without_a_side_is_never_counted_as_a_cancel(self):
+        T = self.TICK
+        out = self.sniper([{"ts": T + 20, "price": 0.61, "size": 100.0, "side": None}])._trace_flow(
+            "up", 0.66, T, {"0": {"depth_cap_sh": 100.0}, "50": {"depth_cap_sh": 0.0}})
+        self.assertEqual((out["flow_traded_sh"], out["flow_cancel_min_sh"], out["flow_unknown_side_sh"]),
+                         (0.0, 0.0, 100.0))
+
+    def test_depth_that_grows_is_no_cancel_and_no_market_feed_is_no_flow(self):
+        T = self.TICK
+        out = self.sniper([])._trace_flow("up", 0.5, T, {"0": {"depth_cap_sh": 10.0}, "50": {"depth_cap_sh": 25.0}})
+        self.assertEqual((out["flow_drop_sh"], out["flow_cancel_min_sh"]), (0.0, 0.0))
+        no_feed = S.Sniper(Hub(), Broker(), settings=_settings(), journal_path=None)
+        self.assertEqual(no_feed._trace_flow("up", 0.5, T, self.POINTS), {})
+
+    def test_a_paper_book_trace_row_carries_the_flow(self):
+        original = Hub.__init__
+
+        def with_market(hub):
+            original(hub)
+            hub.market = types.SimpleNamespace(trades_between=lambda token, lo, hi: [])
+        with patch.object(Hub, "__init__", with_market):
+            rows, _ = run_two()
+        traces = [r for r in rows if r.get("result") == "book_trace"]
+        self.assertTrue(traces)
+        for t in traces:
+            self.assertEqual(t["flow_traded_sh"], 0.0)
+            self.assertEqual(t["flow_drop_sh"], 0.0)                 # the fixture's book never changes
+            self.assertEqual(len(t["flow"]), len(t["points"]) - 1)
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

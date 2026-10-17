@@ -3887,11 +3887,13 @@ class Sniper:
                 points["response"] = dict(self._book_point(view, cap), at_ms=round(at, 1))
             if resp.get("order_type") is None:
                 resp["order_type"] = plan.get("order_type")
+            flow = self._trace_flow(token, cap, tick_ms, points)
             self._write({"wall": time.time(), "result": "book_trace", "id": ref.get("id"), "side": ref.get("side"),
                          "round_end": ref.get("round_end"), "condition_id": plan.get("cond"), "token": token,
                          "live": self.live is not None, "cap": cap, "amount": round(float(plan["amount"]), 4),
                          "ask_seen": ref.get("ask_seen"), "bp": ref.get("bp"), "feed": ref.get("feed"),
-                         "client_order_id": plan.get("client_order_id"), "points": points, **{k: v for k, v in resp.items() if v is not None}})
+                         "client_order_id": plan.get("client_order_id"), "points": points, **flow,
+                         **{k: v for k, v in resp.items() if v is not None}})
             if self.live is not None and resp.get("order_id") and resp.get("kind") is not None:
                 await self._user_trades(ref, resp, t0, token=token, tick_ms=tick_ms,
                                         reply_ms=None if mono is None else tick_ms + (float(mono) - t0) * 1000.0)
@@ -3899,6 +3901,46 @@ class Sniper:
             self.n["book trace errors"] += 1
             self._write({"wall": time.time(), "result": "book_trace_error", "id": ref.get("id"),
                          "reason": f"{type(exc).__name__}: {exc}"[:200]})
+
+    def _trace_flow(self, token, cap: float, tick_ms: float, points: dict) -> dict:
+        """Where the depth under the cap went between consecutive trace points:
+        the shares the public market channel printed as BUY trades at or under
+        the cap (taken by takers), the drop in depth under the cap, and at least
+        how much was cancelled (drop - traded: new asks in between only hide
+        cancels, so the true figure can only be higher). Measurement only.
+        {} when the market channel's prints are not available."""
+        look = getattr(getattr(self.hub, "market", None), "trades_between", None)
+        if look is None:
+            return {}
+        marks = []
+        for label, pt in points.items():
+            depth = pt.get("depth_cap_sh") if isinstance(pt, dict) else None
+            if depth is None:
+                continue                                       # an unknown book: no step through it
+            at = pt.get("at_ms") if label == "response" else float(label)
+            if at is not None:
+                marks.append((float(at), label, float(depth)))
+        marks.sort()
+        if len(marks) < 2:
+            return {}
+        prints = look(token, tick_ms + marks[0][0], tick_ms + marks[-1][0])
+        steps, traded_all, drop_all, cancel_all, unknown_side = [], 0.0, 0.0, 0.0, 0.0
+        for (a, la, da), (b, lb, db) in zip(marks, marks[1:]):
+            lo, hi = tick_ms + a, tick_ms + b
+            inside = [x for x in prints if lo < float(x["ts"]) <= hi and x.get("price") is not None
+                      and float(x["price"]) <= cap + 1e-9 and x.get("size") is not None]
+            traded = sum(float(x["size"]) for x in inside if x.get("side") == "BUY")
+            unknown = sum(float(x["size"]) for x in inside if x.get("side") not in ("BUY", "SELL"))
+            drop = max(0.0, da - db)
+            cancel = max(0.0, drop - traded - unknown)
+            steps.append({"from": la, "to": lb, "depth_from": round(da, 4), "depth_to": round(db, 4),
+                          "traded_sh": round(traded, 4), "cancel_min_sh": round(cancel, 4),
+                          **({"unknown_side_sh": round(unknown, 4)} if unknown else {})})
+            traded_all, drop_all, cancel_all, unknown_side = (traded_all + traded, drop_all + drop,
+                                                              cancel_all + cancel, unknown_side + unknown)
+        return {"flow": steps, "flow_traded_sh": round(traded_all, 4), "flow_drop_sh": round(drop_all, 4),
+                "flow_cancel_min_sh": round(cancel_all, 4), "flow_prints": len(prints),
+                **({"flow_unknown_side_sh": round(unknown_side, 4)} if unknown_side else {})}
 
     async def _user_trades(self, ref: dict, resp: dict, t0: float, *, token=None, tick_ms=None,
                            reply_ms=None) -> None:
