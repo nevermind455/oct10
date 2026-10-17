@@ -59,7 +59,10 @@ import os
 FROZEN_SPEC = (
     # (Settings attribute, environment variable, frozen value, label, format)
     ("primary_feed", "SNIPER_PRIMARY_FEED", "coinbase", "trigger feed", "{}"),
-    ("k_bp", "SNIPER_K_BP", 0.5, "trigger", "{:.2f} bp"),
+    # 2026-10-17, the operator's change: 0.50bp -> 1.00bp (the fair margin stays $0.01).
+    # Live 10-15/16: moves under 1bp lost -$57 on 100 fills (43 wins vs 52.4 expected);
+    # 1bp and up made +$57 on 145. Chosen on that same data: a prospective live run judges it.
+    ("k_bp", "SNIPER_K_BP", 1.0, "trigger", "{:.2f} bp"),
     ("window_ms", "SNIPER_WINDOW_MS", 250.0, "window", "{:.0f} ms"),
     ("order_type", "SNIPER_ORDER_TYPE", "FAK", "execution", "{}"),
     ("slip", "SNIPER_SLIP", 0.05, "slip", "${:.2f}"),

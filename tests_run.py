@@ -64,7 +64,7 @@ def patched(obj, **attrs):
 
 
 # --live also requires the resolved settings to be the frozen spec (exec_latency.FROZEN_SPEC)
-FROZEN_ENV = {"SNIPER_FAIR": "1", "SNIPER_FAIR_MARGIN": "0.01", "SNIPER_K_BP": "0.5", "SNIPER_WINDOW_MS": "250", "SNIPER_ORDER_TYPE": "FAK", "SNIPER_SLIP": "0.05", "SNIPER_COOLDOWN_MS": "300", "SNIPER_SHARES": "10", "SNIPER_MAX_TARGET_SHARES": "20", "SNIPER_CANARY_MAX_SHARES": "25"}
+FROZEN_ENV = {"SNIPER_FAIR": "1", "SNIPER_FAIR_MARGIN": "0.01", "SNIPER_K_BP": "1.0", "SNIPER_WINDOW_MS": "250", "SNIPER_ORDER_TYPE": "FAK", "SNIPER_SLIP": "0.05", "SNIPER_COOLDOWN_MS": "300", "SNIPER_SHARES": "10", "SNIPER_MAX_TARGET_SHARES": "20", "SNIPER_CANARY_MAX_SHARES": "25"}
 SNIPER_ENV = {"SNIPER_ONLY": "1", "SNIPER_LIVE_CANARY": None, "SNIPER_PRIMARY_FEED": None,
               "SNIPER_KRAKEN_LIVE": None, **FROZEN_ENV}
 
@@ -759,7 +759,7 @@ class SettingsErrorTests(unittest.TestCase):
             s = sniper_mode.Settings()
         self.assertEqual((s.k_bp, s.window_ms, s.order_type, s.slip, s.cooldown_ms, s.min_left_s,
                           s.max_fills_round, s.max_side_shares, s.primary_feed),
-                         (0.5, 250.0, "FAK", 0.05, 300.0, 10.0, 20, 200.0, "coinbase"))     # 0.5bp, ask + 5c
+                         (1.0, 250.0, "FAK", 0.05, 300.0, 10.0, 20, 200.0, "coinbase"))     # 1.0bp, ask + 5c
         self.assertEqual(s.shares, 10.0)
 
 

@@ -1568,7 +1568,9 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # found among the public market channel's trade prints (our token, BUY, our size or a maker
     # leg's): match_after_tick_ms / ack_after_match_ms, and a trigger_to_match latency sample.
     # Reviewed 2026-10-17 execution audit: Public price/size coincidences are unverified candidates, not measured matches; require paired legs and BUY side.
-    "sniper_mode.py": "eba0b8231dde84e8cb73de9ef9779b1916ac6cb4ae6bb92b69bcb52ae185d5eb",
+    # 2026-10-17, the operator's change: the trigger default follows the frozen spec,
+    # SNIPER_K_BP 0.5 -> 1.0 (exec_latency.FROZEN_SPEC); the fair margin stays $0.01.
+    "sniper_mode.py": "0f5512852f95f7865014c271bc2e2b57fd0f45aedc1ebc943c54ecca19cf7af7",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
