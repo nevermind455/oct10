@@ -771,7 +771,33 @@ def start_lines(rt: Runtime) -> list[str]:
         if "pure-Python" in exec_latency.signing_backend():
             lines.append("WARNING orders are signed with the pure-Python ECDSA (~1.4ms vs ~0.1ms): pip install coincurve")
     lines += ignored_settings()
+    lines += shadowed_settings()
     return lines
+
+
+def shadowed_settings(env=None, file_values=None) -> list[str]:
+    """SNIPER_* settings whose value in the process environment differs from
+    the .env file's. config loads .env with override=False, so a variable left
+    exported in the shell wins without a word - on 2026-10-18 a shell's
+    SNIPER_CANARY_MAX_SHARES=200 beat .env's 25. SNIPER_* values only: they are
+    settings, never credentials."""
+    import config
+    env = os.environ if env is None else env
+    if file_values is None:
+        try:
+            import dotenv
+            file_values = dotenv.dotenv_values(config._ENV_PATH) if config._ENV_PATH.exists() else {}
+        except Exception:                                   # unreadable: say nothing rather than guess
+            file_values = {}
+    out = []
+    for key in sorted(file_values):
+        if not str(key).startswith("SNIPER_"):
+            continue
+        want, got = file_values.get(key), env.get(key)
+        if got is not None and want is not None and str(got).strip() != str(want).strip():
+            out.append(f"WARNING {key}={got} comes from the shell and overrides .env's {key}={want} "
+                       f"(unset it, or start from a fresh shell)")
+    return out
 
 
 def build_manager(rt: Runtime, *, broker):

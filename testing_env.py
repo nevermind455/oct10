@@ -53,6 +53,7 @@ def _no_dotenv(*_args, **_kwargs) -> bool:
 
 
 dotenv.load_dotenv = _no_dotenv
+dotenv.dotenv_values = lambda *_args, **_kwargs: {}       # run.shadowed_settings: never the bot's .env
 
 _PREFIXES = ("SNIPER_", "PAPER_", "POLY_", "LIVE_", "DASH_", "STOP_LOSS_", "FLIP_", "PHASE1_", "PHASE2_",
              "SETTLE_")

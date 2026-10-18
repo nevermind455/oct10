@@ -606,10 +606,17 @@ class CanaryLimits:
         if any(not isinstance(r, str) or not r for r in pending.values()):
             raise ValueError("invalid pending canary cap")
         with self._lock:
-            self._step = dict(steps)
+            # 2026-10-18: a saved budget may only TIGHTEN what this start's
+            # environment configured. Restoring it as saved kept a $50 loss cap
+            # (and any steps earned after pauses) after .env was lowered to $30:
+            # each ceiling and step is now the lower of the saved value and this
+            # start's own (set from the environment before the restore).
+            configured = {name: getattr(self, name) for name in names}
+            configured_steps = dict(self._step)
+            self._step = {name: min(steps[name], configured_steps[name]) for name in names}
             self._pending_caps = dict(pending)
             for name, value in ceilings.items():
-                setattr(self, name, value)
+                setattr(self, name, min(value, configured[name]))
 
     def check(self, amount: float, shares: float, condition: str, kill: KillSwitch, realized_loss_usd=None):
         with self._lock:

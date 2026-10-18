@@ -1636,7 +1636,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # a balance read 90s and 180s after every round ends (balance_read rows: wallet, applied,
     # rule, hold, Kelly cash) and a cash_stuck alarm when the cash stays > $1 under the wallet
     # for 10 minutes (repeated every 10 minutes until it clears).
-    "sniper_live.py": "a18a4ebc8e025752089318a94ee592906bf906d50cb99ae172c082014cf15310",
+    # 2026-10-18 (safety - tests_canary_limits): a restored canary budget may only tighten this
+    # start's configured limits - each ceiling and step is min(saved, configured); a lowered .env
+    # loss cap was kept at the saved $50.
+    "sniper_live.py": "31ce6abce8c5c3e5ce232c4bde0282d076715eb7e0f8358f7fbf738ab69637df",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads
