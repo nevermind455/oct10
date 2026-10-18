@@ -1577,11 +1577,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # 2026-10-17 (measurement only - tests_book_trace TraceFlow): book_trace rows carry a flow - per
     # step between snapshots, the depth under the cap that disappeared, the part public BUY prints
     # account for, and at least how much was cancelled (flow_report.py summarises them).
-    # 2026-10-17 (measurement only - tests_book_trace RestShadow): after a fully missed order, a
-    # rest_shadow row: what a bid for its shares resting at its limit would have filled by each
-    # SNIPER_REST_SHADOW_S horizon - real SELL prints at or under the limit, behind the queue
-    # already there (rest_report.py settles them). Nothing is sent.
-    "sniper_mode.py": "b28be3ff06fa083d30cd5a167a2b1aac20aa615cd8c524fb155c6db6dd6a83c4",
+    "sniper_mode.py": "88f4e3f9f823ec72dc3478e50379e250773358c1a273632b996cf210a69ecc6f",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.

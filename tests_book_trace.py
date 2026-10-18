@@ -36,7 +36,7 @@ ASKS = ((0.52, 100.0), (0.53, 40.0), (0.60, 900.0))
 
 def _settings(**env):
     base = {"SNIPER_ONLY": "1", "SNIPER_LATENCY_MS": "200", "SNIPER_SLIP": "0.02", "SNIPER_FAIR": "0",
-            "SNIPER_KELLY": "0", "SNIPER_SHADOW_MS": "", "SNIPER_GUARD_DIAG": "0", "SNIPER_REST_SHADOW_S": ""}
+            "SNIPER_KELLY": "0", "SNIPER_SHADOW_MS": "", "SNIPER_GUARD_DIAG": "0"}
     with patch.dict(os.environ, {**base, **env}):
         return S.Settings()
 
@@ -370,57 +370,6 @@ class TraceFlow(unittest.TestCase):
             self.assertEqual(t["flow_traded_sh"], 0.0)
             self.assertEqual(t["flow_drop_sh"], 0.0)                 # the fixture's book never changes
             self.assertEqual(len(t["flow"]), len(t["points"]) - 1)
-
-
-class RestShadow(unittest.TestCase):
-    """What a missed order left resting at its limit would have filled - conservatively."""
-
-    def test_only_sell_prints_at_or_under_the_cap_fill_and_the_queue_goes_first(self):
-        prints = [{"ts": 1, "price": 0.28, "size": 30.0, "side": "SELL"},      # at our price
-                  {"ts": 2, "price": 0.25, "size": 15.0, "side": "SELL"},      # under it
-                  {"ts": 3, "price": 0.04 + 0.24, "size": 5.0, "side": "SELL"},  # float noise just under 0.28
-                  {"ts": 4, "price": 0.29, "size": 99.0, "side": "SELL"},      # above: hits better bids, not ours
-                  {"ts": 5, "price": 0.28, "size": 50.0, "side": "BUY"},       # a taker buying: not to us
-                  {"ts": 6, "price": 0.27, "size": 8.0, "side": None}]         # no side: never a fill
-        filled, sold, unknown = S.Sniper.rest_fill(prints, 0.28, shares=40.0, queue_ahead=20.0)
-        self.assertEqual((sold, unknown), (50.0, 8.0))
-        self.assertEqual(filled, 30.0)                                 # 50 sold - 20 ahead, up to our 40
-        self.assertEqual(S.Sniper.rest_fill(prints, 0.28, 10.0, 0.0)[0], 10.0)
-        self.assertEqual(S.Sniper.rest_fill(prints, 0.28, 40.0, 60.0)[0], 0.0)   # the queue ahead takes it all
-
-    def run_rest(self, prints, horizons="0.2", end_in_s=60.0, cap=0.28):
-        with patch.dict(os.environ, {"SNIPER_REST_SHADOW_S": horizons}):
-            sn = S.Sniper(Hub(), Broker(), settings=_settings(SNIPER_REST_SHADOW_S=horizons), journal_path=None)
-        sn.hub.market = types.SimpleNamespace(
-            trades_between=lambda token, lo, hi: [x for x in prints if lo <= x["ts"] <= hi])
-        rows = []
-        sn._write = rows.append
-        start = time.time() * 1000.0
-        stamped = [dict(x, ts=start + x["ts"]) for x in prints]
-        prints[:] = stamped
-        view = types.SimpleNamespace(bids=((0.30, 40.0), (0.28, 12.0), (0.27, 5.0)), asks=((0.41, 14.0),))
-        plan = {"amount": 40 * cap, "end": time.time() + end_in_s, "cond": "c", "client_order_id": "x"}
-        asyncio.run(sn._rest_shadow({"id": "o1", "side": "UP", "bp": 1.2, "ask_seen": 0.23}, plan, "up", cap,
-                                    start, view))
-        return rows
-
-    def test_a_missed_order_gets_a_rest_shadow_row(self):
-        rows = self.run_rest([{"ts": 50, "price": 0.28, "size": 30.0, "side": "SELL"},
-                              {"ts": 900, "price": 0.28, "size": 99.0, "side": "SELL"}])   # after 0.2s: outside
-        (r,) = rows
-        self.assertEqual((r["result"], r["queue_ahead_sh"], r["better_bids_sh"], r["best_ask_at_start"]),
-                         ("rest_shadow", 12.0, 40.0, 0.41))
-        self.assertAlmostEqual(r["shares"], 40.0)
-        h = r["horizons"]["0.2"]
-        self.assertEqual((h["sold_le_cap_sh"], h["filled_sh"]), (30.0, 18.0))      # 30 sold - 12 queued ahead
-
-    def test_end_inside_the_last_ten_seconds_is_skipped(self):
-        rows = self.run_rest([], horizons="0.2,end", end_in_s=5.0)
-        self.assertEqual(rows[0]["horizons"], {"0.2": {"skipped": "round over"}, "end": {"skipped": "round over"}})
-
-    def test_settings_parse_and_switch_off(self):
-        self.assertEqual(_settings(SNIPER_REST_SHADOW_S="5,15,30,end,abc,0,999").rest_shadow_s, ("5", "15", "30", "end"))
-        self.assertEqual(_settings(SNIPER_REST_SHADOW_S="").rest_shadow_s, ())
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

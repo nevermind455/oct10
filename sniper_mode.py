@@ -1100,20 +1100,6 @@ class Settings:
             self.book_trace_ms = ()
         self.book_trace_ms = tuple(x for x in self.book_trace_ms if 0 <= x <= 5000)
         self.book_trace_levels = max(1, min(20, int(_env_float("SNIPER_BOOK_TRACE_LEVELS", 5))))
-        # Rest shadow (diagnostics only): after a FULLY missed order, what a bid for
-        # the same shares left resting at its limit would have filled - real SELL
-        # prints only, behind the queue already at that price - by these seconds
-        # ("end": the round's last trade window). Empty turns it off. Nothing is sent.
-        raw = os.environ.get("SNIPER_REST_SHADOW_S", "5,15,30,end")
-        rest = []
-        for x in raw.split(","):
-            x = x.strip().lower()
-            try:
-                if x == "end" or 0 < float(x) <= 300:
-                    rest.append(x if x == "end" else f"{float(x):g}")
-            except ValueError:
-                pass
-        self.rest_shadow_s = tuple(dict.fromkeys(rest))
         raw = os.environ.get("SNIPER_SHADOW_SLIPS", "0.03,0.04,0.06")
         try:
             self.shadow_slips = tuple(sorted({round(float(x), 4) for x in raw.split(",") if x.strip()}))
@@ -3895,10 +3881,9 @@ class Sniper:
                 resp = {"source": "no reply in time", "mono": None}
             resp = dict(resp or {})
             mono = resp.pop("mono", None)
-            reply_view = None
             if mono is not None:
                 at = (float(mono) - t0) * 1000.0
-                view = reply_view = await self._book_at(token, tick_ms + at, float(mono))
+                view = await self._book_at(token, tick_ms + at, float(mono))
                 points["response"] = dict(self._book_point(view, cap), at_ms=round(at, 1))
             if resp.get("order_type") is None:
                 resp["order_type"] = plan.get("order_type")
@@ -3912,9 +3897,6 @@ class Sniper:
             if self.live is not None and resp.get("order_id") and resp.get("kind") is not None:
                 await self._user_trades(ref, resp, t0, token=token, tick_ms=tick_ms,
                                         reply_ms=None if mono is None else tick_ms + (float(mono) - t0) * 1000.0)
-            if (self.s.rest_shadow_s and mono is not None and reply_view is not None
-                    and resp.get("kind") in ("NO_FILL", "NO_MATCH")):
-                await self._rest_shadow(ref, plan, token, cap, tick_ms + (float(mono) - t0) * 1000.0, reply_view)
         except Exception as exc:  # noqa: BLE001 - diagnostics only, never the order path
             self.n["book trace errors"] += 1
             self._write({"wall": time.time(), "result": "book_trace_error", "id": ref.get("id"),
@@ -3959,58 +3941,6 @@ class Sniper:
         return {"flow": steps, "flow_traded_sh": round(traded_all, 4), "flow_drop_sh": round(drop_all, 4),
                 "flow_cancel_min_sh": round(cancel_all, 4), "flow_prints": len(prints),
                 **({"flow_unknown_side_sh": round(unknown_side, 4)} if unknown_side else {})}
-
-    REST_END_BEFORE_S = 10.0       # "end": stop resting this long before the round ends (its trade window)
-
-    @staticmethod
-    def rest_fill(prints, cap: float, shares: float, queue_ahead: float) -> tuple[float, float, float]:
-        """(our filled shares, SELL shares printed at or under the cap, prints
-        without a side) for a bid resting at `cap` behind `queue_ahead` shares
-        already bid at that price. Only real taker SELL prints at or under the
-        cap reach it, and the queue ahead fills first. A price touch, other bids
-        cancelling or new bids behind us count for nothing - conservative."""
-        sold = sum(float(x["size"]) for x in prints if x.get("side") == "SELL" and x.get("price") is not None
-                   and x.get("size") is not None and float(x["price"]) <= cap + 1e-9)
-        unknown = sum(float(x["size"]) for x in prints if x.get("side") not in ("BUY", "SELL")
-                      and x.get("price") is not None and x.get("size") is not None
-                      and float(x["price"]) <= cap + 1e-9)
-        return max(0.0, min(float(shares), sold - float(queue_ahead))), sold, unknown
-
-    async def _rest_shadow(self, ref: dict, plan: dict, token, cap: float, start_ms: float, view) -> None:
-        """rest_shadow row: what a bid for the missed order's shares, resting at
-        its limit from the instant it would have matched, would have filled by
-        each SNIPER_REST_SHADOW_S horizon (rest_fill). Read as each horizon
-        passes - the market channel drops a round's prints when it rotates.
-        Diagnostics only: nothing is sent."""
-        look = getattr(getattr(self.hub, "market", None), "trades_between", None)
-        if look is None:
-            return
-        bids = [(float(px), float(q)) for px, q in (getattr(view, "bids", ()) or ())]
-        asks = [(float(px), float(q)) for px, q in (getattr(view, "asks", ()) or ())]
-        queue = sum(q for px, q in bids if abs(px - cap) < 1e-9)
-        better = sum(q for px, q in bids if px > cap + 1e-9)
-        shares = float(plan["amount"]) / cap if cap > 0 else 0.0
-        end_ms = (float(plan["end"]) - self.REST_END_BEFORE_S) * 1000.0 + self.s.venue_offset_ms
-        horizons = {}
-        for h in self.s.rest_shadow_s:
-            until = end_ms if h == "end" else min(start_ms + float(h) * 1000.0, end_ms)
-            if until <= start_ms:
-                horizons[h] = {"skipped": "round over"}
-                continue
-            wait = (until - (time.time() * 1000.0 + self.s.venue_offset_ms)) / 1000.0 + 0.5
-            if wait > 0:
-                await asyncio.sleep(wait)
-            if self._closing:
-                return
-            filled, sold, unknown = self.rest_fill(look(token, start_ms, until), cap, shares, queue)
-            horizons[h] = {"rest_s": round((until - start_ms) / 1000.0, 1), "filled_sh": round(filled, 4),
-                           "sold_le_cap_sh": round(sold, 4), **({"unknown_side_sh": round(unknown, 4)} if unknown else {})}
-        self._write({"wall": time.time(), "result": "rest_shadow", "id": ref.get("id"), "side": ref.get("side"),
-                     "condition_id": plan.get("cond"), "round_end": plan.get("end"), "token": token,
-                     "client_order_id": plan.get("client_order_id"), "live": self.live is not None,
-                     "bp": ref.get("bp"), "ask_seen": ref.get("ask_seen"), "cap": cap, "shares": round(shares, 4),
-                     "queue_ahead_sh": round(queue, 4), "better_bids_sh": round(better, 4),
-                     "best_ask_at_start": asks[0][0] if asks else None, "horizons": horizons})
 
     async def _user_trades(self, ref: dict, resp: dict, t0: float, *, token=None, tick_ms=None,
                            reply_ms=None) -> None:
