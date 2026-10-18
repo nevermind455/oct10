@@ -1100,6 +1100,11 @@ class Settings:
             self.book_trace_ms = ()
         self.book_trace_ms = tuple(x for x in self.book_trace_ms if 0 <= x <= 5000)
         self.book_trace_levels = max(1, min(20, int(_env_float("SNIPER_BOOK_TRACE_LEVELS", 5))))
+        # Liquidity attribution labels (diagnostics only, never a gate): the share of
+        # observed ask reductions under the cap that public BUY prints explain at or
+        # above HI is TRADE_DOMINATED, at or below LO NON_TRADE_DOMINATED, between MIXED.
+        self.attrib_hi = _env_float("SNIPER_ATTRIB_HI", 0.7)
+        self.attrib_lo = _env_float("SNIPER_ATTRIB_LO", 0.3)
         raw = os.environ.get("SNIPER_SHADOW_SLIPS", "0.03,0.04,0.06")
         try:
             self.shadow_slips = tuple(sorted({round(float(x), 4) for x in raw.split(",") if x.strip()}))
@@ -3848,11 +3853,14 @@ class Sniper:
         asks = [(float(p), float(q)) for p, q in (getattr(view, "asks", ()) or ())]
         bids = [(float(p), float(q)) for p, q in (getattr(view, "bids", ()) or ())]
         under = [(p, q) for p, q in asks if p <= float(cap) + 1e-9]
+        at_cap = sum(q for p, q in under if abs(p - float(cap)) <= 1e-9)
         out = {"status": str(getattr(view, "status", "")),
                "bid": bids[0][0] if bids else None, "bid_size": bids[0][1] if bids else None,
                "asks": [[p, round(q, 4)] for p, q in asks[:n]],
                "depth_cap_sh": round(sum(q for _p, q in under), 4),
-               "depth_cap_usd": round(sum(p * q for p, q in under), 4)}
+               "depth_cap_usd": round(sum(p * q for p, q in under), 4),
+               "asks_le_cap": [[p, round(q, 4)] for p, q in under[:40]],
+               "at_cap_sh": round(at_cap, 4), "below_cap_sh": round(sum(q for _p, q in under) - at_cap, 4)}
         ts = getattr(view, "exchange_ts_ms", None)
         if ts is not None:
             out["book_ts"] = ts
@@ -3888,6 +3896,10 @@ class Sniper:
             if resp.get("order_type") is None:
                 resp["order_type"] = plan.get("order_type")
             flow = self._trace_flow(token, cap, tick_ms, points)
+            if mono is not None:
+                attribution = self._attribution(token, cap, t0, float(mono), tick_ms)
+                if attribution:
+                    flow["attribution"] = attribution
             self._write({"wall": time.time(), "result": "book_trace", "id": ref.get("id"), "side": ref.get("side"),
                          "round_end": ref.get("round_end"), "condition_id": plan.get("cond"), "token": token,
                          "live": self.live is not None, "cap": cap, "amount": round(float(plan["amount"]), 4),
@@ -3901,6 +3913,192 @@ class Sniper:
             self.n["book trace errors"] += 1
             self._write({"wall": time.time(), "result": "book_trace_error", "id": ref.get("id"),
                          "reason": f"{type(exc).__name__}: {exc}"[:200]})
+
+    # ---------------------------------------------------------------- liquidity attribution (diagnostics only)
+    ATTRIB_MIN_SH = 1.0            # under this many shares of reductions: NO_DEPLETION
+    ATTRIB_UNKNOWN_FRAC = 0.2      # prints without a side above this share of reductions: INCONCLUSIVE
+    ATTRIB_MAX_EVENTS = 600        # raw level changes / prints kept per row (truncation flagged)
+
+    @staticmethod
+    def attribute_window(states, prints, cap: float, a: float, b: float, *, hi: float = 0.7, lo: float = 0.3,
+                         min_sh: float = 1.0, unknown_frac: float = 0.2) -> dict:
+        """Ask-side liquidity under `cap` between local instants a < t <= b
+        (time.monotonic seconds), from the book's own installed states and the
+        trade prints received in the window.
+
+        states: [(mono, bids_dict, asks_dict)] in order - None dicts mark a gap
+        (disconnect / resync / reset); prints: [{"recv_mono", "price", "size",
+        "side"}]. Gross reductions and additions are summed per level between
+        consecutive observed states (never across a gap); public BUY prints at
+        or under the cap are matched against the reductions (min of the two),
+        the rest is unexplained - consistent with cancels or repricing, never
+        proof of a particular cancel. Missing observations stay None, never 0."""
+        cap_ = float(cap) + 1e-9
+        before = [x for x in states if x[0] <= a]
+        inside = [x for x in states if a < x[0] <= b]
+        out = {"window_ms": None, "feed_coverage_status": None, "coverage_reason": None}
+        if not before and not inside:
+            out.update(feed_coverage_status="UNKNOWN", coverage_reason="no book history for the window",
+                       attribution_classification="INCONCLUSIVE", attribution_confidence="NONE")
+            return out
+        coverage, reason = "COMPLETE_OBSERVED", None
+        base = before[-1] if before else None
+        if base is None:
+            coverage, reason = "PARTIAL", "book history starts inside the window"
+        elif base[2] is None:
+            coverage, reason = "GAPPED", "the book was in a gap at the window start"
+            base = None
+        prev = None if base is None else base[2]
+
+        def depth(asks):
+            return None if asks is None else sum(q for p, q in asks.items() if float(p) <= cap_)
+        initial = depth(prev)
+        red = add = 0.0
+        levels: dict = {}
+        events = resets = 0
+        last = prev
+        for mono, _bids, asks in inside:
+            if asks is None:
+                coverage, reason = "GAPPED", "a feed gap (disconnect / resync) inside the window"
+                prev = None
+                continue
+            if prev is None:
+                resets += 1
+                prev = last = asks
+                if initial is None:
+                    initial = depth(asks)
+                continue
+            events += 1
+            for p in set(prev) | set(asks):
+                if float(p) > cap_:
+                    continue
+                d = float(asks.get(p, 0.0)) - float(prev.get(p, 0.0))
+                if d < 0:
+                    red -= d
+                    levels.setdefault(float(p), [0.0, 0.0])[0] += -d
+                elif d > 0:
+                    add += d
+                    levels.setdefault(float(p), [0.0, 0.0])[1] += d
+            prev = last = asks
+        final = depth(last)
+        rel = [x for x in prints if a < float(x["recv_mono"]) <= b and x.get("price") is not None
+               and x.get("size") is not None and float(x["price"]) <= cap_]
+        buy = sum(float(x["size"]) for x in rel if x.get("side") == "BUY")
+        sell = sum(float(x["size"]) for x in rel if x.get("side") == "SELL")
+        unknown = sum(float(x["size"]) for x in rel if x.get("side") not in ("BUY", "SELL"))
+        matched = min(buy, red)
+        out.update(initial_depth_le_cap=None if initial is None else round(initial, 4),
+                   final_depth_le_cap=None if final is None else round(final, 4),
+                   net_depth_change=None if initial is None or final is None else round(final - initial, 4),
+                   observed_gross_reductions=round(red, 4), observed_gross_additions=round(add, 4),
+                   relevant_public_trade_volume=round(buy, 4), sell_side_volume=round(sell, 4),
+                   unknown_side_volume=round(unknown, 4),
+                   matched_trade_depletion_estimate=round(matched, 4),
+                   unexplained_reduction_estimate=round(red - matched, 4),
+                   trade_attribution_ratio=None if red <= 0 else round(matched / red, 4),
+                   trade_event_count=len(rel), book_event_count=events, resets=resets,
+                   feed_coverage_status=coverage, coverage_reason=reason,
+                   levels={f"{p:g}": [round(r, 4), round(ad, 4)] for p, (r, ad) in sorted(levels.items())})
+        if coverage != "COMPLETE_OBSERVED":
+            label, conf = "INCONCLUSIVE", "LOW"
+        elif red < min_sh:
+            label, conf = "NO_DEPLETION", "HIGH" if events else "MEDIUM"
+        elif unknown > unknown_frac * red:
+            label, conf = "INCONCLUSIVE", "LOW"
+        else:
+            ratio = matched / red
+            label = "TRADE_DOMINATED" if ratio >= hi else "NON_TRADE_DOMINATED" if ratio <= lo else "MIXED"
+            conf = "HIGH" if events and not resets and not unknown else "MEDIUM"
+        out.update(attribution_classification=label, attribution_confidence=conf)
+        return out
+
+    @staticmethod
+    def print_side_check(states, prints, horizon_s: float = 0.25) -> dict:
+        """Empirical side semantics: for each print, did the ask or the bid at
+        its price shrink in the first book state received after it (within
+        horizon_s)? A BUY that consumes asks should show ask drops."""
+        import bisect
+        tally = {}
+        seen = [s for s in states if s[2] is not None]
+        monos = [s[0] for s in seen]
+        for x in prints:
+            if x.get("price") is None:
+                continue
+            t, p = float(x["recv_mono"]), float(x["price"])
+            i = bisect.bisect_right(monos, t)            # seen[i - 1] is in force at t, seen[i] is the next
+            side = str(x.get("side") or "NONE")
+            row = tally.setdefault(side, {"ask_drop": 0, "bid_drop": 0, "neither": 0, "no_state": 0})
+            if i == 0 or i >= len(seen) or seen[i][0] > t + horizon_s:
+                row["no_state"] += 1
+                continue
+            p0, p1 = seen[i - 1], seen[i]
+            ask_drop = float(p1[2].get(p, 0.0)) < float(p0[2].get(p, 0.0)) - 1e-9
+            bid_drop = float((p1[1] or {}).get(p, 0.0)) < float((p0[1] or {}).get(p, 0.0)) - 1e-9
+            row["ask_drop" if ask_drop else "bid_drop" if bid_drop else "neither"] += 1
+        return tally
+
+    def _attribution(self, token, cap: float, t0: float, reply_mono: float, tick_ms: float) -> dict:
+        """attribution on the book_trace row: each step between the trace
+        instants and the reply, the 0-50 / 0-150 / 0-250 ms / signal->reply
+        spans, the side check and the raw events (bounded) for offline
+        sensitivity. {} when the book history or the prints are unavailable."""
+        book = getattr(self.hub, "book", None)
+        market = getattr(self.hub, "market", None)
+        hist = getattr(book, "_hist", None)
+        received = getattr(market, "trades_received", None)
+        if not isinstance(hist, dict) or received is None:
+            return {}
+        # only the states around this order: the one in force at the signal through
+        # 0.3s after the reply. A busy book keeps thousands in its 30s history and
+        # this runs just after the reply, so walk back from the newest end.
+        picked = []
+        for e in reversed(hist.get(str(token)) or ()):
+            if e[1] > reply_mono + 0.3:
+                continue
+            picked.append((e[1], e[4], e[5]))
+            if e[1] <= t0:
+                break
+        states = picked[::-1]
+        prints = received(token, t0 - 1.0, reply_mono + 1.0)
+        kw = {"hi": self.s.attrib_hi, "lo": self.s.attrib_lo, "min_sh": self.ATTRIB_MIN_SH,
+              "unknown_frac": self.ATTRIB_UNKNOWN_FRAC}
+        marks = sorted({t0 + L / 1000.0 for L in self.s.book_trace_ms if t0 + L / 1000.0 < reply_mono} | {t0, reply_mono})
+        steps = {}
+        for a, b in zip(marks, marks[1:]):
+            w = self.attribute_window(states, prints, cap, a, b, **kw)
+            w["window_ms"] = [round((a - t0) * 1000.0, 1), round((b - t0) * 1000.0, 1)]
+            end_label = "reply" if b == reply_mono else f"{w['window_ms'][1]:g}"
+            steps[f"{w['window_ms'][0]:g}-{end_label}"] = w
+        spans = {}
+        for name, end in (("0-50", t0 + 0.05), ("0-150", t0 + 0.15), ("0-250", t0 + 0.25), ("signal-reply", reply_mono)):
+            if end <= reply_mono or name == "signal-reply":
+                w = self.attribute_window(states, prints, cap, t0, min(end, reply_mono), **kw)
+                w["window_ms"] = [0.0, round((min(end, reply_mono) - t0) * 1000.0, 1)]
+                spans[name] = w
+        in_window = [x for x in prints if t0 < float(x["recv_mono"]) <= reply_mono]
+        changes, prev = [], None
+        for mono, _bids, asks in states:
+            if asks is None:
+                prev = None
+                continue
+            if prev is not None and t0 < mono <= reply_mono:
+                for pr in set(prev) | set(asks):
+                    if float(pr) <= float(cap) + 1e-9:
+                        d = float(asks.get(pr, 0.0)) - float(prev.get(pr, 0.0))
+                        if d:
+                            changes.append([round((mono - t0) * 1000.0, 1), float(pr), round(d, 4)])
+            prev = asks
+        raw_prints = [[round((float(x["recv_mono"]) - t0) * 1000.0, 1),
+                       None if x.get("ts") is None else round(float(x["ts"]) - tick_ms, 1),
+                       x.get("price"), x.get("size"), x.get("side")] for x in in_window]
+        n = self.ATTRIB_MAX_EVENTS
+        return {"v": 1, "side_semantics": "print side assumed = taker side (see side_check)",
+                "thresholds": {"hi": self.s.attrib_hi, "lo": self.s.attrib_lo, "min_sh": self.ATTRIB_MIN_SH,
+                               "unknown_frac": self.ATTRIB_UNKNOWN_FRAC},
+                "steps": steps, "spans": spans, "classification": spans["signal-reply"]["attribution_classification"],
+                "side_check": self.print_side_check(states, in_window),
+                "level_changes": changes[:n], "prints": raw_prints[:n],
+                "truncated": len(changes) > n or len(raw_prints) > n}
 
     def _trace_flow(self, token, cap: float, tick_ms: float, points: dict) -> dict:
         """Where the depth under the cap went between consecutive trace points:

@@ -84,7 +84,7 @@ class FeedHub:
                  btc_stale_after: float = 3.0, book_stale_after: float = 8.0,
                  rest_book_fetch=None, urls: dict | None = None,
                  book_refresh_after: float | None = None,
-                 rest_book_timeout: float = 10.0) -> None:
+                 rest_book_timeout: float = 10.0, print_log=None) -> None:
         urls = urls or {}
         self._lock = threading.RLock()
         self._on_event = on_event
@@ -112,7 +112,7 @@ class FeedHub:
             stale_after=btc_stale_after, on_price=self._on_price, **kw)
         self.market = PolyMarketFeed(urls.get("poly_market", DEFAULT_MARKET),
                                      book=self.book, stale_after=book_stale_after,
-                                     request_resync=self._request_resync, **kw)
+                                     request_resync=self._request_resync, print_log=print_log, **kw)
         self.user = PolyUserFeed(creds, urls.get("poly_user", DEFAULT_USER),
                                  store=self.fill_store, **kw)
 

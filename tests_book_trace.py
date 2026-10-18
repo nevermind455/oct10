@@ -195,13 +195,19 @@ class TradePrints(unittest.TestCase):
         feed.set_tokens(["B", "C"])
         self.assertEqual(feed.trades_between("A", now, now + 10), [])
 
-    def test_a_rejected_print_is_not_kept(self):
+    def test_an_out_of_order_print_is_a_trade_but_never_the_last_price(self):
+        # 2026-10-18: every valid print is a trade that happened; only the displayed
+        # last price refuses an older stamp (it used to drop the trade too)
         feed, now = self.feed()
         feed._handle(json.dumps({"event_type": "last_trade_price", "asset_id": "A", "timestamp": now + 5,
                                  "price": ".5", "size": "5", "side": "BUY"}))
         feed._handle(json.dumps({"event_type": "last_trade_price", "asset_id": "A", "timestamp": now + 1,
-                                 "price": ".5", "size": "7", "side": "BUY"}))      # out of order: rejected
-        self.assertEqual([t["size"] for t in feed.trades_between("A", now, now + 10)], [5.0])
+                                 "price": ".4", "size": "7", "side": "BUY"}))      # older stamp
+        self.assertEqual([t["size"] for t in feed.trades_between("A", now, now + 10)], [5.0, 7.0])
+        self.assertEqual((feed.last_trade_price["A"], feed.last_trade_ts["A"]), (0.5, now + 5))
+        feed._handle(json.dumps({"event_type": "last_trade_price", "asset_id": "A", "timestamp": "x",
+                                 "price": ".5", "size": "9", "side": "BUY"}))      # invalid: never a trade
+        self.assertEqual(len(feed.trades_between("A", now, now + 10)), 2)
 
 
 class VenueMatch(unittest.TestCase):

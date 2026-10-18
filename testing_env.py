@@ -73,6 +73,8 @@ os.environ["OTHER_BOT_LOCKS"] = ""
 # Settlement reads the chain by default; no test may reach Polygon or the CLOB
 # through it. The tests of that path turn it back on around fakes.
 os.environ["SETTLE_ONCHAIN"] = "0"
+# No test writes the persisted public-print log (run._print_log); its own tests build one.
+os.environ["SNIPER_PRINTS_LOG"] = "0"
 # The fair-value gate (SNIPER_FAIR, on in the bot) needs a round-start price and a
 # minute of volatility samples that order-path tests do not build: off here, on in
 # tests_sniper_fair.py and wherever a test resolves the frozen spec (clear env / SPEC).

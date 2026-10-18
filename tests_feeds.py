@@ -1577,7 +1577,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # 2026-10-17 (measurement only - tests_book_trace TraceFlow): book_trace rows carry a flow - per
     # step between snapshots, the depth under the cap that disappeared, the part public BUY prints
     # account for, and at least how much was cancelled (flow_report.py summarises them).
-    "sniper_mode.py": "88f4e3f9f823ec72dc3478e50379e250773358c1a273632b996cf210a69ecc6f",
+    # 2026-10-18 (measurement only - tests_liquidity_attribution): book_trace rows carry an
+    # attribution - per step and span, gross ask reductions/additions under the original cap from
+    # the book's own states, public BUY prints matched against them, feed coverage, a diagnostic
+    # label, a print side check and bounded raw events; points list every ask level under the cap.
+    "sniper_mode.py": "7a0ea8ab40a47722d80862e53713d85d9e88f8bea575d65fe270a67778bbc066",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.

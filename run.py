@@ -439,8 +439,25 @@ def build_hub(*, paper: bool = False, read_only: bool = False):
                            "(CLOB create/derive timed out or failed). Check connectivity to CLOB_HOST and retry.")
     hub = FeedHub(creds=credentials, on_event=on_event,
                   btc_stale_after=cfg.btc_stale_after, book_stale_after=cfg.book_stale_after,
-                  rest_book_fetch=orderbook.get_orderbook)
+                  rest_book_fetch=orderbook.get_orderbook, print_log=_print_log())
     return hub, cfg
+
+
+def _print_log():
+    """Persisted public trade prints and market-feed events (measurement only):
+    SNIPER_PRINTS_LOG=0 turns it off; SNIPER_PRINTS_DIR (default market_prints/
+    next to the bot) and SNIPER_PRINTS_KEEP_DAYS (default 3) place and bound it."""
+    if str(os.environ.get("SNIPER_PRINTS_LOG", "1")).strip().lower() in ("0", "false", "off", "no"):
+        return None
+    import atexit
+    from feeds.print_log import PrintLog
+    try:
+        keep = int(float(os.environ.get("SNIPER_PRINTS_KEEP_DAYS", "3") or 3))
+    except ValueError:
+        keep = 3
+    log = PrintLog(_state_path("SNIPER_PRINTS_DIR", "market_prints"), keep_days=keep).start()
+    atexit.register(log.stop)
+    return log
 
 
 # ---------------------------------------------------------------- live fill accounting

@@ -52,8 +52,12 @@ class PolyMarketFeed(SupervisedFeed):
     def __init__(self, url: str = MARKET_WS, *, book: BookState | None = None,
                  stale_after: float = 8.0, recv_timeout: float = 25.0,
                  request_resync=None, on_event=None,
-                 custom_features: bool = True, ping_every: float = PING_EVERY) -> None:
+                 custom_features: bool = True, ping_every: float = PING_EVERY, print_log=None) -> None:
         super().__init__(on_event=on_event)
+        # feeds.print_log.PrintLog (measurement only): every trade print and the
+        # socket's connect / disconnect / subscription events, persisted off-loop
+        self.print_log = print_log
+        self.conn_id = 0
         self.url = url
         self.book = book or BookState(stale_after=stale_after)
         self.recv_timeout = recv_timeout
@@ -80,7 +84,29 @@ class PolyMarketFeed(SupervisedFeed):
         """Copies of this token's trade prints stamped lo_ms..hi_ms (venue ms)."""
         with self._sub_lock:
             q = list(self.trades.get(str(token)) or ())
-        return [{"ts": t, "price": p, "size": s, "side": side} for t, p, s, side in q if lo_ms <= t <= hi_ms]
+        return [{"ts": t, "price": p, "size": s, "side": side, "recv_mono": rm}
+                for t, p, s, side, rm in q if lo_ms <= t <= hi_ms]
+
+    def trades_received(self, token, lo_mono: float, hi_mono: float) -> list[dict]:
+        """Copies of this token's prints RECEIVED lo_mono < t <= hi_mono (time.monotonic)."""
+        with self._sub_lock:
+            q = list(self.trades.get(str(token)) or ())
+        return [{"ts": t, "price": p, "size": s, "side": side, "recv_mono": rm}
+                for t, p, s, side, rm in q if lo_mono < rm <= hi_mono]
+
+    def _log_print(self, m: dict, recv_mono: float, accepted: bool, why) -> None:
+        """One trade print as received (raw strings), off-loop persisted. Never raises."""
+        log = self.print_log
+        if log is None:
+            return
+        try:
+            log.record("trade", conn=self.conn_id, asset_id=m.get("asset_id"), market=m.get("market"),
+                       price=m.get("price"), size=m.get("size"), side=m.get("side"),
+                       fee_rate_bps=m.get("fee_rate_bps"), venue_ms=m.get("timestamp"),
+                       tx=m.get("transaction_hash") or m.get("transactionHash"),
+                       recv_mono_ns=int(recv_mono * 1e9), accepted=accepted, why=why)
+        except Exception:  # noqa: BLE001 - telemetry must never touch the feed
+            pass
 
     # ----------------------------------------------------------- rotation
     def set_tokens(self, tokens) -> None:
@@ -161,6 +187,11 @@ class PolyMarketFeed(SupervisedFeed):
             self.health.mark_connected()
             self.health.status = UNSYNCED
             self.event("connected", "good")
+            self.conn_id += 1
+            if self.print_log is not None:
+                with self._sub_lock:
+                    want = sorted(self._want)
+                self.print_log.record("connect", conn=self.conn_id, tokens=want)
 
             tasks = []
             try:
@@ -184,6 +215,8 @@ class PolyMarketFeed(SupervisedFeed):
                     self._snapshot_requests.clear()
                 self.book.connected = False
                 self.book.desync_all("disconnect")
+                if self.print_log is not None:
+                    self.print_log.record("disconnect", conn=self.conn_id)
 
     async def _sync_subscriptions(self, initial: bool = False) -> None:
         async with self._subscription_send_lock:
@@ -206,6 +239,8 @@ class PolyMarketFeed(SupervisedFeed):
             await ws.send(json.dumps(msg))
             with self._sub_lock:
                 self._sent = set(want)
+            if self.print_log is not None:
+                self.print_log.record("subscribe", conn=self.conn_id, tokens=sorted(want), initial=True)
             return
         add = sorted(want - sent)
         drop = sorted(sent - want)
@@ -219,6 +254,8 @@ class PolyMarketFeed(SupervisedFeed):
             await ws.send(json.dumps(msg))
             with self._sub_lock:
                 self._sent |= set(add)
+            if self.print_log is not None:
+                self.print_log.record("subscribe", conn=self.conn_id, tokens=add)
         if drop:
             await ws.send(json.dumps({"assets_ids": drop, "operation": "unsubscribe"}))
             with self._sub_lock:
@@ -357,8 +394,10 @@ class PolyMarketFeed(SupervisedFeed):
                 self.health.detail = "rejected invalid/stale tick-size event"
         elif et == "last_trade_price":
             token = str(m.get("asset_id") or "")
+            recv_mono = time.monotonic()
             if token not in self.book.active:
                 self.book.note_inactive_drop()
+                self._log_print(m, recv_mono, False, "inactive token")
                 return
             try:
                 if isinstance(m.get("price"), bool) or isinstance(m.get("timestamp"), bool):
@@ -368,29 +407,37 @@ class PolyMarketFeed(SupervisedFeed):
             except (TypeError, ValueError, OverflowError):
                 self.invalid_messages += 1
                 self.health.detail = "rejected invalid last-trade price"
+                self._log_print(m, recv_mono, False, "invalid price or timestamp")
                 return
             if (not math.isfinite(price) or not 0 < price < 1
                     or not self.book._fresh_exchange_ts(timestamp)):
                 self.invalid_messages += 1
                 self.health.detail = "rejected out-of-range/stale last-trade price"
+                self._log_print(m, recv_mono, False, "out-of-range or stale")
                 return
             self.book.note_exchange_ts(timestamp)
             with self._sub_lock:
                 # Discovery can rotate tokens between parsing and assignment.
                 if token not in self._want:
                     self.book.note_inactive_drop()
+                    self._log_print(m, recv_mono, False, "token rotated")
                     return
+                # Every valid print is a trade that happened, in or out of order:
+                # kept for measurement (trades_between) and logged. Only the
+                # displayed last price refuses an older stamp.
+                size = _finite(m.get("size"))
+                self.trades.setdefault(token, collections.deque(maxlen=TRADE_PRINTS_KEPT)).append(
+                    (timestamp, price, size, str(m.get("side") or "").upper() or None, recv_mono))
                 previous = self.last_trade_ts.get(token)
                 if timestamp is not None and previous is not None and timestamp < previous:
                     self.invalid_messages += 1
                     self.health.detail = "rejected out-of-order last-trade price"
+                    self._log_print(m, recv_mono, True, "out of order (kept as a trade; not the last price)")
                     return
+                self._log_print(m, recv_mono, True, None)
                 self.last_trade_price[token] = price
                 if timestamp is not None:
                     self.last_trade_ts[token] = timestamp
-                size = _finite(m.get("size"))
-                self.trades.setdefault(token, collections.deque(maxlen=TRADE_PRINTS_KEPT)).append(
-                    (timestamp, price, size, str(m.get("side") or "").upper() or None))
         elif et == "best_bid_ask":
             # top-of-book only; the full book is authoritative here - but its
             # time still shows how far the feed has got
