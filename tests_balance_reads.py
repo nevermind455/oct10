@@ -81,16 +81,20 @@ class BalanceReads(unittest.IsolatedAsyncioTestCase):
     # ---------------------------------------------------------------- 2: the alarm
     async def test_cash_held_under_the_wallet_alarms_after_ten_minutes_then_every_ten(self):
         rows, events = self.journal()
-        clock = [1000.0]
+        # anchored to the real clock: the fixture's balance reading carries a real
+        # monotonic stamp, which on Windows counts from boot (a fixed fake time
+        # made the reading look stale right after a reboot)
+        base = time.monotonic()
+        clock = [base]
         with mock.patch.object(L.time, "monotonic", lambda: clock[0]):
             p = await self.send()                                     # unconfirmed: the cash is held
             self.assertAlmostEqual(await self.read(130.0), 130.0 - p.reserve, places=6)
             self.assertEqual(self.ex.last_balance_read["rule"], "held")
-            for t in (1300.0, 1599.0):                                # under ten minutes: quiet
-                clock[0] = t
+            for t in (300.0, 599.0):                                  # under ten minutes: quiet
+                clock[0] = base + t
                 await self.read(130.0)
             self.assertFalse(events)
-            clock[0] = 1601.0
+            clock[0] = base + 601.0
             await self.read(130.0)
             self.assertEqual(len(events), 1)
             msg, level = events[0]
@@ -100,10 +104,10 @@ class BalanceReads(unittest.IsolatedAsyncioTestCase):
             stuck = [r for r in rows if r.get("result") == "cash_stuck"]
             self.assertEqual(len(stuck), 1)
             self.assertEqual((stuck[0]["wallet"], stuck[0]["rule"], stuck[0]["awaiting"]), (130.0, "held", ["0xf1"]))
-            clock[0] = 1900.0
+            clock[0] = base + 900.0
             await self.read(130.0)
             self.assertEqual(len(events), 1)                          # not again within ten minutes
-            clock[0] = 2205.0
+            clock[0] = base + 1205.0
             await self.read(130.0)
             self.assertEqual(len(events), 2)                          # and again after ten more
             self.assertEqual(self.ex.n["stuck cash alarms"], 2)
