@@ -33,6 +33,9 @@ UP, DOWN = "up", "down"
 ENV = {"SNIPER_ONLY": "1", "SNIPER_ORDER_TYPE": "FAK", "SNIPER_SLIP": "0.05", "SNIPER_SHARES": "10",
        "SNIPER_MAX_TARGET_SHARES": "20", "SNIPER_LATENCY_MS": "20", "SNIPER_SHADOW_MS": "",
        "SNIPER_MIN_LEFT_S": "10", "SNIPER_MAX_FILLS_ROUND": "20", "SNIPER_MAX_SIDE_SHARES": "200",
+       # Historical IOC fixtures exercise execution independently of hybrid risk.
+       "SNIPER_HYBRID_SIZING": "0",
+       "SNIPER_KELLY_MIN_ENTRY": "0",
        # these tests size the book-cost order; share sizing (the default) has its own
        "SNIPER_ORDER_SIZING": "dollars"}
 

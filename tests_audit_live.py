@@ -554,7 +554,7 @@ class LivePathAudit(LivePathBase):
 
 class SizingAudit(unittest.TestCase):
     def test_FIXED_the_signed_stake_is_never_a_cent_below_the_computed_one(self):
-        """FIXED (was a finding, bug, minor, pre-existing): py_clob_client_v2 signs a BUY's
+        """FIXED (was a finding, bug, minor, pre-existing): clob_sdk signs a BUY's
         dollar amount with round_down(x, 2) = floor(x * 100) / 100 on a float.
         Amounts whose float sits just below the cent (5.10 -> 5.0999999...)
         are signed a cent lower: the live order buys up to ~1% fewer shares
@@ -562,7 +562,7 @@ class SizingAudit(unittest.TestCase):
         cent less than paper, which rounds in Decimal. Live: the amount from
         sniper_mode.Sniper.ioc_spend (and before it shares x ask) reaches the
         SDK via sniper_live.LeanSender.prepare unchanged."""
-        from py_clob_client_v2.order_builder.helpers import round_down
+        from clob_signing import round_down
         short = []
         for cents in range(5, 96):
             ask = cents / 100
@@ -669,9 +669,29 @@ class OldPathAudit(unittest.TestCase):
         say("order-building / posting call sites: " + "; ".join(f"{f}:{n} {c}" for f, n, c in builds))
         live_files = {f for f, _, _ in builds}
         # bench_execution.py builds orders with a throwaway key made in memory and sends
-        # them only to a fake CLOB on 127.0.0.1 (a latency benchmark, not an order path)
+        # them only to a fake CLOB on 127.0.0.1 (a latency benchmark, not an order path).
+        # clob_client.py is the unified-SDK adapter that replaced py-clob-client's
+        # ClobClient (2026-10-19): it is the library the order paths above call, so it
+        # may only delegate inside its own same-named methods (checked below).
         self.assertTrue(live_files <= {"sniper_live.py", "sniper_mode.py", "polymarket_trade.py", "live_preflight.py",
-                                       "bench_execution.py"}, live_files)
+                                       "bench_execution.py", "clob_client.py"}, live_files)
+        tree = ast.parse((ROOT / "clob_client.py").read_text(encoding="utf-8"))
+        delegations = []
+        for cls in (n for n in tree.body if isinstance(n, ast.ClassDef)):
+            for fn in (n for n in cls.body if isinstance(n, ast.FunctionDef)):
+                for node in ast.walk(fn):
+                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in (
+                            "build_market_order", "build_order", "create_market_order", "create_limit_order",
+                            "create_order", "post_order"):
+                        delegations.append((cls.name, fn.name, node.func.attr))
+        adapter_calls = [n for f, n, _ in builds if f == "clob_client.py"]
+        say(f"clob_client.py delegations: {delegations}")
+        self.assertEqual(len(adapter_calls), len([d for d in delegations if d[2] in (
+            "build_market_order", "create_market_order", "create_order", "post_order")]), delegations)
+        allowed = {("create_market_order", "build_market_order"), ("create_market_order", "create_market_order"),
+                   ("create_order", "build_order"), ("create_order", "create_limit_order")}
+        self.assertTrue(delegations and all(c == "ClobClient" and (f, a) in allowed for c, f, a in delegations),
+                        delegations)
 
     def test_every_lean_sender_prepare_passes_the_order_type(self):
         src = (ROOT / "sniper_live.py").read_text(encoding="utf-8")

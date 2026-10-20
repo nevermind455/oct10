@@ -25,10 +25,10 @@ import httpx  # noqa: E402,F401 - the HTTP client the lean sender is tested with
 
 import polymarket_trade as pt  # noqa: E402
 import sniper_live as L  # noqa: E402
-from py_clob_client_v2.clob_types import ApiCreds  # noqa: E402
-from py_clob_client_v2.order_builder.builder import OrderBuilder  # noqa: E402
-from py_clob_client_v2.signer import Signer  # noqa: E402
-from py_clob_client_v2.signing.hmac import build_hmac_signature  # noqa: E402
+from clob_sdk import ApiCreds  # noqa: E402
+from clob_signing import OrderBuilder  # noqa: E402
+from clob_signing import Signer  # noqa: E402
+from polymarket._internal.hmac import build_hmac_signature  # noqa: E402
 
 PASS = FAIL = 0
 FAILURES = []
@@ -260,7 +260,7 @@ def t_the_venue_could_authenticate_what_was_sent():
         await fake.stop()
         return sender, p, fake.orders[-1]
     sender, p, (body, hdrs, raw, server_now) = run(go())
-    want = build_hmac_signature(sender.creds.api_secret, hdrs["poly_timestamp"], "POST", "/order", raw)
+    want = build_hmac_signature(secret=sender.creds.api_secret, timestamp=int(hdrs["poly_timestamp"]), method="POST", path="/order", body=raw)
     check("the L2 HMAC verifies over the exact bytes received (POLY_SIGNATURE)", hdrs.get("poly_signature") == want,
           f"{hdrs.get('poly_signature')} vs {want}")
     check("POLY_TIMESTAMP is the venue's clock (server 4s ahead), from the cached offset - no GET /time",
@@ -274,36 +274,25 @@ def t_the_venue_could_authenticate_what_was_sent():
 
 
 def t_fast_signer_signs_byte_identical_orders():
-    import dataclasses
     import random
-    import py_clob_client_v2.order_builder.builder as B
-    from py_clob_client_v2.clob_types import CreateOrderOptions, MarketOrderArgsV2, OrderType
-    from py_clob_client_v2.order_builder.constants import BUY
+    from unittest.mock import patch
+    from clob_sdk import CreateOrderOptions, MarketOrderArgsV2, OrderType
+    from clob_signing import BUY
     key = "0x" + secrets.token_hex(32)
     lib, fast = OrderBuilder(Signer(key, 137)), OrderBuilder(L.fast_signer(key, 137))
-    rng, same, n, real_ns = random.Random(1), 0, 40, B.time.time_ns
-    import py_clob_client_v2.order_utils.exchange_order_builder_v2 as X
-    real_init = X.ExchangeOrderBuilderV2.__init__
-    salt = [0]
-
-    def init(self, *a, **k):                          # pin the random salt so the two can be compared
-        real_init(self, *a, **k)
-        self.generate_salt = lambda: salt[0]
-    X.ExchangeOrderBuilderV2.__init__ = init
-    try:
-        for i in range(n):
-            salt[0] = rng.getrandbits(60)
-            tick = rng.choice(["0.01", "0.001"])
-            args = dict(token_id=str(10 ** 70 + rng.randint(0, 9)), amount=round(rng.uniform(1, 9), 2), side=BUY,
-                        price=round(rng.uniform(0.05, 0.95), len(tick) - 2), order_type=OrderType.FOK)
-            opts = CreateOrderOptions(tick_size=tick, neg_risk=rng.random() < 0.3)
-            B.time.time_ns = lambda i=i: (1_790_000_000_000 + i) * 1_000_000
+    rng, same, n = random.Random(1), 0, 40
+    for i in range(n):
+        salt = rng.getrandbits(53)
+        tick = rng.choice(["0.01", "0.001"])
+        args = dict(token_id=str(10 ** 70 + rng.randint(0, 9)), amount=round(rng.uniform(1, 9), 2), side=BUY,
+                    price=round(rng.uniform(0.05, 0.95), len(tick) - 2), order_type=OrderType.FOK)
+        opts = CreateOrderOptions(tick_size=tick, neg_risk=rng.random() < 0.3)
+        with patch("polymarket._internal.actions.orders.orders._generate_salt", return_value=salt), \
+             patch("polymarket._internal.actions.orders.orders._current_timestamp_ms", return_value=1_790_000_000_000 + i):
             a = lib.build_market_order(MarketOrderArgsV2(**args), opts, version=2)
             b = fast.build_market_order(MarketOrderArgsV2(**args), opts, version=2)
-            same += dataclasses.asdict(a) == dataclasses.asdict(b)
-    finally:
-        B.time.time_ns, X.ExchangeOrderBuilderV2.__init__ = real_ns, real_init
-    check("the parsed-once key signs byte-identical orders to the library's Signer", same == n, f"{same}/{n}")
+        same += a.sdk_order == b.sdk_order and a.order_hash == b.order_hash
+    check("the parsed-once key signs byte-identical orders to the official SDK signer", same == n, f"{same}/{n}")
     check("...and has the same address", L.fast_signer(key, 137).address() == Signer(key, 137).address())
 
 
@@ -1309,7 +1298,7 @@ def t_fast_h2_writes_in_the_callers_step_on_the_warm_connection():
     check("fast path: MATCHED over the SAME connection the clock refresh opened (no new connection)",
           res["kind"] == L.MATCHED and fake.conns == 1 and res["new_connection"] is False
           and fake.hits[("GET", "/time")] == 1 and fake.hits[("POST", "/order")] == 1, f"{res} conns={fake.conns}")
-    want = build_hmac_signature(sender.creds.api_secret, hdrs["poly_timestamp"], "POST", "/order", raw)
+    want = build_hmac_signature(secret=sender.creds.api_secret, timestamp=int(hdrs["poly_timestamp"]), method="POST", path="/order", body=raw)
     check("fast path: the L2 HMAC verifies over the exact bytes the venue received", hdrs.get("poly_signature") == want,
           f"{hdrs.get('poly_signature')} vs {want}")
     check("fast path: lowercase header names, no connection-specific headers, :authority and content-length right",
@@ -1383,14 +1372,14 @@ def t_fast_h2_keep_warm_and_clock_ride_the_order_connection():
 
 
 def t_fast_order_builder_signs_byte_identically_to_the_library():
-    import dataclasses
     import random
     from eth_account import Account
-    from py_clob_client_v2.clob_types import CreateOrderOptions, MarketOrderArgsV2, OrderType
-    from py_clob_client_v2.config import get_contract_config
-    from py_clob_client_v2.order_builder.constants import BUY, SELL
-    from py_clob_client_v2.order_utils import ExchangeOrderBuilderV2
-    from py_clob_client_v2.order_utils.model.order_data_v2 import OrderV2
+    from clob_sdk import CreateOrderOptions, MarketOrderArgsV2, OrderType
+    from clob_signing import BUY, SELL
+    from eth_account.messages import encode_typed_data
+    from polymarket._internal.actions.orders.typed_data import build_order_signature, build_order_typed_data
+    from polymarket._internal.environment import PRODUCTION_CONFIG
+    from polymarket._internal.wallet import derive_proxy_wallet_address, derive_safe_wallet_address
     import sniper_mode
     rnd = random.Random(20261004)
     mismatches, recovered_bad, fields_bad, n = [], 0, [], 0
@@ -1398,7 +1387,9 @@ def t_fast_order_builder_signs_byte_identically_to_the_library():
         key = "0x" + secrets.token_hex(32)
         signer = L.fast_signer(key, 137) if i % 2 == 0 else Signer(key, 137)     # both signer kinds
         sig_type = rnd.choice([0, 1, 2])
-        funder = None if sig_type == 0 else "0x" + secrets.token_hex(20)
+        funder = (None if sig_type == 0 else
+                  (derive_proxy_wallet_address if sig_type == 1 else derive_safe_wallet_address)(
+                      signer.address(), PRODUCTION_CONFIG.wallet_derivation))
         lib = OrderBuilder(signer, sig_type, funder)
         fast = sniper_mode.FastOrderBuilder(OrderBuilder(signer, sig_type, funder))
         tick = rnd.choice(["0.01", "0.001", "0.0001"])
@@ -1409,16 +1400,13 @@ def t_fast_order_builder_signs_byte_identically_to_the_library():
         got = fast.build_market_order(args, opts, version=2)
         ref = lib.build_market_order(args, opts, version=2)
         # the library signing exactly the order the fast path built (same salt + timestamp)
-        cc = get_contract_config(137)
-        eb = ExchangeOrderBuilderV2(cc.neg_risk_exchange_v2 if opts.neg_risk else cc.exchange_v2, 137, signer)
-        order = OrderV2(**{k: v for k, v in dataclasses.asdict(got).items() if k != "signature"})
-        typed = eb.build_order_typed_data(order)
-        want = eb.build_order_signature(typed)
+        typed = build_order_typed_data(got.unsigned_order)
+        raw = signer.account.sign_message(encode_typed_data(full_message=typed)).signature.hex()
+        want = build_order_signature(got.unsigned_order, "0x" + raw.removeprefix("0x"))
         n += 1
         if got.signature != want:
             mismatches.append((i, got.signature[:20], want[:20]))
-        digest = bytes.fromhex(eb.build_order_hash(typed)[2:])
-        if Account._recover_hash(digest, signature=bytes.fromhex(got.signature[2:])).lower() != signer.address().lower():
+        if Account.recover_message(encode_typed_data(full_message=typed), signature=got.signature).lower() != signer.address().lower():
             recovered_bad += 1
         for f in ("maker", "signer", "tokenId", "makerAmount", "takerAmount", "side", "signatureType", "metadata",
                   "builder", "expiration"):
@@ -1432,9 +1420,9 @@ def t_fast_order_builder_signs_byte_identically_to_the_library():
           not fields_bad, str(fields_bad[:3]))
 
 
-def t_fast_order_builder_hands_poly_1271_and_v1_to_the_library():
-    from py_clob_client_v2.clob_types import CreateOrderOptions, MarketOrderArgsV2, OrderType
-    from py_clob_client_v2.order_builder.constants import BUY
+def t_fast_order_builder_delegates_all_signatures_to_the_sdk_adapter():
+    from clob_sdk import CreateOrderOptions, MarketOrderArgsV2, OrderType
+    from clob_signing import BUY
     import sniper_mode
     signer = L.fast_signer("0x" + secrets.token_hex(32), 137)
     calls = []
@@ -1451,8 +1439,8 @@ def t_fast_order_builder_hands_poly_1271_and_v1_to_the_library():
                                                                                                     version=2)
     except Exception:  # noqa: BLE001 - whatever the library does with it, it was the library
         pass
-    check("FastOrderBuilder: plain v2 EOA signs itself; POLY_1271 goes to the library unchanged",
-          calls == [2], str(calls))
+    check("FastOrderBuilder: all orders delegate to the supported SDK adapter",
+          calls == [2, 2], str(calls))
 
 
 def t_lean_pre_send_view_gives_identical_checks():

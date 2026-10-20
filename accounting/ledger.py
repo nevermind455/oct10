@@ -166,6 +166,13 @@ class Ledger:
         # directory is moved, while a missing/replaced ledger still fails
         # closed instead of silently resetting PnL.
         self.ledger_id = uuid.uuid4().hex
+        # Hybrid sizing's realized-equity high-water mark belongs to the
+        # account ledger, rather than a process or a resettable canary budget.
+        # A worker establishes the epoch; durable P&L transitions retain its
+        # peaks using the existing fill/settlement journal.
+        self._hybrid_risk: dict | None = None
+        self._hybrid_persisted: dict | None = None
+        self._hybrid_realized_total: float | None = None
         self.schema_version: int | None = None
         self.loaded_from_disk = False
         self.balance_marks: list = []        # (wall, balance) from the venue
@@ -640,6 +647,7 @@ class Ledger:
                 return False
             if not pos.condition_id:
                 pos.condition_id = condition
+            hybrid_before = _hybrid_position_realized(pos) if self._hybrid_risk is not None else 0.0
             if pos.settled:
                 # A fill arriving after settlement means our settlement was
                 # premature. Surface it rather than folding it in silently.
@@ -681,6 +689,7 @@ class Ledger:
                 self.seen.add(tid)
                 self._seen_rev += 1
                 self._index_fill_locked(pos)
+                self._observe_hybrid_delta_locked(_hybrid_position_realized(pos) - hybrid_before)
                 return True
             pos.lots.append(Lot(tid, token, condition, order_side,
                                 sh, px, f, st, lot_wall, source_text,
@@ -691,6 +700,7 @@ class Ledger:
             self.seen.add(tid)
             self._seen_rev += 1
             self._index_fill_locked(pos)
+            self._observe_hybrid_delta_locked(_hybrid_position_realized(pos) - hybrid_before)
             return True
 
     def record_fill_durable(self, trade_id, token_id, **kwargs) -> bool:
@@ -715,6 +725,8 @@ class Ledger:
                 # instead. SELL additionally changes FIFO consumption, which
                 # is restored separately if the durable write fails.
                 previous = None if position is None else position.__dict__.copy()
+                previous_hybrid = (None if self._hybrid_risk is None else dict(self._hybrid_risk))
+                previous_hybrid_realized = self._hybrid_realized_total
                 previous_length = 0 if position is None else len(position.lots)
                 consumed = []
                 if position is not None and str(kwargs.get("side", "BUY")).upper() == "SELL":
@@ -746,6 +758,8 @@ class Ledger:
                 self.seen.discard(tid)
                 self._seen_rev += 1
                 self._reindex_locked()
+                self._hybrid_risk = previous_hybrid
+                self._hybrid_realized_total = previous_hybrid_realized
                 # Readers could see this fill before the write failed.
                 self.persistence_halt = self.persistence_halt or (
                     f"fill {tid[-12:]} could not be made durable after it was booked: "
@@ -890,10 +904,17 @@ class Ledger:
                     raise ValueError(
                         f"resolution omitted held token(s): {', '.join(missing[:3])}")
                 settled_wall = time.time()
+                previous_hybrid = (None if self._hybrid_risk is None else dict(self._hybrid_risk))
+                previous_hybrid_realized = self._hybrid_realized_total
+                hybrid_before = math.fsum(_hybrid_position_realized(pos) for pos in targets)
                 for pos in targets:
                     self._settle_position_locked(pos, payouts[pos.token_id], settled_wall)
                     self._note_settled_locked(pos)
                     done.append(pos)
+                # A resolution settles all legs atomically: a winning hedge
+                # leg alone must not create an intermediate equity peak.
+                self._observe_hybrid_delta_locked(
+                    math.fsum(_hybrid_position_realized(pos) for pos in done) - hybrid_before)
                 if not self._persist_locked({
                         "op": "settle", "condition_id": condition, "wall": settled_wall,
                         "payouts": {pos.token_id: payouts[pos.token_id] for pos in done},
@@ -906,6 +927,8 @@ class Ledger:
                         pos.settled = False
                         pos.settled_wall = None
                         self._open_pos[pos.token_id] = pos
+                    self._hybrid_risk = previous_hybrid
+                    self._hybrid_realized_total = previous_hybrid_realized
                     raise RuntimeError("settlement could not be persisted")
         return done
 
@@ -925,13 +948,23 @@ class Ledger:
         not. One journal line when a snapshot is on disk to append to, else
         (the ledger's first write, or after a failed append) a full snapshot."""
         if not self.loaded_from_disk or self._journal_dirty or not os.path.exists(self.path):
-            return self._snapshot_locked()
+            # Snapshot-backed mutations need a revision too. Without this,
+            # an initial cash/reference read cannot detect an intervening
+            # first fill merely because that fill created the snapshot.
+            previous_seq = self.journal_seq
+            self.journal_seq += 1
+            if self._snapshot_locked():
+                return True
+            self.journal_seq = previous_seq
+            return False
         entry = {"seq": self.journal_seq + 1, **entry}
         if not self._append_journal(entry):
             self._journal_dirty = True
             return False
         self.journal_seq += 1
         self._journal_since += 1
+        with self._lock:
+            self._hybrid_persisted = (None if self._hybrid_risk is None else dict(self._hybrid_risk))
         if self._journal_since >= self.JOURNAL_COMPACT_EVERY:
             self._snapshot_locked()          # best effort: the journal still holds everything
         return True
@@ -1037,9 +1070,12 @@ class Ledger:
                            if not p.settled and p.shares > 0 and p.condition_id == e["condition_id"]]
                 if sorted(p.token_id for p in targets) != sorted(e["tokens"]):
                     raise ValueError(f"ledger journal settlement {e['seq']} does not match the positions")
+                hybrid_before = math.fsum(_hybrid_position_realized(p) for p in targets)
                 for p in targets:
                     self._settle_position_locked(p, float(e["payouts"][p.token_id]), float(e["wall"]))
                     self._note_settled_locked(p)
+                self._observe_hybrid_delta_locked(
+                    math.fsum(_hybrid_position_realized(p) for p in targets) - hybrid_before)
             self.journal_seq = e["seq"]
             applied += 1
         return applied
@@ -1161,6 +1197,111 @@ class Ledger:
                 booked[order_id] = sum(float(lot.cost) for lot in (position.lots if position is not None else ())
                                        if lot.order_id == order_id and str(lot.side).upper() == "BUY")
             return realized, open_basis, booked
+
+    @property
+    def hybrid_risk(self) -> dict | None:
+        """A detached initialized risk epoch, or None for a legacy ledger."""
+        with self._lock:
+            return (None if self._hybrid_persisted is None else
+                    _validated_hybrid_risk(self._hybrid_persisted, self.ledger_id))
+
+    def _observe_hybrid_delta_locked(self, delta: float) -> None:
+        """Observe one complete P&L transition without another history scan.
+
+        Its enclosing fill/settlement transaction supplies durability and
+        rollback. Journal replay applies the same transitions in order, so
+        peaks between background refreshes survive restarts without an extra
+        file write per trade. Plain record_fill remains an in-memory API;
+        hybrid_risk_view snapshots an unsaved peak before publishing it.
+        """
+        if self._hybrid_risk is None:
+            return
+        total = self._hybrid_realized_total
+        if total is None:
+            self.persistence_halt = self.persistence_halt or "hybrid realized accounting cache unavailable"
+            return
+        total += delta
+        state = self._hybrid_risk
+        equity = state["reference_equity"] + total - state["pnl_baseline"]
+        if not math.isfinite(total) or not math.isfinite(equity):
+            self.persistence_halt = self.persistence_halt or "non-finite hybrid realized accounting"
+            return
+        self._hybrid_realized_total = total
+        if equity > state["high_water"]:
+            self._hybrid_risk = {**state, "high_water": equity}
+
+    def hybrid_risk_view(self, reference_equity=None, *, expected_journal_seq=None) -> dict:
+        """Durable realized-equity state for hybrid sizing; call on a worker.
+
+        Buying inventory and waiting for redemption do not change realized
+        equity. The first call establishes an explicit positive capital base
+        and the current confirmed realized-P&L baseline. Later calls preserve
+        that epoch, including across process/canary restarts. Partial-sale P&L
+        counts immediately, and settled P&L already includes it exactly once.
+
+        Durable fills/settlements record peaks through their existing journal.
+        Initialization or an unsaved in-memory peak needs a snapshot before
+        publication. No network work occurs here; unchanged reads do not write.
+        """
+        reference = None
+        if (expected_journal_seq is not None and
+                (type(expected_journal_seq) is not int or expected_journal_seq < 0)):
+            raise ValueError("invalid expected hybrid accounting sequence")
+        if reference_equity is not None:
+            reference = _hybrid_number(reference_equity, "reference equity")
+            if reference <= 0:
+                raise ValueError("hybrid reference equity must be positive")
+        with self._save_lock:
+            with self._lock:
+                if self.integrity_error or self.persistence_halt:
+                    raise RuntimeError("hybrid sizing requires healthy durable accounting")
+                state = (None if self._hybrid_risk is None else
+                         _validated_hybrid_risk(self._hybrid_risk, self.ledger_id))
+                values = []
+                for position in self.positions.values():
+                    value = (position.realized if position.settled
+                             else position.realized_from_sales)
+                    values.append(_hybrid_number(value, "realized P&L"))
+                realized = math.fsum(values)
+                if not math.isfinite(realized):
+                    raise ValueError("non-finite hybrid realized P&L")
+                if state is None:
+                    if reference is None:
+                        raise ValueError("first hybrid risk reading needs positive reference equity")
+                    if expected_journal_seq is not None and expected_journal_seq != self.journal_seq:
+                        raise ValueError("hybrid accounting changed during reference reading; retry initialization")
+                    state = {"version": 1, "ledger_id": self.ledger_id,
+                             "reference_equity": reference, "pnl_baseline": realized,
+                             "high_water": reference}
+                elif (reference is not None and
+                      not math.isclose(reference, state["reference_equity"], rel_tol=0, abs_tol=1e-9)):
+                    raise ValueError("hybrid reference equity is already established; refusing to rebase")
+                equity = state["reference_equity"] + realized - state["pnl_baseline"]
+                if not math.isfinite(equity):
+                    raise ValueError("non-finite hybrid equity")
+                state["high_water"] = max(state["high_water"], equity)
+                changed = state != self._hybrid_persisted
+                if changed:
+                    payload = self._payload_locked()
+                    payload["hybrid_risk"] = dict(state)
+            if changed:
+                # All durable ledger writers serialize on _save_lock, so the
+                # snapshot and its journal position remain consistent while
+                # other threads can still read the last published state.
+                if not self._write_payload(payload):
+                    with self._lock:
+                        self.persistence_halt = self.persistence_halt or (
+                            "hybrid risk state could not be persisted: "
+                            f"{self.last_persistence_error or 'ledger save failed'}")[:300]
+                    raise RuntimeError("hybrid risk state could not be persisted")
+                with self._lock:
+                    self._hybrid_risk = dict(state)
+                    self._hybrid_realized_total = realized
+                self._truncate_journal()
+            else:
+                with self._lock:
+                    self._hybrid_realized_total = realized
+            return {**state, "equity": equity, "realized_total": realized}
 
     def order_has_lots(self, order_id, token) -> bool:
         """Whether any fill of this order (on its token) is booked."""
@@ -1392,6 +1533,8 @@ class Ledger:
         return {
             "version": 4,
             "ledger_id": self.ledger_id,
+            **({"hybrid_risk": dict(self._hybrid_risk)}
+               if self._hybrid_risk is not None else {}),
             "opened_wall": self.opened_wall,
             "category": self.category,
             "seen": self._seen_json(),
@@ -1477,6 +1620,9 @@ class Ledger:
             replace_atomic(tmp, self.path)
             tmp = None
             _fsync_directory(d)
+            with self._lock:
+                self._hybrid_persisted = (dict(payload["hybrid_risk"])
+                                          if "hybrid_risk" in payload else None)
             self.schema_version = 4
             self.loaded_from_disk = True
             self.last_persistence_error = None
@@ -1529,6 +1675,8 @@ class Ledger:
                 # ID allocated by __init__; the next successful save upgrades
                 # the file atomically to V4.
                 ledger_id = self.ledger_id
+            hybrid_risk = (_validated_hybrid_risk(data["hybrid_risk"], ledger_id)
+                           if "hybrid_risk" in data else None)
             opened_wall = float(data.get("opened_wall", self.opened_wall))
             integrity_error = data.get("integrity_error")
             if (integrity_error is not None
@@ -1652,6 +1800,10 @@ class Ledger:
             with self._lock:
                 self.opened_wall = opened_wall
                 self.ledger_id = ledger_id
+                self._hybrid_risk = hybrid_risk
+                self._hybrid_persisted = (None if hybrid_risk is None else dict(hybrid_risk))
+                self._hybrid_realized_total = (None if hybrid_risk is None else math.fsum(
+                    _hybrid_position_realized(position) for position in positions.values()))
                 self.schema_version = schema_version
                 self.loaded_from_disk = True
                 self.category = category
@@ -1670,6 +1822,7 @@ class Ledger:
                 self._reindex_locked()
                 self.journal_seq = journal_seq
                 self.journal_replayed = self._replay_journal(journal_seq)
+                self._hybrid_persisted = (None if self._hybrid_risk is None else dict(self._hybrid_risk))
                 self._journal_since = self.journal_replayed
                 self.last_persistence_error = None
                 self.integrity_error = self.integrity_error or integrity_error
@@ -1905,6 +2058,38 @@ def _valid_ledger_id(value: str) -> bool:
         return uuid.UUID(hex=value).hex == value
     except (ValueError, AttributeError):
         return False
+
+
+def _hybrid_number(value, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"invalid hybrid {name}")
+    try:
+        result = float(value)
+    except (ValueError, OverflowError) as exc:
+        raise ValueError(f"invalid hybrid {name}") from exc
+    if not math.isfinite(result):
+        raise ValueError(f"invalid hybrid {name}")
+    return result
+
+
+def _hybrid_position_realized(position) -> float:
+    return _hybrid_number(position.realized if position.settled
+                          else position.realized_from_sales, "realized P&L")
+
+
+def _validated_hybrid_risk(value, ledger_id: str) -> dict:
+    required = {"version", "ledger_id", "reference_equity", "pnl_baseline", "high_water"}
+    if (not isinstance(value, dict) or set(value) != required
+            or type(value.get("version")) is not int or value["version"] != 1
+            or value.get("ledger_id") != ledger_id or not _valid_ledger_id(ledger_id)):
+        raise ValueError("invalid hybrid risk state or ledger identity")
+    reference = _hybrid_number(value["reference_equity"], "reference equity")
+    baseline = _hybrid_number(value["pnl_baseline"], "P&L baseline")
+    high_water = _hybrid_number(value["high_water"], "high-water mark")
+    if reference <= 0 or high_water < reference:
+        raise ValueError("invalid hybrid reference equity or high-water mark")
+    return {"version": 1, "ledger_id": ledger_id, "reference_equity": reference,
+            "pnl_baseline": baseline, "high_water": high_water}
 
 
 def _authorization_metadata(receipt: dict | None) -> dict:

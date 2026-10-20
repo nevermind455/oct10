@@ -1,6 +1,6 @@
-# Resolved dependencies tested on Linux / Python 3.12.
-# Includes the repository requirements and their resolved dependency closure.
-# Re-resolve and run all suites when updating these pins.
+# Dependency pins for Linux / Python 3.12.
+# Unified SDK cryptographic dependencies follow its published 0.13.0 uv.lock.
+# Installation and full SDK integration still require validation on the trading host.
 -r requirements.txt
 
 aiohappyeyeballs==2.7.1
@@ -15,18 +15,18 @@ charset-normalizer==3.5.2
 ckzg==2.1.8
 coincurve==21.0.0
 cytoolz==1.2.0
-eth-abi==6.0.0
-eth-account==0.14.0
+eth-abi==5.2.0
+eth-account==0.13.7
 eth-hash==0.8.0
-eth-keyfile==0.10.0
-eth-keys==0.8.0
-eth-rlp==3.0.0
+eth-keyfile==0.8.1
+eth-keys==0.7.0
+eth-rlp==2.2.0
 eth-typing==6.0.0
-eth-utils==6.0.0
+eth-utils==5.3.1
 frozenlist==1.8.0
 h11==0.16.0
 h2==4.4.1
-hexbytes==2.0.0
+hexbytes==1.3.1
 hpack==4.2.0
 httpcore==1.0.9
 httpx==0.28.1
@@ -34,17 +34,16 @@ hyperframe==6.1.0
 idna==3.18
 iniconfig==2.3.1
 multidict==6.7.1
+msgpack==1.2.1
 numpy==2.3.5
 orjson==3.11.9
 packaging==26.3
 parsimonious==0.10.0
 pluggy==1.6.0
-poly-eip712-structs==0.0.1
+polymarket-client==0.13.0
 psutil==7.2.2
 propcache==0.5.2
-py-clob-client-v2==1.2.0
 py-ecc==8.0.0
-py-order-utils==0.3.2
 pycryptodome==3.24.1
 pydantic==2.13.4
 pydantic-core==2.46.4
@@ -54,7 +53,7 @@ python-dotenv==1.2.2
 pyunormalize==18.0.0
 regex==2026.9.29
 requests==2.34.2
-rlp==5.0.0
+rlp==4.1.0
 socksio==1.0.0
 toolz==1.2.0
 types-requests==2.33.0.20261006

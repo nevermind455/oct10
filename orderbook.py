@@ -9,6 +9,7 @@ import requests
 import config
 import http_pool
 import timer
+from book_snapshot import RestBookSnapshot
 
 BOOK_URL = "https://clob.polymarket.com/book"
 
@@ -180,7 +181,30 @@ def parse_orderbook(data, token_id, *, max_age_s=None, now=None,
     return bids, asks
 
 
-def get_orderbook(token_id, timeout=8.0):
+def parse_orderbook_snapshot(data, token_id, *, received_at=None, received_mono=None):
+    """Keep REST metadata for the hub without changing the legacy levels API.
+
+    Receipt time is captured before JSON parsing by the HTTP caller. The
+    venue timestamp comes only from the validated response, never our clock.
+    """
+    bids, asks = parse_orderbook(data, token_id, received_at=received_at)
+    timestamp = int(round(timer.parse_exchange_ts(data["timestamp"])[0] * 1000))
+    receipt = time.monotonic() if received_mono is None else _number(
+        "received_mono", received_mono, minimum=0, inclusive_min=True)
+    if receipt > time.monotonic():
+        raise ValueError("CLOB book receipt time is in the future")
+    tick_raw = data.get("tick_size", data.get("minimum_tick_size"))
+    tick = None if tick_raw in (None, "") else _number("tick_size", tick_raw, minimum=0)
+    if tick is not None and tick >= 1:
+        raise ValueError("tick_size must be below 1")
+    return RestBookSnapshot(
+        token_id=str(token_id), bids=bids, asks=asks, exchange_ts_ms=timestamp,
+        received_mono=receipt, tick_size=tick,
+        book_hash=str(data["hash"]) if data.get("hash") is not None else None,
+    )
+
+
+def _get_orderbook(token_id, timeout=8.0, *, with_metadata=False):
     token = str(token_id or "")
     if not token.isdigit() or int(token) <= 0:
         raise ValueError("invalid CLOB token id")
@@ -192,8 +216,13 @@ def get_orderbook(token_id, timeout=8.0):
             # Stamp arrival before any parsing, so `held` measures the age of
             # the data we hold rather than however long decoding took.
             received_at = timer.wall()
+            received_mono = time.monotonic()
             resp.raise_for_status()
-            return parse_orderbook(resp.json(), token, received_at=received_at)
+            data = resp.json()
+            if with_metadata:
+                return parse_orderbook_snapshot(data, token, received_at=received_at,
+                                                received_mono=received_mono)
+            return parse_orderbook(data, token, received_at=received_at)
         except (requests.Timeout, requests.ConnectionError) as exc:
             last_error = exc
         except requests.HTTPError as exc:
@@ -209,6 +238,16 @@ def get_orderbook(token_id, timeout=8.0):
     if last_error is not None:
         raise last_error
     raise RuntimeError("CLOB book request failed without an error")
+
+
+def get_orderbook(token_id, timeout=8.0):
+    """Legacy levels-only public read used by liquidity callers."""
+    return _get_orderbook(token_id, timeout)
+
+
+def get_orderbook_snapshot(token_id, timeout=8.0):
+    """Public read for book recovery, preserving validated venue metadata."""
+    return _get_orderbook(token_id, timeout, with_metadata=True)
 
 
 def liquidity_signal(bids, asks):

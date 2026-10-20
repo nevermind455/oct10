@@ -78,8 +78,8 @@ class F1DollarIOC(I.PaperIOCBase):
 
     def test_the_signed_dollars_are_the_stake_exactly(self):
         """What makes the dollar limits hard: makerAmount (USDC) IS the stake."""
-        from py_clob_client_v2.order_builder.builder import ROUNDING_CONFIG, OrderBuilder
-        from py_clob_client_v2.order_builder.constants import BUY
+        from clob_signing import ROUNDING_CONFIG, OrderBuilder
+        from clob_signing import BUY
         import sniper_mode as S
         for stake, cap, tick in ((5.00, 0.55, "0.01"), (9.99, 0.355, "0.001"), (1.00, 0.99, "0.01")):
             _s, maker, taker = OrderBuilder.get_market_order_amounts(
@@ -411,7 +411,7 @@ class PaperFirewall(unittest.TestCase):
         code = r'''
 import sys, asyncio; sys.path.insert(0, %r)
 import testing_env, run, polymarket_trade, sniper_live, fast_h2
-from py_clob_client_v2.client import ClobClient
+from clob_client import ClobClient
 paths = run.install_paper_firewall()
 tries = [lambda: ClobClient.post_order(None, None), lambda: ClobClient.create_market_order(None, None),
          lambda: ClobClient.create_and_post_order(None, None), lambda: polymarket_trade.place_trade("UP", 5),
@@ -424,13 +424,50 @@ for t in tries:
         t()
     except RuntimeError:
         refused += 1
-print("PATHS", len(paths), "REFUSED", refused, "COUNTED", sum(run.LIVE_ORDER_CALLS.values()))
+bot_counted = sum(run.LIVE_ORDER_CALLS.values())
+# Independent oracle: every public method of the SDK's own clients in an order,
+# cancel, fund-moving or credential-creating family must be blocked and refuse.
+families = ("create", "post", "place", "cancel", "approve", "transfer", "split", "merge", "redeem",
+            "deposit", "withdraw")
+try:
+    from polymarket import AsyncSecureClient, SecureClient
+except ImportError:
+    natives = ()
+else:
+    natives = (SecureClient, AsyncSecureClient)
+wanted = sorted(f"{c.__name__}.{n}" for c in natives for n in dir(c)
+                if not n.startswith("_") and n.startswith(families) and callable(getattr(c, n)))
+missing = [w for w in wanted if w not in paths]
+native_refused = 0
+for label in wanted:
+    owner = SecureClient if label.startswith("SecureClient.") else AsyncSecureClient
+    try:
+        getattr(owner, label.split(".", 1)[1])(None)
+    except RuntimeError:
+        native_refused += 1
+print("PATHS", len(paths), "BOT", len(paths) - len(wanted), "NATIVE", len(wanted), "MISSING", missing,
+      "NATIVE_REFUSED", native_refused, "REFUSED", refused, "COUNTED", bot_counted,
+      "TOTAL_COUNTED", sum(run.LIVE_ORDER_CALLS.values()))
 '''
         out = subprocess.run([sys.executable, "-c", code % str(ROOT)], capture_output=True, text=True,
                              timeout=120).stdout
         self.assertIn("REFUSED 9", out, out)
         self.assertIn("COUNTED 8", out, out)          # _get_client refuses by the paper switch itself
-        self.assertIn("PATHS 18", out, out)
+        # 18 bot-level paths (adapter, legacy helpers, live sender, HTTP/2 write)
+        # plus every order/cancel/fund-moving method of the installed SDK's clients.
+        self.assertIn("BOT 18", out, out)
+        self.assertIn("MISSING []", out, out)
+        fields = out.split()
+        native = int(fields[fields.index("NATIVE") + 1])
+        self.assertEqual(int(fields[fields.index("PATHS") + 1]), 18 + native, out)
+        self.assertEqual(int(fields[fields.index("NATIVE_REFUSED") + 1]), native, out)
+        self.assertEqual(int(fields[fields.index("TOTAL_COUNTED") + 1]), 8 + native, out)
+        try:
+            import polymarket  # noqa: F401 - the pinned SDK must be covered when installed
+        except ImportError:
+            self.assertEqual(native, 0, out)
+        else:
+            self.assertGreater(native, 0, out)
 
 
 class PaperAttribution(I.PaperIOCBase):

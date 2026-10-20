@@ -810,21 +810,22 @@ class M6M7Live(unittest.IsolatedAsyncioTestCase):
 
     def test_the_order_hash_is_the_librarys_order_hash(self):
         import secrets
-        from py_clob_client_v2.clob_types import CreateOrderOptions, MarketOrderArgsV2, OrderType
-        from py_clob_client_v2.order_builder.builder import OrderBuilder
-        from py_clob_client_v2.order_builder.constants import BUY
-        from py_clob_client_v2.order_builder import builder as bm
+        from clob_sdk import CreateOrderOptions, MarketOrderArgsV2, OrderType
+        from clob_signing import OrderBuilder
+        from clob_signing import BUY
+        from eth_account.messages import encode_typed_data
+        from eth_utils import keccak
+        from polymarket._internal.actions.orders.typed_data import build_order_typed_data
         signer = S.fast_signer("0x" + secrets.token_hex(32), 137)
         fast = S.FastOrderBuilder(OrderBuilder(signer))
         for i in range(5):
             signed = fast.build_market_order(MarketOrderArgsV2(token_id=self.T.UP, amount=S.signing_amount(5 + i),
                                                                side=BUY, price=0.55, order_type=OrderType.FAK),
                                              CreateOrderOptions(tick_size="0.01", neg_risk=bool(i % 2)), version=2)
-            cc = bm.get_contract_config(137)
-            eb = bm.ExchangeOrderBuilderV2(cc.neg_risk_exchange_v2 if i % 2 else cc.exchange_v2, 137, signer)
-            fields = {k: getattr(signed, k) for k in signed.__dataclass_fields__ if k != "signature"}
-            order = bm.OrderV2(**fields) if hasattr(bm, "OrderV2") else signed
-            self.assertEqual(fast.last_order_hash, eb.build_order_hash(eb.build_order_typed_data(order)))
+            message = encode_typed_data(full_message=build_order_typed_data(signed.unsigned_order))
+            digest = "0x" + keccak(b"\x19" + message.version + message.header + message.body).hex()
+            self.assertEqual(fast.last_order_hash, digest)
+
 
 
 class FillStoreIndex(unittest.TestCase):

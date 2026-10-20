@@ -148,6 +148,10 @@ class Hub:
 
 
 class Broker:
+    # The default FAK sizing (SNIPER_ORDER_SIZING=shares) hands the worker a
+    # share-sized order; Sniper._match refuses a broker that cannot take one.
+    supports_share_sized = True
+
     def __init__(self):
         self.last_fill = self.last_error = None
 

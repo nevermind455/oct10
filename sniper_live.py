@@ -347,6 +347,27 @@ class VenueGuard:
                 "reason": self.reason}
 
 
+def parse_server_time_reply(response) -> float:
+    """A successful public clock reply, never an HTTP error or non-finite time."""
+    if response.status_code != 200:
+        raise ValueError(f"server clock endpoint returned HTTP {response.status_code}")
+    try:
+        payload = response.json()
+    except (AttributeError, ValueError):
+        payload = response.text
+    if isinstance(payload, dict):
+        payload = next((payload[key] for key in ("time", "timestamp", "server_time") if key in payload), None)
+    try:
+        if isinstance(payload, bool):
+            raise ValueError("boolean server time")
+        server = float(payload)
+        if not math.isfinite(server) or server <= 0:
+            raise ValueError("non-positive or non-finite server time")
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("server clock endpoint did not return a valid timestamp") from exc
+    return server
+
+
 class ServerClock:
     """Polymarket server time as local wall time + a measured offset.
 
@@ -405,15 +426,12 @@ class ServerClock:
         r = await http.get(url)
         rtt = (time.perf_counter() - t) * 1000.0
         recv = self.wall()
-        if r.status_code != 200:
+        try:
+            server = parse_server_time_reply(r)
+        except ValueError:
             self.rejected += 1
             return False
-        try:
-            data = r.json()
-        except ValueError:
-            data = r.text
-        server = data.get("time") or data.get("timestamp") if isinstance(data, dict) else data
-        return self.add_sample(float(server), sent, recv, rtt)
+        return self.add_sample(server, sent, recv, rtt)
 
     def status(self) -> dict:
         s = list(self.samples)
@@ -512,7 +530,13 @@ async def keep_warm(http, clock: ServerClock, url: str, every_s: float = 10.0, o
             t = time.perf_counter()
             r = await http.get(url, extensions={"trace": trace})
             rtt = (time.perf_counter() - t) * 1000.0
-            row["ok"] = clock.add_sample(float(r.text.strip().strip('"')), sent, clock.wall(), rtt)
+            recv = clock.wall()
+            try:
+                server = parse_server_time_reply(r)
+            except ValueError:
+                clock.rejected += 1
+                raise
+            row["ok"] = clock.add_sample(server, sent, recv, rtt)
             row["rtt_ms"] = round(rtt, 2)
         except Exception as exc:  # noqa: BLE001 - keep trying; the clock ages meanwhile
             row["error"] = f"{type(exc).__name__}: {exc}"[:160]
@@ -811,6 +835,8 @@ class CanarySession:
         if shares is not None and (isinstance(shares, bool) or not isinstance(shares, (int, float))
                                    or not math.isfinite(shares) or shares <= 0):
             raise ValueError("invalid canary intent shares")
+        if "minimum_entry" in intent and not isinstance(intent["minimum_entry"], bool):
+            raise ValueError("invalid canary minimum-entry marker")
         tids = intent.get("trade_ids")
         if tids is not None and (not isinstance(tids, list)
                                  or any(not isinstance(t, str) or not t for t in tids)):
@@ -959,7 +985,16 @@ class CanarySession:
         if not p.exists():
             return out
         lines = p.read_bytes().split(b"\n")
-        lines.pop()                         # a torn last line: an archive append that never completed
+        tail = lines.pop()
+        if tail.strip():
+            try:
+                json.loads(tail.decode("utf-8"))
+            except ValueError:
+                pass                       # incomplete final append, still retained in hot state
+            else:
+                # A crash may lose only the newline. Keep a complete intent:
+                # dropping it could reopen an already-used minimum-entry slot.
+                lines.append(tail)
         for line in lines:
             if not line.strip():
                 continue
@@ -972,6 +1007,70 @@ class CanarySession:
             if float(rec["intent"].get("wall") or 0) >= since_wall - self.RECENT_S:
                 out[str(rec.get("key"))] = rec["intent"]
         return out
+
+    @staticmethod
+    def _prepare_archive_append(fh) -> None:
+        """Repair only an unfinished final record before appending new ones.
+
+        Complete final JSON retains its evidence and gets its missing newline.
+        An incomplete tail is discarded; compaction never removed those intents
+        from hot state before the archive flush succeeded. Existing complete
+        records remain untouched. The caller flushes/fsyncs this repair together
+        with the following archive records, before removing hot intents.
+        """
+        fh.seek(0, os.SEEK_END)
+        end = fh.tell()
+        if not end:
+            return
+        fh.seek(end - 1)
+        if fh.read(1) == b"\n":
+            return
+        position, start = end, 0
+        while position:
+            lower = max(0, position - 8192)
+            fh.seek(lower)
+            chunk = fh.read(position - lower)
+            newline = chunk.rfind(b"\n")
+            if newline >= 0:
+                start = lower + newline + 1
+                break
+            position = lower
+        fh.seek(start)
+        tail = fh.read(end - start)
+        try:
+            rec = json.loads(tail.decode("utf-8"))
+        except ValueError:
+            fh.truncate(start)
+        else:
+            if not isinstance(rec, dict) or not isinstance(rec.get("intent"), dict):
+                raise ValueError("damaged canary archive line")
+            fh.seek(0, os.SEEK_END)
+            fh.write(b"\n")
+
+    def minimum_entry_claims(self, now_wall: float | None = None) -> set[tuple[str, str, float]]:
+        """Restore unexpired minimum-entry attempts at startup, never on a tick.
+
+        A durable intent consumes the slot even when the venue later reports
+        NO_MATCH, or dispatch is refused after the flush. Finished intents can
+        leave hot state during compaction, so its archive is also consulted.
+        Snapshot the hot state before archive I/O; compaction archives before
+        removing a finished intent, retaining coverage across that transition.
+        """
+        now = time.time() if now_wall is None else now_wall
+        if (isinstance(now, bool) or not isinstance(now, (int, float))
+                or not math.isfinite(now) or now < 0):
+            raise ValueError("invalid minimum-entry recovery time")
+        with self._lock:
+            hot = [(key, dict(intent)) for key, intent in self.intents.items()]
+        archived = self._archived(0)
+        claims = set()
+        for key, intent in [*archived.items(), *hot]:
+            if "minimum_entry" not in intent:
+                continue                 # old intents remain compatible
+            self._validate_intent(key, intent)
+            if intent["minimum_entry"] and intent["end"] > now:
+                claims.add((intent["condition"], intent["token"], float(intent["end"])))
+        return claims
 
     # ------------------------------------------------------------ open
     @staticmethod
@@ -1187,6 +1286,9 @@ class CanarySession:
             if key in self.intents:
                 kill.trip("duplicate durable live send intent")
                 raise Halted("duplicate durable live send intent")
+            minimum_entry = getattr(p, "minimum_entry", False)
+            if not isinstance(minimum_entry, bool):
+                raise Refused("invalid minimum-entry marker before dispatch")
             payload = json.loads(p.body)
             limits.record_send(p.amount, p.condition)
             p.stamps["budget_recorded"] = True
@@ -1196,6 +1298,8 @@ class CanarySession:
                       "order_type": p.order_type, "price": p.price,
                       "body_sha256": hashlib.sha256(p.body.encode()).hexdigest(),
                       "signed_order": payload.get("order"), "order_id": None}
+            if minimum_entry:
+                intent["minimum_entry"] = True
             order_hash = getattr(p, "order_hash", None)
             if order_hash:
                 intent["order_hash"] = str(order_hash)
@@ -1363,8 +1467,10 @@ class CanarySession:
                 finished = {k: dict(v) for k, v in self.intents.items() if v.get("status") in self.FINAL}
             if finished:
                 # The audit trail first: once archived, a finished intent may leave the hot state.
-                with open(self.archive_path, "ab") as fh:
+                with open(self.archive_path, "a+b") as fh:
+                    fh.seek(0, os.SEEK_END)
                     created = fh.tell() == 0
+                    self._prepare_archive_append(fh)
                     for k, v in finished.items():
                         fh.write(self._line({"key": k, "session_id": self.session_id, "intent": v}))
                     fh.flush()
@@ -1462,18 +1568,19 @@ class LeanSender:
                  limits: CanaryLimits, kill: KillSwitch, version: int = 2, journal=None,
                  timeout_s: float = 3.0, latency_halt_ms: float = 1500.0, max_consecutive_errors: int = 3,
                  latency_extreme_ms: float = 5000.0, guard: "VenueGuard | None" = None,
-                 realized_loss=None) -> None:
+                 realized_loss=None, warm_only: bool = False) -> None:
         import polymarket_trade as pt
-        from py_clob_client_v2.clob_types import (CreateOrderOptions, MarketOrderArgsV2, OrderArgsV2, OrderType,
+        from clob_sdk import (CreateOrderOptions, MarketOrderArgsV2, OrderArgsV2, OrderType,
                                                   RequestArgs)
-        from py_clob_client_v2.endpoints import POST_ORDER
-        from py_clob_client_v2.headers.headers import create_level_2_headers
-        from py_clob_client_v2.order_builder.constants import BUY
-        from py_clob_client_v2.order_utils.model.order_data_v2 import order_to_json_v2
+        from clob_signing import POST_ORDER
+        from clob_signing import create_level_2_headers
+        from clob_signing import BUY
+        from clob_signing import order_to_json_v2
         self.pt = pt
         self.builder, self.signer, self.creds = builder, signer, creds
         self.url = f"{host.rstrip('/')}{POST_ORDER}"
         self.http, self.clock, self.rules, self.limits, self.kill = http, clock, rules, limits, kill
+        self.warm_only = warm_only
         self.version, self.journal = version, journal or (lambda row: None)
         self.timeout_s, self.latency_halt_ms = timeout_s, latency_halt_ms
         # Slow venue replies pause new orders and recover automatically; only
@@ -1501,6 +1608,8 @@ class LeanSender:
             raise Refused(f"unknown order type {order_type!r}")
         self.kill.check()
         self.guard.check()                            # Refused while the venue guard has new orders paused
+        if getattr(self, "warm_only", False) and not self._warm_connection_ready():
+            raise Refused("warm-only execution: order connection is not ready")
         for client_id in list(getattr(self, "unresolved", {}) or {}):
             self.kill.trip_once(("order-uncertain", str(client_id)),
                                 f"order {client_id} outcome unknown: reconciling with the venue")
@@ -1565,7 +1674,7 @@ class LeanSender:
         # No Connection header: HTTP/2 forbids connection-specific headers
         # (RFC 9113 8.2.2) and a front end may reset the stream for one -
         # after the headers went out, which reads as an AMBIGUOUS order.
-        headers = {"User-Agent": "py_clob_client_v2", "Accept": "*/*", "Content-Type": "application/json"}
+        headers = {"User-Agent": "polymarket-client", "Accept": "*/*", "Content-Type": "application/json"}
         headers.update(lib["l2"](self.signer, self.creds,
                                  lib["RequestArgs"](method="POST", request_path=lib["POST_ORDER"],
                                                     body=payload, serialized_body=body), timestamp=ts))
@@ -1578,6 +1687,9 @@ class LeanSender:
         return p
 
     # ------------------------------------------------------------ the write, synchronous
+    def _warm_connection_ready(self) -> bool:
+        return callable(getattr(self.http, "post_now", None)) and bool(getattr(self.http, "connected", False))
+
     def _check_send(self, p: Prepared, *, budget: bool = True) -> None:
         self.kill.check()
         self.guard.check()
@@ -1597,12 +1709,21 @@ class LeanSender:
         if budget and not p.stamps.get("budget_recorded"):
             self.limits.check(p.amount, p.amount / p.price, p.condition, self.kill,
                               self.realized_loss() if self.realized_loss else None)
+        if getattr(self, "warm_only", False) and not self._warm_connection_ready():
+            p._warm_connection_unavailable = True
+            raise Refused("warm-only execution: order connection is not ready")
 
     def _record_send(self, p: Prepared) -> None:
         if p.stamps.get("budget_recorded"):
             return
         if self.session is not None:
-            self.session.before_send(p, self.limits, self.kill)
+            p.stamps["intent_start_pc"] = time.perf_counter_ns()
+            try:
+                self.session.before_send(p, self.limits, self.kill)
+            finally:
+                # Separate durable-intent latency from HTTP dispatch without
+                # changing the required flush-before-write ordering.
+                p.stamps["intent_end_pc"] = time.perf_counter_ns()
             return
         self.limits.record_send(p.amount, p.condition)
         p.stamps["budget_recorded"] = True
@@ -1619,8 +1740,12 @@ class LeanSender:
             return p._dispatch_stream
         if getattr(p, "_sender_outcome", None) is not None:
             return None
+        if getattr(p, "_warm_connection_unavailable", False):
+            return None
         post_now = getattr(self.http, "post_now", None)
         if post_now is None or not getattr(self.http, "connected", False):
+            if getattr(self, "warm_only", False):
+                p._warm_connection_unavailable = True
             return None
         p.stamps["post_call_pc"] = time.perf_counter_ns()
         try:
@@ -1629,6 +1754,8 @@ class LeanSender:
             self._check_send(p, budget=False)  # disk flush may have outlived the signal/rules/expiry
             stream = post_now(self.url, p.body.encode("utf-8"), p.headers)
         except Exception as exc:
+            if getattr(self, "warm_only", False) and getattr(p, "_warm_connection_unavailable", False):
+                return None
             from fast_h2 import NotConnected, Stream
             if not isinstance(exc, NotConnected):
                 # An arbitrary transport failure cannot prove nothing left the
@@ -1641,12 +1768,19 @@ class LeanSender:
                     self._record_send(p)
                 p._dispatch_stream = stream
                 return stream
+            if getattr(self, "warm_only", False):
+                p._warm_connection_unavailable = True
             return None
         p._dispatch_stream = stream
         return stream
 
     # ------------------------------------------------------------ the send, async
     async def send(self, p: Prepared, started=None) -> dict:
+        # Dispatch before _once claims the outcome future: start() correctly
+        # refuses orders whose outcome is already owned by another waiter.
+        if (started is None and getattr(self, "warm_only", False)
+                and getattr(p, "_sender_outcome", None) is None):
+            started = self.start(p)
         return await _once(p, "_sender_outcome", self._send_once, p, started)
 
     async def _send_once(self, p: Prepared, started=None) -> dict:
@@ -1654,15 +1788,25 @@ class LeanSender:
             started = p._dispatch_stream
         row = {"client_order_id": p.client_order_id, "side": p.side, "token": p.token,
                "condition": p.condition, "round_end": p.end, "cap": p.cap, "price": p.price, "tick": p.tick, "amount": p.amount,
-               "order_type": p.order_type}
+               "order_type": p.order_type,
+               "http_transport": f"{type(self.http).__module__}.{type(self.http).__name__}",
+               "dispatch_mode": "synchronous" if started is not None else "async"}
         kind, resp, err, status = None, None, None, None
         st = p.stamps
+        if started is None and getattr(self, "warm_only", False):
+            # A cold connection is a skipped opportunity. Its signed order
+            # must never reach the async path, which can connect and POST.
+            row["warm_connection_unavailable"] = True
+            row["dispatch_mode"] = "warm_only_refused"
+            return self._finish(p, row, st, [], NOT_SENT, None,
+                                "warm-only execution: order connection is not ready", None)
         if started is not None:                         # already on the wire (start): await the reply
             events = started.events
             try:
                 r = await started.response(self.timeout_s)
                 st["response_body_pc"] = time.perf_counter_ns()
                 status = r.status_code
+                row["http_version"] = getattr(r, "http_version", None)
                 row["retry_after"] = self._retry_after(r)
                 try:
                     resp = r.json()
@@ -1693,6 +1837,7 @@ class LeanSender:
                                      timeout=self.timeout_s)
             st["response_body_pc"] = time.perf_counter_ns()
             status = r.status_code
+            row["http_version"] = getattr(r, "http_version", None)
             row["retry_after"] = self._retry_after(r)
             try:
                 resp = r.json()
@@ -1853,6 +1998,10 @@ class LeanSender:
             row["warning"] = "a new TCP/TLS connection was opened on the hot path"
         if kind in (MATCHED, PENDING, NO_MATCH) or temporary:
             self.consecutive_errors = 0
+        elif kind == NOT_SENT and row.get("warm_connection_unavailable"):
+            # Background keep-warm owns reconnection. Skips neither hide
+            # preceding transport errors nor count as new order errors.
+            pass
         else:
             self.consecutive_errors += 1
             if self.consecutive_errors >= self.max_consecutive_errors:
@@ -2735,6 +2884,8 @@ class LiveExecution:
         exactly the reply's trades, or add up to the reply's whole reported fill;
         the ledger booked nothing of the order; and all that has held for
         FAILED_RELEASE_S. Anything less stays awaiting (and is warned about)."""
+        if a.get("failed_fill") is not None:
+            return True                         # already released; never refund another order's budget
         rows = self._order_fills(oid)
         ok = bool(rows) and all(str(getattr(f, "status", "") or "").upper() == "FAILED"
                                 and str(f.asset_id) == a["token"] and str(f.market) == a["condition"]
@@ -2759,6 +2910,15 @@ class LiveExecution:
         self.sender.limits.resolve_accepted(a["amount"], zero_fill=True)
         self._resolve_risk(a, filled=False)
         self.awaiting.pop(oid, None)
+        # Publish one complete terminal result. The event-loop synchronizer
+        # must retire its pending slot, or undo an earlier provisional fill;
+        # the worker never mutates the strategy's inventory or carry itself.
+        a["failed_fill"] = {"shares": 0.0, "cost": 0.0, "fee": 0.0, "price": None,
+                            "source": "failed trade settlement", "statuses": ["FAILED"],
+                            "trade_ids": sorted(str(f.trade_id) for f in rows),
+                            "terminal_failure": True, "reason": "every FAK trade FAILED: nothing bought",
+                            "seen_mono": time.monotonic()}
+        a["quantity_resolved"] = True
         self.n["failed trades released"] += 1
         journal = getattr(self, "_journal", None)
         if journal is not None:
@@ -2828,6 +2988,8 @@ class LiveExecution:
 
     def _fak_fill(self, oid, a, rows):
         from paper_trade import MarketRules, curve_fee
+        if a.get("failed_fill") is not None:
+            return dict(a["failed_fill"])
         expected = a.get("trade_ids") or set()
         if a.get("final_size") == 0:
             if rows or expected or a["kind"] == MATCHED:
@@ -2886,9 +3048,10 @@ class LiveExecution:
         if cost > Decimal(str(a["amount"])) + Decimal("0.000001"):
             self._trip_fak(a, f"FAK order {short_id(oid)} filled above its budget: reconcile")
             return None
-        if a.get("size") is not None and shares > Decimal(str(a["size"])) + Decimal("0.000001"):
-            self._trip_fak(a, f"FAK order {short_id(oid)} filled above its signed size: reconcile")
-            return None
+        # The signed maker dollars cap a BUY's principal, not its share fill.
+        # A price improvement can legitimately deliver more than the sizing
+        # target (the Oct 14 incident: $3.74 bought 12.896552 instead of 11).
+        # Keep the actual quantity for inventory and subsequent risk checks.
         if a.get("final_size") is not None and abs(float(shares) - a["final_size"]) > 1e-6:
             return None                            # not all final fills have arrived yet
         a["quantity_resolved"] = True
@@ -2932,6 +3095,9 @@ class LiveExecution:
         order_type = str(plan.get("order_type", "FOK")).upper()
         if order_type not in ("FOK", "FAK"):
             raise Refused(f"unknown order type {order_type!r}")
+        minimum_entry = plan.get("minimum_entry", False)
+        if not isinstance(minimum_entry, bool):
+            raise Refused("invalid minimum-entry marker")
         token, cond, end = plan["token"], plan["cond"], float(plan["end"])
         for oid, a in list(self.fak_orders.items()):
             # Its incomplete quantity pauses once, while its reservation and
@@ -2975,7 +3141,8 @@ class LiveExecution:
             price = (Decimal(str(cap)) / rules.tick_size).to_integral_value(rounding=ROUND_FLOOR) * rules.tick_size
             size = None
             if plan.get("shares") is not None and order_type == "FAK":
-                # F1: exactly these whole shares at the limit, never more
+                # Whole shares at the limit determine the fixed maker stake.
+                # Actual FAK fills can contain more shares at improved prices.
                 size = Decimal(str(plan["shares"]))
                 minimums = [v for v in (book.min_order_size, rules.min_order_size) if v is not None]
                 if minimums and size < max(minimums):
@@ -3005,6 +3172,12 @@ class LiveExecution:
         # More liquidity can arrive after our snapshot. Reserve for the whole
         # signed spend and an upper fee bound, not just the visible partial.
         reserve_fee = max(fee, spend * float(rules.fee_rate))
+        hybrid_check = plan.get("hybrid_check")
+        if callable(hybrid_check):
+            try:
+                hybrid_check(plan, spend, float(rules.fee_rate), reserve_fee)
+            except ValueError as exc:
+                raise Refused(f"hybrid risk check: {exc}") from exc
         free = (self.balance or 0.0) - self.reserved
         if spend + reserve_fee > free + 1e-9:
             raise Refused(f"collateral ${free:.2f} is below the order ${spend + reserve_fee:.2f} incl. fee")
@@ -3013,9 +3186,15 @@ class LiveExecution:
                                 amount=spend, cap=cap, decided_pc=decided_pc, order_type=order_type,
                                 shares=float(size) if size is not None else None)
         p.reserve = spend + reserve_fee
+        p.minimum_entry = minimum_entry
         p.estimate = {"shares": float(quote.shares), "price": float(quote.average_price), "fee": fee}
         def send_guard():
             self._check_loss_budget()
+            if callable(hybrid_check):
+                try:
+                    hybrid_check(plan, spend, float(rules.fee_rate), reserve_fee)
+                except ValueError as exc:
+                    raise Refused(f"hybrid risk check: {exc}") from exc
             if self.balance_at is None or time.monotonic() - self.balance_at > self.balance_max_age_s:
                 raise Refused("collateral balance became stale before dispatch")
             if self.balance is None or self.reserved > self.balance + 1e-9:
@@ -3042,9 +3221,9 @@ class LiveExecution:
         with self._risk_lock:
             self._risk_orders[p.client_order_id] = {"condition": str(cond), "token": str(token),
                                                    "reserve": p.reserve, "order_id": None,
-                                                   # share-sized: exactly what it can add (F1)
-                                                   "shares": (float(size) if size is not None else
-                                                              max(float(quote.shares), spend / float(book.asks[0][0])))}
+                                                   # a sizing estimate; cheaper fills can add more
+                                                   "shares": max(float(quote.shares),
+                                                                 spend / float(book.asks[0][0]))}
         self.reserved += p.reserve
         self._balance_revision += 1
         return p
@@ -3463,7 +3642,16 @@ class LiveExecution:
                 "spend_usd": round(lim.exposure_usd, 2), "worst_case_loss_usd": round(self._risk_budget_used(), 6),
                 "rounds": len(lim.rounds), "awaiting_confirmation": len(self.awaiting),
                 "session_loss_usd": round(self.session_loss, 2), "clock": self.sender.clock.status(),
+                "warm_only": bool(getattr(self.sender, "warm_only", False)),
                 "rules_ready": bool(self.rules_ready), "guard": self.sender.guard.status(), "counts": dict(self.n)}
+
+
+def warm_only_from_env(env=None) -> bool:
+    env = os.environ if env is None else env
+    value = env.get("SNIPER_WARM_ONLY", "0")
+    if value not in ("0", "1"):
+        raise ValueError("SNIPER_WARM_ONLY must be 0 or 1")
+    return value == "1"
 
 
 def build_live_execution(*, ledger, on_event=None, user_ready=None, fills=None, env=None,
@@ -3474,10 +3662,14 @@ def build_live_execution(*, ledger, on_event=None, user_ready=None, fills=None, 
     Blocking (derives the client's credentials): call it from a worker thread."""
     import os
     import config
+    env = os.environ if env is None else env
+    warm_only = warm_only_from_env(env)
+    if warm_only and (str(env.get("SNIPER_HTTP", "fast")).strip().lower() == "httpx"
+                      or str(os.environ.get("SNIPER_HTTP", "fast")).strip().lower() == "httpx"):
+        raise ValueError("SNIPER_WARM_ONLY=1 requires the fast HTTP/2 transport; unset SNIPER_HTTP=httpx")
     import paper_trade
     import polymarket_trade as pt
-    from py_clob_client_v2.order_builder.builder import OrderBuilder
-    env = os.environ if env is None else env
+    from clob_signing import OrderBuilder
     if float(config.ASSUMED_MATCH_DELAY_SECONDS) <= 0:
         raise RuntimeError("set ASSUMED_MATCH_DELAY_SECONDS (e.g. 1): the BTC 5-minute markets flag Polymarket's "
                            "taker matching delay, and the live market-rules check refuses every round without it")
@@ -3495,7 +3687,8 @@ def build_live_execution(*, ledger, on_event=None, user_ready=None, fills=None, 
                                                                           cond, up, down))
     stop_file = env.get("SNIPER_CANARY_STOP_FILE") or str(Path(__file__).resolve().parent / "STOP_LIVE")
     sender = LeanSender(builder=builder, signer=signer, creds=client.creds, host=host, http=make_http(origin=host),
-                        clock=ServerClock(), rules=rules, limits=limits_from_env(env), kill=KillSwitch(stop_file))
+                        clock=ServerClock(), rules=rules, limits=limits_from_env(env), kill=KillSwitch(stop_file),
+                        warm_only=warm_only)
     shim = LiveBrokerShim(lambda cid: paper_trade.fetch_market_rules(cid, host=host),
                           min_buy_price=float(config.MIN_BUY_PRICE), max_buy_price=float(config.MAX_BUY_PRICE),
                           max_spread=float(config.MAX_ALLOWED_SPREAD),

@@ -541,8 +541,8 @@ class Execution(I.PaperIOCBase):
 
 class Precision(unittest.TestCase):
     def amounts(self, stake, cap, tick):
-        from py_clob_client_v2.order_builder.builder import ROUNDING_CONFIG, OrderBuilder
-        from py_clob_client_v2.order_builder.constants import BUY
+        from clob_signing import ROUNDING_CONFIG, OrderBuilder
+        from clob_signing import BUY
         _side, maker, taker = OrderBuilder.get_market_order_amounts(
             None, BUY, S.signing_amount(stake), S.signing_price(cap, tick), ROUNDING_CONFIG[tick])
         return D(maker) / 1_000_000, D(taker) / 1_000_000

@@ -139,8 +139,8 @@ async def run(args) -> int:
             return 1
 
         print("\n6. POST /order SHAPE (throwaway key + credentials: the venue must refuse it)")
-        from py_clob_client_v2.clob_types import ApiCreds
-        from py_clob_client_v2.order_builder.builder import OrderBuilder
+        from clob_sdk import ApiCreds
+        from clob_signing import OrderBuilder
         ghost_signer = L.fast_signer("0x" + secrets.token_hex(32), config.CHAIN_ID)
         ghost = L.LeanSender(builder=OrderBuilder(ghost_signer), signer=ghost_signer,
                              creds=ApiCreds(api_key=str(uuid.uuid4()),

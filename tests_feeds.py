@@ -1199,7 +1199,7 @@ async def t_rest_reconcile_keeps_explicit_two_hour_market_boundary():
     import run
 
     old_poly = sys.modules.get("polymarket_trade")
-    old_sdk = sys.modules.get("py_clob_client_v2")
+    old_sdk = sys.modules.get("clob_sdk")
     old_time = run.time.time
     requests = []
 
@@ -1216,11 +1216,11 @@ async def t_rest_reconcile_keeps_explicit_two_hour_market_boundary():
                 {"id": f"cross-{params.market}", "market": "0xmanual"},
             ]
 
-    sdk = types.ModuleType("py_clob_client_v2")
+    sdk = types.ModuleType("clob_sdk")
     sdk.TradeParams = TradeParams
     poly = types.ModuleType("polymarket_trade")
     poly._get_client = lambda: Client()
-    sys.modules["py_clob_client_v2"] = sdk
+    sys.modules["clob_sdk"] = sdk
     sys.modules["polymarket_trade"] = poly
     run.time.time = lambda: 900_000.0
     try:
@@ -1251,9 +1251,9 @@ async def t_rest_reconcile_keeps_explicit_two_hour_market_boundary():
         else:
             sys.modules["polymarket_trade"] = old_poly
         if old_sdk is None:
-            sys.modules.pop("py_clob_client_v2", None)
+            sys.modules.pop("clob_sdk", None)
         else:
-            sys.modules["py_clob_client_v2"] = old_sdk
+            sys.modules["clob_sdk"] = old_sdk
 
 
 async def t_startup_reconcile_uses_durable_and_current_filters_safely():
@@ -1457,7 +1457,11 @@ def t_paper_state_paths_are_isolated_and_configurable():
 TRADING_FILES = ["sniper_mode.py", "sniper_live.py", "paper_trade.py", "polymarket_trade.py",
                  "orderbook.py", "market_discovery.py", "timer.py", "config.py", "fast_h2.py",
                  "accounting/ledger.py", "accounting/fees.py", "accounting/settlement.py",
-                 "accounting/resolution.py", "feeds/book.py", "feeds/poly_user.py", "feeds/reconcile.py"]
+                 "accounting/resolution.py", "feeds/book.py", "feeds/poly_user.py", "feeds/reconcile.py",
+                 # Added 2026-10-20: since the unified-SDK migration these sign, build and post
+                 # every order (they replaced the external py-clob-client), and hybrid_sizing.py
+                 # sizes every Kelly order. They belong under the same review lock.
+                 "clob_client.py", "clob_signing.py", "clob_sdk.py", "hybrid_sizing.py"]
 BASELINE_SHA = {  # approved trading-file baseline; intentional changes require review
     # Reviewed 2026-10-11 deep audit: transport/dispatch ambiguity, freshness,
     # subscription and REST recovery races, paper slot publication, accounting
@@ -1581,7 +1585,17 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # attribution - per step and span, gross ask reductions/additions under the original cap from
     # the book's own states, public BUY prints matched against them, feed coverage, a diagnostic
     # label, a print side check and bounded raw events; points list every ask level under the cap.
-    "sniper_mode.py": "7a0ea8ab40a47722d80862e53713d85d9e88f8bea575d65fe270a67778bbc066",
+    # Re-recorded 2026-10-20 (completion pass over the 2026-10-19/20 work, which changed this file
+    # without a new digest; review the diff before live): the unified-SDK order builder (clob_sdk);
+    # a FAK whose every trade FAILED retracts its provisional slot, shares, cost and fill count
+    # (BUGFIXES_2026-10-19.md); hybrid sizing - the quarter-Kelly input reduced by trigger-feed
+    # volatility and realized drawdown from a ledger snapshot refreshed off the order path, the
+    # optional order-budget caps (off), the bounded minimum-entry exception, and share-sized FAKs
+    # signed as whole shares x the cap with the side's room bounding the SIGNED shares (share
+    # limits are pre-trade estimates; HYBRID_SIZING.md); paper reserves the all-in stake plus fees
+    # until its worker returns, and worker/executor failures stop new decisions
+    # (AUDIT_FIXES_20261020.md). The whole offline suite and the strict native-SDK check pass.
+    "sniper_mode.py": "7105b783bc45adbed48245fc66c3c43a20daa7c1c23e358b7eecdc4c9fb02549",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
@@ -1643,7 +1657,15 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # 2026-10-18 (safety - tests_canary_limits): a restored canary budget may only tighten this
     # start's configured limits - each ceiling and step is min(saved, configured); a lowered .env
     # loss cap was kept at the saved $50.
-    "sniper_live.py": "31ce6abce8c5c3e5ce232c4bde0282d076715eb7e0f8358f7fbf738ab69637df",
+    # Re-recorded 2026-10-20 (completion pass; review the diff before live): unified-SDK signing
+    # (clob_sdk); FAK fills are accepted by their signed maker dollars - improved-price quantity
+    # above the sizing target is booked, a spend above the signed budget still halts; the hybrid
+    # risk recheck runs at prepare and in the send guard; minimum-entry claims live in the durable
+    # send intent; archive compaction drops only an incomplete tail; optional warm-only dispatch
+    # (SNIPER_WARM_ONLY) and live_send transport/intent telemetry; the clock refresh requires HTTP
+    # 200 and a finite, positive timestamp (BUGFIXES_2026-10-19.md, LATENCY_TARGET_200MS.md,
+    # AUDIT_FIXES_20261020.md).
+    "sniper_live.py": "b943912631d82e3123e4ac97b42540ea640d1a54cbcab3316164f0eeec63c8a8",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads
@@ -1661,16 +1683,32 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved 2026-10-12 (audit 20261012): a failing event observer cannot change a committed
     # paper fill or rejection
     # Reviewed 2026-10-17 execution audit: Arrival comparison quotes use the submitted FAK/FOK semantics, including FAK partial fills.
-    "paper_trade.py": "c551358b1b75de3448fda9e0f436827c113d02d4e799ba60337ec1981c770049",
+    # Re-recorded 2026-10-20 (completion pass): a share-sized FAK walks its fixed signed dollar
+    # budget (shares x the limit, estimate_fak_shares) as the venue does, so a cheaper level buys
+    # more shares; partial fills are classified by unspent dollars; the sniper's hybrid risk guard
+    # is checked at the decision and again at booking (AUDIT_FIXES_20261020.md).
+    "paper_trade.py": "ddfb4b367409a25a5072bbb5c94178b0641021e27e9881973aa11eee4d59e6d8",
     # Re-approved 2026-10-12 (audit 20261012): a rejection that also carries acceptance evidence
     # is not definitive
-    "polymarket_trade.py": "398c55b670843db6f978e76c4848005cacfdaf46ab31a27bbae8b4dd50e89362",
+    # Re-recorded 2026-10-20 (completion pass): the venue client is the unified-SDK adapter
+    # (clob_client via clob_sdk), which configures its own transports; py-clob-client is retired
+    # (SDK_UPGRADE_2026-10-19.md).
+    "polymarket_trade.py": "246f63a7c7a8de604549dceacc7af95babc9b2ad270f0fbba5ddc3a84d8a3125",
     # Re-approved 2026-10-12 (audit 20261012): supplied/cached books pass the same level
     # validation; crossed books refused
-    "orderbook.py": "da71e154a518bebbad1eb95f2a4259f5d228ee51b0f26ccffd9071bcc5a2f8b3",
+    # Re-recorded 2026-10-20 (completion pass): get_orderbook_snapshot keeps a public REST book's
+    # venue timestamp, receipt time, tick and hash (RestBookSnapshot) for executable recovery
+    # (BUGFIXES_2026-10-19.md).
+    "orderbook.py": "650e630fb13b9ae9a552a6e55a08cf4aa9c64723fbc163a178ea1f9c8f22506a",
+    # 2026-10-20: market_discovery.py, timer.py, fast_h2.py, accounting/fees.py, settlement.py,
+    # resolution.py, feeds/poly_user.py and feeds/reconcile.py were unchanged; the uploaded copy
+    # had gained one extra trailing blank line in 113 files, removed again so these match.
     "market_discovery.py": "ca15ccc4c1b0da18248abc91143604d15fe00b1638d727bf5209d6f9ff059dc1",
     "timer.py": "3ca35cc64539d45f7e4b982cbe9b6153138f87ee1be79adfae0c8eaccc875d50",
-    "config.py": "4a1584c419e24d805c691d3bf8d7885f998c00aba2e2195f647e963154fda45d",
+    # Re-recorded 2026-10-20 (completion pass): unified-SDK migration settings; signature type 3
+    # (deposit wallet) stays refused pending its validation with the unified SDK
+    # (SDK_UPGRADE_2026-10-19.md).
+    "config.py": "27c1aec5a5b914fe5a3c01123a569041825c13faa2e1ba119f99101a49497aee",
     "fast_h2.py": "5b9f222bbc3e3ae134d28c13e28db0c8063a35e19ff98b0548d405f0b87cca71",
     # Re-approved (F2): fills and settlements append one fsynced journal line (the snapshot
     # records the entry it includes; load replays newer ones, validated, torn tail dropped,
@@ -1682,7 +1720,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # may rise by the payouts of positions settled from 10 minutes before them (this account's
     # winnings come back as cash automatically); every payout and any deposit were a MISMATCH for
     # the rest of the run. Missing fills (it fell) and deposits (it rose more) still are.
-    "accounting/ledger.py": "479f6c0b3f6322b4df024b820d712961eb5d0b675fce12cee79c82e4c7e0068d",
+    # Re-recorded 2026-10-20 (completion pass): the hybrid realized-equity risk epoch (reference
+    # capital, realized-P&L baseline, high-water mark) is persisted in the snapshot and its peaks
+    # kept through durable transactions and journal replay; hybrid_risk_view refuses a reference
+    # reading that raced a fill or settlement (HYBRID_SIZING.md, SDK_UPGRADE_2026-10-19.md).
+    "accounting/ledger.py": "a3d0af0a828c6afa58a6d7f3b3d6cfe2173bfe33d9773134d6389f0145e82c68",
     "accounting/fees.py": "44e45be00c7c3b330ef0ff11950fa42944029ba83a61ec8066af3494c0956dc7",
     # Re-approved (settlement audit): one record per market (condition id), checked from
     # expiry, concurrently, on the worker's own pool; explicit lifecycle events and a journal;
@@ -1706,14 +1748,28 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved 2026-10-12 (audit 20261012): deltas fenced by the newest observed exchange time,
     # so a REST snapshot cannot rewind them; timestamped tick changes; REST tuples cannot certify
     # a past venue instant
-    "feeds/book.py": "4df242f5023bbc5e5c9bb7d1d5810791e2ef018ef0441acb428a3efd30526055",
+    # Re-recorded 2026-10-20 (completion pass): a REST observation carries its provenance and
+    # receipt time, cannot advance the WebSocket watermark or certify an earlier venue-time book;
+    # history uses installation time while freshness keeps the receipt (BUGFIXES_2026-10-19.md).
+    "feeds/book.py": "8d99e3144f4482270445880cb75099252a273b1e78af7ff4e1a16d65fb1aba50",
     # Reviewed 2026-10-12: user-requested recovery, accounting and portfolio safety fixes.
     # Re-approved 2026-10-12 (audit 20261012): FillStore summary cached until the next mutation
     "feeds/poly_user.py": "6ff37ccc1cda3238b7b702233f339093b84b7bf026576364f87e29111f68facd",
     # Reviewed 2026-10-12: receive fencing and ordered public-token snapshot recovery.
-    "feeds/hub.py": "c7dafeb425bec13e51a9e811aad72e01d765c32d8147ad540fd21d77bc9010f4",
-    "feeds/poly_market.py": "459f43fbd6bc582c48446442f37d2341762932f14f321d5016d2a398e962c70a",
+    # hub.py and poly_market.py are listed, not locked (not in TRADING_FILES). Re-recorded
+    # 2026-10-20: proactive REST recovery uses the metadata-preserving book read
+    # (BUGFIXES_2026-10-19.md).
+    "feeds/hub.py": "78a4290e17723f430b869853559c5af5c391e332a13532209a1bcb10912d46a3",
+    "feeds/poly_market.py": "82b4a0bd2a8cece33e6f5190acb8502cced9775b558d8e20aa2b30907d7392e0",
     "feeds/reconcile.py": "71dea5e832fb970e5cfac1880686cf5eff477a34c48c9b91ba961f77b3e9cb6f",
+    # Added 2026-10-20 (the unified-SDK migration, SDK_UPGRADE_2026-10-19.md): the adapter that
+    # preserves the bot's client API over polymarket-client 0.13.0 and posts each order once; the
+    # SDK-backed signing, hashing and HMAC; their import surface; and the pure hybrid sizing
+    # functions (HYBRID_SIZING.md). tests_unified_sdk checks the native wire, hashes and HMAC.
+    "clob_client.py": "cf39e32e4e78500068de88ef8538073319411fe1710473790cd074cde329f216",
+    "clob_signing.py": "bfe704a25e5cc52ea4bdb4f085eac13d2710a83f64d7beee56d2d287707f305a",
+    "clob_sdk.py": "f03d066498ecde9e0afcb85ae3e4dcbfc0e18d5ffc1f483d3d0cdcf106382de5",
+    "hybrid_sizing.py": "41fdfe4f7f7eb08a929e25b9fb34d2463f62bff700d3b3bc702e60ae7a1c6eed",
 }
 SIDES = (None, "UP", "DOWN")
 PRICES = (None, 0.0, 64_000.0, 64_894.0, 64_894.01, 1e9, -5.0)
@@ -1733,11 +1789,11 @@ def _stub_sdks():
         def to_checksum_address(a): return a
     m.Web3 = _W3
     sys.modules["web3"] = m
-    p = types.ModuleType("py_clob_client_v2")
+    p = types.ModuleType("clob_sdk")
     for n in ("AssetType", "BalanceAllowanceParams", "ClobClient", "MarketOrderArgs",
               "OrderType", "PartialCreateOrderOptions", "Side"):
         setattr(p, n, type(n, (), {"__init__": lambda self, *a, **k: None}))
-    sys.modules["py_clob_client_v2"] = p
+    sys.modules["clob_sdk"] = p
 
 
 def t_trading_file_baselines():

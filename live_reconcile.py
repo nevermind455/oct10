@@ -151,7 +151,7 @@ def main() -> int:
 
     import config  # noqa: F401 - loads .env for the client
     import polymarket_trade as pt
-    from py_clob_client_v2.clob_types import TradeParams
+    from clob_sdk import TradeParams
     client = pt._get_client()
 
     print("\nREFUSED TRADES (the venue's record)")

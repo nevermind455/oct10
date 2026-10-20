@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 import config  # noqa: F401 — loads .env first
 import orderbook
 
-from py_clob_client_v2 import (
+from clob_sdk import (
     AssetType,
     BalanceAllowanceParams,
     ClobClient,
@@ -161,33 +161,13 @@ def _normalize_private_key(raw: str | None) -> str | None:
 
 
 def _apply_clob_http_timeout() -> None:
-    """The SDK's shared httpx client defaults to a 5s read timeout.
-
-    L2 create/derive is two authenticated round trips. A single slow CLOB
-    read used to abort live startup as "credentials could not be derived".
-    """
+    """The unified SDK adapter configures its own transports, without a global pool."""
     global _clob_http_timeout_applied
-    if _clob_http_timeout_applied:
-        return
-    try:
-        import httpx
-        import py_clob_client_v2.http_helpers.helpers as helpers
-    except ImportError:
-        return
-    previous = getattr(helpers, "_http_client", None)
-    helpers._http_client = httpx.Client(
-        http2=True, timeout=httpx.Timeout(_CLOB_HTTP_TIMEOUT_SECONDS),
-        limits=httpx.Limits(keepalive_expiry=_CLOB_KEEPALIVE_SECONDS))
-    if previous is not None:
-        try:
-            previous.close()
-        except Exception:
-            pass
     _clob_http_timeout_applied = True
 
 
 def _is_transient_clob_error(exc: Exception) -> bool:
-    status = getattr(exc, "status_code", None)
+    status = getattr(exc, "status_code", getattr(exc, "status", None))
     if isinstance(status, int) and status < 500:
         return False
     text = str(exc or "").lower()
@@ -254,6 +234,8 @@ def _get_client_unlocked() -> ClobClient:
         "chain_id": config.CHAIN_ID,
         "key": key,
         "use_server_time": True,
+        "timeout_s": _CLOB_HTTP_TIMEOUT_SECONDS,
+        "keepalive_s": _CLOB_KEEPALIVE_SECONDS,
     }
     # Preserve the SDK's EOA defaults instead of overriding them with None.
     if config.POLY_SIGNATURE_TYPE is not None:
@@ -358,7 +340,7 @@ def _explicit_no_match_exception(exc: Exception) -> bool:
     # An exception string is not venue rejection evidence: a transport timeout
     # can contain an old response body or diagnostic text. Retry only a
     # documented client-error response from the venue.
-    return getattr(exc, "status_code", None) in (400, 422) and _is_no_match(str(exc))
+    return getattr(exc, "status_code", getattr(exc, "status", None)) in (400, 422) and _is_no_match(str(exc))
 
 
 _FAILED_ORDER_STATUSES = {

@@ -102,6 +102,8 @@ from pathlib import Path
 import websockets
 
 import exec_latency
+from hybrid_sizing import (HybridPolicy, cent_compatible_shares, enforce_order_budget, minimum_entry_shares,
+                           risk_total, shares_within_budget, sizing_factors)
 from timer import now_et
 
 try:
@@ -785,7 +787,7 @@ def fast_signer(private_key: str, chain_id: int):
     """
     from eth_keys import keys
     from eth_keys.backends import get_backend
-    from py_clob_client_v2.signer import Signer
+    from clob_signing import Signer
     signer = Signer(private_key, chain_id)
     raw = private_key[2:] if private_key.startswith("0x") else private_key
     signer.private_key = keys.PrivateKey(bytes.fromhex(raw), backend=get_backend())
@@ -793,132 +795,40 @@ def fast_signer(private_key: str, chain_id: int):
 
 
 class FastOrderBuilder:
-    """OrderBuilder.build_market_order (v2) with the signature's EIP-712
-    digest computed directly.
+    """Cached-key facade over the pinned unified SDK's order builder.
 
-    The library builds a typed-data dict for every order, runs the generic
-    encoder over it and makes a new exchange builder (re-hashing the domain)
-    each time - most of what signing costs once coincurve makes the ECDSA
-    step cheap. Here the digest is keccak(0x1901 || domain || hashStruct),
-    the same formula the library itself applies for POLY_1271 orders, with
-    the domain hash kept per exchange contract. Everything else - amounts,
-    salt, timestamp, the signer check, the order object - is the library's
-    own code. Signatures are byte-identical (tests_sniper_live checks it on
-    random orders against the library's own signing of the same order).
-    v1 and POLY_1271 orders go to the library unchanged."""
-
-    def __init__(self, builder) -> None:
+    Official order construction, protocol routing and signature wrapping stay
+    in clob_signing. No metadata or clock request occurs in this path.
+    """
+    def __init__(self, builder):
         self.b = builder
         self.signer, self.signature_type, self.funder = builder.signer, builder.signature_type, builder.funder
-        self._exchange: dict = {}
-        self._key = None
-        self.last_sign_ns = None          # (T3, T4) of the newest order built here
-        self.last_order_hash = None       # the EIP-712 digest just signed = the venue's order id
+        self.last_sign_ns = None
+        self.last_order_hash = None
 
-    def _pk(self):
-        if self._key is None:
-            pk = self.b.signer.private_key
-            if not hasattr(pk, "sign_msg_hash"):                    # a plain library Signer: parse once
-                from eth_keys import keys
-                from eth_keys.backends import get_backend
-                raw = str(pk)[2:] if str(pk).startswith("0x") else str(pk)
-                pk = keys.PrivateKey(bytes.fromhex(raw), backend=get_backend())
-            self._key = pk
-        return self._key
+    def _built(self, method, order_args, options, version, fee_rate_bps):
+        result = method(order_args, options, version=version, fee_rate_bps=fee_rate_bps)
+        self.last_sign_ns = getattr(self.b, "last_sign_ns", None)
+        self.last_order_hash = getattr(self.b, "last_order_hash", None)
+        return result
 
-    def build_market_order(self, order_args, options, version: int = 2, fee_rate_bps=None):
-        import dataclasses
-        from py_clob_client_v2.order_builder import builder as bm
-        b = self.b
-        if version != 2 or b.signature_type == bm.SignatureTypeV2.POLY_1271:
-            return b.build_market_order(order_args, options, version=version, fee_rate_bps=fee_rate_bps)
-        side, maker_amount, taker_amount = b.get_market_order_amounts(
-            order_args.side, order_args.amount, order_args.price, bm.ROUNDING_CONFIG[options.tick_size])
-        chain = b.signer.get_chain_id()
-        cc = bm.get_contract_config(chain)
-        exchange = cc.neg_risk_exchange_v2 if options.neg_risk else cc.exchange_v2
-        eb = self._exchange.get(exchange)
-        if eb is None:
-            eb = self._exchange[exchange] = bm.ExchangeOrderBuilderV2(exchange, chain, b.signer)
-        order = eb.build_order(bm.OrderDataV2(
-            maker=b.funder, tokenId=order_args.token_id, makerAmount=str(maker_amount),
-            takerAmount=str(taker_amount), side=side, signer=b._v2_order_signer(), signatureType=b.signature_type,
-            timestamp=str(time.time_ns() // 1_000_000), metadata=getattr(order_args, "metadata", bm.BYTES32_ZERO),
-            builder=order_args.builder_code))
-        fields = dataclasses.asdict(order)
-        # T3 (order constructed) and T4 (signed) for the latency report.
-        t3 = time.perf_counter_ns()
-        signature = self.sign(eb, order)
-        self.last_sign_ns = (t3, time.perf_counter_ns())
-        return bm.SignedOrderV2(**{**fields, "signature": signature})
+    def build_market_order(self, order_args, options, version=2, fee_rate_bps=None):
+        return self._built(self.b.build_market_order, order_args, options, version, fee_rate_bps)
 
-    def build_order(self, order_args, options, version: int = 2, fee_rate_bps=None):
-        """OrderBuilder.build_order (a v2 limit order, F1's share-sized FAK)
-        with the fast digest; amounts, salt and fields are the library's own."""
-        import dataclasses
-        from py_clob_client_v2.order_builder import builder as bm
-        b = self.b
-        if version != 2 or b.signature_type == bm.SignatureTypeV2.POLY_1271:
-            return b.build_order(order_args, options, version=version, fee_rate_bps=fee_rate_bps)
-        side, maker_amount, taker_amount = b.get_order_amounts(
-            order_args.side, order_args.size, order_args.price, bm.ROUNDING_CONFIG[options.tick_size])
-        chain = b.signer.get_chain_id()
-        cc = bm.get_contract_config(chain)
-        exchange = cc.neg_risk_exchange_v2 if options.neg_risk else cc.exchange_v2
-        eb = self._exchange.get(exchange)
-        if eb is None:
-            eb = self._exchange[exchange] = bm.ExchangeOrderBuilderV2(exchange, chain, b.signer)
-        order = eb.build_order(bm.OrderDataV2(
-            maker=b.funder, tokenId=order_args.token_id, makerAmount=str(maker_amount),
-            takerAmount=str(taker_amount), side=side, signer=b._v2_order_signer(), signatureType=b.signature_type,
-            timestamp=str(time.time_ns() // 1_000_000), metadata=getattr(order_args, "metadata", bm.BYTES32_ZERO),
-            builder=order_args.builder_code, expiration=str(getattr(order_args, "expiration", 0))))
-        fields = dataclasses.asdict(order)
-        t3 = time.perf_counter_ns()
-        signature = self.sign(eb, order)
-        self.last_sign_ns = (t3, time.perf_counter_ns())
-        return bm.SignedOrderV2(**{**fields, "signature": signature})
-
-    def sign(self, eb, order) -> str:
-        """The order's EIP-712 signature: '0x' + r || s || v (v = 27/28), as
-        eth_account's sign_message returns it."""
-        digest = order_digest_v2(eb.app_domain_separator, order)
-        # The digest signed IS the order's hash - the library's build_order_hash
-        # and the id the venue knows the order by (M7: an order whose reply was
-        # lost is looked up by it, never sent again).
-        self.last_order_hash = "0x" + digest.hex()
-        sig = self._pk().sign_msg_hash(digest)
-        return "0x" + (sig.r.to_bytes(32, "big") + sig.s.to_bytes(32, "big") + bytes([sig.v + 27])).hex()
+    def build_order(self, order_args, options, version=2, fee_rate_bps=None):
+        return self._built(self.b.build_order, order_args, options, version, fee_rate_bps)
 
 
-def order_digest_v2(domain_separator: bytes, order) -> bytes:
-    """keccak(0x1901 || domain || hashStruct(order)): what a v2 order's
-    signature signs, and the order's hash - the id the venue knows it by."""
-    from eth_utils import keccak
-    from py_clob_client_v2.order_utils import exchange_order_builder_v2 as ev2
-
-    def word(n):
-        return int(n).to_bytes(32, "big")
-
-    def addr(a):
-        return bytes(12) + bytes.fromhex(str(a)[2:])
-    struct = keccak(ev2.ORDER_TYPE_HASH + word(order.salt) + addr(order.maker) + addr(order.signer)
-                    + word(order.tokenId) + word(order.makerAmount) + word(order.takerAmount)
-                    + word(int(order.side)) + word(int(order.signatureType)) + word(order.timestamp)
-                    + ev2._bytes32(order.metadata) + ev2._bytes32(order.builder))
-    return keccak(b"\x19\x01" + domain_separator + struct)
+def order_digest_v2(domain_separator, order):
+    """Compatibility entry point for order hashes using the unified SDK."""
+    from clob_signing import order_digest_v2 as digest
+    return digest(domain_separator, order)
 
 
-def order_hash_v2(signed, *, neg_risk: bool, chain_id: int, signer=None) -> str | None:
-    """The order hash of a signed v2 order built by any builder (the fast one
-    hands it over directly; this recomputes it). None if it cannot be had."""
-    try:
-        from py_clob_client_v2.order_builder import builder as bm
-        cc = bm.get_contract_config(int(chain_id))
-        eb = bm.ExchangeOrderBuilderV2(cc.neg_risk_exchange_v2 if neg_risk else cc.exchange_v2, int(chain_id), signer)
-        return "0x" + order_digest_v2(eb.app_domain_separator, signed).hex()
-    except Exception:  # noqa: BLE001 - no hash: an unknown outcome then halts, as before
-        return None
+def order_hash_v2(signed, *, neg_risk, chain_id, signer=None):
+    """Order identity supplied by the unified SDK signing adapter."""
+    from clob_signing import order_hash_v2 as order_hash
+    return order_hash(signed, neg_risk=neg_risk, chain_id=chain_id, signer=signer)
 
 
 def code_version() -> str | None:
@@ -1064,9 +974,20 @@ class Settings:
         # accounting for cash and both outcome holdings, in whole shares. There is
         # no per-order cap, only what is left of the side's
         # SNIPER_MAX_SIDE_SHARES in the round (live: also the canary's per-order cap);
-        # under the venue's 5-share minimum it skips. Replaces the fixed SNIPER_SHARES + carry.
+        # Small targets normally skip, with an optional bounded first-entry
+        # minimum exception. Replaces fixed SNIPER_SHARES + carry.
         self.kelly = _env_bool("SNIPER_KELLY", True)
-        self.kelly_fraction = _env_float("SNIPER_KELLY_FRACTION", 0.5)       # half Kelly since 2026-10-13 (full before; 0.25 earlier on 10-11)
+        self.kelly_fraction = _env_float("SNIPER_KELLY_FRACTION", 0.25)
+        self.hybrid_sizing = _env_bool("SNIPER_HYBRID_SIZING", True)
+        self.kelly_min_entry = _env_bool("SNIPER_KELLY_MIN_ENTRY", True)
+        try:
+            self.hybrid_policy = HybridPolicy(
+                vol_baseline_bp=_env_float("SNIPER_HYBRID_VOL_BASELINE_BP", 1.0),
+                drawdown_stop=_env_float("SNIPER_HYBRID_DRAWDOWN_STOP", 0.20),
+                risk_fraction=_env_float("SNIPER_HYBRID_RISK_FRACTION", 0.0),
+                max_order_usd=_env_float("SNIPER_HYBRID_MAX_ORDER_USD", 0.0))
+        except ValueError as exc:
+            raise ValueError(f"invalid SNIPER_HYBRID_* settings: {exc}") from exc
         self.stale_ms = _env_float("SNIPER_STALE_MS", 2000)
         # Which book a paper order fills against. "exchange": the book as it
         # stood at the modelled match instant on the venue's own clock (the
@@ -1246,7 +1167,7 @@ class Settings:
         """How much a FAK spends for its shares (the venue fills a FAK BUY by its dollars)."""
         if self.order_type != "FAK":
             return ""
-        return (" (sized as whole shares x the cap: under the cap the saving buys extra shares)"
+        return (" (stake = whole shares x the cap: a cheaper fill can buy extra shares)"
                 if self.order_sizing == "shares" else " (sent as their book cost: more shares only if the ask falls)")
 
     def extra_text(self) -> str:
@@ -1256,11 +1177,20 @@ class Settings:
     def fair_text(self) -> str:
         if not self.fair:
             return ""
+        hybrid = (f"; hybrid: volatility baseline {self.hybrid_policy.vol_baseline_bp:g} bp/sqrt(s), "
+                  f"realized drawdown stop {self.hybrid_policy.drawdown_stop:.0%}, confidence neutral, "
+                  f"additional per-trade cap {'on' if self.hybrid_policy.risk_fraction or self.hybrid_policy.max_order_usd else 'off'}"
+                  if self.hybrid_sizing and self.kelly and self.order_type == "FAK" else "")
+        if self.kelly_min_entry and self.kelly and self.order_type == "FAK" and self.order_sizing == "shares":
+            hybrid += "; one minimum-size entry per side/round may exceed the hybrid target"
+        cap_text = ("optional hybrid per-order cap" if self.hybrid_sizing and (
+                    self.hybrid_policy.risk_fraction or self.hybrid_policy.max_order_usd)
+                    else "no additional per-order cap")
         return (f"; every buy at or under the market-anchored fair value - fee - ${self.fair_margin:.2f} "
                 f"(the market's mid moved by the BTC move over {self.fair_vol_s:.0f}s volatility and the time left)"
-                + (f"; size {self.kelly_fraction:g} Kelly from {KELLY_MIN_SHARES} sh, no per-order cap "
+                + (f"; size {self.kelly_fraction:g} Kelly from {KELLY_MIN_SHARES} sh, {cap_text} "
                    f"(<= {self.max_side_shares:.0f} sh/side per round)"
-                   if self.kelly and self.order_type == "FAK" else ""))
+                   if self.kelly and self.order_type == "FAK" else "") + hybrid)
 
     def lines(self, live: bool = False) -> list[str]:
         if live:
@@ -1570,6 +1500,12 @@ class Sniper:
         self._bankroll: float | None = None
         self._bankroll_at = -1e18
         self._spends: list = []                     # paper: (mono, $) of orders sent - see _set_bankroll
+        self._paper_pending_spends: dict = {}        # monotonic tokens retain cash while workers run
+        self._paper_spend_sequence = 0
+        self._hybrid_risk: dict | None = None       # one immutable worker-produced accounting snapshot
+        self._hybrid_risk_error: str | None = None
+        self._minimum_entry_keys: set = set()
+        self._minimum_entry_seed_error: str | None = None
         self.last_fair: dict | None = None          # the last fair-value decision (the dashboard)
         self.cb_fresh = BinanceFreshness(self.s.coinbase_stale_ms, self.s.coinbase_unknown_ms,
                                          self.s.coinbase_backlog_max, name="coinbase")
@@ -1606,11 +1542,13 @@ class Sniper:
         # on: a restart must not reset a market's caps to zero.
         self.round_baseline: dict = {}
         self._fak_pending: dict = {}        # accepted orders awaiting actual trade quantities
+        self._fak_reported: dict = {}       # provisional quantities, until CONFIRMED or proven FAILED
         # FAK (IOC): shares an order did not fill, per side, for the next
         # same-side order in the same market. Never moved across sides;
         # cleared when the market changes (carry_market).
         self.carry = {"UP": 0.0, "DOWN": 0.0}
         self.carry_market = None            # (condition id, round end) the carry belongs to
+        self._carry_owner: dict = {}        # latest settled plan per side in this carry market
         # Guard diagnostics (guard_diag rows, never the order path): this round's
         # confirmed fills and last sent decision per side, keyed (round end, side).
         self._round_fills: dict = {}
@@ -1889,6 +1827,68 @@ class Sniper:
             return None
         return rate, exponent
 
+    def _share_order_floor(self, condition, view, price_cap) -> int:
+        """Read prefetched venue minimums; never fetch on the decision path."""
+        cached = getattr(self.broker, "cached_rules", None)
+        if callable(cached):
+            rules = cached(str(condition))
+        else:
+            hit = getattr(self.broker, "_rules_cache", {}).get(str(condition))
+            rules = hit[0] if hit else None
+        minimum = Decimal(KELLY_MIN_SHARES)
+        for value in (getattr(rules, "min_order_size", None), getattr(view, "min_order_size", None)):
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                raise ValueError("invalid venue minimum")
+            value = Decimal(str(value))
+            if not value.is_finite() or value <= 0:
+                raise ValueError("invalid venue minimum")
+            minimum = max(minimum, value)
+        return minimum_entry_shares(price_cap, minimum, MIN_ORDER_USD)
+
+    def _seed_minimum_entries(self) -> None:
+        """Recover bounded-entry attempts before feeds start; startup-only I/O."""
+        try:
+            claims = set()
+            if self.live is not None:
+                session = getattr(self.live, "session", None)
+                if session is None:
+                    session = getattr(getattr(self.live, "sender", None), "session", None)
+                if session is None:
+                    raise ValueError("minimum entries require durable canary session state")
+                claims.update(session.minimum_entry_claims())
+            elif self.journal is not None and self.journal.exists():
+                now = time.time()
+                with self.journal.open(encoding="utf-8") as stream:
+                    for line in stream:
+                        try:
+                            row = json.loads(line)
+                        except json.JSONDecodeError:
+                            if line.endswith("\n"):
+                                raise ValueError("minimum-entry journal contains an invalid row") from None
+                            continue  # incomplete final record
+                        key = row.get("minimum_entry_key") if isinstance(row, dict) else None
+                        if (isinstance(row, dict) and row.get("minimum_entry") is True
+                                and row.get("minimum_entry_attempted") is True):
+                            if not isinstance(key, list) or len(key) != 3:
+                                raise ValueError("minimum-entry attempt has an invalid key")
+                            condition, token, end = key
+                            if not (isinstance(condition, str) and condition and isinstance(token, str) and token
+                                    and not isinstance(end, bool) and isinstance(end, (int, float))
+                                    and math.isfinite(end) and end > 0):
+                                raise ValueError("minimum-entry attempt has an invalid round")
+                            if end > now:
+                                claims.add((condition, token, float(end)))
+            self._minimum_entry_keys.update(claims)
+            self._minimum_entry_seed_error = None
+        except Exception as exc:
+            self._minimum_entry_seed_error = f"{type(exc).__name__}: {exc}"
+
+    def _release_minimum_entry(self, plan) -> None:
+        if plan.get("minimum_entry"):
+            self._minimum_entry_keys.discard(plan["minimum_entry_key"])
+
     BANKROLL_EVERY_S = 5.0     # paper: the broker's cash is re-read this often, off the order path
     BANKROLL_STALE_S = 30.0    # older than this (no refresher running): read it on the spot
     BANKROLL_SETTLE_S = 2.0    # paper: an order sent this long before a reading may not be in it yet
@@ -1921,23 +1921,51 @@ class Sniper:
         return self._bankroll
 
     def _set_bankroll(self, v, read_at: float) -> None:
-        """Paper: a cash reading taken at read_at, less what orders sent from
-        BANKROLL_SETTLE_S before it may not have booked yet (no fill, or a fill
-        the reading already holds, only makes the next order smaller until the
-        reading after)."""
+        """Paper cash less active workers and a short completed-order tail.
+
+        A worker can outlast BANKROLL_SETTLE_S. Its reservation stays until an
+        outcome returns, then the tail covers reads begun before that outcome.
+        A reading already containing a fill is temporarily conservative.
+        """
         cut = read_at - self.BANKROLL_SETTLE_S
-        self._spends = [s for s in self._spends if s[0] >= cut]
+        pending = set(getattr(self, "_paper_pending_spends", {}).values())
+        self._spends = [s for s in self._spends if s[0] >= cut or s in pending]
         self._bankroll = None if v is None else v - sum(a for _t, a in self._spends)
         self._bankroll_at = read_at
 
-    def _bankroll_spent(self, amount: float) -> None:
+    def _bankroll_spent(self, amount: float, *, plan=None) -> None:
         """Paper: an order went out - its spend leaves the cash Kelly sizes from
         at once, not at the next reading (up to 5s later: the next order on the
         other side, or this side's after its cooldown, sized from the same cash
         and the two together bet more than Kelly)."""
-        self._spends.append((time.monotonic(), float(amount)))
+        spend = (time.monotonic(), float(amount))
+        self._spends.append(spend)
+        if plan is not None:
+            self._paper_spend_sequence += 1
+            token = self._paper_spend_sequence
+            plan["paper_spend_token"] = token
+            self._paper_pending_spends[token] = spend
         if self._bankroll is not None:
             self._bankroll -= float(amount)
+
+    def _bankroll_completed(self, plan) -> None:
+        """Release active ownership only after the worker returned an outcome.
+
+        Keep the usual two-second tail from completion, rather than dispatch,
+        so a cash read begun before booking cannot prematurely return cash.
+        """
+        token = plan.get("paper_spend_token")
+        pending = getattr(self, "_paper_pending_spends", {})
+        spend = pending.pop(token, None)
+        if spend is None:
+            return
+        completed = (time.monotonic(), spend[1])
+        for i, entry in enumerate(self._spends):
+            if entry == spend:
+                self._spends[i] = completed
+                break
+        else:
+            self._spends.append(completed)
 
     async def _bankroll_loop(self) -> None:
         while True:
@@ -1945,6 +1973,74 @@ class Sniper:
             v = await asyncio.to_thread(self._read_bankroll)
             self._set_bankroll(v, t0)
             await asyncio.sleep(self.BANKROLL_EVERY_S)
+
+    HYBRID_RISK_STALE_S = 30.0
+
+    def _refresh_hybrid_risk(self) -> dict | None:
+        """Worker-only accounting and durable HWM refresh; never called by a tick."""
+        try:
+            ledger = (getattr(self.live, "ledger", None) if self.live is not None
+                      else getattr(self.broker, "ledger", None))
+            read = getattr(ledger, "hybrid_risk_view", None)
+            if not callable(read):
+                raise ValueError("hybrid accounting ledger unavailable")
+            reference = None
+            expected_seq = None
+            if getattr(ledger, "hybrid_risk", None) is None:
+                # Read before cash/basis. The ledger verifies this revision
+                # while holding its normal writer locks, so a concurrent fill
+                # or settlement cannot permanently inflate the new capital base.
+                expected_seq = ledger.journal_seq
+                cash = self._read_bankroll()
+                if cash is None:
+                    raise ValueError("hybrid reference cash unavailable")
+                _realized, open_basis, _booked = ledger.risk_view(0.0, ())
+                reference = max(0.0, cash) + open_basis
+            # Capture the read's START: a slow disk flush must not make an old
+            # accounting observation look newly fresh when the worker returns.
+            observed = time.monotonic()
+            snapshot = dict(read(reference, expected_journal_seq=expected_seq))
+            snapshot["observed_mono"] = observed
+            self._hybrid_risk_error = None
+            self._hybrid_risk = snapshot
+            return snapshot
+        except Exception as exc:  # accounting or persistence failure: no new hybrid orders
+            self._hybrid_risk_error = f"{type(exc).__name__}: {exc}"
+            self._hybrid_risk = None
+            return None
+
+    async def _hybrid_risk_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.BANKROLL_EVERY_S)
+            await asyncio.to_thread(self._refresh_hybrid_risk)
+
+    def _hybrid_factors(self) -> dict:
+        snapshot = self._hybrid_risk
+        if snapshot is None:
+            raise ValueError(self._hybrid_risk_error or "hybrid accounting not ready")
+        age = time.monotonic() - snapshot["observed_mono"]
+        if not math.isfinite(age) or not 0 <= age <= self.HYBRID_RISK_STALE_S:
+            raise ValueError("hybrid accounting stale")
+        equity = max(0.0, float(snapshot["equity"]))
+        factors = sizing_factors(self.s.hybrid_policy, sigma=self.vol_model.vol(), equity=equity,
+                                 high_water=snapshot["high_water"], base_fraction=self.s.kelly_fraction)
+        return {**factors, "equity": equity, "high_water": snapshot["high_water"],
+                "accounting_age_s": age}
+
+    def _check_hybrid_order(self, plan, spend, fee_rate, quoted_fee=0) -> None:
+        """Recheck cached risk before submission; cap only when explicitly enabled."""
+        if not plan.get("hybrid"):
+            return
+        current = self._hybrid_factors()
+        if current["effective_fraction"] <= 0:
+            raise ValueError("hybrid drawdown stop reached")
+        if current["effective_fraction"] + 1e-12 < plan["hybrid"]["effective_fraction"]:
+            raise ValueError("hybrid allocation tightened before dispatch; fresh decision required")
+        budgets = [v for v in (plan.get("risk_budget_usd"), current["risk_budget_usd"]) if v is not None]
+        if budgets:
+            budget = min(budgets)
+            enforce_order_budget(spend, fee_rate, budget, quoted_fee)
+            plan["risk_budget_usd"] = budget
 
     async def _round_watch(self) -> None:
         while True:
@@ -2376,7 +2472,11 @@ class Sniper:
         if self.s.fixed_latency or self._builder is None:
             return None, None, None
         t = time.perf_counter()
-        err, signed = self._sign(plan["token"], plan["amount"], plan["cap"], plan["tick"])
+        if plan.get("shares") is not None:
+            err, signed = self._sign(plan["token"], plan["amount"], plan["cap"], plan["tick"],
+                                     shares=plan["shares"])
+        else:
+            err, signed = self._sign(plan["token"], plan["amount"], plan["cap"], plan["tick"])
         return (time.perf_counter() - t) * 1000.0, (f"order signing failed: {err}" if err else None), signed
 
     def _prepare_request(self, signed):
@@ -2408,6 +2508,21 @@ class Sniper:
             kw["fak"] = True
         if getattr(self.broker, "supports_size_at_limit", False):
             kw["size_at_limit"] = True               # sized as the live sender sizes it
+        if plan.get("shares") is not None:
+            if not getattr(self.broker, "supports_share_sized", False):
+                raise ValueError("broker does not support the decided share-sized order")
+            kw["shares"] = plan["shares"]
+        if plan.get("hybrid"):
+            if not getattr(self.broker, "supports_hybrid_risk_guard", False):
+                raise ValueError("broker does not support hybrid risk checks")
+            # The simulated order is already dispatched. Recheck only its
+            # frozen monetary bound, never cancel a fill using later volatility
+            # or drawdown information that a live taker could not act on.
+            budget = plan.get("risk_budget_usd")
+            def frozen_risk_guard(spend, rate, fee=0):
+                if budget is not None:
+                    enforce_order_budget(spend, rate, budget, fee)
+            kw["hybrid_risk_guard"] = frozen_risk_guard
         if kw and self._history_book() is not None and getattr(self.broker, "supports_arrival_book", False):
             arrival_ms = plan["sent_wall"] * 1000.0 + float(latency_ms) + self.s.venue_offset_ms
             arrival_mono = plan["sent_mono"] + float(latency_ms) / 1000.0
@@ -2549,18 +2664,30 @@ class Sniper:
             return "SPREAD_TOO_WIDE"
         return "TECHNICAL_ERROR"
 
-    def _sign(self, token, amount, cap, tick):
+    def _sign(self, token, amount, cap, tick, *, shares=None):
         try:
             # create_market_order's own range check, which the builder skips.
             t = float(tick)
             price = signing_price(cap, tick)
             if not t <= price <= 1 - t + 1e-9:
                 return f"invalid price ({cap}), min: {t} - max: {1 - t}", None
-            signed = self._builder.build_market_order(
-                self._clob["MarketOrderArgsV2"](token_id=str(token), amount=signing_amount(amount),
-                                                side=self._clob["BUY"], price=price,
-                                                order_type=self._clob[self.s.order_type]),
-                self._clob["CreateOrderOptions"](tick_size=tick, neg_risk=False), version=2)
+            options = self._clob["CreateOrderOptions"](tick_size=tick, neg_risk=False)
+            if shares is not None:
+                if self.s.order_type != "FAK":
+                    return "a share-sized order is a fill-and-kill", None
+                size = Decimal(str(shares))
+                if not size.is_finite() or size <= 0 or size != size.to_integral_value():
+                    return "a share-sized order is whole shares", None
+                signed = self._builder.build_order(
+                    self._clob["OrderArgsV2"](token_id=str(token), size=float(size),
+                                             side=self._clob["BUY"], price=price),
+                    options, version=2)
+            else:
+                signed = self._builder.build_market_order(
+                    self._clob["MarketOrderArgsV2"](token_id=str(token), amount=signing_amount(amount),
+                                                    side=self._clob["BUY"], price=price,
+                                                    order_type=self._clob[self.s.order_type]),
+                    options, version=2)
         except Exception as exc:  # noqa: BLE001 - whatever the library refuses, live would too
             return f"{type(exc).__name__}: {exc}"[:160], None
         return None, signed
@@ -2574,24 +2701,25 @@ class Sniper:
         """
         try:
             import secrets
-            from py_clob_client_v2.clob_types import CreateOrderOptions, MarketOrderArgsV2, OrderType
-            from py_clob_client_v2.order_builder.builder import OrderBuilder
-            from py_clob_client_v2.order_builder.constants import BUY
+            from clob_sdk import CreateOrderOptions, MarketOrderArgsV2, OrderArgsV2, OrderType
+            from clob_signing import OrderBuilder
+            from clob_signing import BUY
             signer = fast_signer("0x" + secrets.token_hex(32), 137)    # as the live sender signs
             builder = FastOrderBuilder(OrderBuilder(signer))
         except Exception:  # noqa: BLE001 - no library: latency stays live-like, signing is skipped
             return None, {}
-        clob = {"MarketOrderArgsV2": MarketOrderArgsV2, "CreateOrderOptions": CreateOrderOptions,
+        clob = {"MarketOrderArgsV2": MarketOrderArgsV2, "OrderArgsV2": OrderArgsV2,
+                "CreateOrderOptions": CreateOrderOptions,
                 "BUY": BUY, "FOK": OrderType.FOK, "FAK": OrderType.FAK, "signer": signer}
         try:
             # The request half of post_order, with throwaway credentials made
             # here (random, never registered or sent) so its CPU cost is real.
             import base64
             import uuid
-            from py_clob_client_v2.clob_types import ApiCreds, RequestArgs
-            from py_clob_client_v2.endpoints import POST_ORDER
-            from py_clob_client_v2.headers.headers import create_level_2_headers
-            from py_clob_client_v2.order_utils.model.order_data_v2 import order_to_json_v2
+            from clob_sdk import ApiCreds, RequestArgs
+            from clob_signing import POST_ORDER
+            from clob_signing import create_level_2_headers
+            from clob_signing import order_to_json_v2
             clob.update(order_to_json=order_to_json_v2, l2_headers=create_level_2_headers,
                         RequestArgs=RequestArgs, POST_ORDER=POST_ORDER,
                         creds=ApiCreds(api_key=str(uuid.uuid4()),
@@ -2663,6 +2791,7 @@ class Sniper:
         if self.carry_market != key:
             self.carry = {"UP": 0.0, "DOWN": 0.0}
             self.carry_market = key
+            self._carry_owner = {}
         return self.carry
 
     def carry_view(self) -> dict:
@@ -2683,6 +2812,10 @@ class Sniper:
             return
         left = max(0.0, float(plan["target"]) - float(filled or 0.0))
         self.carry[side] = round(left, 4) if left >= 0.01 else 0.0
+        owners = getattr(self, "_carry_owner", None)
+        if owners is None:
+            owners = self._carry_owner = {}
+        owners[side] = plan
 
     def _visible_levels(self, token: str, view) -> list:
         """Ask levels (price, size), best first, as a live account would see
@@ -2861,16 +2994,41 @@ class Sniper:
                 req_err = self._prepare_request(signed)
                 if req_err:
                     sign_err = f"order request build failed: {req_err}"
+            if not sign_err and plan.get("hybrid"):
+                try:
+                    self._check_hybrid_order(plan, plan["amount"], plan["fair_fee_rate"])
+                except ValueError as exc:
+                    sign_err = f"hybrid risk check: {exc}"
             st["sent_pc"] = time.perf_counter_ns()      # network-send boundary (simulated in paper)
             plan["sent_wall"], plan["sent_mono"] = time.time(), time.monotonic()
             loop = asyncio.get_running_loop()
             if sign_err:
+                self._release_minimum_entry(plan)
                 fut = loop.create_future()
                 fut.set_result((False, sign_ms, sign_err, st))
             else:
                 st["handoff_pc"] = time.perf_counter_ns()
-                fut = loop.run_in_executor(None, self._match, plan, sign_ms, st)
-                self._bankroll_spent(plan["amount"])
+                if plan.get("minimum_entry"):
+                    row["minimum_entry_attempted"] = True
+                    # Paper records its simulated dispatch independently of
+                    # the later fill, so a normal restart restores NO_MATCH
+                    # attempts as well as successful minimum entries.
+                    self._write({"wall": time.time(), "result": "minimum_entry_attempt",
+                                 "minimum_entry": True, "minimum_entry_attempted": True,
+                                 "minimum_entry_key": list(plan["minimum_entry_key"])})
+                # Match live's all-in cash reservation: a cap-price fill also
+                # charges fees. Reserving only principal made the cached paper
+                # bankroll spend those fees again on the next side's order.
+                reserve = float(risk_total(plan["amount"], plan.get("fair_fee_rate") or 0.0))
+                self._bankroll_spent(reserve, plan=plan)
+                try:
+                    fut = loop.run_in_executor(None, self._match, plan, sign_ms, st)
+                except BaseException:
+                    # Submission infrastructure failed after recording the
+                    # attempt. Do not return its cash/claim and try again from
+                    # an uncertain executor state.
+                    self._closing = True
+                    raise
             if self.s.shadow_ms:
                 # After the send: the shadow sleeps until absolute times anyway.
                 self._spawn(self._shadow(row, plan["token"], plan["other"], plan["cond"],
@@ -2902,10 +3060,20 @@ class Sniper:
             p = self.live.prepare(plan, decided_pc=plan["decided_pc"])
         except (Refused, Halted) as exc:
             self.n["orders"] -= 1                       # decided, but not sent
+            self._release_minimum_entry(plan)
             row["detail"] = str(exc)[:200]
             self._skip("live halted" if isinstance(exc, Halted) else "live refused", row)
             self._release(side)
             return None
+        except Exception:
+            # Preparation never dispatches an order. An unexpected builder or
+            # accounting failure must not consume an unused minimum entry or
+            # count as a submitted order. Stop decisions: partially changed
+            # execution state needs inspection rather than an automatic retry.
+            self.n["orders"] -= 1
+            self._release_minimum_entry(plan)
+            self._closing = True
+            raise
         previous_guard = getattr(p, "send_guard", None)
         def send_guard():
             if previous_guard is not None:
@@ -2915,7 +3083,16 @@ class Sniper:
         # The bytes go out here, still inside the BTC tick's own step: no
         # event-loop turn between the decision and the wire (None: no warm
         # HTTP/2 connection - the task below then connects and sends).
-        started = self.live.start_send(p)
+        try:
+            started = self.live.start_send(p)
+        except Exception:
+            # A transport can fail after writing. Keep the intent, cash and
+            # minimum-entry claim; never turn an unknown send into a free retry.
+            self._closing = True
+            kill = getattr(self.live, "kill", None)
+            if kill is not None:
+                kill.trip("order dispatch failed: reconcile before trading")
+            raise
         plan["order_type"] = p.order_type
         plan["client_order_id"] = p.client_order_id
         self._decision_book(row, plan)
@@ -2962,6 +3139,10 @@ class Sniper:
         try:
             res = await self.live.send(p, started)
             kind = res["kind"]
+            if plan.get("minimum_entry"):
+                row["minimum_entry_attempted"] = bool(p.stamps.get("budget_recorded"))
+                if kind == "NOT_SENT" and not row["minimum_entry_attempted"]:
+                    self._release_minimum_entry(plan)
             if res.get("auto_reconcile"):
                 row["live_send_auto_reconcile"] = True
             ts = res.get("ts_us") or {}                 # microseconds after the decision
@@ -3124,7 +3305,8 @@ class Sniper:
         else:
             rd["fills"] -= 1               # terminal, proven-zero delayed order
             self.n["refused"] += 1
-            row.update(result="refused", outcome="LIVE_NO_MATCH", reason="FAK canceled with zero matched size")
+            row.update(result="refused", outcome="LIVE_NO_MATCH",
+                       reason=fill.get("reason") or "FAK canceled with zero matched size")
         if update:
             # Keep the initial acknowledgement distinct from the quantity update.
             row.update(result="live_fill_update", wall=time.time(), resolved_result="filled" if shares else "refused")
@@ -3135,6 +3317,46 @@ class Sniper:
         self._write(row)
         self._table_row(side, fill["cost"] + fill.get("fee", 0), "filled" if shares else "missed", plan["end"],
                         order_id=row.get("order_id"))
+        if shares > 0 and row.get("order_id") and fill.get("statuses") != ["CONFIRMED"]:
+            # Keep the original contribution by order/round. MATCHED and MINED
+            # may still fail settlement after their quantity was reported.
+            reported = getattr(self, "_fak_reported", None)
+            if reported is None:
+                reported = self._fak_reported = {}
+            reported[row["order_id"]] = (dict(row), plan, dict(fill))
+
+    def _retract_failed_fak(self, row, plan, previous, failure):
+        """Event loop: undo only this order's provisional strategy contribution."""
+        side, rd, shares = row["side"], plan["rd"], float(previous["shares"])
+        rd["fills"] = max(0, rd["fills"] - 1)
+        rd[side] = max(0.0, rd[side] - shares)
+        total = self._round_fills.get((plan["end"], side))
+        if total is not None:
+            total["shares"] = max(0.0, total["shares"] - shares)
+            total["cost"] = max(0.0, total["cost"] - float(previous["cost"])
+                                - float(previous.get("fee") or 0.0))
+            if total["shares"] <= 1e-9:
+                self._round_fills.pop((plan["end"], side), None)
+        # Carry is the LAST order's unfilled target, not a cumulative deficit.
+        # A late failure may restore its own target only while it still owns
+        # this side's carry; a later same-side outcome keeps its own remainder.
+        if (plan.get("carry_market") is not None and plan["carry_market"] == self.carry_market
+                and getattr(self, "_carry_owner", {}).get(side) is plan):
+            self._settle_carry(plan, side, 0.0)
+        self.n["filled"] = max(0, self.n["filled"] - 1)
+        self.n["refused"] += 1
+        self.n["failed provisional fills"] += 1
+        updated = dict(row, wall=time.time(), result="live_fill_update", resolved_result="refused",
+                       outcome="LIVE_NO_MATCH", shares=0.0, price=None, cost=0.0, fee=0.0, partial=False,
+                       fill_statuses=failure["statuses"], price_source=failure["source"],
+                       reason=failure["reason"], retracted_shares=shares,
+                       retracted_cost=float(previous["cost"]) + float(previous.get("fee") or 0.0))
+        if plan.get("target") is not None:
+            updated["carry_out"] = self.carry[side]
+        self.quality.retract_fill(row, updated)
+        self._write(updated)
+        self._table_row(side, 0.0, "missed", plan["end"], order_id=row.get("order_id"))
+        self.on_event("sniper", f"LIVE FAK settlement FAILED: removed {shares:.4f} provisional {side} shares", "warn")
 
     def _sync_live_fak(self):
         """Called on the event loop, including after background reconciliation."""
@@ -3145,6 +3367,14 @@ class Sniper:
             if fill is not None:
                 self._fak_pending.pop(oid)
                 self._record_fak_fill(row, plan, fill, update=True)
+        reported = getattr(self, "_fak_reported", {})
+        for oid, (row, plan, previous) in list(reported.items()):
+            fill = self.live.fill_for(oid)
+            if fill is not None and fill.get("terminal_failure"):
+                reported.pop(oid)
+                self._retract_failed_fak(row, plan, previous, fill)
+            elif fill is not None and fill.get("statuses") == ["CONFIRMED"]:
+                reported.pop(oid)              # terminal success no longer needs a rollback record
 
     async def _markout_live(self, row: dict, token: str, order_id) -> None:
         """Bought-side mid 1s and 5s after the venue's reply, minus the price
@@ -3285,6 +3515,12 @@ class Sniper:
             row.update(ask_seen=ask, cap=cap)
             return self._skip("price cap at the price floor", row)
         target = carry = None
+        hybrid = None
+        risk_budget = None
+        minimum_entry = False
+        minimum_key = (str(cond), str(token), float(end))
+        share_floor = None
+        signed_limit = None
         kelly = False
         if self.s.order_type == "FAK":
             if fair is not None and self.s.kelly:
@@ -3301,16 +3537,54 @@ class Sniper:
                 live_cap = getattr(getattr(getattr(self.live, "sender", None), "limits", None), "max_order_shares", None)
                 if live_cap is not None:
                     room = min(room, float(live_cap))
+                if self.s.order_sizing == "shares":
+                    tick = Decimal(str(getattr(view, "tick_size", None) or 0.01))
+                    signed_limit = (Decimal(str(min(cap, hi))) / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+                    try:
+                        share_floor = self._share_order_floor(cond, view, signed_limit)
+                        # Shrink a cash-limited target instead of rejecting a
+                        # valid smaller order at the final reservation check.
+                        room = min(room, shares_within_budget(max(bank, 0.0), signed_limit, fee_rate))
+                    except ValueError as exc:
+                        row["detail"] = str(exc)
+                        return self._skip("venue minimum unavailable", row)
                 held, opposite = self._kelly_inventory(cond, end, side, token, down if side == "UP" else up)
-                shares, f = kelly_shares(fair, ask, fee_rate, self.s.kelly_fraction, bank,
+                fraction = self.s.kelly_fraction
+                if getattr(self.s, "hybrid_sizing", False):
+                    try:
+                        hybrid = self._hybrid_factors()
+                    except ValueError as exc:
+                        row["detail"] = str(exc)
+                        return self._skip("hybrid risk unavailable", row)
+                    row["hybrid"] = hybrid
+                    fraction = hybrid["effective_fraction"]
+                    risk_budget = hybrid["risk_budget_usd"]
+                    if fraction <= 0:
+                        return self._skip("hybrid drawdown stop", row)
+                    if risk_budget is not None:
+                        room = min(room, shares_within_budget(risk_budget, cap, fee_rate))
+                shares, f = kelly_shares(fair, ask, fee_rate, fraction, bank,
                                          max(room, 0.0), held_shares=held, opposite_shares=opposite,
                                          fee_exponent=fee_exponent)
                 row.update(kelly_f=round(f, 4), bankroll=round(bank, 2), kelly_shares=shares,
                            kelly_held_shares=round(held, 4), kelly_opposite_shares=round(opposite, 4))
                 self.last_fair["shares"] = shares
-                if shares < KELLY_MIN_SHARES:
+                required = share_floor or KELLY_MIN_SHARES
+                if shares < required and getattr(self.s, "kelly_min_entry", False) and share_floor is not None:
+                    if self._minimum_entry_seed_error:
+                        row["detail"] = self._minimum_entry_seed_error
+                        return self._skip("minimum entry state unavailable", row)
+                    if minimum_key in self._minimum_entry_keys:
+                        return self._skip("minimum entry already attempted this side and round", row)
+                    if held <= 1e-9 and f > 0 and fraction > 0 and bank > 0 and room + 1e-9 >= share_floor:
+                        shares = float(share_floor)
+                        minimum_entry = True
+                        row.update(minimum_entry=True, minimum_entry_attempted=False,
+                                   minimum_entry_key=list(minimum_key),
+                                   minimum_entry_shares=share_floor)
+                if shares < required:
                     row.update(ask_seen=ask)
-                    return self._skip(f"kelly size under the {KELLY_MIN_SHARES}-share minimum", row)
+                    return self._skip(f"kelly size under the {required}-share minimum", row)
                 target, carry, kelly = shares, 0.0, True
             else:
                 # IOC: a share target - the base clip plus what this side's last
@@ -3320,7 +3594,7 @@ class Sniper:
                 target = min(self.s.shares + carry, self.s.max_target_shares)
             amount = max(self.ioc_spend(self._visible_levels(str(token), view), target, ask, min(cap, hi)),
                          MIN_ORDER_USD)
-            if kelly:
+            if kelly and self.s.order_sizing != "shares":
                 # The round gate deliberately estimates shares at the best ask.
                 # Paying deeper levels (or rounding the stake up a cent) can
                 # exceed that estimate even after Kelly trimmed its target to
@@ -3351,14 +3625,26 @@ class Sniper:
         if self.s.order_type == "FAK" and self.s.order_sizing == "shares":
             tick = Decimal(str(getattr(view, "tick_size", None) or 0.01))
             limit = (Decimal(str(min(cap, hi))) / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
-            floor_shares = max(KELLY_MIN_SHARES, int((Decimal(str(MIN_ORDER_USD)) / limit).to_integral_value(
-                rounding="ROUND_CEILING")))
-            order_shares = max(int(math.floor(target + 1e-9)), floor_shares)
-            if kelly and order_shares > room + 1e-9:
+            floor_shares = share_floor or self._share_order_floor(cond, view, limit)
+            order_shares = cent_compatible_shares(target, limit)
+            if kelly and (order_shares < floor_shares or order_shares > room + 1e-9):
                 row.update(ask_seen=ask, order_shares=order_shares, room_shares=round(room, 4))
                 return self._skip("kelly room under venue minimum at price cap", row)
-            amount = max(float((Decimal(order_shares) * limit).quantize(Decimal("0.01"), rounding=ROUND_FLOOR)),
-                         gate_amount)
+            order_shares = max(order_shares, floor_shares)
+            # Whole shares set the signed maker-dollar stake at the cap. The
+            # venue executes a FAK BUY by those dollars, so cheaper executions
+            # can buy extra shares. Reserve the full stake, not book cost.
+            signed_spend = Decimal(order_shares) * limit
+            if signed_spend != signed_spend.quantize(Decimal("0.01")):
+                row.update(ask_seen=ask, order_shares=order_shares)
+                return self._skip("share order is not a whole-cent amount at price cap", row)
+            amount = float(signed_spend)
+            if kelly:
+                try:
+                    enforce_order_budget(signed_spend, fee_rate, max(bank, 0.0))
+                except ValueError as exc:
+                    row.update(ask_seen=ask, amount=amount, detail=str(exc))
+                    return self._skip("kelly cash below signed order reservation", row)
         rd = self.rounds.get(end)
         if rd is None:
             # A new round: rounds that ended over an hour ago go (one entry per
@@ -3377,11 +3663,8 @@ class Sniper:
         other = self.inflight.get("DOWN" if side == "UP" else "UP")
         in_flight = 1 if isinstance(other, dict) and other.get("end") == end else 0
         if order_shares is not None:
-            # A share-sized order expects amount / ask shares at the ask: never more
-            # than the room - Kelly's (the side's cap and the canary's per-order cap
-            # in it), else the side's room this round and the canary's cap. Near a
-            # cap it spends less (never under the book cost the gates judged); more
-            # shares then come only from a fall below the ask, as with the book cost.
+            # Enforce quantity limits using the shares that will actually be
+            # signed. Trimming dollars here cannot shrink a share-sized order.
             if kelly:
                 bound = room
             else:
@@ -3390,16 +3673,25 @@ class Sniper:
                                    "max_order_shares", None)
                 if live_cap is not None:
                     bound = min(bound, float(live_cap))
-            most = float((Decimal(str(max(bound, 0.0))) * Decimal(str(ask))).quantize(
-                Decimal("0.01"), rounding=ROUND_FLOOR))
-            if amount > most:
-                amount = max(gate_amount, most)
+            if order_shares > max(bound, 0.0) + 1e-9:
+                return self._skip("round cap", row)
+        gate_shares = order_shares if order_shares is not None else gate_amount / ask
         if (rd["fills"] + in_flight >= self.s.max_fills_round
-                or rd[side] + gate_amount / ask > self.s.max_side_shares):
+                or rd[side] + gate_shares > self.s.max_side_shares):
             return self._skip("round cap", row)
+        if risk_budget is not None:
+            try:
+                enforce_order_budget(amount, fee_rate, risk_budget)
+            except ValueError as exc:
+                row["detail"] = str(exc)
+                return self._skip("hybrid order risk cap", row)
         decided_pc = time.perf_counter_ns()     # every check passed: this signal trades
-        self.inflight[side] = {"end": end, "amount": amount, "risk_shares": amount / ask}
-        row.update(ask_seen=ask, cap=cap, shares=round(amount / ask, 4), amount=round(amount, 4))
+        risk_shares = order_shares if order_shares is not None else amount / ask
+        self.inflight[side] = {"end": end, "amount": amount, "risk_shares": risk_shares}
+        if minimum_entry:
+            self._minimum_entry_keys = {key for key in self._minimum_entry_keys if key[2] > time.time()}
+            self._minimum_entry_keys.add(minimum_key)
+        row.update(ask_seen=ask, cap=cap, shares=round(risk_shares, 4), amount=round(amount, 4))
         if order_shares is not None:
             row.update(order_shares=order_shares, book_cost=round(gate_amount, 4))
         if target is not None:
@@ -3409,7 +3701,10 @@ class Sniper:
         row.update(latency_ms=round(lat, 1), **parts)
         tick = getattr(view, "tick_size", None)
         return {"end": end, "token": str(token), "amount": amount, "rd": rd, "cap": cap, "lat": lat, "view": view,
-                "risk_shares": amount / ask, "fair_fee_rate": fee_rate, "fair_fee_exponent": fee_exponent,
+                "risk_shares": risk_shares, "fair_fee_rate": fee_rate, "fair_fee_exponent": fee_exponent,
+                "shares": order_shares, "hybrid": hybrid, "risk_budget_usd": risk_budget,
+                "minimum_entry": minimum_entry, "minimum_entry_key": minimum_key,
+                "hybrid_check": self._check_hybrid_order if hybrid is not None else None,
                 # a Kelly-sized order carries nothing to the next: each is sized fresh
                 "target": target, "carry_market": self.carry_market if target is not None and not kelly else None,
                 "order_type": self.s.order_type, "tick": f"{float(tick):g}" if tick else "0.01",
@@ -3422,7 +3717,17 @@ class Sniper:
         """The order's outcome: journal, dashboard row, markout. Off the critical path."""
         end, rd, amount, token = plan["end"], plan["rd"], plan["amount"], plan["token"]
         try:
-            ok, sign_ms, sign_err, st = await fut
+            try:
+                ok, sign_ms, sign_err, st = await fut
+            except BaseException:
+                # PaperRejected is returned as an ordinary no-fill. A worker
+                # exception instead means the broker's persistence/invariants
+                # may have failed, or the waiter lost an order still running.
+                # Keep its cash held and block new orders. Later telemetry/UI
+                # failures below must not be confused with that fatal state.
+                self._closing = True
+                raise
+            self._bankroll_completed(plan)
             if sign_ms is not None:
                 row["sign_ms"] = round(sign_ms, 2)
             row.update(self._stages(t_pc, start_pc, call_pc, st))
@@ -4301,6 +4606,8 @@ class Sniper:
                 "binance_fut": self.bf_fresh.snapshot() if "binance_fut" in self.s.extra_feeds else None,
                 "binance": self.fresh.snapshot(),
                 "carry": self.carry_view() if self.s.order_type == "FAK" else None,
+                "hybrid": {"enabled": getattr(self.s, "hybrid_sizing", False),
+                           "accounting": self._hybrid_risk, "error": self._hybrid_risk_error},
                 "fair": ({"vol_bp": (round(v * 1e4, 3) if (v := self.vol_model.vol()) is not None else None),
                           "samples": len(self.vol_model._incs),
                           "bankroll": self._bankroll if self.live is None else self._read_bankroll(),
@@ -4352,6 +4659,7 @@ class Sniper:
                    if "binance_fut" in self.s.extra_feeds else {}),
                 **({"carry": snap["carry"]} if self.s.order_type == "FAK" else {}),
                 **({"fair": snap["fair"]} if self.s.fair else {}),
+                "hybrid": snap["hybrid"],
                 "errors": n["errors"], "shadow_errors": n["shadow errors"],
                 "latency_ms": snap["latency_ms"],       # paper's MODELLED flight, not a measurement
                 "exec_latency": self.latency.summary_from(snap["exec_latency"]), "exec_quality": snap["exec_quality"],
@@ -4398,6 +4706,12 @@ class Sniper:
     # ---------------------------------------------------------------- run
     async def run(self) -> None:
         import sys
+        if (getattr(self.s, "kelly_min_entry", False) and self.s.kelly
+                and self.s.order_type == "FAK" and self.s.order_sizing == "shares"):
+            await asyncio.to_thread(self._seed_minimum_entries)
+        if getattr(self.s, "hybrid_sizing", False) and self.s.fair and self.s.kelly:
+            await asyncio.to_thread(self._refresh_hybrid_risk)
+            self._spawn(self._hybrid_risk_loop())
         switch_ms = _env_float("SNIPER_SWITCH_MS", 0)
         if switch_ms > 0:
             # How long another thread may hold the GIL before the event loop
@@ -4425,7 +4739,7 @@ class Sniper:
         if not self.s.fixed_latency:
             self._spawn(self._net_probe())
             if self._builder is None and self.live is None:
-                self.on_event("sniper", "py_clob_client_v2 not importable: orders are not signed "
+                self.on_event("sniper", "polymarket-client not importable: orders are not signed "
                                         "(latency is still live-like)", "warn")
         if self.s.primary_feed == "kraken":
             await self._kraken_loop()

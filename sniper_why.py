@@ -17,6 +17,8 @@ from pathlib import Path
 
 import sniper_check as sc
 
+LIVE_REASON_LIMIT = 200  # _fire_live detail and LiveExecution._on_resume reason
+
 EXPLAIN = {
     "no current round": "the bot has no current 5-minute market (market discovery failing or between rounds)",
     "before trade window": "the market is open but TRADE_LAST_SECONDS has not been reached yet",
@@ -30,7 +32,7 @@ EXPLAIN = {
     "cooldown": "an order on the same side was submitted within SNIPER_COOLDOWN_MS",
     "previous order in flight": "the previous order was still waiting for its match",
     "awaiting FAK fill size": "a live FAK order's fill size has not arrived yet",
-    "live halted": "the live canary is HALTED (kill switch) - restart needed",
+    "live halted": "the live canary was paused by its kill switch (see current status below)",
     "live refused": "the live canary refused the order (see the detail)",
     "binance feed behind": "Binance's trade timestamps were more than SNIPER_BINANCE_STALE_MS behind their 5-min "
                            "best - a stalled feed; the move may already be priced",
@@ -44,6 +46,121 @@ EXPLAIN = {
 def ago(t: float) -> str:
     s = time.time() - t
     return f"{s / 60:.0f} min ago" if s < 7200 else f"{s / 3600:.1f} h ago"
+
+
+def live_pause_state(rows: list[dict], now: float) -> tuple[list[str] | None, float | None]:
+    """Latest recorded pause state, or None when it cannot be shown current.
+
+    A summary's explicit reason list replaces earlier observations. Between
+    summaries, a resume clears only its own reason: fills can arrive while
+    other pauses remain active. Missing/malformed status and cumulative skip
+    counts never mean that a pause has ended.
+    """
+    reasons: dict[str, float] = {}
+    opaque: set[str] = set()
+    observed = None
+    ambiguous_resume = False
+    for row in rows:
+        wall = row.get("wall")
+        if not isinstance(wall, (int, float)) or isinstance(wall, bool):
+            continue
+        live = row.get("live")
+        halted = live.get("halted") if isinstance(live, dict) else None
+        if (row.get("result") == "summary" and isinstance(halted, list)
+                and all(isinstance(r, str) and r for r in halted)):
+            reasons = dict.fromkeys(halted, wall)
+            opaque.clear()
+            observed = wall
+            ambiguous_resume = False
+        elif row.get("result") == "skipped" and row.get("reason") == "live halted":
+            detail = row.get("detail")
+            if isinstance(detail, str) and detail:
+                if reasons and detail == "; ".join(reasons)[:LIVE_REASON_LIMIT]:
+                    reasons = dict.fromkeys(reasons, wall)
+                else:
+                    # A joined/truncated detail is opaque without a complete
+                    # status list. An unrelated resume must not clear it.
+                    reasons[detail] = wall
+                    if len(detail) == LIVE_REASON_LIMIT:
+                        opaque.add(detail)
+                observed = wall
+        elif row.get("result") in ("pause", "halt"):
+            reason = row.get("reason")
+            if isinstance(reason, str) and reason:
+                reasons[reason] = wall
+                observed = wall
+        elif row.get("result") == "resume":
+            reason = row.get("reason")
+            if not isinstance(reason, str):
+                continue
+            matches = [r for r in reasons if r == reason
+                       or (len(reason) == LIVE_REASON_LIMIT and r.startswith(reason))]
+            if len(matches) == 1 and matches[0] not in opaque:
+                del reasons[matches[0]]
+                observed = wall
+            elif matches:
+                # Resume rows truncate their reason. Shared prefixes cannot
+                # identify which cause ended, and an opaque truncated skip
+                # can hide other causes. Require a complete status.
+                ambiguous_resume = True
+                observed = wall
+    if ambiguous_resume:
+        return None, observed
+    if reasons:
+        fresh = [reason for reason, wall in reasons.items() if 0 <= now - wall < 420]
+        return (fresh, max(reasons[r] for r in fresh)) if fresh else (None, max(reasons.values()))
+    if observed is None or not 0 <= now - observed < 420:
+        return None, observed
+    return list(reasons), observed
+
+
+def fill_evidence(rows: list[dict], summary: dict) -> tuple[int, list[dict]]:
+    """Reconcile row-derived fills by order, including later failed fills.
+
+    A summary supplies the cumulative count at its position in the journal;
+    later order transitions adjust that count. Shared order/client/decision
+    identifiers link an initial outcome to its subsequent quantity updates.
+    """
+    aliases: dict[tuple[str, str], dict] = {}
+    groups: list[dict] = []
+    after_summary = not summary
+    for index, row in enumerate(rows):
+        if row is summary:
+            after_summary = True
+        if row.get("result") not in ("filled", "refused", "error", "pending", "live_fill_update"):
+            continue
+        ids = [(field, str(row[field])) for field in ("order_id", "client_order_id", "id")
+               if row.get(field) is not None and str(row[field])]
+        linked = [aliases[key] for key in ids if key in aliases]
+        group = linked[0] if linked else {"latest": None, "before": None}
+        if not linked:
+            groups.append(group)
+        for other in linked[1:]:
+            if other is group:
+                continue
+            for slot in ("latest", "before"):
+                if other[slot] and (not group[slot] or other[slot][0] > group[slot][0]):
+                    group[slot] = other[slot]
+            for key, value in list(aliases.items()):
+                if value is other:
+                    aliases[key] = group
+            groups[:] = [g for g in groups if g is not other]
+        for key in ids:
+            aliases[key] = group
+        group["latest"] = (index, row)
+        if not after_summary:
+            group["before"] = (index, row)
+
+    def filled(entry):
+        row = entry[1] if entry else {}
+        return row.get("result") == "filled" or (row.get("result") == "live_fill_update"
+                                                  and row.get("resolved_result") == "filled")
+
+    fills = [group["latest"] for group in groups if filled(group["latest"])]
+    count = int(summary.get("filled") or 0) if summary else 0
+    for group in groups:
+        count += int(filled(group["latest"])) - int(filled(group["before"]))
+    return max(0, count), [row for _index, row in sorted(fills)]
 
 
 def main() -> int:
@@ -109,11 +226,10 @@ def main() -> int:
         print("  journal rows (skips throttled to 1/s per reason):")
         for (res, why), n in rows_by.most_common(12):
             print(f"    {n:6d}  {res:8s} {str(why)[:90]}")
-    halted = [r for r in since if r.get("result") == "skipped" and r.get("reason") == "live halted" and r.get("detail")]
     for why in ("live halted", "live refused"):
         rr = [r for r in since if r.get("result") == "skipped" and r.get("reason") == why and r.get("detail")]
         if rr:
-            print(f"  {why} - latest reason: {str(rr[-1]['detail'])[:220]}")
+            print(f"  {why} - latest recorded reason ({ago(float(rr[-1]['wall']))}): {str(rr[-1]['detail'])[:220]}")
     band = [r for r in since if r.get("result") == "skipped" and r.get("reason") == "ask outside price band"]
     if band:
         try:
@@ -144,20 +260,33 @@ def main() -> int:
 
     print("\nVERDICT:")
     top = max(skips.items(), key=lambda kv: kv[1])[0] if skips else None
-    if halted:
-        print(f"  the LIVE CANARY IS HALTED - no orders until it is restarted: {str(halted[-1]['detail'])[:200]}")
-    elif errors or errs:
-        print(f"  orders are FAILING with errors ({errors or len(errs)}) - see the ERROR lines above; paste them.")
+    is_live = args.live or st.get("live") is True
+    pauses, pause_wall = live_pause_state(since, time.time()) if is_live else ([], None)
+    outcomes = [r for r in since if r.get("result") in ("filled", "refused", "error", "pending", "live_fill_update")]
+    latest_outcome = outcomes[-1] if outcomes else None
+    recorded_filled, recent_fills = fill_evidence(since, s)
+    if pauses:
+        print(f"  the LIVE CANARY IS HALTED in its latest recorded status ({ago(pause_wall)}): "
+              f"{'; '.join(pauses)[:200]}. Pauses may expire automatically; check again for a resume or fresh status.")
+    elif is_live and pauses is None:
+        print("  current live pause status is UNKNOWN - the journal has no fresh, complete pause status "
+              "or matching pause/resume evidence. Historical skips do not establish a current halt.")
+    elif latest_outcome is not None and latest_outcome.get("result") == "error":
+        print(f"  the latest order ended with an error ({ago(float(latest_outcome['wall']))}) "
+              "- see the ERROR lines above.")
+    elif recorded_filled:
+        last_fill = f"; latest fill {ago(float(recent_fills[-1]['wall']))}" if recent_fills else ""
+        print(f"  it IS trading: {recorded_filled} recorded fill(s) since the start{last_fill}.")
     elif sums and signals == 0:
         print(f"  no BTC signal in {up_min:.0f} min: BTC never moved >= the trigger (SNIPER_K_BP) within the lookback.")
         print("  Quiet market, or the Binance feed is down (dashboard: 'Binance book ticker connected'?).")
+    elif sums and orders == 0 and top == "live halted" and is_live:
+        print(f"  {signals} signal(s) were stopped earlier by a live pause; that pause is no longer recorded as active.")
     elif sums and orders == 0 and top:
         print(f"  BTC gave {signals} signal(s) but every one was stopped - mostly by '{top}': "
               f"{EXPLAIN.get(top.split(' (')[0], '')}.")
-    elif orders and not filled:
-        print(f"  {orders} order(s) sent, none filled - the price was gone past the limit (see reasons above).")
-    elif filled:
-        print(f"  it IS trading: {filled} fill(s) of {orders} order(s) since the start.")
+    elif orders:
+        print(f"  {orders} order(s) sent, no fills currently recorded - see the refusal reasons above.")
     else:
         print("  too early to tell - run again after the first 5-minute summary.")
     return 0

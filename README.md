@@ -3,6 +3,11 @@
 A Polymarket bot that trades one thing: Polymarket's 5-minute **btc-updown-5m**
 markets, the instant BTC moves. It runs in **paper** (simulated fills on the real book, the default) or as a capped **live canary** (real orders under hard limits).
 
+The trading integration now targets the supported `polymarket-client==0.13.0`
+unified SDK. See [migration and validation notes](SDK_UPGRADE_2026-10-19.md)
+before installing this update. Native SDK integration and live latency still
+require verification on the intended host.
+
 This repo is carved out of `spe24` at **aaff811**: b314d70's engine, plus
 ace4d41 (the paper model's documented 250ms taker hold) and aaff811 (order rows
 journal their market and taker-delay flag). The trading engine was copied byte for
@@ -74,18 +79,24 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
     rules used by execution, including its exponent. A first version
     priced from Coinbase against the round's start price disagreed with the market by
     10-30c and bought the losing side; it was replaced the same day.
-  - **Kelly size (2026-10-11).** Each FAK order buys `SNIPER_KELLY_FRACTION` (0.5: half Kelly since 2026-10-13; full before, ¼ at first) of the
-    Kelly bet on that fair value: f* = (fair − p) / (1 − p), p the ask plus its fee,
-    times the account's cash (live: the sender's balance less what its orders in flight
-    reserve, read on every decision; paper: re-read every 5s off the order path, each
-    sent order's spend taken off at once), in whole shares,
-    from 5 with no per-order cap - only what is left of `SNIPER_MAX_SIDE_SHARES` (200)
-    for the side in the round, and live the canary's per-order cap; under 5 it skips.
-    Sizing optimizes final wealth in both outcomes using existing UP/DOWN shares;
-    another signal buys only the additional allocation still needed. Unconfirmed
-    orders count as same-side risk and provide no opposing hedge credit. There is
-    no carry. The dashboard's "fair" line shows the volatility and the last decision
-    (market mid -> fair, the limit, the size). The fair model still needs empirical
+  - **Hybrid position size.** Base sizing uses quarter Kelly
+    (`SNIPER_KELLY_FRACTION=0.25`), reduced when trigger-feed volatility exceeds
+    `SNIPER_HYBRID_VOL_BASELINE_BP`, and progressively during realized losses.
+    The volatility multiplier is `min(1, baseline / sigma)`; the drawdown multiplier
+    falls linearly to zero at 20% below the persisted realized-equity high-water mark.
+    Confidence stays neutral at 1.0 until historical predictive accuracy is validated.
+    These multipliers reduce the desired portfolio allocation before existing
+    UP/DOWN inventory is subtracted. Another signal buys only the additional
+    allocation still needed; unconfirmed orders count as same-side risk and provide
+    no opposing hedge credit. Lower volatility never raises the base above quarter
+    Kelly. Cash, venue minimums, round limits and live canary limits still apply.
+    Optional new per-order risk and dollar caps are both disabled by default, as
+    requested. `SNIPER_KELLY_MIN_ENTRY=1` allows one venue-minimum attempt per side
+    and round when an otherwise eligible positive target is too small and that
+    side has no inventory or pending risk. This exception can exceed the hybrid
+    target; cash, the fair-value margin, drawdown stop and existing limits still
+    apply. There is no carry in Kelly mode. See [hybrid sizing](HYBRID_SIZING.md)
+    for formulas, settings and limitations. The fair model still needs empirical
     probability calibration; passing formula tests does not establish a profitable edge.
   - **FOK.** `SNIPER_ORDER_TYPE=FOK` keeps the old all-or-nothing order with no carry.
 - **Paper fills.** Paper fills against Polymarket's book at the modelled match
@@ -119,7 +130,7 @@ is left of trigger -> ACK is outside the process:
 **The frozen spec.** `--live` refuses to start unless the resolved settings are
 exactly the frozen spec (`exec_latency.FROZEN_SPEC`: Coinbase, 0.50bp in 250ms, FAK,
 ask+$0.05, 300ms per side, 10 shares, every buy at or under the market-anchored fair value
-− fee − $0.01, full Kelly size from 5 shares) and `SNIPER_CANARY_MAX_SHARES` admits the 20-share carried target. A missing
+− fee − $0.01, hybrid quarter-Kelly sizing from 5 shares) and `SNIPER_CANARY_MAX_SHARES` admits the 20-share carried target. A missing
 `.env` value falls back to a code default; for the trigger and the limit those are the
 spec (0.5bp, ask+$0.05). Every
 start prints the resolved configuration and which ECDSA backend signs (install
@@ -207,6 +218,10 @@ frozen spec's feed (Coinbase, the recorder's `xb` rows); `--feed binance` replay
 the Binance trigger instead. The recorder keeps a Coinbase ticker only when its
 best bid or ask changed, so the replay's rule restarts after quiet spells a
 little more often than live.
+
+The replay runs the frozen spec's hybrid sizing: it refreshes the realized-equity
+snapshot every 5 seconds of replay time, as the bot's worker does, and it fills a
+share-sized FAK by its signed dollars (shares x the limit), as paper and the venue do.
 
 Replay preserves recorded Coinbase exchange times and sequences when present;
 older rows receive deterministic sequences. It reports malformed inputs and
@@ -323,7 +338,13 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | `SNIPER_ORDER_TYPE` | FAK | IOC limit: partial fills kept, the rest cancelled; FOK is all-or-nothing |
 | `SNIPER_SLIP` | 0.05 | limit = the ask seen + 0.05, clipped at `MAX_BUY_PRICE`: never pays more |
 | `SNIPER_FAIR` / `SNIPER_FAIR_MARGIN` | 1 / 0.01 | every buy at or under the market-anchored fair value − fee − margin (the limit capped there) |
-| `SNIPER_KELLY` / `SNIPER_KELLY_FRACTION` | 1 / 0.5 | FAK size: half Kelly on the fair value from the account's cash, from 5 shares, no per-order cap (side cap 200 per round) |
+| `SNIPER_KELLY` / `SNIPER_KELLY_FRACTION` | 1 / 0.25 | quarter-Kelly base allocation; existing inventory is subtracted after the hybrid modifiers |
+| `SNIPER_HYBRID_SIZING` | 1 | enable volatility and realized-drawdown reductions; required by the live specification |
+| `SNIPER_KELLY_MIN_ENTRY` | 1 | allow one venue-minimum attempt per side/round for an eligible positive target below minimum; can exceed the hybrid target; 0 restores strict sizing |
+| `SNIPER_HYBRID_VOL_BASELINE_BP` | 1.0 | volatility baseline in bp per sqrt(second); exposure multiplier `min(1, baseline / sigma)` |
+| `SNIPER_HYBRID_DRAWDOWN_STOP` | 0.20 | allocation scales linearly to zero at this realized-equity drawdown from its persisted high-water mark |
+| `SNIPER_HYBRID_RISK_FRACTION` | 0 | optional maximum all-in new-order spend as a fraction of realized equity; 0 disables |
+| `SNIPER_HYBRID_MAX_ORDER_USD` | 0 | optional maximum all-in new-order spend in dollars; 0 disables; the tighter enabled cap applies |
 | `SNIPER_FAIR_VOL_S` / `SNIPER_FAIR_FEE_RATE` | 300 / 0.07 | the volatility window (s) and the taker fee rate the fair limit uses |
 | `SNIPER_COOLDOWN_MS` | 300 | per side: an order starts a pause on ITS side only, from its submission |
 | `SNIPER_MIN_LEFT_S` | 10 | no order with fewer seconds left in the round |
@@ -366,7 +387,7 @@ The supervisor starts two things in their own folder (`~/sniperbtc-realtime`; ne
 
 Every 30 seconds it samples the bot's CPU, RAM, threads and handles, re-checks the paper invariants, and writes both to `monitor.jsonl`.
 
-At start, paper prints `TRADING MODE: REAL-TIME PAPER ... LIVE ORDER EXECUTION: DISABLED ... REAL MONEY RISK: $0`. Every order-capable live entry point (18 of them) is replaced by a refusal that is counted; the final report shows the count.
+At start, paper prints `TRADING MODE: REAL-TIME PAPER ... LIVE ORDER EXECUTION: DISABLED ... REAL MONEY RISK: $0`. Every order-capable live entry point is replaced by a refusal that is counted; the final report shows the count. That is 18 of the bot's own paths (the SDK adapter, the legacy helpers, the live sender and the HTTP/2 order write) plus, with the pinned `polymarket-client` installed, the SDK's own clients' order, cancel, fund-moving and credential calls: 58 in all for 0.13.0.
 
 Each paper fill's ledger source carries its strategy (`paper_live_book/sniper` or `/manager`). That gives exact per-source spend, fees and P/L, which the dashboard shows in `PAPER P/L BY SOURCE`.
 
@@ -379,7 +400,7 @@ To stop any bot cleanly without a console (on Windows a background process canno
 - **The live canary's budget survives restarts.** Orders, fills, spend, rounds, the loss window, pause deadlines and budget increments are kept in `live_canary_state.json`. At start they are reconciled with the ledger's order authorizations, and an unreadable or missing file refuses the live start. Unresolved orders from earlier runs retain their worst-case loss reservations. `--new-canary-session` starts a new budget deliberately and keeps the old file as `.bak`.
 - **Paper.** Round caps are rebuilt from the ledger. The manager's per-market limits are rebuilt from its journal. The carry restarts at 0, which is smaller, never larger.
 
-**Share caps are estimates.** The sniper's IOC is signed in dollars (makerAmount, USDC). If the ask falls before the match, the same stake buys more shares than the target, so the share target, the round side cap and the canary's shares-per-order cap are checked at the decision's prices only. Dollar limits (stake, spend cap, cash) are hard. A fill above target is journalled as `over_target`.
+**Share sizing fixes the dollar stake, not the maximum fill quantity.** The default FAK derives its signed maker stake from whole shares times the limit price and reserves that stake plus conservative fees. The venue fills a BUY by its maker dollars: price improvement can deliver more shares than the sizing target (journal: `over_target`), and partial fills can spend less. Paper uses the same budget-based matching rule. Share limits are pre-trade estimates; signed dollar spend, cash and live canary budgets remain binding. An improved-price fill within its signed stake is booked at its actual quantity rather than halted as an invalid share overfill.
 
 ## Daily checks (read-only; safe beside a running bot)
 
@@ -499,7 +520,7 @@ python run_tests.py run feeds    # just tests_run.py and tests_feeds.py
 ```
 
 - **No network, no wallet.** The suites never read `.env`: `testing_env.py` turns the load off for the test process and removes the bot's settings from the inherited environment.
-- **Hash-locked trading files.** `tests_feeds.py` locks the trading files to their approved SHA-256. Any change to a trading file needs review, a new digest, and a comment beside it saying what changed.
+- **Hash-locked trading files.** `tests_feeds.py` locks the trading files to their approved SHA-256 (since 2026-10-20 also the SDK adapter and signing, `clob_client.py`, `clob_signing.py`, `clob_sdk.py`, and `hybrid_sizing.py`). Any change to a trading file needs review, a new digest, and a comment beside it saying what changed.
 - **The final audit (2026-10-07).** `tests_final_audit.py` checks every rule against expected values the test computes itself (Decimal/Fraction), never with the production function. `tests_stress.py` runs 10,000 concurrent order races and 10,000 full-system scenarios, then 600 market rotations for resource growth. That suite takes about 5 minutes; `STRESS_SCALE=0.1` runs a tenth. `bench_loop_costs.py` measures what the event loop pays as the ledger grows. `bench_execution.py --pm off|on|stress` compares the order path with the Position Manager off and on.
 - **Regression tests carried over.**
   - b50cb59: a 400 FOK miss is NO_MATCH (`tests_sniper_recovery`).

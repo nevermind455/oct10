@@ -245,7 +245,11 @@ class ReplayBroker:
     replay clock reaches the arrival); the manager submits from the driver."""
     supports_size_at_limit = False
     supports_arrival_book = False
-    supports_share_sized = True       # F1: a share-sized FAK buys at most its shares
+    # A share-sized FAK signs shares x its limit; like the paper broker and the
+    # venue (AUDIT_FIXES_20261020.md), it fills by those maker dollars, so a
+    # cheaper level can buy more shares than the sizing target.
+    supports_share_sized = True
+    supports_hybrid_risk_guard = True  # the sniper's frozen order-budget check, at the fill
     own_fill_ttl_s = 0
 
     def __init__(self, ledger: Ledger, clock: Clock, book, *, start_cash: float, latency_ms: float,
@@ -283,7 +287,7 @@ class ReplayBroker:
         return hit[0]
 
     def _enqueue(self, side, amount, up, down, cond, end, cap, tag, ref_ask, callback=None, fok=False,
-                 shares=None):
+                 shares=None, hybrid_risk_guard=None):
         ev, slot = threading.Event(), {}
         token = up if side == "UP" else down
         with self.lock:
@@ -292,14 +296,15 @@ class ReplayBroker:
                                  "token": str(token), "cond": str(cond), "end": float(end), "cap": float(cap),
                                  "tag": tag, "ref_ask": ref_ask, "decided": self.clock.now, "ev": ev, "slot": slot,
                                  "callback": callback, "fok": bool(fok),
-                                 "shares": None if shares is None else float(shares)})
+                                 "shares": None if shares is None else float(shares),
+                                 "hybrid_risk_guard": hybrid_risk_guard})
         return ev, slot
 
     def place_trade(self, side, amount, up, down, cond, end, max_price, min_price=None, *, latency_ms=None,
-                    tag=None, fak=False, shares=None, **_kw) -> bool:
+                    tag=None, fak=False, shares=None, hybrid_risk_guard=None, **_kw) -> bool:
         view = self.book.view(str(up if side == "UP" else down))
         ev, slot = self._enqueue(side, amount, up, down, cond, end, max_price, tag or "sniper", view.best_ask,
-                                 fok=not fak, shares=shares)
+                                 fok=not fak, shares=shares, hybrid_risk_guard=hybrid_risk_guard)
         ev.wait(120)
         self._local.fill, self._local.error = slot.get("fill"), slot.get("error")
         return bool(slot.get("ok"))
@@ -359,13 +364,15 @@ class ReplayBroker:
         elif str(getattr(view, "status", "")) != "LIVE":
             err = "unknown book state at arrival"
         if err is None:
-            cap = math.floor(o["cap"] * 100 + 1e-9) / 100
+            # The signed limit: the order's cap, never above the account ceiling, on the tick.
+            cap = math.floor(min(o["cap"], self.max_buy_price) * 100 + 1e-9) / 100
+            # Dollar and share-sized orders alike spend their signed maker dollars
+            # (a share-sized order's amount is its shares x that limit).
             spend, shares, notional, fee, used = o["amount"], 0.0, 0.0, 0.0, []
-            want = o.get("shares")            # F1: a share-sized order stops at its shares
             for p, q in asks:
-                if p > cap + 1e-9 or spend <= 1e-9 or (want is not None and shares >= want - 1e-9):
+                if p > cap + 1e-9 or spend <= 1e-9:
                     break
-                take = min(q, spend / p) if want is None else min(q, want - shares)
+                take = min(q, spend / p)
                 shares += take
                 notional += take * p
                 fee += take * FEE_RATE * (p * (1 - p)) ** FEE_EXP
@@ -378,6 +385,11 @@ class ReplayBroker:
                 err = f"FOK no-fill: only ${o['amount'] - spend:.6f} available at or below {cap}"
             elif notional + fee > self.cash_balance() + 1e-9:
                 err = "insufficient available collateral including fees"
+            elif o.get("hybrid_risk_guard") is not None:
+                try:
+                    o["hybrid_risk_guard"](o["amount"], FEE_RATE, fee)
+                except ValueError as exc:
+                    err = f"hybrid risk check: {exc}"
         if err is not None:
             slot.update(ok=False, error=err, fill=None)
         else:
@@ -388,10 +400,9 @@ class ReplayBroker:
                                     source=f"replay-{o['tag']}")
             for p, take in used:
                 self.own[tok].append((self.clock.now, round(p, 4), take))
+            # Partial by unspent dollars, as the paper broker classifies it.
             fill = {"tag": o["tag"], "order_id": oid, "shares": shares, "average_price": vwap, "fee": fee,
-                    "total_cost": notional + fee,
-                    "partial": (notional < o["amount"] - 0.01) if o.get("shares") is None
-                    else shares < o["shares"] - 1e-9}
+                    "total_cost": notional + fee, "partial": notional < o["amount"] - 0.01}
             slot.update(ok=True, error=None, fill=fill)
         self.orders.append({"tag": o["tag"], "side": o["side"], "cond": o["cond"], "decided": o["decided"],
                             "ref_ask": o["ref_ask"], "cap": o["cap"], "amount": o["amount"], "shares": o.get("shares"),
@@ -456,6 +467,19 @@ async def run_variant(paths, rounds, results, *, with_pm: bool, pm_cfg: PMM.PMCo
                       own_rounds=True)
         sn.fresh.enabled = sn.cb_fresh.enabled = False
         on_btc = sn.on_coinbase if feed == "coinbase" else sn.on_tick
+        # Hybrid sizing (the frozen spec) reads a cached realized-equity snapshot
+        # that Sniper.run() refreshes on a worker every BANKROLL_EVERY_S. A replay
+        # never calls run(), so the driver refreshes it on the replay clock, between
+        # recorded events and never inside a decision; without it every signal is
+        # "hybrid risk unavailable".
+        hybrid_refresh = bool(getattr(sn.s, "hybrid_sizing", False) and sn.s.fair and sn.s.kelly)
+        hybrid_at = None
+
+        def refresh_hybrid(now):
+            nonlocal hybrid_at
+            if hybrid_refresh and (hybrid_at is None or now - hybrid_at >= sn.BANKROLL_EVERY_S):
+                hybrid_at = now
+                sn._refresh_hybrid_risk()
         pm = None
         if with_pm:
             pm = PMM.PositionManager(replace(pm_cfg, enabled=True), hub=hub, ledger=ledger, broker=broker, sniper=sn,
@@ -540,6 +564,7 @@ async def run_variant(paths, rounds, results, *, with_pm: bool, pm_cfg: PMM.PMCo
                     exposure_sample()
             rotate(now)
             settle_due(now)
+            refresh_hybrid(now)
             if kind == "pm":
                 for a, ladder in ev[2].items():
                     latest[a] = ladder

@@ -1,20 +1,19 @@
 requests>=2.31.0,<3
-websockets>=12.0,<16
+websockets>=13.0,<16
 python-dotenv>=1.0.0,<2
 # Windows Python has no built-in IANA tz database; ZoneInfo("America/New_York")
 # needs this package. Harmless on Linux.
 tzdata>=2024.1
-# The venue client: signing, L2 credentials, market rules (pulls in httpx,
-# eth-account, eth-utils and eth-keys, which the sniper's fast signer uses).
-py-clob-client-v2>=1.1.0,<2
+# Official supported unified SDK. Internal signing helpers are deliberately
+# pinned: upgrades require signing, payload and reconciliation compatibility checks.
+polymarket-client==0.13.0
 # Fast ECDSA for order signing: eth_keys uses it automatically when installed.
 # Measured (bench_execution.py): ~0.1ms per order with it, ~1.4ms with the
 # pure-Python fallback. The bot prints which one it signs with at start.
 coincurve>=17.0.0,<22
 # The live sender's HTTP/2 connection (fast_h2) and httpx(http2=True).
 h2>=4.1.0,<5
-# py-clob-client-v2 imports httpx's proxy transport at import time; SOCKS
-# support keeps an ALL_PROXY environment from crashing it.
+# SOCKS support for explicitly configured SDK proxy transports.
 socksio>=1.0.0,<2
 # On-chain settlement (payoutNumerators on Polygon, ~85s after a round instead
 # of ~10min from the CLOB/Gamma mirrors). Optional at runtime: without it

@@ -287,7 +287,7 @@ class SenderAudit(unittest.IsolatedAsyncioTestCase):
             calls[0] += 1
             if calls[0] == 1:
                 raise ConnectionError("idle connection lost")
-            return types.SimpleNamespace(text=str(time.time()))
+            return types.SimpleNamespace(status_code=200, text=str(time.time()))
 
         def observe(row):
             rows.append(row)

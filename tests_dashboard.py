@@ -58,12 +58,12 @@ def stub_missing() -> None:
             def to_checksum_address(a): return a
         m.Web3 = _W3
         sys.modules["web3"] = m
-    if "py_clob_client_v2" not in sys.modules:
-        m = types.ModuleType("py_clob_client_v2")
+    if "clob_sdk" not in sys.modules:
+        m = types.ModuleType("clob_sdk")
         for n in ("AssetType", "BalanceAllowanceParams", "ClobClient",
                   "MarketOrderArgs", "OrderType", "PartialCreateOrderOptions", "Side"):
             setattr(m, n, type(n, (), {"__init__": lambda self, *a, **k: None}))
-        sys.modules["py_clob_client_v2"] = m
+        sys.modules["clob_sdk"] = m
 
 
 stub_missing()

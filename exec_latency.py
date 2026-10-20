@@ -74,7 +74,9 @@ FROZEN_SPEC = (
     ("kelly", "SNIPER_KELLY", True, "kelly size", "{}"),
     # 2026-10-13, the operator's choice: half Kelly (was 1.0) - about 3/4 of full Kelly's
     # long-run growth for about half its swings while the fair value is still unproven.
-    ("kelly_fraction", "SNIPER_KELLY_FRACTION", 0.5, "kelly fraction", "{:g}"),
+    # 2026-10-19: quarter Kelly, reduced further by volatility and realized drawdown.
+    ("kelly_fraction", "SNIPER_KELLY_FRACTION", 0.25, "kelly fraction", "{:g}"),
+    ("hybrid_sizing", "SNIPER_HYBRID_SIZING", True, "hybrid sizing", "{}"),
     # 2026-10-15, the operator's choice: share sizing - a FAK spends its whole
     # shares x the cap; Polymarket fills by dollars, so a cheaper fill buys extra
     # shares (journalled, never a halt). "dollars" (the book cost) is paper A/B.
@@ -134,6 +136,20 @@ def effective_config_lines(settings, *, live: bool, canary_max_shares=None) -> l
         src = "env" if os.environ.get(var) not in (None, "") else "default"
         mark = "" if _same(got, want) else f"   <- frozen spec {fmt.format(want)}"
         lines.append(f"  {label:13s} {fmt.format(got) if got is not None else '--':16s} ({var}, {src}){mark}")
+    policy = getattr(settings, "hybrid_policy", None)
+    if policy is not None and getattr(settings, "hybrid_sizing", False):
+        lines.extend([
+            f"  hybrid vol    {policy.vol_baseline_bp:g} bp/sqrt(s) (SNIPER_HYBRID_VOL_BASELINE_BP)",
+            f"  hybrid dd     linear to zero at {policy.drawdown_stop:.1%} realized drawdown "
+            "(SNIPER_HYBRID_DRAWDOWN_STOP)",
+            f"  hybrid cap    equity fraction {policy.risk_fraction:g}, USD {policy.max_order_usd:g}; "
+            "0 disables each additional cap (SNIPER_HYBRID_RISK_FRACTION / SNIPER_HYBRID_MAX_ORDER_USD)",
+            "  confidence    neutral 1.0; no validated predictive-accuracy estimate supplied",
+        ])
+    lines.append("  minimum entry " + (
+        "one venue-minimum attempt per side/round; may exceed hybrid target"
+        if getattr(settings, "kelly_min_entry", False) else "off; strict hybrid target")
+        + " (SNIPER_KELLY_MIN_ENTRY)")
     extra = tuple(getattr(settings, "extra_feeds", ()) or ())
     lines.append(f"  {'2nd trigger':13s} {','.join(extra) or 'none':16s} (SNIPER_EXTRA_FEEDS; whichever feed "
                  f"signals first)" + ("" if extra in LIVE_EXTRA_FEEDS else "   <- not accepted live"))
@@ -146,22 +162,19 @@ def effective_config_lines(settings, *, live: bool, canary_max_shares=None) -> l
     # F1 (audit 2026-10-07): say what is a hard limit and what is an estimate.
     lines.append(f"  {'hard caps':13s} dollars: each IOC signs its stake (makerAmount, USDC) - the venue cannot "
                  f"take more; the canary spend cap and cash are enforced on it")
-    lines.append(f"  {'share caps':13s} ESTIMATES: target / max target / side cap / canary shares-per-order are "
-                 f"checked at the decision's prices; a dollar-sized IOC buys MORE shares if the ask falls before "
-                 f"the match (journal: over_target)")
+    lines.append(f"  {'share caps':13s} ESTIMATES: FAK BUY orders spend signed dollars, including "
+                 "whole-shares-at-cap sizing; a cheaper fill can buy extra shares (journal: over_target)")
     return lines
 
 
 def signing_backend() -> str:
-    """Which ECDSA implementation eth_keys signs with here. Measured: about
-    0.1ms per order with coincurve, about 1.4ms with the pure-Python fallback."""
-    try:
-        from eth_keys.backends import get_backend
-        name = type(get_backend()).__name__
-    except Exception as exc:  # noqa: BLE001 - reported, not fatal
-        return f"unknown ({type(exc).__name__})"
-    return {"CoinCurveECCBackend": "coincurve (C)",
-            "NativeECCBackend": "pure-Python eth_keys (slow: pip install coincurve)"}.get(name, name)
+    """Report the signing path without inferring its backend from a cached key.
+
+    The unified adapter signs through signer.account.sign_typed_data; replacing
+    signer.private_key's eth_keys backend does not select that account's backend.
+    Native backend selection and timing require validation in the installed SDK.
+    """
+    return "eth_account.LocalAccount.sign_typed_data (backend unverified)"
 
 
 # ---------------------------------------------------------------- latency budget
@@ -333,6 +346,7 @@ class ExecQuality:
     def __init__(self) -> None:
         self.n = collections.Counter()
         self.slips: collections.deque = collections.deque(maxlen=1000)
+        self._slip_ids: collections.deque = collections.deque(maxlen=1000)
         self.last: dict = {}
 
     def observe(self, row: dict) -> None:
@@ -357,7 +371,7 @@ class ExecQuality:
             self._filled(row)
         elif result == "error" or kind in ("AMBIGUOUS", "NOT_SENT"):
             n["failed"] += 1
-        elif kind == "NO_MATCH" or "no-fill" in reason or "zero matched" in reason:
+        elif kind == "NO_MATCH" or row.get("outcome") == "LIVE_NO_MATCH" or "no-fill" in reason or "zero matched" in reason:
             n["zero_fill"] += 1
         else:
             n["rejected"] += 1
@@ -380,6 +394,27 @@ class ExecQuality:
             return
         if math.isfinite(slip):
             self.slips.append(slip)
+            self._slip_ids.append(row.get("order_id") or row.get("id"))
+
+    def retract_fill(self, previous: dict, row: dict) -> None:
+        """A previously reported live quantity proved to have failed settlement.
+
+        The caller applies this once per order. It changes neither attempts nor
+        another order's pending count, and removes only this order's slippage.
+        """
+        key = "partial" if previous.get("partial") else "filled"
+        self.n[key] = max(0, self.n[key] - 1)
+        self.n["zero_fill"] += 1
+        oid = previous.get("order_id") or previous.get("id")
+        if oid is not None:
+            try:
+                index = self._slip_ids.index(oid)
+            except ValueError:
+                pass                              # its sample already aged out of the bounded window
+            else:
+                del self._slip_ids[index]
+                del self.slips[index]
+        self.last = {k: row.get(k) for k in ("side", "signal_mid", "ask_seen", "cap", "price", "shares", "result")}
 
     def summary(self) -> dict:
         n = self.n

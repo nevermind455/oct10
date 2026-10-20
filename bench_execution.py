@@ -22,10 +22,10 @@ What runs (all in this process, on one event loop, as in the bot):
                    Sides alternate; a share of orders get MATCHED replies whose
                    private trades are delivered right after (fill path).
                    Includes rapid opposite-side pairs (UP then DOWN at once).
-  3. signing       the order builder alone, with the signing backend the
-                   bot would pick here (coincurve if installed) and with
-                   eth_keys' pure-Python backend (what a box without
-                   coincurve runs).
+  3. signing       the order builder alone through the production
+                   eth_account.LocalAccount.sign_typed_data path. The
+                   underlying ECDSA backend is not independently verified;
+                   no C-versus-pure-Python comparison is reported.
   4. journal       one Sniper._write (open/append/close) in the system temp
                    directory and next to the bot.
 
@@ -192,8 +192,8 @@ async def make_live(tmp: str):
     from accounting import Ledger
     from fast_h2 import FastH2
     from feeds.poly_user import FillStore
-    from py_clob_client_v2.clob_types import ApiCreds
-    from py_clob_client_v2.order_builder.builder import OrderBuilder
+    from clob_sdk import ApiCreds
+    from clob_signing import OrderBuilder
     fake = await T.FakeH2Clob().start()
     T.reset_ambiguity()
     signer = L.fast_signer("0x" + secrets.token_hex(32), 137)          # throwaway, never funded or sent anywhere
@@ -373,25 +373,25 @@ async def bench_live(m: int, matched_every: int = 5, with_pm: bool = False, pm_s
 # --------------------------------------------------------------------------- 3. signing
 def bench_signing(n: int) -> dict:
     import secrets
-    from eth_keys import keys
-    from eth_keys.backends import NativeECCBackend, get_backend
-    from py_clob_client_v2.clob_types import CreateOrderOptions, MarketOrderArgsV2, OrderType
-    from py_clob_client_v2.order_builder.builder import OrderBuilder
-    from py_clob_client_v2.order_builder.constants import BUY
-    out = {"default_backend": type(get_backend()).__name__}
+    from clob_sdk import CreateOrderOptions, MarketOrderArgsV2, OrderType
+    from clob_signing import OrderBuilder
+    from clob_signing import BUY
+    out = {"signing_path": "eth_account.LocalAccount.sign_typed_data",
+           "default_backend": "unverified", "backend_verified": False}
     raw = secrets.token_hex(32)
-    for label, backend in (("default", get_backend()), ("pure_python", NativeECCBackend())):
-        signer = S.fast_signer("0x" + raw, 137)
-        signer.private_key = keys.PrivateKey(bytes.fromhex(raw), backend=backend)
-        builder = S.FastOrderBuilder(OrderBuilder(signer))
-        per = []
-        for i in range(n):
-            args = MarketOrderArgsV2(token_id=T.UP, amount=S.signing_amount(5.0 + (i % 50) / 10),
-                                     side=BUY, price=S.signing_price(0.6, "0.01"), order_type=OrderType.FAK)
-            t = time.perf_counter_ns()
-            builder.build_market_order(args, CreateOrderOptions(tick_size="0.01", neg_risk=False), version=2)
-            per.append((time.perf_counter_ns() - t) / 1e6)
-        out[f"{label}_build_and_sign_ms"] = stats(per)
+    # Changing signer.private_key does not change signer.account, which owns
+    # typed-data signing. Measure the production path without relabeling it
+    # as a different ECDSA backend based on that unrelated cached key.
+    signer = S.fast_signer("0x" + raw, 137)
+    builder = S.FastOrderBuilder(OrderBuilder(signer))
+    per = []
+    for i in range(n):
+        args = MarketOrderArgsV2(token_id=T.UP, amount=S.signing_amount(5.0 + (i % 50) / 10),
+                                 side=BUY, price=S.signing_price(0.6, "0.01"), order_type=OrderType.FAK)
+        t = time.perf_counter_ns()
+        builder.build_market_order(args, CreateOrderOptions(tick_size="0.01", neg_risk=False), version=2)
+        per.append((time.perf_counter_ns() - t) / 1e6)
+    out["default_build_and_sign_ms"] = stats(per)
     return out
 
 
@@ -497,9 +497,8 @@ def table(res: dict) -> str:
                  f"{res['live']['new_connection_on_hot_path']})")
     for k, s in res["live"]["stages_ms"].items():
         add(k, s, "ms")
-    lines.append(f"signing (default backend: {res['signing']['default_backend']})")
-    add("build+sign, default backend", res["signing"]["default_build_and_sign_ms"], "ms")
-    add("build+sign, pure-Python backend", res["signing"]["pure_python_build_and_sign_ms"], "ms")
+    lines.append(f"signing ({res['signing']['signing_path']}; backend unverified)")
+    add("build+sign, production typed account", res["signing"]["default_build_and_sign_ms"], "ms")
     lines.append("packet -> handler (loopback socket to the event loop)")
     for k, s in res.get("wakeup_us", {}).items():
         add(k, s, "us")

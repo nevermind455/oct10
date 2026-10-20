@@ -135,7 +135,7 @@ def main() -> int:
           + (f", totals ${totals[0]} for {totals[1]} shares" if totals else ", no totals"))
 
     import polymarket_trade
-    from py_clob_client_v2 import TradeParams
+    from clob_sdk import TradeParams
     client = polymarket_trade._get_client()
     raw = client.get_order(oid)
     order = raw if isinstance(raw, dict) and str(raw.get("id")) == oid else None

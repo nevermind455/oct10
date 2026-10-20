@@ -126,6 +126,48 @@ class Replay(unittest.TestCase):
 
 
 class Evidence(unittest.TestCase):
+    def reconciliation_archive(self, members):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "records.tgz"
+        with tarfile.open(path, "w:gz") as archive:
+            for name, content in members:
+                raw = content.encode()
+                info = tarfile.TarInfo(name)
+                info.size = len(raw)
+                archive.addfile(info, io.BytesIO(raw))
+        return path
+
+    def test_compacted_zero_evidence_survives_snapshot_rotation_and_repeated_archives(self):
+        intent = {"status": "NO_MATCH", "order_id": "failed-then-released", "spent": 0.0,
+                  "reserve": 15.92, "signed_order": "PRIVATE_ARCHIVED_BODY"}
+        record = json.dumps({"key": "client", "session_id": "old", "intent": intent}) + "\n"
+        path = self.reconciliation_archive([
+            ("sniperbtc/live_canary_state.json", json.dumps({"intents": {}})),
+            ("sniperbtc/live_canary_state.json.archive.jsonl", record + record),
+        ])
+        ids, provenance = A.reconciled_zeros(path)
+        self.assertEqual(ids, {"failed-then-released"})
+        self.assertEqual(len(provenance), 2)
+        self.assertNotIn("PRIVATE_ARCHIVED_BODY", json.dumps(provenance))
+
+    def test_archived_zero_requires_explicit_numeric_zero_spend(self):
+        records = [{"intent": {"status": "NO_MATCH", "order_id": str(i), "spent": spent}}
+                   for i, spent in enumerate([None, False, "0", 1, float("nan"), 0])]
+        path = self.reconciliation_archive([("sniperbtc/live_canary_state.json.archive.jsonl",
+                                             "".join(json.dumps(r) + "\n" for r in records))])
+        self.assertEqual(A.reconciled_zeros(path)[0], {"5"})
+
+    def test_duplicate_archive_member_is_rejected(self):
+        name = "sniperbtc/live_canary_state.json.archive.jsonl"
+        with self.assertRaisesRegex(ValueError, "invalid canary reconciliation"):
+            A.reconciled_zeros(self.reconciliation_archive([(name, ""), (name, "")]))
+
+    def test_malformed_archived_intent_is_rejected(self):
+        path = self.reconciliation_archive([("sniperbtc/live_canary_state.json.archive.jsonl", '{"intent": []}\n')])
+        with self.assertRaisesRegex(ValueError, "invalid archived canary intent"):
+            A.reconciled_zeros(path)
+
     def test_terminal_canary_zero_keeps_original_reservation_but_no_signed_payload(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "records.tgz"

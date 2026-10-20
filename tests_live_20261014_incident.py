@@ -542,13 +542,21 @@ class ShareSizing(I.PaperIOCBase):
         self.assertGreater(r["over_target"], 0)                                  # journalled
         self.assertEqual(self.sn.n["errors"], 0)
 
-    def test_near_the_side_cap_it_spends_at_most_the_room(self):
+    def test_near_the_side_cap_the_signed_shares_fit_the_room(self):
+        """2026-10-20 (AUDIT_FIXES_20261020.md, HYBRID_SIZING.md): a share-sized FAK
+        is a limit order for whole shares at the cap, so the side's room bounds the
+        SIGNED shares and the stake stays shares x the cap. The venue fills by those
+        dollars, so a fill at the ask buys more than the room (journalled as
+        over_target). The 2026-10-15 dollar order trimmed its stake to the room at
+        the ask (4.70 here); share limits are now pre-trade estimates."""
         rd = self.sn.rounds[self.m.window_end]
         rd["UP"] = 190.0                                                         # 10 shares of room left
         r = self.fire("UP", [(0.47, 100)], [(0.47, 100)])
-        self.assertEqual(r["result"], "filled")
-        self.assertAlmostEqual(r["amount"], 4.70, places=6)                      # 10 x the ask, not 10 x the cap
-        self.assertLessEqual(rd["UP"], 200.0 + 1e-9)
+        self.assertEqual((r["result"], r["order_shares"]), ("filled", 10))     # signed: never more than the room
+        self.assertAlmostEqual(r["amount"], 5.20, places=6)                      # 10 x the cap: the signed stake
+        self.assertAlmostEqual(r["shares"], 5.20 / 0.47, places=4)              # the venue's dollars at the ask
+        self.assertGreater(r["over_target"], 0)
+        self.assertAlmostEqual(rd["UP"], 190.0 + 5.20 / 0.47, places=4)
         self.sn.last_fire_by_side["UP"] = -1e18
         rd["UP"] = 195.0
         r = self.fire("UP", [(0.47, 100)], [(0.47, 100)])

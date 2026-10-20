@@ -439,7 +439,7 @@ def build_hub(*, paper: bool = False, read_only: bool = False):
                            "(CLOB create/derive timed out or failed). Check connectivity to CLOB_HOST and retry.")
     hub = FeedHub(creds=credentials, on_event=on_event,
                   btc_stale_after=cfg.btc_stale_after, book_stale_after=cfg.book_stale_after,
-                  rest_book_fetch=orderbook.get_orderbook, print_log=_print_log())
+                  rest_book_fetch=orderbook.get_orderbook_snapshot, print_log=_print_log())
     return hub, cfg
 
 
@@ -471,7 +471,7 @@ def fetch_trades(markets=()):
         return []
     try:
         import polymarket_trade
-        from py_clob_client_v2 import TradeParams
+        from clob_sdk import TradeParams
         client = polymarket_trade._get_client()
     except Exception as exc:
         detail = f"cannot open CLOB client: {type(exc).__name__}"
@@ -895,6 +895,17 @@ def _tracker(settler):
 # PAPER: every attempt on a blocked live order path, by path (must stay empty).
 LIVE_ORDER_CALLS: collections.Counter = collections.Counter()
 PAPER_FIREWALL: list = []
+# The unified SDK's own clients (polymarket-client 0.13.0): every order call,
+# every cancel, and every call that moves funds or creates credentials on the
+# venue or on chain. Paper never builds one; these refuse even if something did.
+PAPER_FIREWALL_NATIVE = (
+    "create", "create_market_order", "create_limit_order", "post_order", "post_orders",
+    "place_market_order", "place_limit_order",
+    "cancel_order", "cancel_orders", "cancel_all", "cancel_market_orders",
+    "approve_erc20", "approve_erc1155_for_all", "transfer_erc20",
+    "split_position", "merge_positions", "merge_multiple_positions", "redeem_positions",
+    "deposit_to_perps", "withdraw_from_perps", "create_builder_api_key",
+)
 
 
 def install_paper_firewall() -> list[str]:
@@ -902,17 +913,26 @@ def install_paper_firewall() -> list[str]:
     is counted, so "no real order was sent" is a number, not a belief. Paper
     already never builds the live client (polymarket_trade.disable_live_execution)
     or the live sender; this also replaces each order-capable entry point (the
-    SDK client's create/post/cancel calls, the legacy place_trade/sell_shares,
+    SDK adapter's and the SDK's own clients' create/post/place/cancel calls, the
+    SDK's fund-moving and credential calls, the legacy place_trade/sell_shares,
     the live sender and LiveExecution, the HTTP/2 order write) with a refusal.
     Only run() installs it, for --paper: it is process-wide and irreversible."""
     import fast_h2
     import polymarket_trade
     import sniper_live
-    from py_clob_client_v2.client import ClobClient
+    from clob_client import ClobClient
     polymarket_trade.disable_live_execution()
     targets = [(ClobClient, n) for n in ("create_order", "create_market_order", "post_order", "post_orders",
                                          "create_and_post_order", "create_and_post_market_order",
                                          "cancel_order", "cancel_orders", "cancel_all", "cancel_market_orders")]
+    try:
+        from polymarket import AsyncSecureClient, SecureClient
+    except ImportError:
+        pass
+    else:
+        for native_client in (SecureClient, AsyncSecureClient):
+            targets.extend((native_client, name) for name in PAPER_FIREWALL_NATIVE
+                           if hasattr(native_client, name))
     targets += [(polymarket_trade, "place_trade"), (polymarket_trade, "sell_shares"),
                 (sniper_live.LeanSender, "start"), (sniper_live.LeanSender, "send"),
                 (sniper_live.LiveExecution, "send"), (sniper_live.LiveExecution, "start_send"),

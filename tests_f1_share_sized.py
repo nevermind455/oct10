@@ -1,34 +1,21 @@
 #!/usr/bin/env python3
-"""F1 (2026-10-14 repair): share-sized FAK orders. No network, no wallet.
+"""FAK orders sized from whole shares times their signed limit.
 
     python tests_f1_share_sized.py
 
-WITHDRAWN from the strategy on 2026-10-14: live, Polymarket filled an
-11-share order (makerAmount $3.74 = 11 x the 0.34 cap) with 12.896552 shares
-at 0.29 - it fills a FAK BUY by its dollars, so a share-sized order cannot
-cap the shares there. The sniper sends a FAK's shares as their book cost
-again and SNIPER_ORDER_SIZING=shares is refused. The signing and execution
-plumbing below stays tested (the kill switch's "filled above its signed size"
-check is what caught it), but no strategy path uses it.
+The recorded Oct 14 incident bought 12.896552 shares at .29 for an order
+sized as 11 shares times a .34 limit ($3.74). The signed maker stake is the
+principal bound; the taker amount is not a maximum share fill. Price
+improvement may increase quantity, and only a dollar-budget overfill halts.
 
-The plumbing's design: a limit order for whole shares at the cap
-(takerAmount = shares, makerAmount = shares x limit); every dollar limit
-reserves the order's maximum spend.
-
-  - the signed amounts are exact for every whole share count and cent price
-    (the library's own get_order_amounts);
-  - the fast builder's limit order equals the library's, its hash the venue's id;
-  - live: signs exactly the shares, reserves shares x limit + a fee bound, refuses
-    fractional / sub-minimum / over-cap sizes, trips on a fill above its size;
-    UP and DOWN in flight together each reserve their own worst case;
-  - paper: the share estimate never exceeds its shares or the cap (random books
-    against a brute-force oracle);
-  - the sniper sends the shares' book cost, and SNIPER_ORDER_SIZING=shares is refused.
+The pure paper quote tests compare the maker-budget walk against a separate
+oracle. Signing/live fixture cases additionally need the installed native
+SDK, cryptographic dependencies and local test sockets. They make no venue
+calls. tests_fak_budget_parity.py covers the incident with SDK-free fixtures.
 """
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import json
 import pathlib
 import random
@@ -55,8 +42,8 @@ class SignedAmounts(unittest.TestCase):
     def test_whole_shares_at_a_cent_price_sign_exact_amounts(self):
         """Every share count 5..300 at every cent price: takerAmount is the shares and
         makerAmount is shares x price, to the micro-dollar - the library's own rounding."""
-        from py_clob_client_v2.order_builder.builder import ROUNDING_CONFIG, OrderBuilder
-        from py_clob_client_v2.order_builder.constants import BUY
+        from clob_signing import ROUNDING_CONFIG, OrderBuilder
+        from clob_signing import BUY
         bad = []
         for shares in range(5, 301):
             for cents in range(1, 100):
@@ -69,19 +56,23 @@ class SignedAmounts(unittest.TestCase):
 
     def test_the_fast_builder_signs_the_librarys_limit_order(self):
         from eth_account import Account
-        from py_clob_client_v2.clob_types import CreateOrderOptions, OrderArgsV2
-        from py_clob_client_v2.config import get_contract_config
-        from py_clob_client_v2.order_builder.builder import OrderBuilder
-        from py_clob_client_v2.order_builder.constants import BUY
-        from py_clob_client_v2.order_utils import ExchangeOrderBuilderV2
-        from py_clob_client_v2.order_utils.model.order_data_v2 import OrderV2
-        from py_clob_client_v2.signer import Signer
+        from clob_sdk import CreateOrderOptions, OrderArgsV2
+        from clob_signing import OrderBuilder
+        from clob_signing import BUY
+        from eth_account.messages import encode_typed_data
+        from eth_utils import keccak
+        from polymarket._internal.actions.orders.typed_data import build_order_signature, build_order_typed_data
+        from polymarket._internal.environment import PRODUCTION_CONFIG
+        from polymarket._internal.wallet import derive_proxy_wallet_address, derive_safe_wallet_address
+        from clob_signing import Signer
         rnd = random.Random(20261014)
         for i in range(60):
             key = "0x" + secrets.token_hex(32)
             signer = L.fast_signer(key, 137) if i % 2 == 0 else Signer(key, 137)        # both signer kinds
             sig_type = rnd.choice([0, 1, 2])
-            funder = None if sig_type == 0 else "0x" + secrets.token_hex(20)
+            funder = (None if sig_type == 0 else
+                      (derive_proxy_wallet_address if sig_type == 1 else derive_safe_wallet_address)(
+                          signer.address(), PRODUCTION_CONFIG.wallet_derivation))
             lib = OrderBuilder(signer, sig_type, funder)
             fast = S.FastOrderBuilder(OrderBuilder(signer, sig_type, funder))
             args = OrderArgsV2(token_id=str(rnd.randrange(10 ** 70, 10 ** 77)), price=rnd.randrange(5, 96) / 100,
@@ -92,21 +83,20 @@ class SignedAmounts(unittest.TestCase):
             for f in ("maker", "signer", "tokenId", "makerAmount", "takerAmount", "side", "signatureType",
                       "metadata", "builder", "expiration"):
                 self.assertEqual(getattr(got, f), getattr(ref, f), (i, f))
-            cc = get_contract_config(137)
-            eb = ExchangeOrderBuilderV2(cc.neg_risk_exchange_v2 if opts.neg_risk else cc.exchange_v2, 137, signer)
-            order = OrderV2(**{k: v for k, v in dataclasses.asdict(got).items() if k != "signature"})
-            typed = eb.build_order_typed_data(order)
-            self.assertEqual(got.signature, eb.build_order_signature(typed), i)          # byte-identical
-            digest = eb.build_order_hash(typed)
-            self.assertEqual(fast.last_order_hash, digest, i)                            # the venue's order id
-            self.assertEqual(Account._recover_hash(bytes.fromhex(digest[2:]),
-                                                   signature=bytes.fromhex(got.signature[2:])).lower(),
+            typed = build_order_typed_data(got.unsigned_order)
+            message = encode_typed_data(full_message=typed)
+            raw = signer.account.sign_message(message).signature.hex()
+            want = build_order_signature(got.unsigned_order, "0x" + raw.removeprefix("0x"))
+            self.assertEqual(got.signature, want, i)
+            digest = "0x" + keccak(b"\x19" + message.version + message.header + message.body).hex()
+            self.assertEqual(fast.last_order_hash, digest, i)
+            self.assertEqual(Account.recover_message(message, signature=got.signature).lower(),
                              signer.address().lower())
 
-    def test_poly_1271_limit_orders_go_to_the_library(self):
-        from py_clob_client_v2.clob_types import CreateOrderOptions, OrderArgsV2
-        from py_clob_client_v2.order_builder.builder import OrderBuilder
-        from py_clob_client_v2.order_builder.constants import BUY
+    def test_all_limit_orders_delegate_to_the_sdk_adapter(self):
+        from clob_sdk import CreateOrderOptions, OrderArgsV2
+        from clob_signing import OrderBuilder
+        from clob_signing import BUY
         calls = []
 
         class Spy(OrderBuilder):
@@ -121,7 +111,7 @@ class SignedAmounts(unittest.TestCase):
             S.FastOrderBuilder(Spy(signer, 3, "0x" + secrets.token_hex(20))).build_order(args, opts, version=2)
         except Exception:  # noqa: BLE001 - whatever the library does with it, it was the library
             pass
-        self.assertEqual(calls, [2])
+        self.assertEqual(calls, [2, 2])
 
 
 class LiveShareSized(unittest.IsolatedAsyncioTestCase):
@@ -161,10 +151,10 @@ class LiveShareSized(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((int(order["takerAmount"]), int(order["makerAmount"])), (10_000_000, 5_200_000))
         self.assertAlmostEqual(p.reserve, 5.2 + 5.2 * 0.07, places=9)       # the whole signed spend + a fee bound
         self.assertAlmostEqual(ex.reserved, p.reserve, places=9)
-        self.assertEqual(ex._risk_orders[p.client_order_id]["shares"], 10.0)
+        self.assertEqual(ex._risk_orders[p.client_order_id]["shares"], 10.4)
 
     async def test_the_fast_builder_path_signs_the_same_order(self):
-        from py_clob_client_v2.order_builder.builder import OrderBuilder
+        from clob_signing import OrderBuilder
         ex = await self.canary()
         ex.sender.builder = S.FastOrderBuilder(OrderBuilder(ex.sender.signer))
         p = ex.prepare(self.plan(9, cap=0.55))
@@ -182,17 +172,18 @@ class LiveShareSized(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ex.reserved, 0.0)
         self.assertEqual(self.fake.hits[("POST", "/order")], 0)
 
-    async def test_a_fill_above_the_signed_size_trips_the_kill_switch(self):
+    async def test_price_improvement_above_the_sizing_target_is_accepted(self):
         T = self.T
         ex = await self.canary()
         self.fake.script.append(("json", 200, T.MATCHED_REPLY))
         await ex.send(ex.prepare(self.plan(10)))
-        # 11 shares at 0.40 = $4.40: inside the dollar budget, above the 10 signed shares
+        # 11 shares at 0.40 = $4.40: inside the dollar budget, above the target.
         self.store.record_trade("trade-1", order_id="0xorder1", asset_id=T.UP, market=T.COND, side="BUY",
                                 price=0.40, size=11, status="MATCHED")
-        self.assertIsNone(ex.fill_for("0xorder1"))
-        self.assertTrue(ex.kill.tripped)
-        self.assertIn("signed size", "; ".join(ex.kill.reasons))
+        fill = ex.fill_for("0xorder1")
+        self.assertIsNotNone(fill)
+        self.assertEqual((fill['shares'], fill['cost']), (11, 4.4))
+        self.assertFalse(ex.kill.tripped, ex.kill.reasons)
 
     async def test_a_fill_at_a_better_price_counts_its_real_cost(self):
         T = self.T
@@ -322,7 +313,13 @@ class LiveShareSized(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(ex.reserved, 5.2 * 1.07, places=9)
         down = ex.prepare(dict(self.plan(10, side="DOWN", cap=0.53, asks=((0.50, 30),)), order_type="FAK"))
         self.assertAlmostEqual(ex.reserved, up.reserve + down.reserve, places=9)
-        self.assertEqual({r["shares"] for r in ex._risk_orders.values()}, {10.0})
+        # Each side's inventory estimate is its own signed stake at its own best
+        # ask: UP $5.20 / 0.50 and DOWN $5.30 / 0.51 (live_book's DOWN asks 0.51).
+        got = sorted(r["shares"] for r in ex._risk_orders.values())
+        want = sorted([5.2 / 0.50, 5.3 / 0.51])
+        self.assertEqual(len(got), 2)
+        for g, w in zip(got, want):
+            self.assertAlmostEqual(g, w, places=9)
         # $12 holds both worst cases ($11.24) but not a third
         with self.assertRaises(L.Refused) as cm:
             ex.prepare(self.plan(5, side="UP", cap=0.52))
@@ -330,12 +327,12 @@ class LiveShareSized(unittest.IsolatedAsyncioTestCase):
 
 
 def brute(asks, shares, cap):
-    left, got, cost = D(shares), D(0), D(0)
+    left, got, cost = D(shares) * cap, D(0), D(0)
     for price, size in sorted(asks):
         if price > cap or left <= 0:
             break
-        take = min(left, size)
-        got, cost, left = got + take, cost + take * price, left - take
+        spend = min(left, size * price)
+        got, cost, left = got + spend / price, cost + spend, left - spend
     return got, cost
 
 
@@ -347,7 +344,7 @@ class PaperShareEstimate(unittest.TestCase):
         return BookSnapshot(token_id="u", bids=((D("0.01"), D("100")),), asks=tuple(sorted(asks)),
                             tick_size=D("0.01"), min_order_size=D("5"))
 
-    def test_never_more_than_its_shares_or_above_its_cap_on_random_books(self):
+    def test_budget_and_price_cap_hold_on_random_books(self):
         rnd = random.Random(14)
         for _ in range(3000):
             n = rnd.randint(0, 8)
@@ -361,8 +358,9 @@ class PaperShareEstimate(unittest.TestCase):
                 self.assertEqual(want_shares, 0, (asks, shares, cap))
                 self.assertIn("FAK no-fill", str(exc))
                 continue
-            self.assertEqual((q.shares, q.notional), (want_shares, want_cost), (asks, shares, cap))
-            self.assertLessEqual(q.shares, shares)
+            self.assertAlmostEqual(q.shares, want_shares, places=20, msg=str((asks, shares, cap)))
+            self.assertEqual(q.notional, want_cost, (asks, shares, cap))
+            self.assertLessEqual(q.notional, D(shares) * cap)
             self.assertLessEqual(q.worst_price, cap)
             self.assertEqual([p for p, *_ in q.levels], sorted(p for p, *_ in q.levels))   # cheapest first
 

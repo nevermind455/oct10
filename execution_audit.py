@@ -130,27 +130,41 @@ def reconciled_zeros(path):
     This is the bot's persisted reconciliation evidence, not a fresh venue
     lookup. A confirmed ledger lot always takes precedence over this state.
     """
-    member = "sniperbtc/live_canary_state.json"
+    members = {"sniperbtc/live_canary_state.json": 8 * 1024 * 1024,
+               "sniperbtc/live_canary_state.json.archive.jsonl": 64 * 1024 * 1024}
+    ids, provenance = set(), {}
     with tarfile.open(path, "r:gz") as t:
-        matches = [m for m in t.getmembers() if m.name == member]
-        if not matches:
-            return set(), {}
-        if len(matches) != 1 or not matches[0].isfile() or matches[0].size > 8 * 1024 * 1024:
-            raise ValueError("invalid canary snapshot member")
-        raw = t.extractfile(matches[0]).read()
-        state = json.loads(raw)
-    ids = set()
-    for intent in state.get("intents", {}).values():
-        if not isinstance(intent, dict) or intent.get("status") != "NO_MATCH" or not intent.get("order_id"):
-            continue
-        # reserve is the original signed reservation, retained for audit even
-        # after release. The terminal state and explicit spent=0 prove this
-        # bot reconciliation, not a zero in that historical reserve field.
-        spent = intent.get("spent")
-        if isinstance(spent, (int, float)) and not isinstance(spent, bool) and math.isfinite(spent) and spent == 0:
-            ids.add(str(intent["order_id"]))
-    return ids, {member: {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
-                         "evidence": "durable bot reconciliation; signed order bodies excluded from outputs"}}
+        archive_members = t.getmembers()
+        for member, maximum in members.items():
+            matches = [m for m in archive_members if m.name == member]
+            if not matches:
+                continue
+            if len(matches) != 1 or not matches[0].isfile() or matches[0].size > maximum:
+                raise ValueError("invalid canary reconciliation member")
+            raw = t.extractfile(matches[0]).read()
+            if member.endswith(".jsonl"):
+                records = [json.loads(line) for line in raw.splitlines() if line.strip()]
+                if any(not isinstance(r, dict) or not isinstance(r.get("intent"), dict) for r in records):
+                    raise ValueError("invalid archived canary intent")
+                intents = (r["intent"] for r in records)
+            else:
+                state = json.loads(raw)
+                if not isinstance(state, dict) or not isinstance(state.get("intents", {}), dict):
+                    raise ValueError("invalid canary intent snapshot")
+                intents = state.get("intents", {}).values()
+            for intent in intents:
+                if not isinstance(intent, dict) or intent.get("status") != "NO_MATCH" or not intent.get("order_id"):
+                    continue
+                # reserve remains historical evidence after release. Only
+                # explicit terminal spent=0 qualifies; archived repetitions
+                # are deduplicated by order ID. Confirmed lots still win.
+                spent = intent.get("spent")
+                if (isinstance(spent, (int, float)) and not isinstance(spent, bool)
+                        and math.isfinite(spent) and spent == 0):
+                    ids.add(str(intent["order_id"]))
+            provenance[member] = {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+                                  "evidence": "durable bot reconciliation; signed order bodies excluded from outputs"}
+    return ids, provenance
 
 
 def orders_from(rows, ledger, settlements, live, zero_ids=()):

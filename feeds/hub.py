@@ -24,6 +24,8 @@ import threading
 import time
 from dataclasses import dataclass
 
+from book_snapshot import RestBookSnapshot
+
 from .binance import BinanceTradeFeed
 from .book import BookState, BookView
 from .health import LIVE, UNSYNCED, worst
@@ -125,7 +127,7 @@ class FeedHub:
         self._user_markets: list[str] = []
         self.generation = 0
 
-        self._rest_book_fetch = rest_book_fetch   # callable(token) -> (bids, asks)
+        self._rest_book_fetch = rest_book_fetch   # callable(token) -> RestBookSnapshot or legacy (bids, asks)
         self._resync_wanted: set[str] = set()
         self._next_book_fetch_at: dict[str, tuple[int, float]] = {}
         self._next_ws_snapshot_at: dict[str, tuple[int, float]] = {}
@@ -415,9 +417,21 @@ class FeedHub:
                     self._book_fetches[token] = (fetch_task, view)
                 else:
                     fetch_task, view = pending
-                bids, asks = await asyncio.wait_for(asyncio.shield(fetch_task),
-                                                  timeout=self.rest_book_timeout)
+                result = await asyncio.wait_for(asyncio.shield(fetch_task),
+                                               timeout=self.rest_book_timeout)
                 self._book_fetches.pop(token, None)
+                metadata = {"source": "rest"}
+                if isinstance(result, RestBookSnapshot):
+                    if result.token_id != token:
+                        raise ValueError("REST recovery book token does not match the requested token")
+                    bids, asks = result.bids, result.asks
+                    metadata.update(ts_ms=result.exchange_ts_ms, received_mono=result.received_mono,
+                                    tick=result.tick_size, hash_=result.book_hash,
+                                    require_exchange_ts=True)
+                else:
+                    # Legacy levels-only fixtures remain usable, but cannot
+                    # invent the exchange timestamp needed by order entry.
+                    bids, asks = result
             except asyncio.TimeoutError as exc:
                 # A Python worker cannot be killed. Keep its handle so no
                 # replacement HTTP call accumulates behind a hung request.
@@ -442,7 +456,7 @@ class FeedHub:
                     token, bids, asks, only_if_unsynced=True,
                     expected_generation=view.generation, expected_updates=view.updates,
                     expected_receive_revision=view.receive_revision,
-                    refresh_if_older_than=self.book_refresh_after):
+                    refresh_if_older_than=self.book_refresh_after, **metadata):
                 self.rest_resyncs += 1
                 with self._lock:
                     self._resync_wanted.discard(token)

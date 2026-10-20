@@ -172,7 +172,9 @@ class Gate(I.PaperIOCBase):
         self.make()
 
     def make(self, **env):
-        self.sn = S.Sniper(self.m, self.broker, settings=I.settings(**{"SNIPER_FAIR": "1", "SNIPER_KELLY": "1", **env}))
+        self.sn = S.Sniper(self.m, self.broker, settings=I.settings(**{
+            "SNIPER_FAIR": "1", "SNIPER_FAIR_MARGIN": str(MARGIN), "SNIPER_KELLY": "1",
+            "SNIPER_KELLY_FRACTION": "0.5", **env}))
         self.sn._write = self.rows.append
         for i in range(70):                                     # a known minute: steps of exactly V
             self.sn.vol_model.observe(float(i), 60_000.0 * math.exp(self.V if i % 2 else 0.0))
@@ -380,7 +382,9 @@ class Gate(I.PaperIOCBase):
         r1 = self.order("UP", [(0.41, 1000)], mid=0.40, move_bp=5.0)
         r2 = self.order("DOWN", [(0.41, 1000)], mid=0.40, move_bp=-5.0)   # before the next cash reading
         self.assertEqual(r1["bankroll"], 1000.0)
-        self.assertAlmostEqual(r2["bankroll"], 1000.0 - r1["amount"], places=2)
+        # Before the next cash refresh, paper holds the same conservative
+        # all-in stake plus fee bound as live, not only the signed principal.
+        self.assertAlmostEqual(r2["bankroll"], 1000.0 - r1["amount"] * (1 + r1["fee_rate"]), places=2)
 
     def test_a_cap_at_the_price_floor_is_skipped_not_sent(self):
         """10-12 VPS run: 14 orders with ask 0.05 = MIN_BUY_PRICE and cap 0.05
@@ -521,17 +525,22 @@ class Settings(unittest.TestCase):
             s = S.Settings()
             self.assertEqual(X.spec_violations(s, 25), [])
         self.assertEqual((s.fair, s.fair_margin, s.kelly, s.kelly_fraction, s.max_target_shares),
-                         (True, 0.01, True, 0.5, 20.0))
+                         (True, 0.01, True, 0.25, 20.0))
+        self.assertTrue(s.hybrid_sizing)
+        self.assertTrue(s.kelly_min_entry)
+        self.assertEqual((s.hybrid_policy.risk_fraction, s.hybrid_policy.max_order_usd), (0, 0))
         spec = dict((a, v) for a, _n, v, _l, _f in X.FROZEN_SPEC)
         self.assertEqual((spec["fair"], spec["fair_margin"], spec["kelly"], spec["kelly_fraction"]),
-                         (True, 0.01, True, 0.5))
+                         (True, 0.01, True, 0.25))
         for line in (s.lines()[0], s.lines(live=True)[0]):
             self.assertIn("market-anchored fair value - fee - $0.01", line)
-            self.assertIn("size 0.5 Kelly from 5 sh, no per-order cap (<= 200 sh/side per round)", line)
+            self.assertIn("size 0.25 Kelly", line)
 
     def test_live_refuses_them_off_or_changed(self):
         for kw, word in (({"SNIPER_FAIR": "0"}, "fair value"), ({"SNIPER_FAIR_MARGIN": "0.02"}, "fair margin"),
-                         ({"SNIPER_KELLY": "0"}, "kelly size"), ({"SNIPER_KELLY_FRACTION": "1"}, "kelly fraction")):
+                         ({"SNIPER_KELLY": "0"}, "kelly size"), ({"SNIPER_KELLY_FRACTION": "1"}, "kelly fraction"),
+                         ({"SNIPER_KELLY_FRACTION": "0.5"}, "kelly fraction"),
+                         ({"SNIPER_HYBRID_SIZING": "0"}, "hybrid sizing")):
             with self.subTest(kw), self.env(SNIPER_ONLY="1", **kw):
                 bad = X.spec_violations(S.Settings(), 25)
             self.assertTrue(any(word in v for v in bad), bad)

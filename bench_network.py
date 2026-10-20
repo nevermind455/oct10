@@ -42,6 +42,7 @@ import argparse
 import asyncio
 import collections
 import json
+import math
 import pathlib
 import socket
 import ssl
@@ -90,6 +91,20 @@ def host_steps(host: str, port: int = 443, alpn=("h2",)) -> dict:
             "ip": addr[0], "alpn": proto}
 
 
+def check_time_reply(response) -> None:
+    """Do not count an error/challenge page as a healthy public RTT sample."""
+    if response.status_code != 200:
+        raise ValueError(f"CLOB public /time returned HTTP {response.status_code}")
+    try:
+        value = response.json()
+        if isinstance(value, dict):
+            value = value.get("server_time")
+        if isinstance(value, bool) or not math.isfinite(float(value)) or float(value) <= 0:
+            raise ValueError("invalid time")
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("CLOB public /time did not return a valid timestamp") from exc
+
+
 async def warm_gets(n: int) -> dict:
     from fast_h2 import FastH2
     h = FastH2(CLOB, timeout_s=10)
@@ -98,10 +113,13 @@ async def warm_gets(n: int) -> dict:
         t = time.perf_counter()
         r = await h.get(CLOB + "/time")                 # opens the connection
         first = (time.perf_counter() - t) * 1000
+        check_time_reply(r)
         for _ in range(n):
             t = time.perf_counter()
-            await h.get(CLOB + "/time")
-            rtts.append((time.perf_counter() - t) * 1000)
+            r = await h.get(CLOB + "/time")
+            elapsed = (time.perf_counter() - t) * 1000
+            check_time_reply(r)
+            rtts.append(elapsed)
             await asyncio.sleep(0.05)
         connects = h.connects
     finally:
@@ -116,8 +134,10 @@ async def cold_gets(n: int) -> dict:
         h = FastH2(CLOB, timeout_s=10)
         t = time.perf_counter()
         try:
-            await h.get(CLOB + "/time")
-            out.append((time.perf_counter() - t) * 1000)
+            response = await h.get(CLOB + "/time")
+            elapsed = (time.perf_counter() - t) * 1000
+            check_time_reply(response)
+            out.append(elapsed)
         finally:
             await h.aclose()
         await asyncio.sleep(0.1)
@@ -575,9 +595,42 @@ def budget(res: dict, hold_ms: float = VENUE_HOLD_MS, server_ms: float = 25.0, i
             "btc_to_match_ms": feed_true + in_process_ms + one_way + hold_ms + server_ms}
 
 
+def ack_budget(res: dict, *, target_ms: float = 200.0, in_process_ms: float = 5.0,
+               hold_ms: float = VENUE_HOLD_MS, server_ms: float = 25.0) -> dict:
+    """Planning scenario, not an order or a measured acknowledgement.
+
+    An acknowledgement requires the return path, so use the full warm RTT.
+    GET /time does not measure matching-engine processing or queueing. The
+    hold and server allowance are explicit assumptions to verify on the VPS.
+    """
+    values = (target_ms, in_process_ms, hold_ms, server_ms)
+    if (any(isinstance(v, bool) or not math.isfinite(v) for v in values)
+            or target_ms <= 0 or any(v < 0 for v in values[1:])):
+        raise ValueError("ACK budget needs a positive target and finite non-negative allowances")
+    warm = ((res.get("clob_warm") or {}).get("warm_rtt_ms") or {})
+    result = {"target_ms": target_ms, "in_process_ms": in_process_ms, "hold_ms": hold_ms,
+              "server_allowance_ms": server_ms,
+              "warm_rtt_budget_ms": target_ms - in_process_ms - hold_ms - server_ms,
+              "scenario_ack_ms": {}, "measured_order_ack": False,
+              "limitation": "Public GET RTT scenario only; venue queueing is unmeasured; verify with actual live acknowledgements."}
+    for percentile in ("p50", "p95", "p99"):
+        rtt = warm.get(percentile)
+        if isinstance(rtt, (int, float)) and not isinstance(rtt, bool) and math.isfinite(rtt) and rtt >= 0:
+            result["scenario_ack_ms"][percentile] = in_process_ms + hold_ms + server_ms + rtt
+    return result
+
+
 async def main_async(n: int, feed_s: float = 60.0, race_s: float = 120.0, feed_race_s: float = 0.0,
-                     feed_race_only: bool = False) -> dict:
+                     feed_race_only: bool = False, clob_only: bool = False) -> dict:
     res = {"when": time.strftime("%Y-%m-%d %H:%M:%S %z"), "host": socket.gethostname()}
+    if clob_only:
+        res["clob_only"] = True
+        progress("CLOB warm HTTP/2 public GET /time (no orders)")
+        try:
+            res["clob_warm"] = await warm_gets(n)
+        except Exception as exc:  # noqa: BLE001 - report unavailable coverage
+            res["clob_warm"] = {"error": f"{type(exc).__name__}: {exc}"}
+        return res
     if feed_race_only:
         progress(f"feed race: {', '.join(RACE_FEEDS)} ({feed_race_s:g}s)")
         res["feed_race"] = await feed_race(feed_race_s)
@@ -615,9 +668,31 @@ async def main_async(n: int, feed_s: float = 60.0, race_s: float = 120.0, feed_r
     return res
 
 
+def ack_table(ack: dict) -> list[str]:
+    out = [f"ACK target {ack['target_ms']:g}ms: public-RTT planning scenario, not measured order execution",
+           f"  local {ack['in_process_ms']:g}ms + venue hold assumption {ack['hold_ms']:g}ms"
+           f" + server allowance {ack['server_allowance_ms']:g}ms; warm RTT budget <{ack['warm_rtt_budget_ms']:g}ms"]
+    for percentile, value in ack["scenario_ack_ms"].items():
+        out.append(f"  {percentile} scenario ACK {value:.1f}ms; actual matching queue latency remains unmeasured")
+    if not ack["scenario_ack_ms"]:
+        out.append("  no valid warm RTT samples: target feasibility is unknown")
+    return out
+
+
 def table(res: dict) -> str:
     f = lambda v: "--" if v is None else f"{v:.1f}"  # noqa: E731
     out = [f"network from {res['host']} at {res['when']}"]
+    if res.get("clob_only"):
+        warm = res.get("clob_warm") or {}
+        measured = warm.get("warm_rtt_ms")
+        if warm.get("error"):
+            out.append(f"  CLOB warm public GET /time failed: {warm['error']}")
+        elif measured:
+            out.append(f"  CLOB warm public GET /time n={measured['n']} p50 {f(measured['p50'])}ms"
+                       f" p95 {f(measured['p95'])}ms p99 {f(measured['p99'])}ms; connections {warm.get('connections')}")
+        if res.get("ack_budget") is not None:
+            out.extend(ack_table(res["ack_budget"]))
+        return "\n".join(out)
     fr = res.get("feed_race")
     if fr is not None and "budget" not in res:                  # --feed-race-only
         return "\n".join(out + ([f"feed race: {fr['error']}"] if "error" in fr else feed_race_table(fr)))
@@ -690,6 +765,8 @@ def table(res: dict) -> str:
                    f"(paper's default SNIPER_HOLD_MS is 250: {f(bu['signal_to_match_ms'] - bu['hold_ms'] + 250)}ms)")
     else:
         out.append("latency budget: needs both the Coinbase feed and the CLOB warm round trip")
+    if (ack := res.get("ack_budget")) is not None:
+        out.extend(ack_table(ack))
     return "\n".join(out)
 
 
@@ -702,11 +779,27 @@ def main(argv=None) -> int:
                     help="seconds racing the Coinbase ticker against its full book, Binance futures/spot and "
                          "Polymarket's Chainlink price (0 = skip)")
     ap.add_argument("--feed-race-only", action="store_true", help="run only the feed race")
+    ap.add_argument("--clob-only", action="store_true", help="public warm HTTP/2 RTT only; no feeds, handshakes or orders")
+    ap.add_argument("--target-ack-ms", type=float, default=200.0, help="ACK planning target, not a live-order timeout")
+    ap.add_argument("--in-process-ms", type=float, default=5.0, help="explicit local trigger-to-wire allowance")
+    ap.add_argument("--server-ms", type=float, default=25.0, help="explicit server processing allowance, not a measurement")
     ap.add_argument("--json", default=None)
     args = ap.parse_args(argv)
     if args.feed_race_only and args.feed_race_s <= 0:
         ap.error("--feed-race-only needs --feed-race-s > 0")
-    res = asyncio.run(main_async(args.n, args.feed_s, args.race_s, args.feed_race_s, args.feed_race_only))
+    if args.clob_only and args.feed_race_only:
+        ap.error("--clob-only and --feed-race-only are mutually exclusive")
+    if args.n < 1:
+        ap.error("--n must be positive")
+    try:
+        ack_budget({}, target_ms=args.target_ack_ms, in_process_ms=args.in_process_ms, server_ms=args.server_ms)
+    except ValueError as exc:
+        ap.error(str(exc))
+    res = asyncio.run(main_async(args.n, args.feed_s, args.race_s, args.feed_race_s,
+                                args.feed_race_only, args.clob_only))
+    if not args.feed_race_only:
+        res["ack_budget"] = ack_budget(res, target_ms=args.target_ack_ms,
+                                       in_process_ms=args.in_process_ms, server_ms=args.server_ms)
     print(table(res))
     if args.json:
         pathlib.Path(args.json).write_text(json.dumps(res, indent=1, default=str), encoding="utf-8")

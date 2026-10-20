@@ -24,5 +24,7 @@ jobs:
         run: python -m pip install -r requirements.lock.txt
       - name: Check dependency consistency
         run: python -m pip check
+      - name: Native SDK checks must run (a skipped SDK check fails)
+        run: python run_tests.py --require-native-sdk unified_sdk
       - name: Run every suite with external networking blocked by testing_env
         run: python run_tests.py

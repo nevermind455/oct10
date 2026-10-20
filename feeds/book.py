@@ -46,6 +46,8 @@ class BookView:
     # Includes refused/ignored venue messages, unlike `updates` which counts
     # installed book states. REST recovery must race against both.
     receive_revision: int = 0
+    # REST is executable on receipt, but cannot prove stream-ordered history.
+    source: str = "ws"
 
     @property
     def best_bid(self) -> float | None:
@@ -122,9 +124,12 @@ class BookState:
         # matter how late a timer woke or how long the event loop stalled.
         # Writers never mutate a level dict once stored - every update swaps
         # in a new one - so an entry is just references: (key_ms, applied
-        # monotonic, applied wall, exchange ts, bids, asks, tick). key_ms is
-        # the exchange ts, never decreasing per token; a feed gap is an entry
-        # with bids None. ts_hwm is the newest exchange time any message on
+        # monotonic, applied wall, exchange ts, bids, asks, tick, source,
+        # receipt monotonic). Installation and receipt are separate: REST
+        # decoding may take time before its levels become visible locally.
+        # key_ms is the WS exchange ts or the stream watermark for REST/gaps,
+        # never decreasing per token. A gap has bids None. ts_hwm is the newest
+        # exchange time any message on
         # the feed carried: once it passes T, every change stamped <= T has
         # arrived (the feed is one ordered connection).
         self.history_s = float(history_s)
@@ -154,18 +159,22 @@ class BookState:
         if h is None:
             h = self._hist[token] = collections.deque(maxlen=20000)
         prev = h[-1][0] if h else None
-        key = ts if (ts is not None and not gap) else self.ts_hwm
+        source = "gap" if gap else self._meta[token].get("source", "ws")
+        key = ts if (ts is not None and not gap and source != "rest") else self.ts_hwm
         if key is None:
             key = prev if prev is not None else 0
         if prev is not None and key < prev:
             key = prev
-        mono = time.monotonic() if mono is None else mono
+        # REST's receipt clock measures held age, not when parsed levels
+        # became available. Backdating history to receipt would change what
+        # view_at_mono reports for instants while that response was decoding.
+        mono = time.monotonic() if mono is None or source == "rest" else mono
         wall = time.time() if wall is None else wall
         if gap:
-            h.append((key, mono, wall, None, None, None, None))
+            h.append((key, mono, wall, None, None, None, None, source, None))
         else:
             h.append((key, mono, wall, ts, self._bids[token], self._asks[token],
-                      self._meta[token].get("tick")))
+                      self._meta[token].get("tick"), source, self._meta[token].get("updated")))
         cutoff = mono - self.history_s
         while len(h) > 1 and h[1][1] < cutoff:      # keep the state in force at the window start
             h.popleft()
@@ -174,7 +183,7 @@ class BookState:
         return BookView(token=token, generation=self._generation.get(token, 0), status=LIVE,
                         bids=tuple(sorted(e[4].items(), key=lambda kv: kv[0], reverse=True)),
                         asks=tuple(sorted(e[5].items(), key=lambda kv: kv[0])),
-                        updated_mono=e[1], exchange_ts_ms=e[3], tick_size=e[6])
+                        updated_mono=e[8], exchange_ts_ms=e[3], tick_size=e[6], source=e[7])
 
     def view_at(self, token: str, venue_ms: float, *, allow_quiet: bool = False):
         """(BookView, info) of the book as it stood at venue time venue_ms, or
@@ -208,6 +217,12 @@ class BookState:
                 return None, info
             if e[4] is None:
                 info["why"] = "feed gap (disconnect or resync) at that time"
+                return None, info
+            if e[7] == "rest":
+                # /book is not ordered against the WS stream. Its timestamp
+                # makes the current snapshot executable, not evidence that
+                # these levels were present at an earlier venue instant.
+                info["why"] = "REST snapshot is not stream-ordered history"
                 return None, info
             if e[3] is None:
                 # A REST tuple has receipt time but no exchange timestamp.
@@ -347,13 +362,19 @@ class BookState:
                        expected_updates: int | None = None,
                        expected_receive_revision: int | None = None,
                        refresh_if_older_than: float | None = None,
-                       require_exchange_ts: bool = False) -> bool:
+                       require_exchange_ts: bool = False,
+                       source: str = "ws", received_mono: float | None = None) -> bool:
         """Full replace. Returns False if the token is not active."""
         with self._lock:
             if token not in self._active:
                 self.dropped_inactive += 1
                 return False
             m = self._meta[token]
+            if source not in ("ws", "rest"):
+                raise ValueError("book snapshot source must be ws or rest")
+            receipt_mono = time.monotonic() if received_mono is None else float(received_mono)
+            if not math.isfinite(receipt_mono) or receipt_mono < 0 or receipt_mono > time.monotonic():
+                raise ValueError("book snapshot receipt time is invalid")
             if expected_generation is not None and self._generation.get(token) != expected_generation:
                 return False
             if expected_updates is not None and m.get("updates", 0) != expected_updates:
@@ -364,7 +385,7 @@ class BookState:
             incoming_ts = _int(ts_ms)
             # A REST recovery is guarded by its request's receive revision;
             # it is not itself an observed venue event.
-            if expected_receive_revision is None:
+            if expected_receive_revision is None and source == "ws":
                 self._observe_locked((token,), incoming_ts if self._fresh_exchange_ts(incoming_ts) else None)
             if only_if_unsynced and m.get("synced") and self._status(token) != STALE:
                 # A quiet but connected book may hit a consumer's shorter
@@ -396,12 +417,13 @@ class BookState:
                 return False
             self._bids[token] = new_bids
             self._asks[token] = new_asks
-            m.update(synced=True, updated=time.monotonic(), ts=incoming_ts,
+            m.update(synced=True, updated=receipt_mono, ts=incoming_ts, source=source,
                      hash=hash_, updates=m.get("updates", 0) + 1)
             if tick is not None:
                 m["tick"] = tick
             self._dirty[token] = self._dirty.get(token, 0) + 1
-            self._note_ts(incoming_ts)
+            if source == "ws":
+                self._note_ts(incoming_ts)
             self._record(token, incoming_ts, mono=m["updated"])
             return True
 
@@ -437,7 +459,7 @@ class BookState:
                 return False
             # Anonymous REST tuples must not erase the observed venue
             # watermark; an older WS delta still cannot rewind this book.
-            previous_ts = m.get("seen_ts") or m.get("ts")
+            previous_ts = max((t for t in (m.get("seen_ts"), m.get("ts")) if t is not None), default=None)
             if (incoming_ts is not None and previous_ts is not None
                     and incoming_ts < previous_ts):
                 return False
@@ -452,7 +474,7 @@ class BookState:
                 self._desync_locked((token,), "delta crossed the book")
                 return False
             self._bids[token], self._asks[token] = bids, asks
-            m.update(updated=time.monotonic(), ts=incoming_ts,
+            m.update(updated=time.monotonic(), ts=incoming_ts, source="ws",
                      updates=m.get("updates", 0) + 1)
             if hash_:
                 m["hash"] = hash_
@@ -508,7 +530,7 @@ class BookState:
                     # discard deltas for a token that is already live.
                     skipped_pending = True
                     continue
-                previous_ts = meta.get("seen_ts") or meta.get("ts")
+                previous_ts = max((t for t in (meta.get("seen_ts"), meta.get("ts")) if t is not None), default=None)
                 if (incoming_ts is not None and previous_ts is not None
                         and incoming_ts < previous_ts):
                     continue
@@ -551,7 +573,7 @@ class BookState:
                 bids, asks = staged[token]
                 self._bids[token], self._asks[token] = bids, asks
                 meta = self._meta[token]
-                meta.update(updated=now_mono, ts=incoming_ts,
+                meta.update(updated=now_mono, ts=incoming_ts, source="ws",
                             updates=meta.get("updates", 0) + 1)
                 token_hash = token_hashes.get(token)
                 if token_hash or hash_:
@@ -568,7 +590,8 @@ class BookState:
                 if require_exchange_ts and not self._fresh_exchange_ts(timestamp):
                     return False
                 meta = self._meta[token]
-                previous = meta.get("tick_ts") or meta.get("seen_ts") or meta.get("ts")
+                previous = max((t for t in (meta.get("tick_ts"), meta.get("seen_ts"), meta.get("ts"))
+                                if t is not None), default=None)
                 if timestamp is not None and previous is not None and timestamp < previous:
                     return False
                 try:
@@ -614,7 +637,7 @@ class BookState:
                          bids=bids, asks=asks, updated_mono=m.get("updated"),
                          exchange_ts_ms=m.get("ts"), tick_size=m.get("tick"),
                          hash=m.get("hash"), updates=m.get("updates", 0),
-                         receive_revision=m.get("receive_revision", 0))
+                         receive_revision=m.get("receive_revision", 0), source=m.get("source", "ws"))
             self._cache[token] = (dirty, v)
             return v
 
@@ -721,7 +744,7 @@ def _replace_status(self: BookView, status: str) -> BookView:
                     bids=self.bids, asks=self.asks, updated_mono=self.updated_mono,
                     exchange_ts_ms=self.exchange_ts_ms, tick_size=self.tick_size,
                     hash=self.hash, updates=self.updates,
-                    receive_revision=self.receive_revision)
+                    receive_revision=self.receive_revision, source=self.source)
 
 
 BookView._replace_status = _replace_status

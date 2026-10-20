@@ -297,7 +297,7 @@ def t_sniper_signing_price_never_exceeds_the_cap_and_keeps_the_tick():
     import math
     from decimal import Decimal as Dc
     import sniper_mode
-    from py_clob_client_v2.order_builder.helpers import round_down
+    from clob_signing import round_down
     plain_losses, bad = [], []
     for tick, digits in (("0.01", 2), ("0.001", 3), ("0.0001", 4)):
         step = Dc(tick)
@@ -313,8 +313,11 @@ def t_sniper_signing_price_never_exceeds_the_cap_and_keeps_the_tick():
                 plain_losses.append((tick, float(on)))
     check("the signed price is exactly the cap floored to the tick, never above it, at every price",
           not bad, str(bad[:5]))
-    check("(the library's own float floor loses a tick for some prices, e.g. 0.57 -> 0.56)",
-          ("0.01", 0.57) in plain_losses, str(plain_losses[:5]))
+    # The retired py-clob-client floored with floats and signed a 0.57 cap as 0.56;
+    # signing_price's nudge was the remedy. The unified SDK (clob_signing.round_down)
+    # floors in Decimal, so an on-tick price keeps its tick; the nudge stays harmless.
+    check("(the unified SDK's Decimal floor keeps every on-tick price, e.g. 0.57 stays 0.57)",
+          not plain_losses, str(plain_losses[:5]))
 
 
 def t_sniper_stallwatch_names_what_blocked_the_loop_and_stays_quiet_otherwise():
@@ -2236,7 +2239,7 @@ def t_sniper_live_like_mode_signs_and_uses_measured_latency():
     check("latency = half the median round trip + 250ms hold (documented) + 25ms server",
           abs(lat - (20 + 250 + 25)) < 1e-9 and parts["net_measured"], str((lat, parts)))
     if sn._builder is None:
-        check("py_clob_client_v2 is importable in the test environment", False)
+        check("clob_sdk is importable in the test environment", False)
         return
     rows = []
     sn._write = rows.append

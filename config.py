@@ -771,14 +771,13 @@ if not math.isfinite(MAX_ROUND_EXPOSURE) or MAX_ROUND_EXPOSURE < BET_SIZE:
     raise ValueError("MAX_ROUND_EXPOSURE must be finite and at least BET_SIZE")
 if POLY_SIGNATURE_TYPE not in (None, 0, 1, 2, 3):
     raise ValueError("POLY_SIGNATURE_TYPE must be 0, 1, 2, or 3")
-# py-clob-client-v2's L1 API-key derivation does not currently bind a type-3
-# (POLY_1271 deposit-wallet) key to the funder. Upstream issue #70 remains
-# open; allowing it here produces orders that the CLOB rejects as the wrong
-# signer. Fail before any credential or order request instead.
+# Keep the bot's existing type-3 restriction until its configured deposit
+# wallet has been validated end to end with the unified SDK. SDK support
+# alone does not establish that the deployed bot's credentials are correct.
 if POLY_SIGNATURE_TYPE == 3:
     raise ValueError(
-        "POLY_SIGNATURE_TYPE=3 is blocked: py-clob-client-v2 cannot currently "
-        "derive a funder-bound POLY_1271 API key (upstream issue #70)"
+        "POLY_SIGNATURE_TYPE=3 remains disabled pending unified-SDK "
+        "deposit-wallet integration validation"
     )
 if POLY_SIGNATURE_TYPE in (1, 2, 3) and not POLY_FUNDER:
     raise ValueError("proxy signature types 1/2/3 require POLY_FUNDER")
