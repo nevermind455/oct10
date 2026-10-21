@@ -147,7 +147,6 @@ class CoinbaseHistory(unittest.TestCase):
         for unsafe_lag in (1200.0, None):
             with self.subTest(lag=unsafe_lag):
                 sn, fired = T.make()
-                sn.trigger.k_bp = 0.5                    # these ticks are sized for the 0.5bp rule
                 sn.cb_fresh.enabled = sn.cb_fresh.connected = True
                 clock = [1000.0]
                 sn.cb_fresh.note_message(clock[0], 0)

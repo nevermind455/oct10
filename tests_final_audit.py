@@ -114,12 +114,12 @@ class Config(unittest.TestCase):
             lim = L.limits_from_env({})
         got = (s.k_bp, s.window_ms, s.order_type, s.slip, s.cooldown_ms, s.shares, s.max_target_shares,
                lim.max_order_shares)
-        self.assertEqual(got[:7], (1.0, 250.0, "FAK", 0.05, 300.0, 10.0, 20.0))      # 1.0bp since 2026-10-17 (0.5 before)
+        self.assertEqual(got[:7], (0.5, 250.0, "FAK", 0.05, 300.0, 10.0, 20.0))      # 0.5bp (0.3 for part of 2026-10-11)
         self.assertGreaterEqual(lim.max_order_shares, 20.0)                    # canary cap >= max target
         self.assertEqual(exec_latency.spec_violations(s, lim.max_order_shares), [])
 
     def test_old_values_cannot_silently_restore_the_old_strategy(self):
-        olds = {"SNIPER_K_BP": "0.5", "SNIPER_ORDER_TYPE": "FOK", "SNIPER_SLIP": "0.45",
+        olds = {"SNIPER_K_BP": "1.0", "SNIPER_ORDER_TYPE": "FOK", "SNIPER_SLIP": "0.45",
                 "SNIPER_COOLDOWN_MS": "1000", "SNIPER_WINDOW_MS": "500"}
         for var, raw in olds.items():
             with env(SPEC, {var: raw}):
@@ -131,7 +131,7 @@ class Config(unittest.TestCase):
 
     def test_live_gate_refuses_an_old_value_and_the_manager_live_flag(self):
         import run
-        for extra in ({"SNIPER_K_BP": "0.5"}, {"SNIPER_ORDER_TYPE": "FOK"}, {"SNIPER_CANARY_MAX_SHARES": "10"},
+        for extra in ({"SNIPER_K_BP": "1.0"}, {"SNIPER_ORDER_TYPE": "FOK"}, {"SNIPER_CANARY_MAX_SHARES": "10"},
                       {"POSITION_MANAGER_LIVE_ENABLED": "1"}, {"SNIPER_CANARY_MAX_SPEND_USD": "nan"}):
             with env(SPEC, {"SNIPER_LIVE_CANARY": "1"}, extra):
                 with self.assertRaises((RuntimeError, ValueError), msg=extra):
@@ -321,8 +321,8 @@ class Trigger(unittest.TestCase):
         with env(SPEC):
             s = S.Settings()
         # 2026-10-10: the trigger feed is Coinbase's BTC-USD ticker (the operator's change)
-        # Coinbase's ticker (2026-10-11), a 1.0bp move (2026-10-17; the operator's changes)
-        self.assertEqual((s.primary_feed, s.k_bp, s.window_ms), ("coinbase", 1.0, 250.0))
+        # 2026-10-11: Coinbase's ticker, a 0.5bp move (the operator's changes)
+        self.assertEqual((s.primary_feed, s.k_bp, s.window_ms), ("coinbase", 0.5, 250.0))
 
 
 # =========================================================================== BOOK

@@ -38,7 +38,7 @@ untouched:
                                 LIVE refuses it unless SNIPER_LIVE_CANARY=1
     SNIPER_LIVE_CANARY=1        LIVE only, with SNIPER_ONLY: real orders under the
                                 SNIPER_CANARY_* limits (see sniper_live.limits_from_env)
-    SNIPER_K_BP=1.0             SNIPER_WINDOW_MS=250
+    SNIPER_K_BP=0.5             SNIPER_WINDOW_MS=250
     SNIPER_SHARES=10            SNIPER_SLIP=0.05
     SNIPER_LATENCY_MS=(unset)   SNIPER_COOLDOWN_MS=300 (per side, from the order's submission)
     SNIPER_MIN_LEFT_S=10        SNIPER_MAX_FILLS_ROUND=20
@@ -102,7 +102,7 @@ from pathlib import Path
 import websockets
 
 import exec_latency
-from hybrid_sizing import (HybridPolicy, cent_compatible_shares, enforce_order_budget, minimum_entry_shares,
+from hybrid_sizing import (HybridPolicy, at_drawdown_stop, cent_compatible_shares, enforce_order_budget, minimum_entry_shares,
                            risk_total, shares_within_budget, sizing_factors)
 from timer import now_et
 
@@ -908,9 +908,9 @@ def live_delays(path) -> tuple[list[float], float]:
 
 class Settings:
     def __init__(self) -> None:
-        # the frozen spec's trigger (exec_latency.FROZEN_SPEC): a 1.0bp move since
-        # 2026-10-17 (0.5bp before; 0.3bp for part of 2026-10-11)
-        self.k_bp = _env_float("SNIPER_K_BP", 1.0)
+        # the frozen spec's trigger (exec_latency.FROZEN_SPEC): a 0.5bp move
+        # (1.0bp 2026-10-17..22; 0.3bp for part of 2026-10-11)
+        self.k_bp = _env_float("SNIPER_K_BP", 0.5)
         self.window_ms = _env_float("SNIPER_WINDOW_MS", 250)
         self.shares = _env_float("SNIPER_SHARES", 10)
         # the frozen spec's limit (exec_latency.FROZEN_SPEC): the ask seen + $0.05 at most
@@ -988,6 +988,13 @@ class Settings:
                 max_order_usd=_env_float("SNIPER_HYBRID_MAX_ORDER_USD", 0.0))
         except ValueError as exc:
             raise ValueError(f"invalid SNIPER_HYBRID_* settings: {exc}") from exc
+        # 2026-10-22, the operator's choice: at the drawdown stop, no orders for this long,
+        # then a new hybrid epoch from the current equity (peak = equity: full sizing
+        # again). It repeats, so the stop caps each run of losses, not their total
+        # (the canary's loss budget still applies). 0: the stop holds until a recovery.
+        self.hybrid_dd_pause_s = _env_float("SNIPER_HYBRID_DRAWDOWN_PAUSE_S", 600.0)
+        if not math.isfinite(self.hybrid_dd_pause_s) or not 0.0 <= self.hybrid_dd_pause_s <= 86400.0:
+            raise ValueError(f"invalid SNIPER_HYBRID_DRAWDOWN_PAUSE_S {self.hybrid_dd_pause_s!r}: 0..86400 s")
         self.stale_ms = _env_float("SNIPER_STALE_MS", 2000)
         # Which book a paper order fills against. "exchange": the book as it
         # stood at the modelled match instant on the venue's own clock (the
@@ -1503,6 +1510,7 @@ class Sniper:
         self._paper_pending_spends: dict = {}        # monotonic tokens retain cash while workers run
         self._paper_spend_sequence = 0
         self._hybrid_risk: dict | None = None       # one immutable worker-produced accounting snapshot
+        self._dd_stop_since: float | None = None    # monotonic: the drawdown stop first seen (worker only)
         self._hybrid_risk_error: str | None = None
         self._minimum_entry_keys: set = set()
         self._minimum_entry_seed_error: str | None = None
@@ -2000,6 +2008,7 @@ class Sniper:
             # accounting observation look newly fresh when the worker returns.
             observed = time.monotonic()
             snapshot = dict(read(reference, expected_journal_seq=expected_seq))
+            snapshot = self._hybrid_drawdown_pause(read, snapshot)
             snapshot["observed_mono"] = observed
             self._hybrid_risk_error = None
             self._hybrid_risk = snapshot
@@ -2008,6 +2017,45 @@ class Sniper:
             self._hybrid_risk_error = f"{type(exc).__name__}: {exc}"
             self._hybrid_risk = None
             return None
+
+    def _hybrid_drawdown_pause(self, read, snapshot: dict) -> dict:
+        """SNIPER_HYBRID_DRAWDOWN_PAUSE_S, on the accounting worker. At the drawdown
+        stop sizing is zero (no orders); once it has held for the pause, the ledger
+        starts a new epoch from the current equity and that snapshot is used. A
+        failed reset keeps the stop and is retried at the next refresh."""
+        pause = float(getattr(self.s, "hybrid_dd_pause_s", 0.0) or 0.0)
+        if pause <= 0:
+            return snapshot
+        try:
+            equity, peak = max(0.0, float(snapshot["equity"])), float(snapshot["high_water"])
+            stopped = at_drawdown_stop(self.s.hybrid_policy, equity=equity, high_water=peak)
+        except (KeyError, TypeError, ValueError):
+            return snapshot
+        now = time.monotonic()
+        if not stopped:
+            self._dd_stop_since = None
+            return snapshot
+        if self._dd_stop_since is None:
+            self._dd_stop_since = now
+            self._write({"wall": time.time(), "result": "hybrid_drawdown_pause", "pause_s": pause,
+                         "equity": round(equity, 4), "high_water": round(peak, 4)})
+            self.on_event("sniper", f"HYBRID drawdown stop: equity ${equity:.2f} vs peak ${peak:.2f} - no orders for "
+                                    f"{pause / 60:g} min, then a fresh start from the equity then", "warn")
+            return snapshot
+        if now - self._dd_stop_since < pause:
+            return snapshot
+        try:
+            fresh = dict(read(None, rebase=True))
+        except Exception:  # noqa: BLE001 - not reset: the stop holds; tried again next refresh
+            self.n["hybrid drawdown reset errors"] += 1
+            return snapshot
+        self._dd_stop_since = None
+        self.n["hybrid drawdown resets"] += 1
+        self._write({"wall": time.time(), "result": "hybrid_drawdown_reset", "old_high_water": round(peak, 4),
+                     "equity": round(float(fresh["equity"]), 4)})
+        self.on_event("sniper", f"HYBRID drawdown pause over: a fresh start from ${float(fresh['equity']):.2f} "
+                                f"(the old peak ${peak:.2f} is dropped)", "warn")
+        return fresh
 
     async def _hybrid_risk_loop(self) -> None:
         while True:

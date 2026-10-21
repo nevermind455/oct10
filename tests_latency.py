@@ -63,9 +63,9 @@ class TriggerBoundaries(unittest.TestCase):
 
     def test_just_under_at_and_over_the_spec_threshold_both_ways(self):
         K = self.K
-        self.assertEqual(K, 1.0)
+        self.assertEqual(K, 0.5)
         for bp, want in ((K - 0.01, None), (K, 1), (K + 0.01, 1), (-(K - 0.01), None), (-K, -1), (-(K + 0.01), -1),
-                         (0.5, None), (-0.5, None), (0.99, None)):          # the previous 0.5bp spec no longer fires
+                         (0.5, 1), (-0.5, -1), (1.00, 1), (-1.00, -1)):     # the previous specs fire too
             self.assertEqual(self.fire(bp), want, bp)
         self.assertIsNone(self.fire(0.29))                                  # 0.29bp: no signal
 
@@ -131,7 +131,7 @@ class CooldownBoundary(unittest.TestCase):
 
 # =========================================================================== config fail-fast
 class FrozenSpec(unittest.TestCase):
-    FROZEN = {"SNIPER_ONLY": "1", "SNIPER_LIVE_CANARY": "1", "SNIPER_PRIMARY_FEED": "coinbase", "SNIPER_K_BP": "1.0",
+    FROZEN = {"SNIPER_ONLY": "1", "SNIPER_LIVE_CANARY": "1", "SNIPER_PRIMARY_FEED": "coinbase", "SNIPER_K_BP": "0.5",
               "SNIPER_WINDOW_MS": "250", "SNIPER_ORDER_TYPE": "FAK", "SNIPER_SLIP": "0.05",
               "SNIPER_COOLDOWN_MS": "300", "SNIPER_SHARES": "10", "SNIPER_MAX_TARGET_SHARES": "20",
               "SNIPER_CANARY_MAX_SHARES": "25"}
@@ -155,7 +155,7 @@ class FrozenSpec(unittest.TestCase):
             self.assertIn("SNIPER_PRIMARY_FEED", str(ctx.exception))
 
     def test_an_old_env_value_refuses_live_and_names_it(self):
-        for var, value, word in (("SNIPER_K_BP", "0.5", "trigger"), ("SNIPER_SLIP", "0.04", "slip"),
+        for var, value, word in (("SNIPER_K_BP", "1.0", "trigger"), ("SNIPER_SLIP", "0.04", "slip"),
                                  ("SNIPER_SLIP", "0.02", "slip"),
                                  ("SNIPER_ORDER_TYPE", "FOK", "execution"), ("SNIPER_COOLDOWN_MS", "1000", "cooldown"),
                                  ("SNIPER_WINDOW_MS", "500", "window"), ("SNIPER_SHARES", "5", "base_target"),
@@ -166,11 +166,11 @@ class FrozenSpec(unittest.TestCase):
             self.assertIn(var, str(ctx.exception))
 
     def test_a_missing_trigger_or_slip_falls_back_to_the_spec(self):
-        # the code defaults ARE the spec: 1.0bp, ask + $0.05 (the slip default was $0.02)
+        # the code defaults ARE the spec: 0.5bp, ask + $0.05 (the slip default was $0.02)
         self.assertTrue(self.gate(SNIPER_K_BP=None, SNIPER_SLIP=None))
         with patch.dict(os.environ, {"SNIPER_ONLY": "1"}, clear=True):
             s = S.Settings()
-        self.assertEqual((s.k_bp, s.slip), (1.0, 0.05))
+        self.assertEqual((s.k_bp, s.slip), (0.5, 0.05))
 
     def test_a_missing_value_falling_back_to_a_non_spec_default_is_named(self):
         with patch.dict(os.environ, {}, clear=True):                  # without SNIPER_ONLY the default is FOK
@@ -184,7 +184,7 @@ class FrozenSpec(unittest.TestCase):
 
     def test_paper_only_warns_and_the_config_lines_hold_no_secret(self):
         import run
-        env = dict(self.FROZEN, SNIPER_K_BP="0.5", POLY_PRIVATE_KEY="0x" + "ab" * 32, POLY_FUNDER="0x" + "cd" * 20)
+        env = dict(self.FROZEN, SNIPER_K_BP="1.0", POLY_PRIVATE_KEY="0x" + "ab" * 32, POLY_FUNDER="0x" + "cd" * 20)
         with patch.dict(os.environ, env, clear=True):
             self.assertFalse(run._live_sniper_gate(paper=True))
             s = S.Settings()
@@ -193,7 +193,7 @@ class FrozenSpec(unittest.TestCase):
         text = "\n".join(lines)
         self.assertIn("trigger", text)
         self.assertIn("1.00 bp", text)
-        self.assertIn("<- frozen spec 1.00 bp", text)
+        self.assertIn("<- frozen spec 0.50 bp", text)
         self.assertNotIn("ab" * 32, text)
         self.assertNotIn("cd" * 20, text)
         self.assertEqual(len(bad), 1)
@@ -777,7 +777,7 @@ class StrategyEquivalence(unittest.TestCase):
         # the replay's clock: each round's trade window is open (300s..10s left) for most steps
         steps = [(dt, mid, au, ad, end) for dt, mid, au, ad, end in steps]
         for mode_env in ({"SNIPER_LATENCY_MS": "5"}, {"SNIPER_LATENCY_MS": ""}):
-            env = dict(SPEC_ENV, SNIPER_SHADOW_MS="", SNIPER_K_BP="0.5", **mode_env)   # mids sized for 0.5bp
+            env = dict(SPEC_ENV, SNIPER_SHADOW_MS="", **mode_env)
             a = asyncio.run(replay(old, steps, env))
             b = asyncio.run(replay(S, steps, env))
             self.assertGreater(sum(1 for r in a if r["result"] in ("filled", "refused")), 20, "too few orders replayed")
@@ -794,7 +794,7 @@ class StrategyEquivalence(unittest.TestCase):
             self.skipTest(f"git history with {OLD_COMMIT} is not available")
         steps = replay_steps(11, 1500)
         for mode_env in ({"SNIPER_LATENCY_MS": "5"}, {"SNIPER_LATENCY_MS": ""}):
-            env = dict(SPEC_ENV, SNIPER_SHADOW_MS="", SNIPER_K_BP="0.5", **mode_env)   # mids sized for 0.5bp
+            env = dict(SPEC_ENV, SNIPER_SHADOW_MS="", **mode_env)
             a = asyncio.run(replay(old, steps, env, feed="binance"))
             b = asyncio.run(replay(S, steps, env, feed="coinbase"))
             self.assertGreater(sum(1 for r in a if r["result"] in ("filled", "refused")), 20, "too few orders replayed")

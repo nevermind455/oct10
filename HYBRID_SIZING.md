@@ -26,6 +26,14 @@ It is a configurable operating assumption, not an empirically optimized threshol
 Volatility below the baseline does not increase exposure above quarter Kelly.
 For example, twice the baseline volatility halves the allocation fraction.
 
+**Drawdown pause (2026-10-22, the operator's choice).** At the stop, no new orders for
+`SNIPER_HYBRID_DRAWDOWN_PAUSE_S` (default **600 s**). Then the ledger starts a new hybrid
+epoch from the current realized equity (capital = equity, P&L counted from then, peak =
+equity), so sizing returns to the full fraction. It repeats on the next 20% fall: the stop
+then limits each run of losses, not their total; the canary loss budget still applies.
+The reset is durable, journalled as `hybrid_drawdown_pause` / `hybrid_drawdown_reset`.
+`SNIPER_HYBRID_DRAWDOWN_PAUSE_S=0` keeps the old rule: the stop holds until equity recovers.
+
 The drawdown stop defaults to **20%**. At 5%, 10% and 20% realized drawdown, its
 multiplier is 0.75, 0.5 and 0 respectively. At twice baseline volatility and 10%
 drawdown, the effective fraction is `0.25 × 0.5 × 0.5 = 0.0625` of full Kelly.

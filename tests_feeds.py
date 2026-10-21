@@ -1600,7 +1600,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # spuriously starting a new five-minute pause after round rotation.
     # Also freeze the original dispatch-window deadline in each decision and
     # recheck it at the transport boundary after persistence/connection waits.
-    "sniper_mode.py": "70552dc21e8961d26b6aede26597314d2828438b6fddecb0d8dc07e7c01c5ac5",
+    # 2026-10-22, the operator's changes: the trigger default back to 0.5bp (the frozen spec;
+    # 1.0bp from 10-17); SNIPER_HYBRID_DRAWDOWN_PAUSE_S (default 600): at the drawdown stop
+    # no orders that long, then a new hybrid epoch from the current equity (peak = equity).
+    "sniper_mode.py": "257b2f0d0f9265032d5b15cf6e23b431b7a71147b7ed0a81ba11cd7eff6aaef8",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
@@ -1735,7 +1738,9 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # reading that raced a fill or settlement (HYBRID_SIZING.md, SDK_UPGRADE_2026-10-19.md).
     # 2026-10-22: durable authorization keeps the writer lock while releasing
     # the inventory state lock before journal/snapshot disk I/O.
-    "accounting/ledger.py": "5a9cfe61c3224940e2de275eb75a3d33eaf64356ddca9c2c71f7098a5307e40a",
+    # 2026-10-22: hybrid_risk_view(rebase=True) starts a new epoch from the current realized
+    # equity (capital = equity, P&L from now, peak = equity), durable - the drawdown pause's reset.
+    "accounting/ledger.py": "32e08e978e02f75693a6ff0b847c022b91fe3011d92cef3230ddad54bd32e62c",
     "accounting/fees.py": "44e45be00c7c3b330ef0ff11950fa42944029ba83a61ec8066af3494c0956dc7",
     # Re-approved (settlement audit): one record per market (condition id), checked from
     # expiry, concurrently, on the worker's own pool; explicit lifecycle events and a journal;
@@ -1782,7 +1787,9 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     "clob_client.py": "cf39e32e4e78500068de88ef8538073319411fe1710473790cd074cde329f216",
     "clob_signing.py": "bfe704a25e5cc52ea4bdb4f085eac13d2710a83f64d7beee56d2d287707f305a",
     "clob_sdk.py": "f03d066498ecde9e0afcb85ae3e4dcbfc0e18d5ffc1f483d3d0cdcf106382de5",
-    "hybrid_sizing.py": "41fdfe4f7f7eb08a929e25b9fb34d2463f62bff700d3b3bc702e60ae7a1c6eed",
+    # 2026-10-22: at_drawdown_stop - sizing_factors' exact drawdown-stop test alone (no volatility),
+    # for the drawdown pause.
+    "hybrid_sizing.py": "939ccf5b1ecabdf8b0e3e46f8b012d9324997e8c50dcc927405a371b40eb3cd0",
 }
 SIDES = (None, "UP", "DOWN")
 PRICES = (None, 0.0, 64_000.0, 64_894.0, 64_894.01, 1e9, -5.0)

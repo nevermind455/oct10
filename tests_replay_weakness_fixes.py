@@ -32,7 +32,7 @@ class ReplayWeaknessFixes(unittest.TestCase):
 
     def market_fixture(self):
         # A minute of tiny changes warms the REAL volatility model. A later
-        # 1.2bp burst crosses the frozen 1.0bp threshold. Polymarket's quote
+        # 0.8bp burst crosses the frozen 0.5bp threshold. Polymarket's quote
         # already exists before the move; no fair/Kelly/connection gates are
         # disabled or mocked. Only venue network lookup is absent.
         w = 1_800_000_000
@@ -50,8 +50,8 @@ class ReplayWeaknessFixes(unittest.TestCase):
                                  [[0.49, 1000]], [[0.51, 1000]]])
             mid = 60000.0 + (0.005 if i % 2 else 0.0)
             rows.append(["xb", ns, ns, R.COINBASE_CODE, wall * 1000 - 80, mid - 0.01, mid + 0.01])
-        for dt, mid in ((61.1, 60001.2), (61.2, 60007.2), (61.4, 60007.2), (62.0, 60007.2),
-                        (302.0, 60007.2)):
+        for dt, mid in ((61.1, 60001.2), (61.2, 60004.8), (61.4, 60004.8), (62.0, 60004.8),
+                        (302.0, 60004.8)):
             wall = w + dt
             ns = round(wall * 10**9)
             rows.append(["xb", ns, ns, R.COINBASE_CODE, wall * 1000 - 80, mid - 0.01, mid + 0.01])

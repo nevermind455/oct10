@@ -280,7 +280,7 @@ async def bench_live(m: int, matched_every: int = 5, with_pm: bool = False, pm_s
         sn.trigger.q.clear()
         ref = 60_000.0
         sn.trigger.q.append((now - 300.0, ref))
-        move = 2.0 if with_fair else 1.2  # over the 1.0bp frozen trigger; 2.0: enough edge for the fair-value gate
+        move = 2.0 if with_fair else 0.6  # enough synthetic edge to pass the real fair-value gate
         mid = ref * (1 + (move if side == "UP" else -move) / 1e4)
         feed_tick(sn, tick_raw(sn.s.primary_feed, mid))
         return oid, tid, n_order % matched_every == 0

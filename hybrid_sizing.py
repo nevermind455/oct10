@@ -54,6 +54,19 @@ class HybridPolicy:
             object.__setattr__(self, name, value)
 
 
+def at_drawdown_stop(policy: HybridPolicy, *, equity, high_water) -> bool:
+    """sizing_factors' drawdown stop alone (no volatility needed): the loss from
+    the peak at or beyond drawdown_stop of it - the same exact Decimal test."""
+    if not isinstance(policy, HybridPolicy):
+        raise ValueError("policy must be a HybridPolicy")
+    equity = _number(equity, "equity")
+    high_water = _number(high_water, "high_water", positive=True)
+    with localcontext() as context:
+        context.prec = 50
+        peak = Decimal(str(high_water))
+        return peak - Decimal(str(equity)) >= peak * Decimal(str(policy.drawdown_stop))
+
+
 def sizing_factors(policy: HybridPolicy, *, sigma, equity, high_water,
                    base_fraction=0.25) -> dict:
     """Return target-allocation factors, not a scale for incremental orders.

@@ -59,10 +59,10 @@ import os
 FROZEN_SPEC = (
     # (Settings attribute, environment variable, frozen value, label, format)
     ("primary_feed", "SNIPER_PRIMARY_FEED", "coinbase", "trigger feed", "{}"),
-    # 2026-10-17, the operator's change: 0.50bp -> 1.00bp (the fair margin stays $0.01).
-    # Live 10-15/16: moves under 1bp lost -$57 on 100 fills (43 wins vs 52.4 expected);
-    # 1bp and up made +$57 on 145. Chosen on that same data: a prospective live run judges it.
-    ("k_bp", "SNIPER_K_BP", 1.0, "trigger", "{:.2f} bp"),
+    # 2026-10-22, the operator's change: back to 0.50bp (1.00bp from 10-17, b31f4b2).
+    # Under 1bp lost -$57 on 100 live fills 10-15/16 (43 wins vs 52.4); with 1.0bp, live
+    # 10-17..10-21 was +$4.03 then -$11.34 - no better. The operator chose 0.5bp knowing both.
+    ("k_bp", "SNIPER_K_BP", 0.5, "trigger", "{:.2f} bp"),
     ("window_ms", "SNIPER_WINDOW_MS", 250.0, "window", "{:.0f} ms"),
     ("order_type", "SNIPER_ORDER_TYPE", "FAK", "execution", "{}"),
     ("slip", "SNIPER_SLIP", 0.05, "slip", "${:.2f}"),
@@ -141,7 +141,11 @@ def effective_config_lines(settings, *, live: bool, canary_max_shares=None) -> l
         lines.extend([
             f"  hybrid vol    {policy.vol_baseline_bp:g} bp/sqrt(s) (SNIPER_HYBRID_VOL_BASELINE_BP)",
             f"  hybrid dd     linear to zero at {policy.drawdown_stop:.1%} realized drawdown "
-            "(SNIPER_HYBRID_DRAWDOWN_STOP)",
+            "(SNIPER_HYBRID_DRAWDOWN_STOP); "
+            + (f"there {getattr(settings, 'hybrid_dd_pause_s', 0.0):g}s without orders, then a fresh start "
+               "from the equity (SNIPER_HYBRID_DRAWDOWN_PAUSE_S)"
+               if getattr(settings, "hybrid_dd_pause_s", 0.0) else
+               "held until the equity recovers (SNIPER_HYBRID_DRAWDOWN_PAUSE_S=0)"),
             f"  hybrid cap    equity fraction {policy.risk_fraction:g}, USD {policy.max_order_usd:g}; "
             "0 disables each additional cap (SNIPER_HYBRID_RISK_FRACTION / SNIPER_HYBRID_MAX_ORDER_USD)",
             "  confidence    neutral 1.0; no validated predictive-accuracy estimate supplied",

@@ -1233,7 +1233,7 @@ class Ledger:
         if equity > state["high_water"]:
             self._hybrid_risk = {**state, "high_water": equity}
 
-    def hybrid_risk_view(self, reference_equity=None, *, expected_journal_seq=None) -> dict:
+    def hybrid_risk_view(self, reference_equity=None, *, expected_journal_seq=None, rebase=False) -> dict:
         """Durable realized-equity state for hybrid sizing; call on a worker.
 
         Buying inventory and waiting for redemption do not change realized
@@ -1245,6 +1245,11 @@ class Ledger:
         Durable fills/settlements record peaks through their existing journal.
         Initialization or an unsaved in-memory peak needs a snapshot before
         publication. No network work occurs here; unchanged reads do not write.
+
+        rebase=True (2026-10-22, the operator's drawdown pause): a new epoch from
+        the current realized equity - capital = equity, P&L counted from now,
+        peak = equity - durable like any epoch. Needs an established epoch and
+        positive equity.
         """
         reference = None
         if (expected_journal_seq is not None and
@@ -1282,6 +1287,10 @@ class Ledger:
                 equity = state["reference_equity"] + realized - state["pnl_baseline"]
                 if not math.isfinite(equity):
                     raise ValueError("non-finite hybrid equity")
+                if rebase:
+                    if reference is not None or not equity > 0:
+                        raise ValueError("a hybrid epoch reset needs an established epoch and positive equity")
+                    state = {**state, "reference_equity": equity, "pnl_baseline": realized, "high_water": equity}
                 state["high_water"] = max(state["high_water"], equity)
                 changed = state != self._hybrid_persisted
                 if changed:
