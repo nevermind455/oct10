@@ -70,7 +70,8 @@ class DispatchAge(unittest.TestCase):
     def test_original_book_cannot_be_refreshed_by_a_newer_snapshot(self):
         sn = sniper()
         sn.s.stale_ms = 2000
-        plan = {'view': types.SimpleNamespace(updated_mono=7.9), 't_ms': 10000}
+        plan = {'view': types.SimpleNamespace(updated_mono=7.9), 't_ms': 10000,
+                'dispatch_deadline': time.time() + 120}
         with patch.object(S.time, 'monotonic', return_value=10):
             with self.assertRaisesRegex(Refused, 'decision book'):
                 sn._check_dispatch_age(plan, None, None)
@@ -81,7 +82,8 @@ class DispatchAge(unittest.TestCase):
         sn.cb_fresh.connected = True
         sn.cb_fresh.last_trade_mono = 10
         sn.cb_fresh.last_excess = 0
-        plan = {'view': types.SimpleNamespace(updated_mono=10), 't_ms': 8900}
+        plan = {'view': types.SimpleNamespace(updated_mono=10), 't_ms': 8900,
+                'dispatch_deadline': time.time() + 120}
         with patch.object(S.time, 'monotonic', return_value=10):
             with self.assertRaisesRegex(Refused, 'signal became stale'):
                 sn._check_dispatch_age(plan, sn.cb_fresh, 0)
@@ -91,14 +93,16 @@ class DispatchAge(unittest.TestCase):
         sn.cb_fresh.enabled = sn.cb_fresh.connected = True
         sn.cb_fresh.last_trade_mono = 10
         sn.cb_fresh.last_excess = 0
-        plan = {'view': types.SimpleNamespace(updated_mono=10), 't_ms': 9900}
+        plan = {'view': types.SimpleNamespace(updated_mono=10), 't_ms': 9900,
+                'dispatch_deadline': time.time() + 120}
         with patch.object(S.time, 'monotonic', return_value=10):
             with self.assertRaises(Refused):
                 sn._check_dispatch_age(plan, sn.cb_fresh, 950)
 
     def test_fresh_plan_passes_and_disabled_feed_gate_stays_disabled(self):
         sn = sniper()
-        plan = {'view': types.SimpleNamespace(updated_mono=9.9), 't_ms': 9000}
+        plan = {'view': types.SimpleNamespace(updated_mono=9.9), 't_ms': 9000,
+                'dispatch_deadline': time.time() + 120}
         with patch.object(S.time, 'monotonic', return_value=10):
             sn._check_dispatch_age(plan, sn.cb_fresh, None)
 

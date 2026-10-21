@@ -23,7 +23,7 @@ is optional: a missing value is drawn as "--", never invented.
                 (exec_latency.STAGES + TOTALS), quality (exec_latency.ExecQuality
                 summary), paper
     budget      exec_latency.latency_budget(): primary, feeds {feed: ms}, bot_ms,
-                one_way_ms, hold_ms, venue_ms, venue_simulated, totals {feed: ms}
+                one_way_ms, return_ms, hold_ms, venue_ms, venue_simulated, totals {feed: ms}
     market      slug, seconds_left, trade_until_s, book_status, up / down
                 ({bid, ask, status, age_ms}), round_fills, max_fills,
                 round_up_sh, round_down_sh, max_side_shares
@@ -671,6 +671,8 @@ def _budget_body(b: dict, w: int, g: Glyphs) -> list[Row]:
     full = UNATTRIBUTED + sim
     lw = min(len(full), max(16, w - vw - pw - 3 - 12))          # keep at least a 12-cell bar
     parts[-1] = ((full if len(full) <= lw else "Unattrib. delay" + sim),) + parts[-1][1:]
+    if not b.get("venue_simulated"):
+        parts.append(("Network < CLOB", b.get("return_ms"), Style("amber")))
     total = _num(totals.get(primary))
     known = sum(_num(v) or 0.0 for _, v, _ in parts)
     base = total if total else known
@@ -933,6 +935,10 @@ def _build(snap: dict, cols: int, rows: int, g: Glyphs) -> list[Row]:
     room -= pnl_h
     # 9 rows: the stage list (2) + header + four totals; at 8 the stage list takes one line
     lat_h = 9 if room >= 9 + 8 + 5 else 8 if room >= 8 + 8 + 5 else 0
+    if lat_h == 8 and cols >= 150 and isinstance(snap.get("budget"), dict):
+        # Both network legs plus the ACK total need seven body rows. Use one
+        # row of the events area so the total is never clipped off the panel.
+        lat_h = 9
     room -= lat_h
     mid_h = min(room, max(8, len(side_rows) + 2))
     if room - mid_h < 5:                          # not enough for events below: take it all

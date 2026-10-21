@@ -267,8 +267,11 @@ class Ledger:
                 metadata = self.authorized_orders.get(oid)
                 if metadata is None:
                     return False
-                if not self._persist_locked({"op": "authorize", "order_id": oid, "metadata": dict(metadata)}):
-                    raise RuntimeError("authorized order could not be persisted")
+                entry = {"op": "authorize", "order_id": oid, "metadata": dict(metadata)}
+            # Serialize writers, while inventory readers remain independent of
+            # journal fsync and first-write/compaction snapshot I/O.
+            if not self._persist_locked(entry):
+                raise RuntimeError("authorized order could not be persisted")
             return True
 
     def authorized_notional_for_window(self, window_start: int) -> float:

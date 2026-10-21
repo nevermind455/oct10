@@ -77,6 +77,17 @@ class Fill:
     # Matched shares and prices expressed in the taker's token. Keeping every
     # leg lets accounting apply the nonlinear fee curve at each execution price.
     maker_legs: tuple[tuple[float, float], ...] | None = None
+    # First complete execution observation, distinct from seeing a RETRYING
+    # trade id or a partial record. Later confirmations do not backdate it.
+    execution_seen: float | None = None
+
+    @property
+    def execution_known(self) -> bool:
+        return (self.status in ("MATCHED", "MATCHED_NOT_BROADCASTED", "MINED", "CONFIRMED")
+                and self.order_id is not None and self.asset_id is not None
+                and self.market is not None and self.side in ("BUY", "SELL")
+                and self.price is not None and math.isfinite(self.price) and 0 < self.price < 1
+                and math.isfinite(self.size) and self.size > 0)
 
     @property
     def notional(self) -> float:
@@ -180,6 +191,8 @@ class FillStore:
                     status=status, first_seen=now, last_seen=now,
                     sources={str(source)}, fee_rate_bps=incoming["fee_rate_bps"],
                     paid=paid, maker_legs=legs)
+                if self.fills[tid].execution_known:
+                    self.fills[tid].execution_seen = now
                 if self._by_order_n == len(self.fills) - 1:
                     self._index_order_locked(self.fills[tid])
                     self._by_order_n = len(self.fills)
@@ -253,6 +266,8 @@ class FillStore:
                 rec.fee_rate_bps = incoming["fee_rate_bps"]
             if incoming["size"] is not None and rec.size <= 0:
                 rec.size = incoming["size"]
+            if rec.execution_seen is None and rec.execution_known:
+                rec.execution_seen = now
             return False
 
     def record_order(self, order_id, *, asset_id=None, side=None, price=None,

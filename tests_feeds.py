@@ -1595,7 +1595,12 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # limits are pre-trade estimates; HYBRID_SIZING.md); paper reserves the all-in stake plus fees
     # until its worker returns, and worker/executor failures stop new decisions
     # (AUDIT_FIXES_20261020.md). The whole offline suite and the strict native-SDK check pass.
-    "sniper_mode.py": "7105b783bc45adbed48245fc66c3c43a20daa7c1c23e358b7eecdc4c9fb02549",
+    # 2026-10-22: scope the decision-layer pending-FAK gate to the current
+    # condition and token; old-market orders retain reconciliation without
+    # spuriously starting a new five-minute pause after round rotation.
+    # Also freeze the original dispatch-window deadline in each decision and
+    # recheck it at the transport boundary after persistence/connection waits.
+    "sniper_mode.py": "70552dc21e8961d26b6aede26597314d2828438b6fddecb0d8dc07e7c01c5ac5",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
@@ -1665,7 +1670,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # (SNIPER_WARM_ONLY) and live_send transport/intent telemetry; the clock refresh requires HTTP
     # 200 and a finite, positive timestamp (BUGFIXES_2026-10-19.md, LATENCY_TARGET_200MS.md,
     # AUDIT_FIXES_20261020.md).
-    "sniper_live.py": "b943912631d82e3123e4ac97b42540ea640d1a54cbcab3316164f0eeec63c8a8",
+    # 2026-10-22: retain uncertain cash reservations during balance refresh;
+    # serialize counter observations with their journal sequence; checkpoint
+    # markers reflect persisted state; use execution-observation timestamps and
+    # recheck the original decision cutoff at dispatch.
+    "sniper_live.py": "23f5b106abc4a4c901aabee3fb76c29e6ecd64aa47861c66dee3f3cf37207875",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads
@@ -1724,7 +1733,9 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # capital, realized-P&L baseline, high-water mark) is persisted in the snapshot and its peaks
     # kept through durable transactions and journal replay; hybrid_risk_view refuses a reference
     # reading that raced a fill or settlement (HYBRID_SIZING.md, SDK_UPGRADE_2026-10-19.md).
-    "accounting/ledger.py": "a3d0af0a828c6afa58a6d7f3b3d6cfe2173bfe33d9773134d6389f0145e82c68",
+    # 2026-10-22: durable authorization keeps the writer lock while releasing
+    # the inventory state lock before journal/snapshot disk I/O.
+    "accounting/ledger.py": "5a9cfe61c3224940e2de275eb75a3d33eaf64356ddca9c2c71f7098a5307e40a",
     "accounting/fees.py": "44e45be00c7c3b330ef0ff11950fa42944029ba83a61ec8066af3494c0956dc7",
     # Re-approved (settlement audit): one record per market (condition id), checked from
     # expiry, concurrently, on the worker's own pool; explicit lifecycle events and a journal;
@@ -1754,7 +1765,9 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     "feeds/book.py": "8d99e3144f4482270445880cb75099252a273b1e78af7ff4e1a16d65fb1aba50",
     # Reviewed 2026-10-12: user-requested recovery, accounting and portfolio safety fixes.
     # Re-approved 2026-10-12 (audit 20261012): FillStore summary cached until the next mutation
-    "feeds/poly_user.py": "6ff37ccc1cda3238b7b702233f339093b84b7bf026576364f87e29111f68facd",
+    # 2026-10-22: separately timestamp when a complete trade becomes execution
+    # evidence, so RETRYING and incomplete rows cannot backdate fill latency.
+    "feeds/poly_user.py": "b1a92f77feb3658f738bf32034c39595d4f7c61ccb5db40973230fdc9f45a1f6",
     # Reviewed 2026-10-12: receive fencing and ordered public-token snapshot recovery.
     # hub.py and poly_market.py are listed, not locked (not in TRADING_FILES). Re-recorded
     # 2026-10-20: proactive REST recovery uses the metadata-preserving book read

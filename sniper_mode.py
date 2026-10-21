@@ -3114,6 +3114,11 @@ class Sniper:
         from sniper_live import Refused
         if self._closing:
             raise Refused("sniper is shutting down before dispatch")
+        deadline = plan.get("dispatch_deadline")
+        if deadline is None:
+            deadline = float(plan["end"]) - self._window()[1]
+        if time.time() >= float(deadline):
+            raise Refused("outside the original decision window before dispatch")
         now = time.monotonic()
         updated = getattr(plan["view"], "updated_mono", None)
         if updated is not None:
@@ -3432,16 +3437,22 @@ class Sniper:
     def _decide(self, side: str, row: dict, t_ms: float):
         """Every check and every field of the order; None (skip journalled) if it must not trade."""
         self._sync_live_fak()
-        pending_guard = getattr(self.live, "blocks_pending_fak", None)
-        for oid, (pending_row, _plan) in list(self._fak_pending.items()):
-            if pending_row.get("side") != side:
-                continue
-            if pending_guard is None or pending_guard(oid, client_order_id=pending_row.get("client_order_id")):
-                return self._skip("awaiting FAK fill size", row)
         hub = self.hub
         up, down, cond, end = hub.up_token, hub.down_token, hub.condition_id, hub.window_end
         if not (up and down and cond and end):
             return self._skip("no current round", row)
+        token = up if side == "UP" else down
+        pending_guard = getattr(self.live, "blocks_pending_fak", None)
+        for oid, (pending_row, pending_plan) in list(self._fak_pending.items()):
+            # UP/DOWN labels repeat every round. An old order retains its
+            # reconciliation and cash reservation, but must not pause a new
+            # market's token (matching LiveExecution.prepare's token scope).
+            if (pending_row.get("side") != side
+                    or str(pending_plan.get("cond")) != str(cond)
+                    or str(pending_plan.get("token")) != str(token)):
+                continue
+            if pending_guard is None or pending_guard(oid, client_order_id=pending_row.get("client_order_id")):
+                return self._skip("awaiting FAK fill size", row)
         left = float(end) - time.time()
         row.update(round_end=end, left_s=round(left, 1), condition_id=str(cond))
         first, last = self._window()
@@ -3449,7 +3460,6 @@ class Sniper:
             return self._skip("before trade window", row)
         if left < last:
             return self._skip("too late in round", row)
-        token = up if side == "UP" else down
         view = hub.book.view(str(token))
         status = str(getattr(view, "status", ""))
         if status != "LIVE":
@@ -3701,6 +3711,7 @@ class Sniper:
         row.update(latency_ms=round(lat, 1), **parts)
         tick = getattr(view, "tick_size", None)
         return {"end": end, "token": str(token), "amount": amount, "rd": rd, "cap": cap, "lat": lat, "view": view,
+                "dispatch_deadline": float(end) - last,
                 "risk_shares": risk_shares, "fair_fee_rate": fee_rate, "fair_fee_exponent": fee_exponent,
                 "shares": order_shares, "hybrid": hybrid, "risk_budget_usd": risk_budget,
                 "minimum_entry": minimum_entry, "minimum_entry_key": minimum_key,

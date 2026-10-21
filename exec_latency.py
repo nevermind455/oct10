@@ -198,7 +198,7 @@ def latency_budget(feeds: dict, primary: str, lat: dict, clob_rtt_ms, hold_ms: f
 
       feed     the trigger feed's delay, per feed (receipt - the trade's own time)
       bot      feed message in -> bytes on the wire (feed_to_trigger + trigger_to_send)
-      network  one way to the CLOB: half the measured round trip
+      network  outbound and return legs: each half the measured round trip
       hold     the venue's documented taker hold
       venue    the unattributed response delay: what is left of send -> ACK after
                the network legs and the hold (matching, queueing, anything else
@@ -220,9 +220,10 @@ def latency_budget(feeds: dict, primary: str, lat: dict, clob_rtt_ms, hold_ms: f
     if ack is not None and one_way is not None:
         venue = max(0.0, (ack if simulated else ack - one_way) - one_way - hold_ms)
     feeds = {k: (float(v) if isinstance(v, (int, float)) and math.isfinite(v) else None) for k, v in (feeds or {}).items()}
-    after = None if None in (bot, one_way, venue) else bot + one_way + hold_ms + venue
+    return_ms = 0.0 if simulated else one_way
+    after = None if None in (bot, one_way, venue) else bot + one_way + hold_ms + venue + return_ms
     return {"primary": primary, "feeds": feeds, "bot_ms": bot, "one_way_ms": one_way, "hold_ms": hold_ms,
-            "venue_ms": venue, "venue_simulated": simulated,
+            "return_ms": return_ms, "venue_ms": venue, "venue_simulated": simulated,
             "totals": {k: (None if v is None or after is None else v + after) for k, v in feeds.items()}}
 
 

@@ -424,7 +424,7 @@ def test_latency_budget_panel() -> None:
                                                  snap["exec"]["latency"], 34.2)
     text = _text(build(snap, 200, 52, UNICODE))
     check("the budget panel is drawn on a wide terminal", "LATENCY BUDGET" in text, text)
-    for label in ("Coinbase feed", "Bot in-process", "Network > CLOB", "Polymarket hold", "Unattributed response delay",
+    for label in ("Coinbase feed", "Bot in-process", "Network > CLOB", "Network < CLOB", "Polymarket hold", "Unattributed response delay",
                   "BTC > ACK", "via bin fut"):
         check(f"budget shows {label}", label in text, text)
     row = next((ln for ln in text.splitlines() if "Polymarket hold" in ln), "")

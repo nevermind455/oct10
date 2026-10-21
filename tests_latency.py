@@ -804,7 +804,7 @@ class StrategyEquivalence(unittest.TestCase):
 
 
 class LatencyBudget(unittest.TestCase):
-    """exec_latency.latency_budget: BTC trade -> matched, the dashboard's LATENCY BUDGET."""
+    """exec_latency.latency_budget: BTC trade -> ACK, including the return path."""
     LAT = {"feed_to_trigger": {"p50": 0.02}, "trigger_to_send": {"p50": 1.1},
            "send_to_ack": {"p50": 240.0, "simulated": False}}
 
@@ -813,7 +813,8 @@ class LatencyBudget(unittest.TestCase):
         self.assertAlmostEqual(b["one_way_ms"], 17.0)
         self.assertAlmostEqual(b["bot_ms"], 1.12)
         self.assertAlmostEqual(b["venue_ms"], 240.0 - 17.0 - 17.0 - X.VENUE_HOLD_MS)   # 56ms after the hold
-        self.assertAlmostEqual(b["totals"]["coinbase"], 46.0 + 1.12 + 17.0 + 150.0 + 56.0)
+        self.assertAlmostEqual(b["totals"]["coinbase"], 46.0 + 1.12 + 17.0 + 150.0 + 56.0 + 17.0)
+        self.assertEqual(b["return_ms"], 17.0)
         self.assertAlmostEqual(b["totals"]["binance_fut"] - b["totals"]["coinbase"], 63.0)
         self.assertFalse(b["venue_simulated"])
 
@@ -821,6 +822,7 @@ class LatencyBudget(unittest.TestCase):
         lat = dict(self.LAT, send_to_ack={"p50": 240.0, "simulated": True})
         b = X.latency_budget({"coinbase": 46.0}, "coinbase", lat, 34.0)
         self.assertTrue(b["venue_simulated"])
+        self.assertEqual(b["return_ms"], 0)
         self.assertAlmostEqual(b["venue_ms"], 240.0 - 17.0 - X.VENUE_HOLD_MS)
 
     def test_unmeasured_parts_are_none_never_guessed(self):

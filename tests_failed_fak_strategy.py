@@ -6,14 +6,90 @@ orders/fills. No signing SDK, credentials, venue calls or ledger writes.
 import testing_env  # noqa: F401 - before config or any bot imports
 
 import collections
+import os
 import threading
 import time
 import types
 import unittest
+from unittest.mock import Mock, patch
 
 import exec_latency
 import sniper_live as L
-from sniper_mode import Sniper
+from feeds.book import BookView
+from sniper_mode import Settings, Sniper
+
+
+class PendingFakMarketScope(unittest.TestCase):
+    """A pending quantity belongs to its original market and outcome token."""
+
+    def setUp(self):
+        self.end = time.time() + 120
+        book = types.SimpleNamespace(view=lambda token: BookView(
+            token=str(token), generation=1, status="LIVE", asks=((.50, 100),),
+            updated_mono=time.monotonic(), tick_size=.01))
+        self.hub = types.SimpleNamespace(up_token="new-up", down_token="new-down",
+                                         condition_id="new-condition", window_end=self.end, book=book)
+        broker = types.SimpleNamespace(min_buy_price=.05, max_buy_price=.95)
+        with patch.dict(os.environ, {"SNIPER_LATENCY_MS": "20", "SNIPER_DELAY_SOURCE": "model",
+                                     "SNIPER_FAIR": "0", "SNIPER_ORDER_TYPE": "FAK",
+                                     "SNIPER_ORDER_SIZING": "shares"}):
+            self.sn = Sniper(self.hub, broker, settings=Settings())
+        self.rows = []
+        self.sn._write = self.rows.append
+        # Exercise the real live pending guard and five-minute pause, with no
+        # signing, account, network or persistence dependencies.
+        self.ex = object.__new__(L.LiveExecution)
+        self.ex.sender = types.SimpleNamespace(kill=L.KillSwitch())
+        self.ex.fill_for = Mock(return_value=None)
+        self.ex.fak_orders = {}
+        self.ex._tripped_once, self.ex._announced = set(), set()
+        self.ex.on_event = Mock()
+        self.sn.live = self.ex
+
+    def pending(self, *, side="UP", condition="old-condition", token="old-up", end=None):
+        row = {"side": side, "client_order_id": "pending-client"}
+        plan = {"cond": condition, "token": token, "end": self.end - 300 if end is None else end}
+        self.sn._fak_pending["pending-order"] = (row, plan)
+        return row, plan
+
+    def decide(self, side="UP"):
+        return self.sn._decide(side, {"side": side, "bp": 1}, time.monotonic() * 1000)
+
+    def test_old_market_pending_does_not_pause_new_market_on_either_side(self):
+        for side, token in (("UP", "old-up"), ("DOWN", "old-down")):
+            with self.subTest(side=side):
+                pending = self.pending(side=side, token=token)
+                plan = self.decide(side)
+                self.assertIsNotNone(plan, self.rows)
+                self.assertEqual(plan["token"], "new-up" if side == "UP" else "new-down")
+                self.assertFalse(self.ex.kill.tripped)
+                self.assertEqual(self.sn._fak_pending["pending-order"], pending)
+                self.assertFalse(self.ex._tripped_once)
+
+    def test_current_market_pending_still_blocks_and_pauses_its_side(self):
+        self.pending(condition=self.hub.condition_id, token=self.hub.up_token, end=self.end)
+        self.assertIsNone(self.decide())
+        self.assertEqual(self.rows[-1]["reason"], "awaiting FAK fill size")
+        self.assertTrue(self.ex.kill.tripped)
+        self.assertIn("pending-order", self.sn._fak_pending)
+
+    def test_current_market_opposite_pending_does_not_pause_this_side(self):
+        self.pending(side="DOWN", condition=self.hub.condition_id, token=self.hub.down_token, end=self.end)
+        self.assertIsNotNone(self.decide(), self.rows)
+        self.assertFalse(self.ex.kill.tripped)
+
+    def test_rotation_does_not_clear_an_existing_pause(self):
+        self.pending()
+        self.ex.kill.trip("existing incident")
+        self.decide()
+        self.assertEqual(self.ex.kill.reasons, ["existing incident"])
+
+    def test_missing_current_round_does_not_pause_for_an_old_order(self):
+        self.pending()
+        self.hub.condition_id = None
+        self.assertIsNone(self.decide())
+        self.assertEqual(self.rows[-1]["reason"], "no current round")
+        self.assertFalse(self.ex.kill.tripped)
 
 
 class FailedFakStrategy(unittest.TestCase):

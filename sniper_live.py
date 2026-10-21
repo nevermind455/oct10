@@ -1255,10 +1255,10 @@ class CanarySession:
         a compaction has not archived yet (one that finished while a compaction
         ran is in neither its archive batch nor, were it left out here, any
         file at all once the older segments are deleted)."""
-        with limits._lock:
-            counters = self._counters(limits)
-            rounds = sorted(map(str, limits.rounds))
         with self._lock:
+            with limits._lock:
+                counters = self._counters(limits)
+                rounds = sorted(map(str, limits.rounds))
             intents = {k: dict(v) for k, v in self.intents.items()}
             seq = self._seq
         return {"version": self.VERSION, "session_id": self.session_id, "wallet": self.wallet_key,
@@ -1428,15 +1428,20 @@ class CanarySession:
         """Periodic (a worker): record counter or halt changes not tied to an
         intent - one small line, only when something changed - and compact
         once the journal has grown. True when the disk holds the current state."""
-        counters = self._counters(limits)
-        reasons = [r for r in kill.reasons if not str(r).startswith(self.TRANSIENT)]
-        controls = self._controls(limits, kill)
-        marker = self._state_marker(counters, reasons, len(limits.rounds), controls)
-        ok = True
-        if marker != self._marker:
-            with self._lock:
+        # The counter observation and its sequence belong to one transaction.
+        # Otherwise a send can land between them and a later state record can
+        # overwrite its counters with an older, smaller exposure at restart.
+        line = None
+        with self._lock:
+            counters = self._counters(limits)
+            reasons = [r for r in kill.reasons if not str(r).startswith(self.TRANSIENT)]
+            controls = self._controls(limits, kill)
+            marker = self._state_marker(counters, reasons, len(limits.rounds), controls)
+            if marker != self._marker:
                 line = self._line({"seq": self._next(), "op": "state", "kill_reasons": reasons,
                                    "c": counters, **controls})
+        ok = True
+        if line is not None:
             ok = self._durable_append(line)
             if ok:
                 self._marker = marker
@@ -1504,7 +1509,9 @@ class CanarySession:
                         self._segment_path(k).unlink()
                     except OSError:
                         pass                # replayed again at the next start: harmless, older than the snapshot
-            self._marker = self._state_marker(self._counters(limits), state["kill_reasons"], len(limits.rounds),
+            self._marker = self._state_marker({k: state[k] for k in (
+                                                  "orders", "fills", "pending_fills", "exposure_usd")},
+                                              state["kill_reasons"], len(state["rounds"]),
                                               {k: state[k] for k in ("kill_state", "limit_state")})
             self.last_error = None
             return True
@@ -2319,7 +2326,9 @@ class LiveExecution:
         revision = self._balance_revision
         # Taken BEFORE the reading: later bookings only shrink it, so it can only
         # overstate, never understate, what an unconfirmed order may still take.
-        held, hold = bool(self.awaiting), None
+        with self._risk_lock:
+            held = bool(self.awaiting) or bool(self._risk_orders)
+        hold = None
         if held:
             try:
                 hold = await asyncio.to_thread(self._awaiting_hold)
@@ -2342,13 +2351,21 @@ class LiveExecution:
                 # A send started or ended during this read (or is on the wire): the
                 # reading can predate its debit. It may lower our bound, never raise it.
                 available = min(available, self.balance)
-            elif self.balance is not None and (held or self.awaiting):
+            elif held or self.awaiting or self._risk_orders:
                 # Accepted orders not confirmed yet. Min() with our own figure here froze
                 # the cash for an hour on 2026-10-16 (one order's only trade FAILED and it
                 # stayed awaiting; every payout after it stayed invisible). The reading less
                 # what they could still take is never counted twice and lets payouts and
                 # unused budget show. Without a hold (unknown, or its lookup failed): the strict rule.
-                available = min(available, self.balance) if hold is None else max(0.0, available - hold)
+                if hold is None:
+                    # No prior cash bound is usable at startup without a
+                    # complete reservation observation. Wait for a fresh read.
+                    if self.balance is None:
+                        self.n["balance hold errors"] += 1
+                        return
+                    available = min(available, self.balance)
+                else:
+                    available = max(0.0, available - hold)
                 rule = "strict" if hold is None else "held"
             self.balance = available
             self.balance_at = time.monotonic()
@@ -2392,7 +2409,7 @@ class LiveExecution:
                      "awaiting": [str(o) for o in orders]})
 
     def _awaiting_hold(self) -> float | None:
-        """What this run's accepted, unconfirmed orders could still take from the
+        """What this run's accepted or uncertain orders could still take from the
         wallet: each one's reservation (its spend plus the fee bound) less the cost
         the ledger has booked for it - booked trades are CONFIRMED, settled, so a
         reading already shows them. None when any of them has no known reservation:
@@ -2400,7 +2417,11 @@ class LiveExecution:
         Worker thread (the ledger lock)."""
         live = set(self.awaiting)
         with self._risk_lock:
-            reservations = [dict(a) for a in self._risk_orders.values() if a.get("order_id") in live]
+            # Unknown outcomes and interrupted waiters can have no venue id
+            # and no awaiting entry. Their full reservation still binds cash.
+            reservations = [dict(a) for a in self._risk_orders.values()]
+        if any(a.get("reserve") is None for a in reservations):
+            return None
         if not live <= {a.get("order_id") for a in reservations if a.get("reserve") is not None}:
             return None
         if not reservations:
@@ -2414,6 +2435,8 @@ class LiveExecution:
             with self.ledger._lock:
                 for a in reservations:
                     pos = self.ledger.positions.get(str(a.get("token")))
+                    if not a.get("order_id"):
+                        continue
                     booked[a.get("order_id")] = sum(float(lot.cost) for lot in (pos.lots if pos is not None else ())
                                                     if lot.order_id == a.get("order_id")
                                                     and str(lot.side).upper() == "BUY")
@@ -2974,7 +2997,9 @@ class LiveExecution:
         a = self.fak_orders.get(order_id)
         if a is not None:
             return self._fak_fill(order_id, a, rows)
-        mine = [(float(f.size or 0), float(f.price or 0), str(f.status or ""), getattr(f, "paid", None))
+        mine = [(float(f.size or 0), float(f.price or 0), str(f.status or ""), getattr(f, "paid", None),
+                 float(getattr(f, "execution_seen", None) or getattr(f, "last_seen", 0.0)
+                       or getattr(f, "first_seen", 0.0) or 0.0))
                 for f in rows if str(getattr(f, "order_id", "") or "") == str(order_id)]
         mine = [m for m in mine if m[0] > 0 and m[1] > 0
                 and m[2] in ("MATCHED", "MATCHED_NOT_BROADCASTED", "MINED", "CONFIRMED")]
@@ -2984,7 +3009,8 @@ class LiveExecution:
         # the maker legs' real cost when known (the headline price is not their average)
         cost = sum(m[3] if m[3] is not None else m[0] * m[1] for m in mine)
         return {"shares": round(shares, 6), "price": round(cost / shares, 6), "cost": round(cost, 6),
-                "trades": len(mine), "statuses": sorted({m[2] for m in mine}), "source": "user channel"}
+                "trades": len(mine), "statuses": sorted({m[2] for m in mine}), "source": "user channel",
+                "seen_mono": max(m[4] for m in mine) or None}
 
     def _fak_fill(self, oid, a, rows):
         from paper_trade import MarketRules, curve_fee
@@ -3059,7 +3085,9 @@ class LiveExecution:
         # clock): the last of the order's trades arriving on the private
         # channel - or, when the reply named no trade ids, the order status
         # that fixed the final size, if that came later.
-        seen = max(float(getattr(f, "first_seen", 0.0) or 0.0) for f in rows)
+        seen = max(float(getattr(f, "execution_seen", None)
+                         or getattr(f, "last_seen", 0.0)
+                         or getattr(f, "first_seen", 0.0) or 0.0) for f in rows)
         if not expected and a.get("final_mono") is not None:
             seen = max(seen, float(a["final_mono"]))
         return {"shares": float(shares), "price": float(cost / shares), "cost": float(cost), "fee": float(fee),
@@ -3202,8 +3230,12 @@ class LiveExecution:
             if self.user_ready is not None and not self.user_ready(cond):
                 raise Refused("private fill coverage lost before dispatch")
             left = end - time.time()
+            deadline = plan.get("dispatch_deadline")
+            if deadline is not None and time.time() >= float(deadline):
+                raise Refused("outside the original decision window before dispatch")
             cutoff = max(float(self.shim.min_seconds_to_expiry),
-                         self.assumed_delay_s if order_rules.get("taker_delay") else 0.0)
+                         self.assumed_delay_s if order_rules.get("taker_delay") else 0.0,
+                         float(getattr(getattr(self, "_sniper_settings", None), "min_left_s", 0.0)))
             if left <= cutoff:
                 raise Refused("inside the matching-delay/expiry window before dispatch")
             if self.hub is not None:
