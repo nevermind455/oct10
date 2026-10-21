@@ -2327,7 +2327,9 @@ class LiveExecution:
         # Taken BEFORE the reading: later bookings only shrink it, so it can only
         # overstate, never understate, what an unconfirmed order may still take.
         with self._risk_lock:
-            held = bool(self.awaiting) or bool(self._risk_orders)
+            # A previous run's unresolved orders do not hold cash (see _awaiting_hold).
+            previous = set(getattr(self, "_previous_run_keys", None) or ())
+            held = bool(self.awaiting) or any(k not in previous for k in self._risk_orders)
         hold = None
         if held:
             try:
@@ -2351,7 +2353,7 @@ class LiveExecution:
                 # A send started or ended during this read (or is on the wire): the
                 # reading can predate its debit. It may lower our bound, never raise it.
                 available = min(available, self.balance)
-            elif held or self.awaiting or self._risk_orders:
+            elif held or self.awaiting:
                 # Accepted orders not confirmed yet. Min() with our own figure here froze
                 # the cash for an hour on 2026-10-16 (one order's only trade FAILED and it
                 # stayed awaiting; every payout after it stayed invisible). The reading less
@@ -2418,8 +2420,15 @@ class LiveExecution:
         live = set(self.awaiting)
         with self._risk_lock:
             # Unknown outcomes and interrupted waiters can have no venue id
-            # and no awaiting entry. Their full reservation still binds cash.
-            reservations = [dict(a) for a in self._risk_orders.values()]
+            # and no awaiting entry. Their full reservation still binds cash -
+            # in THIS run. A previous run's unresolved orders are at least the
+            # 5-minute start-up pause old before this run sends anything: whatever
+            # they took has settled (or FAILED) and the wallet reading shows it; holding
+            # them again counts it twice (2026-10-22: five AMBIGUOUS sends of
+            # 10-16..10-20 held $27.09 of a $40.04 wallet; Kelly sized from $12.95).
+            # They still count in the loss budget (_risk_budget_used).
+            previous = set(getattr(self, "_previous_run_keys", None) or ())
+            reservations = [dict(a) for k, a in self._risk_orders.items() if k not in previous]
         if any(a.get("reserve") is None for a in reservations):
             return None
         if not live <= {a.get("order_id") for a in reservations if a.get("reserve") is not None}:

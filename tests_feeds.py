@@ -1677,7 +1677,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # serialize counter observations with their journal sequence; checkpoint
     # markers reflect persisted state; use execution-observation timestamps and
     # recheck the original decision cutoff at dispatch.
-    "sniper_live.py": "23f5b106abc4a4c901aabee3fb76c29e6ecd64aa47861c66dee3f3cf37207875",
+    # 2026-10-22 (live: wallet $40.04, the bot used $12.95): a previous run's unresolved
+    # orders no longer hold cash - the wallet already shows whatever they took; they still
+    # count in the loss budget. This run's uncertain orders keep holding it.
+    "sniper_live.py": "84e96016bafdb5db1690ac32fb1eef9014f04b9ed8b114c10e2f11e7c73a2a43",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads
