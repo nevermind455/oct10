@@ -1680,7 +1680,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # 2026-10-22 (live: wallet $40.04, the bot used $12.95): a previous run's unresolved
     # orders no longer hold cash - the wallet already shows whatever they took; they still
     # count in the loss budget. This run's uncertain orders keep holding it.
-    "sniper_live.py": "84e96016bafdb5db1690ac32fb1eef9014f04b9ed8b114c10e2f11e7c73a2a43",
+    # 2026-10-23, the operator's choice "read + orders wait": the cash is read in the 5s before
+    # every round starts (retried each second until a read succeeds) and no order in a round
+    # until there is a good reading from 10s before its start or later (_pre_start_read_loop).
+    "sniper_live.py": "e36bf420836d74f977ade0a53b6777b5603f63a984e06f5f0cb771bf145de693",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads

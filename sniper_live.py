@@ -2264,6 +2264,7 @@ class LiveExecution:
         self._tasks = [loop.create_task(keep_warm(self.sender.http, self.sender.clock, self.clock_url,
                                                   self.keep_warm_s, self._warm_event)),
                        loop.create_task(self._balance_loop()), loop.create_task(self._settle_read_loop(hub)),
+                       loop.create_task(self._pre_start_read_loop(hub)),
                        loop.create_task(self._reconcile_loop()),
                        loop.create_task(self._rules_loop(hub)), loop.create_task(self._guard_loop())]
         if self.session is not None:
@@ -2492,6 +2493,56 @@ class LiveExecution:
                 await self._read_balance()
             except Exception:  # noqa: BLE001 - the age check in prepare refuses orders if this keeps failing
                 self.n["balance read errors"] += 1
+
+    # A round sizes from cash read just before it starts (the operator's choice,
+    # 2026-10-23): a read PRE_START_READ_S before every round begins, retried every
+    # PRE_START_RETRY_S until one succeeds, and no order in the round (prepare)
+    # until there is a good reading from PRE_START_OK_S before its start or later.
+    # The 30s loop's read counts when it falls there. The round that is ending is
+    # not in it: its payout lands a minute or two later (SETTLE_READ_AFTER_S).
+    ROUND_S = 300.0
+    PRE_START_READ_S = 5.0
+    PRE_START_OK_S = 10.0
+    PRE_START_RETRY_S = 1.0
+
+    def _cash_read_for(self, start: float) -> bool:
+        """A good collateral reading taken PRE_START_OK_S before `start` (a
+        round's first second, wall clock) or later."""
+        if self.balance_at is None:
+            return False
+        read_wall = time.time() - (time.monotonic() - self.balance_at)
+        return read_wall >= start - self.PRE_START_OK_S
+
+    async def _pre_start_read_loop(self, hub) -> None:
+        """The read before every round starts, each with a balance_read row
+        (round_start; before_start_s is negative when it came after the start)."""
+        while True:
+            try:
+                end = float(getattr(hub, "window_end", None) or 0.0)
+            except (TypeError, ValueError):
+                end = 0.0
+            now = time.time()
+            if end > 0.0:
+                # the next round once it is that close, else the one under way
+                start = end if end - now <= self.PRE_START_READ_S else end - self.ROUND_S
+                if not self._cash_read_for(start):
+                    before = self.balance
+                    try:
+                        await self._read_balance()
+                    except Exception:  # noqa: BLE001 - retried; the round's orders wait for it
+                        self.n["balance read errors"] += 1
+                    if not self._cash_read_for(start):
+                        self.n["pre-start balance read retries"] += 1
+                        await asyncio.sleep(self.PRE_START_RETRY_S)
+                        continue
+                    self.n["pre-start balance reads"] += 1
+                    journal = getattr(self, "_journal", None)
+                    if journal is not None and self.balance is not None:
+                        journal({"wall": time.time(), "result": "balance_read", "round_start": start,
+                                 "before_start_s": round(start - now, 3),
+                                 "before": None if before is None else round(before, 6),
+                                 "kelly_cash": round(self.balance - self.reserved, 6), **self.last_balance_read})
+            await asyncio.sleep(0.25)
 
     async def _rules_loop(self, hub) -> None:
         """Load the round's order rules (tick, minimum, neg-risk, fees and the
@@ -3147,6 +3198,9 @@ class LiveExecution:
         side, amount, up, down = plan["send"][:4]
         if self.balance_at is None or time.monotonic() - self.balance_at > self.balance_max_age_s:
             raise Refused("collateral balance is stale")
+        # The cash read just before this round started, or since (_pre_start_read_loop).
+        if not self._cash_read_for(min(end - self.ROUND_S, time.time())):
+            raise Refused("cash not read for this round yet")
         if self.user_ready is not None and not self.user_ready(cond):
             raise Refused("the private fill channel is not subscribed to this market yet")
         rules = self.shim.cached_rules(cond)
