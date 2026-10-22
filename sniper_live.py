@@ -3323,6 +3323,8 @@ class LiveExecution:
         self._balance_revision += 1
         return p
 
+    RESERVED_EPSILON = 1e-6     # dollars: no order reserves this little; below it is float residue
+
     def start_send(self, p: Prepared):
         """The order's bytes onto the warm connection now (see LeanSender.start)."""
         return self.sender.start(p)
@@ -3343,7 +3345,11 @@ class LiveExecution:
                             "order waiter interrupted: reconcile before trading")
             raise
         finally:
-            self.reserved = max(0.0, self.reserved - reserve)
+            # Overlapping orders' float sums can leave ~1e-16 here. Above 0, every
+            # read took the in_flight rule and the cash could only fall (2026-10-22:
+            # Kelly sized from $0.17 of a $40.60 wallet for about 21 hours).
+            left = self.reserved - reserve
+            self.reserved = left if left > self.RESERVED_EPSILON else 0.0
             self._balance_revision += 1
         kind = row["kind"]
         if kind in (NO_MATCH, REJECTED, NOT_SENT):

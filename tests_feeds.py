@@ -1683,7 +1683,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # 2026-10-23, the operator's choice "read + orders wait": the cash is read in the 5s before
     # every round starts (retried each second until a read succeeds) and no order in a round
     # until there is a good reading from 10s before its start or later (_pre_start_read_loop).
-    "sniper_live.py": "e36bf420836d74f977ade0a53b6777b5603f63a984e06f5f0cb771bf145de693",
+    # 2026-10-23: `reserved` goes back to exactly 0 when no order is on the wire - float residue
+    # from overlapping orders (4.4e-16) kept every read on the in_flight rule and Kelly sized from
+    # $0.17 of a $40.60 wallet for about 21 hours on 10-22.
+    "sniper_live.py": "8ab8487fa061f806816a32efb332448e91335c07717e23a0f0dba413509cfb07",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads
