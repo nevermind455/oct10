@@ -102,7 +102,7 @@ class FAKTests(unittest.IsolatedAsyncioTestCase):
         self.ex.reconcile_once()
         self.assertIn("0xorder1", self.ex.awaiting)
         self.assertEqual(self.ex.sender.limits.exposure_usd, 5)
-        with self.assertRaisesRegex(L.Halted, "complete fill quantities"):
+        with self.assertRaisesRegex(L.Refused, "awaiting its fill size"):    # its token only (H2, 2026-10-23)
             self.ex.prepare(self.plan())
         self.trade(tid="trade-2", qty=1, px=0.52)
         self.ledger.ingest_fill_store(self.store)
@@ -153,15 +153,14 @@ class FAKTests(unittest.IsolatedAsyncioTestCase):
         _, row = await self.send(response=T.AMOUNTS_REPLY)
         self.assertIsNone(row["fill"])
         self.assertEqual(self.ex.sender.limits.exposure_usd, 5)
-        with self.assertRaisesRegex(L.Halted, "complete fill quantities"):
+        # 2026-10-23 (H2): the unknown size holds its own token, it no longer pauses all orders
+        with self.assertRaisesRegex(L.Refused, "awaiting its fill size"):
             self.ex.prepare(self.plan())
+        self.assertFalse(self.ex.kill.tripped)
         self.assertEqual(len(self.fake.orders), 1)
         self.trade(qty=3, px=0.51)
         self.assertEqual(self.ex.fill_for("0xorder1")["shares"], 3)
-        self.assertTrue(self.ex.kill.tripped)
-        self.mono.t += 300
-        self.ex.kill.check()
-        self.assertFalse(self.ex.kill.tripped)
+        self.ex.prepare(self.plan())                                      # its size is known: it trades again
 
     async def test_provisional_fill_does_not_release_spend_before_confirmation(self):
         self.trade(status="MATCHED")

@@ -1583,6 +1583,10 @@ class Sniper:
         self._tasks: set = set()
         self._order_tasks: set = set()
         self._closing = False
+        # M2 (2026-10-23): a stop of all decisions is never silent - its reason is
+        # journalled, announced and in the summary; order-path faults likewise.
+        self.stopped: dict | None = None
+        self._execution_faults: dict = {"count": 0, "last": None}
         self.code = code_version()
         self._live_delays: list = []
         if live is None and self.s.delay_source == "live":
@@ -2139,11 +2143,52 @@ class Sniper:
                 # can be reused by later tasks, so they are not incident IDs.
                 kill.trip("order task failed: reconcile before trading")
             else:
-                self._closing = True
+                self._stop("an order task failed: its outcome is unknown, reconcile before trading")
         detail = f"{task.get_name()}: {type(exc).__name__}: {exc}"[:240]
         self._write({"wall": time.time(), "result": "task_error", "reason": detail})
         try:
             self.on_event("sniper", detail, "bad")
+        except Exception:
+            self.n["event errors"] += 1
+
+    def _stop(self, reason: str) -> None:
+        """Stop all new decisions where no kill switch can pause them instead (paper,
+        or a failed dispatch that could not be held) - visibly: journalled, announced
+        and in the summary (the dashboard's SNIPER row), never silent. A restart
+        after reconciling clears it."""
+        self._closing = True
+        if self.stopped is not None:
+            return
+        self.stopped = {"wall": time.time(), "reason": str(reason)[:200]}
+        self._write({"wall": time.time(), "result": "sniper_stopped", "reason": str(reason)[:200]})
+        try:
+            self.on_event("sniper", f"SNIPER STOPPED: {reason} - no new orders until a restart", "bad")
+        except Exception:
+            self.n["event errors"] += 1
+
+    def _execution_fault(self, stage: str, exc: BaseException) -> None:
+        """An unexpected failure on the live order path: a visible pause, never a
+        silent stop (M2; it used to stop every decision while the dashboard looked
+        healthy). New orders pause 5 minutes on the kill switch - the dashboard shows
+        it with this reason - and the fault is journalled and announced; decisions
+        resume after the pause. Preparation sends nothing; a failed dispatch's order
+        is held as an unknown outcome first (LiveExecution.dispatch_unknown)."""
+        what = {"prepare": "order preparation failed", "dispatch": "order dispatch failed"}.get(
+            stage, f"order {stage} failed")
+        detail = f"{type(exc).__name__}: {exc}"[:160]
+        reason = f"{what} ({detail}): reconcile before trading"
+        self.n[f"execution faults ({stage})"] += 1
+        self._execution_faults["count"] += 1
+        self._execution_faults["last"] = {"wall": time.time(), "stage": stage, "error": detail}
+        kill = getattr(self.live, "kill", None)
+        if kill is not None:
+            kill.trip(reason)
+        else:
+            self._stop(reason)
+        self._write({"wall": time.time(), "result": "execution_fault", "stage": stage, "error": detail,
+                     "reason": reason})
+        try:
+            self.on_event("sniper", f"LIVE EXECUTION FAULT ({stage}): {detail} - new orders paused 5 min", "bad")
         except Exception:
             self.n["event errors"] += 1
 
@@ -3075,7 +3120,7 @@ class Sniper:
                     # Submission infrastructure failed after recording the
                     # attempt. Do not return its cash/claim and try again from
                     # an uncertain executor state.
-                    self._closing = True
+                    self._stop("order submission failed: its outcome is unknown, reconcile before trading")
                     raise
             if self.s.shadow_ms:
                 # After the send: the shadow sleeps until absolute times anyway.
@@ -3113,14 +3158,14 @@ class Sniper:
             self._skip("live halted" if isinstance(exc, Halted) else "live refused", row)
             self._release(side)
             return None
-        except Exception:
+        except Exception as exc:
             # Preparation never dispatches an order. An unexpected builder or
             # accounting failure must not consume an unused minimum entry or
-            # count as a submitted order. Stop decisions: partially changed
-            # execution state needs inspection rather than an automatic retry.
+            # count as a submitted order. A visible 5-minute pause, then decisions
+            # resume - nothing was sent (it used to stop them all, silently).
             self.n["orders"] -= 1
             self._release_minimum_entry(plan)
-            self._closing = True
+            self._execution_fault("prepare", exc)
             raise
         previous_guard = getattr(p, "send_guard", None)
         def send_guard():
@@ -3133,13 +3178,20 @@ class Sniper:
         # HTTP/2 connection - the task below then connects and sends).
         try:
             started = self.live.start_send(p)
-        except Exception:
+        except Exception as exc:
             # A transport can fail after writing. Keep the intent, cash and
-            # minimum-entry claim; never turn an unknown send into a free retry.
-            self._closing = True
-            kill = getattr(self.live, "kill", None)
-            if kill is not None:
-                kill.trip("order dispatch failed: reconcile before trading")
+            # minimum-entry claim; never turn an unknown send into a free retry:
+            # the order is held as an unknown outcome - reserved, its token blocked,
+            # settled by the venue's records - and new orders pause, visibly.
+            hold = getattr(self.live, "dispatch_unknown", None)
+            try:
+                if not callable(hold):
+                    raise RuntimeError("the live execution cannot hold an unknown dispatch")
+                hold(p, exc)
+            except Exception as held_exc:  # noqa: BLE001 - not held: stop, visibly
+                self._stop(f"order dispatch failed ({type(exc).__name__}) and could not be held as unknown "
+                           f"({type(held_exc).__name__}): reconcile before trading")
+            self._execution_fault("dispatch", exc)
             raise
         plan["order_type"] = p.order_type
         plan["client_order_id"] = p.client_order_id
@@ -3784,7 +3836,7 @@ class Sniper:
                 # may have failed, or the waiter lost an order still running.
                 # Keep its cash held and block new orders. Later telemetry/UI
                 # failures below must not be confused with that fatal state.
-                self._closing = True
+                self._stop("a paper order worker failed: its outcome is unknown")
                 raise
             self._bankroll_completed(plan)
             if sign_ms is not None:
@@ -4677,7 +4729,10 @@ class Sniper:
                 "loop_lag": list(self.loop_lag),
                 "book_feed_age": book.feed_age_samples() if hasattr(book, "feed_age_samples") else (
                     book.feed_age_summary() if hasattr(book, "feed_age_summary") else None),
-                "live": self.live.status() if self.live is not None else None}
+                "live": self.live.status() if self.live is not None else None,
+                "stopped": dict(self.stopped) if self.stopped else None,
+                "execution_faults": {"count": self._execution_faults["count"],
+                                     "last": dict(self._execution_faults["last"] or {}) or None}}
 
     def summary_from(self, snap: dict) -> dict:
         """summary() from a summary_snapshot() - any thread; the sorting is here."""
@@ -4731,6 +4786,7 @@ class Sniper:
                 "book_feed_age_ms": (book_age if not isinstance(book_age, list) else
                                      ({k: v for k, v in quantiles(book_age).items() if k != "p95"}
                                       if book_age else None)),
+                "stopped": snap.get("stopped"), "execution_faults": snap.get("execution_faults"),
                 **({"pending": n["pending"], "live": snap["live"]} if self.live is not None else {})}
 
     def _lag_summary(self, xs=None):

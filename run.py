@@ -2112,6 +2112,15 @@ class DashView:
     def _health_rows(self, summary: dict, health: dict) -> list[tuple[str, str, str]]:
         rt = self.rt
         rows = []
+        # A sniper that stopped deciding, or faults on the order path, are never silent (M2)
+        stopped = summary.get("stopped")
+        if stopped:
+            rows.append(("SNIPER", "FAIL", "STOPPED: " + safe_log_text(stopped.get("reason"), limit=70)))
+        faults = summary.get("execution_faults") or {}
+        if faults.get("count"):
+            last = faults.get("last") or {}
+            rows.append(("EXEC FAULT", "WARN", f"{faults['count']} - last {last.get('stage')}: "
+                                               + safe_log_text(last.get("error"), limit=50)))
         b = summary.get("binance") or {}
         primary = rt.sniper.s.primary_feed if rt.sniper is not None else None
         if primary == "coinbase":

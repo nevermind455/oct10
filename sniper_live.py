@@ -246,16 +246,20 @@ class KillSwitch:
 
 
 class VenueGuard:
-    """Slow replies pause new signals for five minutes and never hard-stop.
+    """Slow replies pause new signals for five minutes and never hard-stop:
+    strikes_to_long_pause of them within a rolling strike_window_s (3 in 30
+    minutes, the operator's choice 2026-10-23), or one over extreme_ms. Fewer
+    keep trading, DEGRADED, until they age out (one slow reply paused 101 times,
+    8.4 hours, 10-15..10-21).
 
     Health probes remain diagnostic. A continuing bad probe cannot extend a
-    pause; a fresh slow order reply after recovery can start another pause.
+    pause; fresh slow order replies after recovery can start another pause.
     """
     HEALTHY, DEGRADED, PAUSED, RECOVERED, HARD_HALTED = "HEALTHY", "DEGRADED", "PAUSED", "RECOVERED", "HARD_HALTED"
     _LEVEL = {"HEALTHY": "good", "RECOVERED": "good", "DEGRADED": "warn", "PAUSED": "warn", "HARD_HALTED": "bad"}
 
     def __init__(self, kill: KillSwitch, *, slow_ms: float = 1500.0, extreme_ms: float = 5000.0,
-                 strikes_to_long_pause: int = 3, strike_window_s: float = 300.0, healthy_checks: int = 3,
+                 strikes_to_long_pause: int = 3, strike_window_s: float = 1800.0, healthy_checks: int = 3,
                  max_pause_s: float = 300.0, long_pause_s: float = 300.0, journal=None, on_event=None,
                  mono=time.monotonic) -> None:
         self.kill = kill
@@ -289,18 +293,27 @@ class VenueGuard:
             pass
 
     def on_reply(self, rtt_ms: float) -> str:
-        """One definite order reply's send -> response time; returns the state."""
+        """One definite order reply's send -> response time; returns the state.
+        Unknown outcomes are not replies (LeanSender._after never passes them)."""
         self._resume_if_due()
         if rtt_ms > self.slow_ms:
             now = self.mono()
             self.strikes.append(now)
-            while self.strikes and now - self.strikes[0] > self.strike_window_s:
-                self.strikes.popleft()
-            detail = f"reply {rtt_ms:.0f}ms > {self.slow_ms:.0f}ms (strike {len(self.strikes)})"
+            self._prune_strikes(now)
+            extreme = rtt_ms > self.extreme_ms
+            detail = (f"reply {rtt_ms:.0f}ms > {self.extreme_ms if extreme else self.slow_ms:.0f}ms (strike "
+                      f"{len(self.strikes)} of {self.strikes_to_long_pause} in {self.strike_window_s / 60:g} min)")
             if self.state != self.PAUSED:
-                self._to(self.DEGRADED, detail)
-                self.pause_for(self.long_pause_s, detail)
+                if self.state != self.DEGRADED:
+                    self._to(self.DEGRADED, detail)
+                if extreme or len(self.strikes) >= self.strikes_to_long_pause:
+                    self.pause_for(self.long_pause_s, detail)
+                    self.strikes.clear()                # the pause spends its strikes
         return self.state
+
+    def _prune_strikes(self, now: float) -> None:
+        while self.strikes and now - self.strikes[0] > self.strike_window_s:
+            self.strikes.popleft()
 
     def _resume_if_due(self) -> None:
         if self.state == self.PAUSED and self.mono() >= self.retry_not_before:
@@ -308,6 +321,10 @@ class VenueGuard:
             self.paused_at, self.healthy_streak, self.reason = None, 0, ""
             self.retry_not_before = 0.0
             self._to(self.HEALTHY, "new orders resume")
+        if self.state == self.DEGRADED:
+            self._prune_strikes(self.mono())
+            if not self.strikes:
+                self._to(self.HEALTHY, f"no slow reply in the last {self.strike_window_s / 60:g} min")
 
     def check(self) -> None:
         """The order path: refused (journalled by the caller) while PAUSED."""
@@ -2087,6 +2104,29 @@ def limits_from_env(env=None) -> CanaryLimits:
                         max_daily_loss_usd=num("SNIPER_CANARY_MAX_LOSS_USD", 20))
 
 
+def execution_settings_from_env(env=None) -> dict:
+    """SNIPER_SEND_TIMEOUT_S: how long a sent order's reply is awaited before its
+    outcome is unknown (default 10s; 3s turned five slow replies of 10-16..10-20 into
+    unknown orders). SNIPER_GUARD_STRIKES / SNIPER_GUARD_WINDOW_S: the slow replies
+    within that rolling window that pause new orders (default 3 in 30 minutes, the
+    operator's choice 2026-10-23). A value out of range is refused by name."""
+    env = os.environ if env is None else env
+
+    def num(name, default, lo, hi, cast=float):
+        raw = str(env.get(name, "") or "").strip()
+        try:
+            value = cast(raw) if raw else default
+            ok = math.isfinite(float(value)) and lo <= value <= hi
+        except (TypeError, ValueError, OverflowError):
+            ok = False
+        if not ok:
+            raise ValueError(f"{name}={raw!r}: expected {lo:g} to {hi:g}")
+        return value
+    return {"send_timeout_s": float(num("SNIPER_SEND_TIMEOUT_S", 10.0, 1.0, 30.0)),
+            "guard_strikes": int(num("SNIPER_GUARD_STRIKES", 3, 1, 20, int)),
+            "guard_window_s": float(num("SNIPER_GUARD_WINDOW_S", 1800.0, 60.0, 86400.0))}
+
+
 class LiveBrokerShim:
     """The broker surface the Sniper reads, for a live canary (there is no
     paper broker in live): the round's trade window, the account's price band
@@ -2159,13 +2199,16 @@ class LiveExecution:
                  assumed_delay_s: float = 0.0, keep_warm_s: float = 10.0, balance_every_s: float = 30.0,
                  balance_max_age_s: float = 120.0, reconcile_every_s: float = 5.0,
                  confirm_within_s: float = 180.0, unexplained_grace_s: float = 20.0,
-                 rules_refresh_s: float = 240.0) -> None:
+                 rules_refresh_s: float = 240.0, account_trades=None) -> None:
         import polymarket_trade as pt
         self.pt = pt
         self.sender, self.shim, self.ledger = sender, shim, ledger
         # A venue tick/minimum rejection invalidates BOTH views of the rules.
         sender.rules.on_invalidate = shim.invalidate
         self.receipt_sink, self.balance_fetch, self.order_status = receipt_sink, balance_fetch, order_status
+        # account_trades(market, after) -> this account's trades in one market since
+        # `after` (every page): what settles an unknown-outcome FAK (H1)
+        self.account_trades = account_trades
         # user_ready(condition) -> bool: the private fill channel covers that
         # market. An order whose fills cannot arrive would only trip the
         # confirmation deadline later.
@@ -2222,6 +2265,15 @@ class LiveExecution:
 
     FAILED_RELEASE_S = 120.0        # every trade FAILED, unchanged this long: a zero fill
     UNRESOLVED_WARN_S = 300.0       # an order past its deadline: warned this often
+    # H1 (2026-10-23): an unknown-outcome FAK - a send timeout, which get_order cannot
+    # settle (the CLOB answers null for FAKs) - is settled from the account's own trade
+    # record of its market once no order can match there any more.
+    HISTORY_AFTER_END_S = 180.0     # its market closed this long ago: its trade record is complete
+    HISTORY_RETRY_S = 60.0          # a failed lookup is retried this often...
+    HISTORY_ATTEMPTS = 60           # ...about an hour, then it is the operator's
+    # H2: an accepted FAK's fill size arrives within seconds (10-15..10-21: p50 1.0s,
+    # max 9s). Meanwhile only its token waits; still unknown this long, all orders pause.
+    PENDING_FAK_HALT_S = 60.0
 
     @property
     def kill(self) -> KillSwitch:
@@ -3157,7 +3209,12 @@ class LiveExecution:
                 "seen_mono": seen or None}
 
     def blocks_pending_fak(self, oid, *, client_order_id=None) -> bool:
-        """Pause once for an unknown quantity, keeping its evidence and risk.
+        """True while this order's complete fill quantity is unknown: new orders on
+        its token wait (the callers skip or refuse them) - its reservation keeps the
+        cash and the loss budget meanwhile. All orders pause (once) only for an
+        accepted order still unknown after PENDING_FAK_HALT_S, or one whose outcome
+        itself is unknown (2026-10-23: a size a second away paused everything for 5
+        minutes, 20 times in 6 days).
 
         The decision layer supplies the original client id for an ambiguous
         order whose venue authorization is still being looked up.
@@ -3167,10 +3224,17 @@ class LiveExecution:
             if a.get("quantity_resolved") or self.fill_for(oid) is not None:
                 return False
             client_order_id = a.get("client_order_id") or client_order_id
+            try:
+                age = time.time() - float(a.get("wall"))
+            except (TypeError, ValueError):
+                age = math.inf
+            if age < self.PENDING_FAK_HALT_S:
+                self.n["pending FAK size waits (token only)"] += 1
+                return True
         identity = str(client_order_id or oid)
         self._trip_once(("order-uncertain", identity),
                         f"FAK order {short_id(oid)} is still awaiting complete fill quantities")
-        return self.kill.tripped
+        return True
 
     # ------------------------------------------------------------ one order (event loop)
     def prepare(self, plan: dict, decided_pc: int | None = None) -> Prepared:
@@ -3188,12 +3252,13 @@ class LiveExecution:
             raise Refused("invalid minimum-entry marker")
         token, cond, end = plan["token"], plan["cond"], float(plan["end"])
         for oid, a in list(self.fak_orders.items()):
-            # Its incomplete quantity pauses once, while its reservation and
-            # reconciliation remain even after that pause ends.
+            # Its incomplete quantity holds this token (its reservation and
+            # reconciliation remain); only one unknown too long pauses everything.
             if a.get("token") != token:
                 continue
             if self.blocks_pending_fak(oid, client_order_id=a.get("client_order_id")):
                 self.kill.check()
+                raise Refused(f"FAK order {short_id(oid)} on this token is awaiting its fill size")
         self.sender.guard.check()                       # Refused (journalled) while the venue guard has orders paused
         side, amount, up, down = plan["send"][:4]
         if self.balance_at is None or time.monotonic() - self.balance_at > self.balance_max_age_s:
@@ -3404,6 +3469,35 @@ class LiveExecution:
         self._sync_fak()
 
     # ------------------------------------------------------------ unknown outcomes (audit M7)
+    def dispatch_unknown(self, p: Prepared, exc: BaseException) -> None:
+        """The order path failed while writing p (Sniper._fire_live): it may be on
+        the wire. Held exactly as an unknown outcome, never resent: its reservation
+        leaves `reserved` (left there, every read took the in_flight rule - C1's
+        ratchet) for the uncertain hold it keeps in _risk_orders, its token is
+        blocked for its round, new orders pause once, and the venue's records
+        settle it (_resolve_ambiguity, H1)."""
+        reserve = float(getattr(p, "reserve", p.amount))
+        left = self.reserved - reserve
+        self.reserved = left if left > self.RESERVED_EPSILON else 0.0
+        self._balance_revision += 1
+        if self.balance is not None:
+            self.balance -= reserve                     # spent, or may be; the next read corrects it
+        error = f"dispatch failed: {type(exc).__name__}: {exc}"[:200]
+        self.pt._mark_ambiguous(p.condition, p.end, p.token)
+        pauses = getattr(self.sender, "_ambiguous_pauses", None)
+        if pauses is None:
+            pauses = self.sender._ambiguous_pauses = {}
+        pauses[(str(p.condition), str(p.token))] = p.client_order_id
+        self.n["dispatch failures held as unknown"] += 1
+        self._trip_once(("order-uncertain", str(p.client_order_id)),
+                        f"order {p.client_order_id} {error}: outcome unknown, reconciling with the venue")
+        if getattr(p, "order_hash", None) and p.order_type == "FAK":
+            unresolved = getattr(self.sender, "unresolved", None)
+            if unresolved is None:
+                unresolved = self.sender.unresolved = {}
+            unresolved[p.client_order_id] = p
+            self._schedule_ambiguity(p, {"kind": AMBIGUOUS, "error": error, "wall": time.time()})
+
     def _schedule_ambiguity(self, p, row) -> None:
         if self.order_status is None:
             self._trip_once(("order-uncertain", str(p.client_order_id)),
@@ -3438,29 +3532,119 @@ class LiveExecution:
             return NO_MATCH, 0.0, []
         return MATCHED, float(size), list(tids)
 
+    def _trade_history_verdict(self, *, order_hash, token, condition, end, sent_wall):
+        """Worker thread. The account's own trade record of the order's market (every
+        page, from before the send) settles an unknown-outcome FAK once that market
+        closed HISTORY_AFTER_END_S ago - a FAK matches on arrival or never, and no
+        order matches in a closed market:
+          (NO_MATCH, [])   no trade of the order in it, or only FAILED ones;
+          (MATCHED, rows)  its trades: it executed.
+        None while it cannot tell yet. A failed or malformed lookup raises (never
+        evidence), and so does a trade of the order on another market, token or side,
+        or as a maker (a FAK never rests): RuntimeError, for the operator. Missing
+        local fills or ledger lots are never evidence either way."""
+        lookup = getattr(self, "account_trades", None)
+        if lookup is None or not order_hash or not condition or not token:
+            return None
+        try:
+            end, sent = float(end), float(sent_wall)
+        except (TypeError, ValueError):
+            return None
+        if not (math.isfinite(end) and math.isfinite(sent)) or time.time() < end + self.HISTORY_AFTER_END_S:
+            return None
+        rows = lookup(str(condition), sent - 120.0)
+        if not isinstance(rows, list):
+            raise TypeError("the account trade record is not a list")
+        h, mine = str(order_hash), []
+        for row in rows:
+            if not isinstance(row, dict):
+                raise TypeError("malformed account trade record")
+            makers = row.get("maker_orders") or []
+            if any(isinstance(m, dict) and str(m.get("order_id") or "") == h for m in makers):
+                raise RuntimeError(f"order {short_id(h)} is a maker in trade ...{str(row.get('id'))[-10:]}: "
+                                   f"a FAK never rests")
+            if str(row.get("taker_order_id") or "") != h:
+                continue
+            if (str(row.get("market") or "") != str(condition) or str(row.get("asset_id") or "") != str(token)
+                    or str(row.get("side") or "").upper() != "BUY" or not row.get("id")):
+                raise RuntimeError(f"trade ...{str(row.get('id'))[-10:]} of order {short_id(h)} does not match it")
+            mine.append(row)
+        if all(str(r.get("status") or "").upper() == "FAILED" for r in mine):
+            return NO_MATCH, []
+        return MATCHED, mine
+
+    def _store_rest_trades(self, rows) -> None:
+        """The venue's own record of an order's trades into the fill store (once per
+        trade id), so the ledger books the CONFIRMED ones under its authorization."""
+        store = self.fills
+        if store is None:
+            return
+        for r in rows:
+            store.record_trade(r.get("id"), order_id=r.get("taker_order_id"), asset_id=r.get("asset_id"),
+                               market=r.get("market"), side=r.get("side"), price=r.get("price"),
+                               size=r.get("size"), status=r.get("status"), source="rest",
+                               fee_rate_bps=r.get("fee_rate_bps"), maker_orders=r.get("maker_orders"))
+
+    async def _history_evidence(self, p, sent_wall: float):
+        """(evidence, why) for an unknown outcome the venue's order record could not
+        settle: its market's trade record once that market has closed
+        (_trade_history_verdict), looked up again while lookups fail."""
+        if getattr(self, "account_trades", None) is None:
+            return None, "no account trade record to check"
+        wait = float(p.end) + self.HISTORY_AFTER_END_S - time.time()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        why = "the account trade record could not be read"
+        for _attempt in range(int(self.HISTORY_ATTEMPTS)):
+            try:
+                verdict = await asyncio.to_thread(self._trade_history_verdict, order_hash=p.order_hash, token=p.token,
+                                                  condition=p.condition, end=p.end, sent_wall=sent_wall)
+            except RuntimeError as exc:
+                return None, str(exc)
+            except Exception:  # noqa: BLE001 - a lookup that failed is not evidence: retried
+                self.n["trade history errors"] += 1
+                verdict = None
+            if verdict is not None:
+                kind, rows = verdict
+                if kind == NO_MATCH:
+                    return (NO_MATCH, 0.0, []), None
+                self._store_rest_trades(rows)
+                size = sum(float(r.get("size") or 0) for r in rows if str(r.get("status") or "").upper() != "FAILED")
+                return (MATCHED, size, [str(r["id"]) for r in rows]), None
+            await asyncio.sleep(self.HISTORY_RETRY_S)
+        return None, why
+
     async def _resolve_ambiguity(self, p, row) -> None:
         """An order whose outcome is unknown: the venue's record of its hash
         decides - matched (authorized, its fills then count as any other's)
-        or proven zero execution (its reservation released). Nothing is ever
-        sent again. No record in time: the kill switch, as before."""
+        or proven zero execution (its reservation released); when the CLOB has
+        no record of it (a FAK: null), its market's trade record once that market
+        has closed (H1). Nothing is ever sent again. Nothing settles it in about
+        an hour: the operator (a visible pause), its reservation kept."""
         evidence = None
         why = "the venue has no terminal record of it"
+        conflict = False
         for delay in self.ambiguity_delays_s:
             await asyncio.sleep(delay)
             try:
                 order = await asyncio.to_thread(self.order_status, p.order_hash)
                 evidence = self._ambiguity_evidence(order, p)
             except RuntimeError as exc:
-                why = str(exc)
+                why, conflict = str(exc), True
                 break
             except Exception:  # noqa: BLE001 - a lookup that failed is not evidence
                 self.n["order status errors"] += 1
                 continue
             if evidence is not None:
                 break
+        if evidence is None and not conflict:
+            sent = float(row.get("wall") or time.time()) - float(getattr(self.sender, "timeout_s", 0.0) or 0.0)
+            evidence, history_why = await self._history_evidence(p, sent)
+            why = history_why or why
         limits = self.sender.limits
         if evidence is None:
-            self._trip_once(("order-uncertain", str(p.client_order_id)),
+            # its own key: the unknown outcome's first pause already used ("order-uncertain", id)
+            self._trip_once(("order-unresolved", str(p.client_order_id)),
                             f"order {p.client_order_id} outcome unknown ({row.get('error')}); {why}: reconcile by hand")
             return
         kind, size, tids = evidence
@@ -3638,6 +3822,29 @@ class LiveExecution:
                     self.n["order status errors"] += 1
                     notes[key] = f"venue lookup failed ({type(exc).__name__})"
                     continue
+                if verdict is None and not order:
+                    # No order record (a FAK): its market's trade record, once closed (H1).
+                    try:
+                        history = await asyncio.to_thread(
+                            self._trade_history_verdict, order_hash=intent["order_hash"], token=intent.get("token"),
+                            condition=intent.get("condition"), end=intent.get("end"), sent_wall=intent.get("wall"))
+                    except RuntimeError as exc:
+                        notes[key] = str(exc)
+                        continue
+                    except Exception as exc:  # noqa: BLE001 - a lookup that failed is not evidence
+                        self.n["trade history errors"] += 1
+                        notes[key] = f"account trade record lookup failed ({type(exc).__name__})"
+                        continue
+                    if history is not None and history[0] == MATCHED:
+                        notes[key] = ("the venue's trade record shows it executed, but it was never authorized: "
+                                      "reconcile by hand (reconcile_order.py)")
+                        continue
+                    if history is not None:
+                        if self._order_booked(str(intent["order_hash"]), intent.get("token")):
+                            notes[key] = ("the ledger holds lots of an order the venue's trade record has no "
+                                          "trade of: reconcile by hand")
+                            continue
+                        verdict = NO_MATCH, 0.0
                 if verdict is None:
                     notes[key] = "no terminal venue record, or its trades are not in the ledger yet"
                     continue
@@ -3787,18 +3994,25 @@ def build_live_execution(*, ledger, on_event=None, user_ready=None, fills=None, 
     rules = RoundRules(lambda cond, up, down: pt._validate_market_mapping(client.get_clob_market_info(cond),
                                                                           cond, up, down))
     stop_file = env.get("SNIPER_CANARY_STOP_FILE") or str(Path(__file__).resolve().parent / "STOP_LIVE")
+    settings = execution_settings_from_env(env)
+    kill = KillSwitch(stop_file)
+    guard = VenueGuard(kill, strikes_to_long_pause=settings["guard_strikes"],
+                       strike_window_s=settings["guard_window_s"])
     sender = LeanSender(builder=builder, signer=signer, creds=client.creds, host=host, http=make_http(origin=host),
-                        clock=ServerClock(), rules=rules, limits=limits_from_env(env), kill=KillSwitch(stop_file),
-                        warm_only=warm_only)
+                        clock=ServerClock(), rules=rules, limits=limits_from_env(env), kill=kill,
+                        warm_only=warm_only, timeout_s=settings["send_timeout_s"], guard=guard)
     shim = LiveBrokerShim(lambda cid: paper_trade.fetch_market_rules(cid, host=host),
                           min_buy_price=float(config.MIN_BUY_PRICE), max_buy_price=float(config.MAX_BUY_PRICE),
                           max_spread=float(config.MAX_ALLOWED_SPREAD),
                           trade_window_seconds=float(config.EXECUTION_WINDOW_SECONDS),
                           min_seconds_to_expiry=float(config.MIN_SECONDS_TO_EXPIRY))
+    from clob_sdk import TradeParams
     ex = LiveExecution(sender=sender, shim=shim, ledger=ledger, receipt_sink=pt._journal_receipt,
                        balance_fetch=pt.get_balance_allowance, clock_url=f"{host}/time",
                        order_status=lambda oid: client.get_order(oid), user_ready=user_ready, fills=fills,
-                       on_event=on_event, assumed_delay_s=float(config.ASSUMED_MATCH_DELAY_SECONDS))
+                       on_event=on_event, assumed_delay_s=float(config.ASSUMED_MATCH_DELAY_SECONDS),
+                       account_trades=lambda market, after: client.get_trades(
+                           TradeParams(market=market, after=int(after))))
     # The session budget survives restarts (audit F3): restored, reconciled
     # with the ledger's authorizations, or refused - before anything trades.
     holder = client.builder.funder or signer.address()
@@ -3808,4 +4022,7 @@ def build_live_execution(*, ledger, on_event=None, user_ready=None, fills=None, 
     sender.session = ex.session
     ex.session_start = ex.session.started_wall
     (on_event or (lambda *a: None))("sniper", f"LIVE CANARY {line}", "warn")
+    (on_event or (lambda *a: None))(
+        "sniper", f"LIVE send timeout {settings['send_timeout_s']:g}s; slow replies pause after "
+                  f"{settings['guard_strikes']} in {settings['guard_window_s'] / 60:g} min", "info")
     return ex

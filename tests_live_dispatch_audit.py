@@ -31,7 +31,8 @@ class LiveDispatchAudit(unittest.TestCase):
             self.fire_live()
         self.assertNotIn(self.key, self.sn._minimum_entry_keys)
         self.assertEqual(self.sn.n['orders'], 0)
-        self.assertTrue(self.sn._closing)
+        self.assertTrue(self.sn._closing)                    # no kill switch to pause: a stop ...
+        self.assertIn('order preparation failed', self.sn.stopped['reason'])    # ... never a silent one
         self.assertIsNone(self.sn._fire_now('UP', 5, time.monotonic() * 1000))
 
     def test_dispatch_failure_retains_claim_and_halts_for_reconciliation(self):
@@ -44,8 +45,12 @@ class LiveDispatchAudit(unittest.TestCase):
             self.fire_live()
         self.assertIn(self.key, self.sn._minimum_entry_keys)
         self.assertEqual(self.sn.n['orders'], 1)
+        # 2026-10-23 (M2): this execution cannot hold the order as an unknown outcome
+        # (no dispatch_unknown), so decisions stop - visibly, with the reason
         self.assertTrue(self.sn._closing)
-        self.sn.live.kill.trip.assert_called_once_with('order dispatch failed: reconcile before trading')
+        self.assertIn('could not be held as unknown', self.sn.stopped['reason'])
+        (reason,), _ = self.sn.live.kill.trip.call_args
+        self.assertEqual(reason, 'order dispatch failed (OSError: write outcome unknown): reconcile before trading')
 
     def test_expected_prepare_refusal_remains_recoverable_and_unsent(self):
         self.sn.live = types.SimpleNamespace(prepare=Mock(side_effect=L.Refused('book became stale')))

@@ -1603,7 +1603,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # 2026-10-22, the operator's changes: the trigger default back to 0.5bp (the frozen spec;
     # 1.0bp from 10-17); SNIPER_HYBRID_DRAWDOWN_PAUSE_S (default 600): at the drawdown stop
     # no orders that long, then a new hybrid epoch from the current equity (peak = equity).
-    "sniper_mode.py": "257b2f0d0f9265032d5b15cf6e23b431b7a71147b7ed0a81ba11cd7eff6aaef8",
+    # 2026-10-23 (AUDIT_20261023.md M2): an unexpected order-path failure is a visible 5-minute
+    # pause (journalled execution_fault, announced, in the summary), never a silent stop of all
+    # decisions; a failed dispatch is held as an unknown outcome first; a stop without a kill
+    # switch is visible (Sniper.stopped). Trading formulas, sizing and settings are unchanged.
+    "sniper_mode.py": "80bed05d88cc1cc3cd9f2aa3210c4eed463b7d2db09a2d9f2441f7d1674d9721",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
@@ -1686,7 +1690,13 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # 2026-10-23: `reserved` goes back to exactly 0 when no order is on the wire - float residue
     # from overlapping orders (4.4e-16) kept every read on the in_flight rule and Kelly sized from
     # $0.17 of a $40.60 wallet for about 21 hours on 10-22.
-    "sniper_live.py": "8ab8487fa061f806816a32efb332448e91335c07717e23a0f0dba413509cfb07",
+    # 2026-10-23 (AUDIT_20261023.md H1 H2 H3 M1 M2): an unknown-outcome FAK is settled from the
+    # account's trade record of its market once that market closed (no trade, or only FAILED: zero;
+    # its trades: authorized); a previous run's the same way. A pending fill size holds only its token
+    # (all orders pause only after PENDING_FAK_HALT_S). Slow replies pause after 3 in 30 min (one
+    # over 5s at once). SNIPER_SEND_TIMEOUT_S (10s) / SNIPER_GUARD_*. A failed dispatch is held as
+    # an unknown outcome (dispatch_unknown). The final reconcile-by-hand pause has its own key.
+    "sniper_live.py": "bd308f8a6a14b5b7e545751267d0207f9d8cc0ce1d5da69e87f163682173879f",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads

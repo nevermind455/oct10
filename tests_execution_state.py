@@ -205,14 +205,14 @@ class LivePerSideTests(A.LivePathBase):
                 await self.tick(60_000.0, 60_003.6)                       # UP again: its own FAK holds it
                 self.assertEqual(self.fake.hits[("POST", "/order")], 1)
                 self.assertEqual(self.rows("skipped")[-1]["reason"], "awaiting FAK fill size")
-                with self.assertRaises(L.Halted):                        # unknown size pauses all new orders
+                # 2026-10-23 (H2): its unknown size holds only its own token; it used
+                # to pause all new orders 5 minutes, so DOWN waited too
+                with self.assertRaises(L.Refused):
                     self.ex.prepare(dict(T.live_plan(self.book.view(T.UP), cap=0.6, amount=5.5,
                                                      end=self.hub.window_end), order_type="FAK"))
-                await self.tick(60_000.0, 59_996.4)
-                self.assertEqual(self.fake.hits[("POST", "/order")], 1)
-                mono.t += 300
+                self.assertFalse(self.ex.kill.tripped, self.ex.kill.reasons)
                 dn_oid, dn_tid = self.reply()
-                await self.tick(60_000.0, 59_996.4)                       # after five minutes DOWN can send
+                await self.tick(60_000.0, 59_996.4)                       # DOWN sends at once
                 self.assertEqual(self.fake.hits[("POST", "/order")], 2)
                 self.trade(dn_tid, dn_oid, 7, 0.51, token=T.DN)           # trades arrive out of order
                 self.trade(up_tid, up_oid, 6, 0.55)

@@ -265,7 +265,9 @@ class PersistentAccounting(unittest.TestCase):
         self.assertTrue(ex.blocks_pending_fak("order-1"))
         clock.advance(300)
         for _ in range(20):
-            self.assertFalse(ex.blocks_pending_fak("order-1"))
+            # 2026-10-23 (H2): its token keeps waiting while the size is unknown
+            # (it used to be released here) - but it never pauses everything twice
+            self.assertTrue(ex.blocks_pending_fak("order-1"))
             ex._trip_fak(first, "same order now has contradictory fill evidence")
             ex.kill.check()
         self.assertIs(ex.fak_orders["order-1"], first)

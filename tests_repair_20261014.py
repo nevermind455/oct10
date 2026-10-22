@@ -734,16 +734,26 @@ class M6M7Live(unittest.IsolatedAsyncioTestCase):
         self.assertLess(took, 1.0)
         self.assertEqual(self.ex.fill_for("0xorder1")["shares"], 10.0)
 
-    async def test_m6_unknown_venue_status_pauses_once_then_allows_a_fresh_order(self):
+    async def test_m6_unknown_venue_status_holds_its_token_and_pauses_once_when_late(self):
+        # 2026-10-23 (H2): an unknown size holds only its own token; all orders pause
+        # (once) only when it is still unknown after PENDING_FAK_HALT_S. It used to
+        # pause everything at the first signal on that token.
         self.fake.script.append(("json", 200, {"success": True, "status": "matched", "orderID": "0xorder1"}))
         self.ex.order_status = lambda oid: {}
         await self.ex.send(self.ex.prepare(self.plan()))
         await asyncio.sleep(0.5)
         self.assertIsNone(self.ex.fill_for("0xorder1"))
+        with self.assertRaisesRegex(L.Refused, "awaiting its fill size"):
+            self.ex.prepare(self.plan())
+        self.assertFalse(self.ex.kill.tripped)
+        self.ex.prepare(self.plan(side="DOWN"))                          # the other token trades
+        self.ex.fak_orders["0xorder1"]["wall"] -= self.ex.PENDING_FAK_HALT_S + 1
         with self.assertRaisesRegex(L.Halted, "awaiting complete fill quantities"):
             self.ex.prepare(self.plan())
         self.mono.t += 300
-        self.ex.prepare(self.plan())
+        with self.assertRaisesRegex(L.Refused, "awaiting its fill size"):
+            self.ex.prepare(self.plan())                                 # its token still waits ...
+        self.ex.kill.check()                                             # ... and it never pauses twice
         self.assertIn("0xorder1", self.ex.fak_orders)
 
     async def test_m7_a_reset_after_the_write_is_reconciled_as_matched_without_resending(self):
