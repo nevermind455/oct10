@@ -1696,7 +1696,13 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # (all orders pause only after PENDING_FAK_HALT_S). Slow replies pause after 3 in 30 min (one
     # over 5s at once). SNIPER_SEND_TIMEOUT_S (10s) / SNIPER_GUARD_*. A failed dispatch is held as
     # an unknown outcome (dispatch_unknown). The final reconcile-by-hand pause has its own key.
-    "sniper_live.py": "bd308f8a6a14b5b7e545751267d0207f9d8cc0ce1d5da69e87f163682173879f",
+    # 2026-10-25 (H1's window): LeanSender._after stamps the row's wall before the unknown-outcome
+    # resolver copies it (it got none and dated the send from the clock after ~120s of get_order
+    # lookups, so the trade record was read from ~0.9s AFTER the send and an executed FAK could
+    # settle NO_MATCH); the record is read for the whole round (HISTORY_BEFORE_END_S = 600s
+    # before its end, or 120s before the send if earlier) - a late or missing send time cannot
+    # narrow it. No order, size, cash or pause rule changed.
+    "sniper_live.py": "2057cd9fc506d7af485be4e9158106972d50cdfefad732f70d1be2f545cb968c",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads

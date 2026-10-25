@@ -1980,6 +1980,10 @@ class LeanSender:
 
     def _after(self, p: Prepared, row: dict, st: dict) -> None:
         kind = row["kind"]
+        # The reply's (or the timeout's) time, stamped before anything copies the row: the
+        # unknown-outcome resolver gets a copy and dates the send from it (2026-10-25: it used
+        # to get none, and dated the send ~120s late).
+        row["wall"] = time.time()
         if st.get("budget_recorded"):
             self.limits.record_outcome(kind, p.amount)
         if kind == AMBIGUOUS:
@@ -2040,7 +2044,6 @@ class LeanSender:
         base = st.get("decided_pc") or st["prepare_pc"]
         row["ts_us"] = {k[:-3]: round((v - base) / 1000) for k, v in st.items()
                         if k.endswith("_pc") and isinstance(v, int)}
-        row["wall"] = time.time()
         if self.session is not None:
             self.session.outcome(p, row, self.limits, self.kill)
         self.journal(row)
@@ -2269,6 +2272,10 @@ class LiveExecution:
     # settle (the CLOB answers null for FAKs) - is settled from the account's own trade
     # record of its market once no order can match there any more.
     HISTORY_AFTER_END_S = 180.0     # its market closed this long ago: its trade record is complete
+    # The record is read from this long before the round's end - the whole round, so from
+    # before any send in it - whatever the send time says (2026-10-25: a send time dated
+    # ~120s late read the record from ~0.9s AFTER the send, past a fill in its first second).
+    HISTORY_BEFORE_END_S = 600.0
     HISTORY_RETRY_S = 60.0          # a failed lookup is retried this often...
     HISTORY_ATTEMPTS = 60           # ...about an hour, then it is the operator's
     # H2: an accepted FAK's fill size arrives within seconds (10-15..10-21: p50 1.0s,
@@ -3534,25 +3541,34 @@ class LiveExecution:
 
     def _trade_history_verdict(self, *, order_hash, token, condition, end, sent_wall):
         """Worker thread. The account's own trade record of the order's market (every
-        page, from before the send) settles an unknown-outcome FAK once that market
-        closed HISTORY_AFTER_END_S ago - a FAK matches on arrival or never, and no
-        order matches in a closed market:
+        page, for the whole round: from HISTORY_BEFORE_END_S before its end, or 120s
+        before the send if that is earlier) settles an unknown-outcome FAK once that
+        market closed HISTORY_AFTER_END_S ago - a FAK matches on arrival or never, and
+        no order matches in a closed market:
           (NO_MATCH, [])   no trade of the order in it, or only FAILED ones;
           (MATCHED, rows)  its trades: it executed.
         None while it cannot tell yet. A failed or malformed lookup raises (never
         evidence), and so does a trade of the order on another market, token or side,
         or as a maker (a FAK never rests): RuntimeError, for the operator. Missing
-        local fills or ledger lots are never evidence either way."""
+        local fills or ledger lots are never evidence either way. The send time only
+        ever widens the window: a late, missing or malformed one cannot narrow it."""
         lookup = getattr(self, "account_trades", None)
         if lookup is None or not order_hash or not condition or not token:
             return None
         try:
-            end, sent = float(end), float(sent_wall)
+            end = float(end)
         except (TypeError, ValueError):
             return None
-        if not (math.isfinite(end) and math.isfinite(sent)) or time.time() < end + self.HISTORY_AFTER_END_S:
+        if not math.isfinite(end) or time.time() < end + self.HISTORY_AFTER_END_S:
             return None
-        rows = lookup(str(condition), sent - 120.0)
+        after = end - self.HISTORY_BEFORE_END_S
+        try:
+            sent = float(sent_wall)
+        except (TypeError, ValueError):
+            sent = math.nan
+        if math.isfinite(sent):
+            after = min(after, sent - 120.0)
+        rows = lookup(str(condition), after)
         if not isinstance(rows, list):
             raise TypeError("the account trade record is not a list")
         h, mine = str(order_hash), []
@@ -3585,7 +3601,7 @@ class LiveExecution:
                                size=r.get("size"), status=r.get("status"), source="rest",
                                fee_rate_bps=r.get("fee_rate_bps"), maker_orders=r.get("maker_orders"))
 
-    async def _history_evidence(self, p, sent_wall: float):
+    async def _history_evidence(self, p, sent_wall: float | None):
         """(evidence, why) for an unknown outcome the venue's order record could not
         settle: its market's trade record once that market has closed
         (_trade_history_verdict), looked up again while lookups fail."""
@@ -3638,7 +3654,12 @@ class LiveExecution:
             if evidence is not None:
                 break
         if evidence is None and not conflict:
-            sent = float(row.get("wall") or time.time()) - float(getattr(self.sender, "timeout_s", 0.0) or 0.0)
+            # The reply's time less the wait for it dates the send. Never the clock now: that
+            # is after the lookups above (~2 minutes) - the record still covers the whole round.
+            try:
+                sent = float(row["wall"]) - float(getattr(self.sender, "timeout_s", 0.0) or 0.0)
+            except (KeyError, TypeError, ValueError):
+                sent = None
             evidence, history_why = await self._history_evidence(p, sent)
             why = history_why or why
         limits = self.sender.limits
