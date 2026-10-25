@@ -187,6 +187,11 @@ class LockTests(unittest.TestCase):
                 holder.kill()
                 holder.wait()
                 holder.stdout.close()
+            # Windows frees a killed process's byte-range lock a moment after wait() returns
+            # (~50ms measured; AUDIT_20261023.md L7) - poll up to a second before judging it.
+            deadline = time.monotonic() + 1.0
+            while run.lock_held_elsewhere(path) and time.monotonic() < deadline:
+                time.sleep(0.02)
             self.assertFalse(run.lock_held_elsewhere(path), "a dead holder still reads as running")
             lock = run._ProcessLock(path)
             lock.acquire()
