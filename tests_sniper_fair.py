@@ -527,7 +527,7 @@ class Settings(unittest.TestCase):
         self.assertEqual((s.fair, s.fair_margin, s.kelly, s.kelly_fraction, s.max_target_shares),
                          (True, 0.01, True, 0.25, 20.0))
         self.assertTrue(s.hybrid_sizing)
-        self.assertTrue(s.kelly_min_entry)
+        self.assertFalse(s.kelly_min_entry)       # off by default since 2026-10-25 (AUDIT_20261023.md M3)
         self.assertEqual((s.hybrid_policy.risk_fraction, s.hybrid_policy.max_order_usd), (0, 0))
         spec = dict((a, v) for a, _n, v, _l, _f in X.FROZEN_SPEC)
         self.assertEqual((spec["fair"], spec["fair_margin"], spec["kelly"], spec["kelly_fraction"]),

@@ -44,18 +44,26 @@ an automatic sell.
 
 The resulting new-order size is rounded down and checked against the venue's
 minimum shares and minimum notional. With strict target sizing, a size below
-those minimums is skipped. The enabled minimum-entry exception below allows
-a bounded first attempt above a small positive target.
+those minimums is skipped - the default since 2026-10-25. The optional
+minimum-entry exception below allows a bounded first attempt above a small
+positive target.
 
 ## Minimum-entry exception
+
+Off by default since 2026-10-25 (`SNIPER_KELLY_MIN_ENTRY=0`, strict target
+sizing). Its 37 fills of 10-15..10-21 lost $20.96 on $106 (-19.7%) where Kelly
+wanted 1.08 shares on average, and one bought 5 shares at an 18.7% realized
+drawdown (scale 0.064) where Kelly said 0 (AUDIT_20261023.md M3).
 
 `SNIPER_KELLY_MIN_ENTRY=1` reduces minimum-size skips by permitting one
 venue-minimum order attempt per side and round when the estimated edge and
 hybrid allocation are positive, but the target is below the order minimum.
-It applies only with no same-side inventory or outstanding same-side risk.
-It does not top up existing small positions, and a new signal cannot repeatedly
-use the exception. Ordinary additions can still proceed when the hybrid target
-itself supports them. Set the option to `0` for strict target sizing.
+It applies only with no same-side inventory or outstanding same-side risk, and
+never below the equity high-water mark: in a realized drawdown the hybrid scale
+alone sets the size (the row records `minimum_entry_blocked`). It does not top
+up existing small positions, and a new signal cannot repeatedly use the
+exception. Ordinary additions can still proceed when the hybrid target itself
+supports them.
 
 This is an explicit exception to quarter-Kelly sizing: a target of three shares
 can become a stake sized from five shares at the cap. The minimum also respects prefetched venue rules,
@@ -138,7 +146,7 @@ SNIPER_FAIR_MARGIN=0.01
 SNIPER_KELLY=1
 SNIPER_KELLY_FRACTION=0.25
 SNIPER_HYBRID_SIZING=1
-SNIPER_KELLY_MIN_ENTRY=1
+SNIPER_KELLY_MIN_ENTRY=0
 SNIPER_HYBRID_VOL_BASELINE_BP=1.0
 SNIPER_HYBRID_DRAWDOWN_STOP=0.20
 SNIPER_HYBRID_RISK_FRACTION=0

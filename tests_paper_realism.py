@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""SNIPER_PAPER_EXTRA_MS: optional paper arrival-delay sensitivity.
-An extra delay is an assumption; matching aggregate fill rates is not proof
-of a measured feed lag or correct per-order fills. See EXECUTION_AUDIT.md.
+"""SNIPER_PAPER_EXTRA_MS: paper's arrival-delay calibration - 200ms by default since
+2026-10-25 (it was 0, the setting live's own 1,154 orders showed paper +$210.68 where live
+made +$1.42); 0 turns it off. An extra delay is an assumption; matching aggregate fill rates
+is not proof of a measured feed lag or correct per-order fills. See EXECUTION_AUDIT.md.
 Paper only. No network.
 
     python tests_paper_realism.py
@@ -36,8 +37,16 @@ def plan(s, *, delays=(), live=None, rtt=()):
 
 
 class PaperExtraDelay(unittest.TestCase):
-    def test_off_by_default_and_unchanged(self):
+    def test_on_by_default_at_200ms(self):
         s = settings()
+        self.assertEqual(s.paper_extra_ms, 200.0)
+        lat, parts = plan(s, delays=[300.0])
+        self.assertEqual(lat, 500.0)
+        self.assertEqual((parts["delay_ms"], parts["extra_ms"]), (300.0, 200.0))
+        self.assertIn("+ 200ms calibration", " ".join(s.lines()))
+
+    def test_zero_turns_it_off(self):
+        s = settings(SNIPER_PAPER_EXTRA_MS="0")
         self.assertEqual(s.paper_extra_ms, 0.0)
         lat, parts = plan(s, delays=[300.0])
         self.assertEqual(lat, 300.0)
@@ -50,7 +59,7 @@ class PaperExtraDelay(unittest.TestCase):
         self.assertEqual((parts["delay_ms"], parts["extra_ms"]), (300.0, 200.0))   # both journalled
 
     def test_the_live_like_model_gets_it_too(self):
-        base, _ = plan(settings(), rtt=[20.0])
+        base, _ = plan(settings(SNIPER_PAPER_EXTRA_MS="0"), rtt=[20.0])
         lat, parts = plan(settings(SNIPER_PAPER_EXTRA_MS="200"), rtt=[20.0])
         self.assertAlmostEqual(lat, base + 200.0, places=9)
         self.assertEqual(parts["extra_ms"], 200.0)

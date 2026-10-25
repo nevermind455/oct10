@@ -1607,7 +1607,12 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # pause (journalled execution_fault, announced, in the summary), never a silent stop of all
     # decisions; a failed dispatch is held as an unknown outcome first; a stop without a kill
     # switch is visible (Sniper.stopped). Trading formulas, sizing and settings are unchanged.
-    "sniper_mode.py": "80bed05d88cc1cc3cd9f2aa3210c4eed463b7d2db09a2d9f2441f7d1674d9721",
+    # 2026-10-25 (the operator's "fix everything"): SNIPER_PAPER_EXTRA_MS defaults to 200 (was 0 -
+    # on live's own 1,154 orders 0 made paper +$210.68 where live made +$1.42; 200 matched live's
+    # fill rate); paper only, never live. SNIPER_KELLY_MIN_ENTRY defaults to 0 (AUDIT_20261023.md
+    # M3), and when on it is never taken below the equity high-water mark (minimum_entry_blocked
+    # "realized drawdown"). Trigger, fair value, Kelly formula, caps and live dispatch are unchanged.
+    "sniper_mode.py": "2313ab258c8495d18093804cb1cd93845719db39780b55e064038cbc3a72d37b",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.

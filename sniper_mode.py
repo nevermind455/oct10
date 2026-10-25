@@ -945,7 +945,9 @@ class Settings:
         # filled 31% of live's own orders (live 21%) for +$210.68 (live +$1.42), +$202 of it on
         # fills live never got. Meeting the book 200ms later than each order's measured delay
         # matched live: 21% vs 21%, +$7.00 vs +$1.42. Paper only (live's orders meet the real venue).
-        self.paper_extra_ms = _env_float("SNIPER_PAPER_EXTRA_MS", 0.0)
+        # Default 200 since 2026-10-25 (was 0: every default paper run was the optimistic one);
+        # SNIPER_PAPER_EXTRA_MS=0 brings that back. Still an assumption, not a measured lag.
+        self.paper_extra_ms = _env_float("SNIPER_PAPER_EXTRA_MS", 200.0)
         if not math.isfinite(self.paper_extra_ms) or not 0.0 <= self.paper_extra_ms <= 5000.0:
             raise ValueError(f"invalid SNIPER_PAPER_EXTRA_MS {self.paper_extra_ms!r}: 0..5000 ms")
         self.delay_note = ""                   # set by a paper Sniper once the live delays are loaded
@@ -979,7 +981,10 @@ class Settings:
         self.kelly = _env_bool("SNIPER_KELLY", True)
         self.kelly_fraction = _env_float("SNIPER_KELLY_FRACTION", 0.25)
         self.hybrid_sizing = _env_bool("SNIPER_HYBRID_SIZING", True)
-        self.kelly_min_entry = _env_bool("SNIPER_KELLY_MIN_ENTRY", True)
+        # Off by default since 2026-10-25 (AUDIT_20261023.md M3): the 37 minimum entries of
+        # 10-15..10-21 lost $20.96 on $106 where Kelly wanted 1.08 shares on average; on, it is
+        # still never taken in a realized drawdown (the hybrid scale under 1).
+        self.kelly_min_entry = _env_bool("SNIPER_KELLY_MIN_ENTRY", False)
         try:
             self.hybrid_policy = HybridPolicy(
                 vol_baseline_bp=_env_float("SNIPER_HYBRID_VOL_BASELINE_BP", 1.0),
@@ -3660,6 +3665,7 @@ class Sniper:
                         return self._skip("venue minimum unavailable", row)
                 held, opposite = self._kelly_inventory(cond, end, side, token, down if side == "UP" else up)
                 fraction = self.s.kelly_fraction
+                drawdown_scale = 1.0
                 if getattr(self.s, "hybrid_sizing", False):
                     try:
                         hybrid = self._hybrid_factors()
@@ -3668,6 +3674,7 @@ class Sniper:
                         return self._skip("hybrid risk unavailable", row)
                     row["hybrid"] = hybrid
                     fraction = hybrid["effective_fraction"]
+                    drawdown_scale = float(hybrid.get("drawdown_scale", 1.0))
                     risk_budget = hybrid["risk_budget_usd"]
                     if fraction <= 0:
                         return self._skip("hybrid drawdown stop", row)
@@ -3686,7 +3693,12 @@ class Sniper:
                         return self._skip("minimum entry state unavailable", row)
                     if minimum_key in self._minimum_entry_keys:
                         return self._skip("minimum entry already attempted this side and round", row)
-                    if held <= 1e-9 and f > 0 and fraction > 0 and bank > 0 and room + 1e-9 >= share_floor:
+                    if drawdown_scale < 1.0:
+                        # M3 (2026-10-25): in a realized drawdown the hybrid scale is what cuts the
+                        # risk - a minimum entry bought 5 shares at an 18.7% drawdown (scale 0.064)
+                        # where Kelly said 0. No minimum entry below the high-water mark.
+                        row["minimum_entry_blocked"] = "realized drawdown"
+                    elif held <= 1e-9 and f > 0 and fraction > 0 and bank > 0 and room + 1e-9 >= share_floor:
                         shares = float(share_floor)
                         minimum_entry = True
                         row.update(minimum_entry=True, minimum_entry_attempted=False,
