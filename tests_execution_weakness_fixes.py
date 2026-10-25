@@ -456,6 +456,8 @@ class LiveVenueAndRisk(unittest.IsolatedAsyncioTestCase):
         position.settled, position.settled_wall, position.realized = True, time.time(), 3 - position.cost
         self.assertEqual(self.ex._risk_budget_used(), 0)
         position.realized = -position.cost
+        # an in-place edit behind the ledger's back: its realized-since cache (2026-10-25) is told
+        self.ledger.invalidate_caches()
         self.assertAlmostEqual(self.ex._risk_budget_used(), position.cost)
 
     async def test_fee_rule_change_after_fair_decision_refuses_before_signing(self):

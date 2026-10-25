@@ -2236,6 +2236,11 @@ class LiveExecution:
         self._balance_revision = 0
         self.awaiting: dict = {}            # order id -> what we expect the ledger to confirm
         self.fak_orders: dict = {}          # retained metadata for validating partial-fill updates
+        # token -> its FAK order ids, so prepare() visits one market's orders, not every FAK
+        # the process ever sent (2026-10-25, audit L2: ~300 a day, walked on every order).
+        self._fak_lock = threading.Lock()
+        self._fak_index: dict | None = None
+        self._fak_indexed = None            # (id, len) of the fak_orders the index was built from
         self._sync_fak = lambda: None       # event-loop callback, never invoked from a worker
         self.session_start = time.time()
         self.session_loss = 0.0
@@ -3215,6 +3220,34 @@ class LiveExecution:
                 "statuses": sorted({str(f.status).upper() for f in rows}), "source": "user channel",
                 "seen_mono": seen or None}
 
+    def _put_fak(self, oid, a: dict) -> None:
+        """Hold one FAK's metadata (fill validation, pending-size blocks) and index it
+        by token. Any thread (_authorize runs on a worker). Entries are never removed:
+        a process holds its session's FAKs (~300 a day)."""
+        with self._fak_lock:
+            current = self._fak_index is not None and self._fak_indexed == (id(self.fak_orders),
+                                                                            len(self.fak_orders))
+            self.fak_orders[oid] = a
+            if current:
+                ids = self._fak_index.setdefault(str(a.get("token")), [])
+                if oid not in ids:
+                    ids.append(oid)
+                self._fak_indexed = (id(self.fak_orders), len(self.fak_orders))
+
+    def _faks_on_token(self, token) -> list:
+        """The FAK order ids held for one token, oldest first. Callers re-read each
+        entry (and its token) from fak_orders. The index is rebuilt whenever
+        fak_orders is another dict or another size than it was built from - a
+        test or tool inserting directly, behind _put_fak."""
+        with self._fak_lock:
+            if self._fak_index is None or self._fak_indexed != (id(self.fak_orders), len(self.fak_orders)):
+                index: dict = {}
+                items = list(self.fak_orders.items())
+                for oid, a in items:
+                    index.setdefault(str(a.get("token")), []).append(oid)
+                self._fak_index, self._fak_indexed = index, (id(self.fak_orders), len(items))
+            return list(self._fak_index.get(str(token), ()))
+
     def blocks_pending_fak(self, oid, *, client_order_id=None) -> bool:
         """True while this order's complete fill quantity is unknown: new orders on
         its token wait (the callers skip or refuse them) - its reservation keeps the
@@ -3258,10 +3291,11 @@ class LiveExecution:
         if not isinstance(minimum_entry, bool):
             raise Refused("invalid minimum-entry marker")
         token, cond, end = plan["token"], plan["cond"], float(plan["end"])
-        for oid, a in list(self.fak_orders.items()):
+        for oid in self._faks_on_token(token):
             # Its incomplete quantity holds this token (its reservation and
             # reconciliation remain); only one unknown too long pauses everything.
-            if a.get("token") != token:
+            a = self.fak_orders.get(oid)
+            if a is None or a.get("token") != token:
                 continue
             if self.blocks_pending_fak(oid, client_order_id=a.get("client_order_id")):
                 self.kill.check()
@@ -3690,12 +3724,12 @@ class LiveExecution:
             # the sniper holds this order as a pending FAK under its hash: a
             # proven zero fill releases its round slot (fill_for -> 0 shares)
             rules = getattr(p, "rules", None) or {}
-            self.fak_orders[oid] = {"wall": time.time(), "condition": p.condition, "token": p.token,
-                                    "amount": p.amount, "kind": NO_MATCH, "client_order_id": p.client_order_id,
-                                    "order_type": "FAK", "cap": p.price, "trade_ids": set(), "final_size": 0.0,
-                                    "fee_rate": float(rules.get("fee_rate") or 0),
-                                    "fee_exponent": int(rules.get("fee_exponent") or 1),
-                                    "final_mono": time.monotonic()}
+            self._put_fak(oid, {"wall": time.time(), "condition": p.condition, "token": p.token,
+                                "amount": p.amount, "kind": NO_MATCH, "client_order_id": p.client_order_id,
+                                "order_type": "FAK", "cap": p.price, "trade_ids": set(), "final_size": 0.0,
+                                "fee_rate": float(rules.get("fee_rate") or 0),
+                                "fee_exponent": int(rules.get("fee_exponent") or 1),
+                                "final_mono": time.monotonic()})
         self.pt._resolve_ambiguous(p.condition, p.token)
         self.sender.unresolved.pop(p.client_order_id, None)
         self._sync_fak()
@@ -3951,7 +3985,7 @@ class LiveExecution:
                 a["final_size"] = float(totals[1])
                 a["final_mono"] = time.monotonic()
                 a["reply_totals"] = totals
-            self.fak_orders[oid] = a
+            self._put_fak(oid, a)
         try:
             ok = self.receipt_sink(receipt)
         except Exception as exc:  # noqa: BLE001
@@ -4011,6 +4045,8 @@ def build_live_execution(*, ledger, on_event=None, user_ready=None, fills=None, 
         raise RuntimeError("canary signer does not match the live client's signer")
     # the library's builder with the EIP-712 digest computed directly (byte-identical signatures)
     builder = FastOrderBuilder(OrderBuilder(signer, client.builder.signature_type, client.builder.funder))
+    # The direct EIP-712 signing path is proven now (no order is signed), not on the first live order.
+    signing_note = builder.b.prove_fast_signing()
     host = config.CLOB_HOST.rstrip("/")
     rules = RoundRules(lambda cond, up, down: pt._validate_market_mapping(client.get_clob_market_info(cond),
                                                                           cond, up, down))
@@ -4046,4 +4082,7 @@ def build_live_execution(*, ledger, on_event=None, user_ready=None, fills=None, 
     (on_event or (lambda *a: None))(
         "sniper", f"LIVE send timeout {settings['send_timeout_s']:g}s; slow replies pause after "
                   f"{settings['guard_strikes']} in {settings['guard_window_s'] / 60:g} min", "info")
+    if signing_note:
+        (on_event or (lambda *a: None))("sniper", f"LIVE signing: {signing_note}",
+                                        "warn" if "DISABLED" in signing_note or "failed" in signing_note else "info")
     return ex

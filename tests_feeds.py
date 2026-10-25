@@ -1612,7 +1612,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # fill rate); paper only, never live. SNIPER_KELLY_MIN_ENTRY defaults to 0 (AUDIT_20261023.md
     # M3), and when on it is never taken below the equity high-water mark (minimum_entry_blocked
     # "realized drawdown"). Trigger, fair value, Kelly formula, caps and live dispatch are unchanged.
-    "sniper_mode.py": "2313ab258c8495d18093804cb1cd93845719db39780b55e064038cbc3a72d37b",
+    # 2026-10-25 (live-log analysis, execution): SNIPER_SWITCH_MS defaults to 1ms (Python's 5ms let a
+    # dashboard frame hold up a tick: 10.4ms p50 vs 2.4ms in bench_execution's wakeup); fast_signer
+    # holds the libsecp256k1 key once (same call, same bytes); paper's throwaway builder proves the
+    # direct signing path before its first order, as live does. No decision, size or price changed.
+    "sniper_mode.py": "5cb26beebd5f217645484bef44726ad836d868e182aff25f4149d2755edd4e20",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
@@ -1707,7 +1711,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # settle NO_MATCH); the record is read for the whole round (HISTORY_BEFORE_END_S = 600s
     # before its end, or 120s before the send if earlier) - a late or missing send time cannot
     # narrow it. No order, size, cash or pause rule changed.
-    "sniper_live.py": "2057cd9fc506d7af485be4e9158106972d50cdfefad732f70d1be2f545cb968c",
+    # 2026-10-25 (live-log analysis): prepare() reads only its token's FAK orders (an index by token,
+    # rebuilt when fak_orders changes behind _put_fak) instead of every FAK of the session; the live
+    # build proves direct EIP-712 signing at start and logs 'LIVE signing: ...'. Every check unchanged.
+    "sniper_live.py": "d859d7174c317fd9e05423a33337b8e645c9e9b2abc1824a3ae5ca2853dda688",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads
@@ -1770,7 +1777,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # the inventory state lock before journal/snapshot disk I/O.
     # 2026-10-22: hybrid_risk_view(rebase=True) starts a new epoch from the current realized
     # equity (capital = equity, P&L from now, peak = equity), durable - the drawdown pause's reset.
-    "accounting/ledger.py": "32e08e978e02f75693a6ff0b847c022b91fe3011d92cef3230ddad54bd32e62c",
+    # 2026-10-25 (live-log analysis): realized_since() is kept per since_wall until a settlement, its
+    # rollback, a reopened position or a reindex bumps _settled_rev (invalidate_caches() for in-place
+    # edits). The live loss budget walked every position settled since the 10-day-old canary session
+    # start 3x per order: decided -> wire 3.9ms (10-15) -> 8.3ms (10-25). Values unchanged.
+    "accounting/ledger.py": "81a656b83b14857f1e43d9d9b67759270ccb15d1e359ee04650a2f0d8d2ba9f8",
     "accounting/fees.py": "44e45be00c7c3b330ef0ff11950fa42944029ba83a61ec8066af3494c0956dc7",
     # Re-approved (settlement audit): one record per market (condition id), checked from
     # expiry, concurrently, on the worker's own pool; explicit lifecycle events and a journal;
@@ -1815,7 +1826,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # SDK-backed signing, hashing and HMAC; their import surface; and the pure hybrid sizing
     # functions (HYBRID_SIZING.md). tests_unified_sdk checks the native wire, hashes and HMAC.
     "clob_client.py": "cf39e32e4e78500068de88ef8538073319411fe1710473790cd074cde329f216",
-    "clob_signing.py": "bfe704a25e5cc52ea4bdb4f085eac13d2710a83f64d7beee56d2d287707f305a",
+    # 2026-10-25 (live-log analysis): orders of signature types 0-2 sign their EIP-712 digest encoded
+    # directly (order_typed_digest) with the held key - the same bytes as sign_typed_data, ~0.1ms
+    # instead of ~0.6ms - once proven: at start without signing any order, or on a builder's first
+    # order; type 3, SNIPER_FAST_SIGN=0 or any mismatch keep the SDK path (tests_fast_sign.py).
+    "clob_signing.py": "49161cc2e45c684f82cace2da8f307ef1fd8136054de8cb064d87855364a034f",
     "clob_sdk.py": "f03d066498ecde9e0afcb85ae3e4dcbfc0e18d5ffc1f483d3d0cdcf106382de5",
     # 2026-10-22: at_drawdown_stop - sizing_factors' exact drawdown-stop test alone (no volatility),
     # for the drawdown pause.

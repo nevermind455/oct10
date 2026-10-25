@@ -370,7 +370,8 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | `PAPER_LEDGER_PATH` / `PAPER_ACCOUNT_PATH` / `PAPER_AUDIT_PATH` | paper_*.json(l) | paper state files; the sniper journal is `<audit>_sniper.jsonl` |
 | `POSITION_MANAGER_ENABLED` / `_LIVE_ENABLED` | 0 / 0 | the Position Manager (paper orders; LIVE shadow-only) / real manager orders (refused for now) |
 | `SNIPER_HOLD_MS` | 250 | paper's modelled taker hold; the venue's crypto delay is 150ms since 2026-09-04 |
-| `SNIPER_SWITCH_MS` | unset (5ms) | Python's GIL switch interval: how long another thread (a dashboard frame) can hold up a tick |
+| `SNIPER_SWITCH_MS` | 1 | Python's GIL switch interval in ms: how long another thread (a dashboard frame) can hold up a tick. 1 since 2026-10-25 (Python's own 5ms: a packet waited 10.4ms p50 behind a frame build, 2.4ms at 1ms); 0 keeps Python's default |
+| `SNIPER_FAST_SIGN` | 1 | orders (signature types 0-2) are signed from their EIP-712 digest encoded directly, with the key held once: build+sign ~0.1ms instead of ~0.6ms, the same bytes. Each start proves it on a throwaway order (never sent) against the SDK's `sign_typed_data` and logs `LIVE signing: ...`; any difference, and type 3, keep the SDK path. 0 = always the SDK path |
 | `SETTLE_ONCHAIN` | on (unset) | read results from the chain first; `0` = the CLOB + Gamma mirrors only (5-13 min later) |
 | `POLYGON_RPC` | publicnode | the Polygon RPC for those reads (may embed an API key) |
 | `SETTLE_RPC_TIMEOUT` / `SETTLE_API_EVERY_S` / `SETTLE_TIMEOUT_S` | 8 / 5 / 900 | one RPC read's limit; how often a market asks the mirrors when the chain cannot answer; when a pending market raises SETTLEMENT_TIMEOUT (it keeps being checked) |

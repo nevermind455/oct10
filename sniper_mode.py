@@ -791,6 +791,14 @@ def fast_signer(private_key: str, chain_id: int):
     signer = Signer(private_key, chain_id)
     raw = private_key[2:] if private_key.startswith("0x") else private_key
     signer.private_key = keys.PrivateKey(bytes.fromhex(raw), backend=get_backend())
+    try:
+        # eth_keys' coincurve backend rebuilds the libsecp256k1 key (two curve
+        # operations) inside every signature; held once, a signature costs ~21us
+        # instead of ~56us here, with the same call and the same bytes (2026-10-25).
+        import coincurve
+        signer.secp_key = coincurve.PrivateKey(bytes.fromhex(raw))
+    except Exception:  # noqa: BLE001 - no coincurve: the eth_keys key above signs
+        signer.secp_key = None
     return signer
 
 
@@ -2804,6 +2812,7 @@ class Sniper:
             from clob_signing import BUY
             signer = fast_signer("0x" + secrets.token_hex(32), 137)    # as the live sender signs
             builder = FastOrderBuilder(OrderBuilder(signer))
+            builder.b.prove_fast_signing()                              # as live: proven before the first order
         except Exception:  # noqa: BLE001 - no library: latency stays live-like, signing is skipped
             return None, {}
         clob = {"MarketOrderArgsV2": MarketOrderArgsV2, "OrderArgsV2": OrderArgsV2,
@@ -4839,11 +4848,15 @@ class Sniper:
         if getattr(self.s, "hybrid_sizing", False) and self.s.fair and self.s.kelly:
             await asyncio.to_thread(self._refresh_hybrid_risk)
             self._spawn(self._hybrid_risk_loop())
-        switch_ms = _env_float("SNIPER_SWITCH_MS", 0)
+        switch_ms = _env_float("SNIPER_SWITCH_MS", 1.0)
         if switch_ms > 0:
             # How long another thread may hold the GIL before the event loop
-            # gets it back (Python default 5ms). Shorter = the loop waits less
-            # behind ledger/dashboard work; those threads switch more often.
+            # gets it back (Python's own default 5ms; 0 keeps it). Shorter = the
+            # loop waits less behind ledger/dashboard work; those threads switch
+            # more often. 2026-10-25: 1ms by default - the VPS builds dashboard
+            # frames on its worker threads, and with one building, a packet
+            # waited 10.4ms (p50) for the loop at 5ms vs 2.4ms at 1ms
+            # (bench_execution.py wakeup); fills fall off within milliseconds.
             sys.setswitchinterval(switch_ms / 1000.0)
         # Marks a restart in the journal: the checker reports from here by default.
         self._write({"wall": time.time(), "result": "start", "code": self.code, "live": self.live is not None,
