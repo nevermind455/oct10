@@ -15,6 +15,7 @@ reading is dated from its request, never from its reply. No network, no wallet.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import pathlib
 import random
 import sys
@@ -105,19 +106,23 @@ class OlderReplyLandingLast(unittest.IsolatedAsyncioTestCase):
 
     async def test_any_completion_order_ends_on_the_newest_read(self):
         rnd = random.Random(20261026)
+        which = contextvars.ContextVar("which")                 # asyncio.to_thread carries it to the fetch
+
+        async def read(ex, i):
+            which.set(i)
+            await ex._read_balance()
         for trial in range(20):
             delays = [rnd.uniform(0, 0.03) for _ in range(6)]
 
-            def fetch_for(i):
-                def fetch():
-                    time.sleep(delays[i])
-                    return {"balance": 100.0 + i, "allowance": 1e9}
-                return fetch
-            ex = execution(Routed(*(fetch_for(i) for i in range(6))))
+            def fetch():
+                i = which.get()
+                time.sleep(delays[i])
+                return {"balance": 100.0 + i, "allowance": 1e9}
+            ex = execution(fetch)
             tasks = []
-            for _ in range(6):
-                tasks.append(asyncio.create_task(ex._read_balance()))
-                await asyncio.sleep(0.002)                     # each begins after the one before
+            for i in range(6):
+                tasks.append(asyncio.create_task(read(ex, i)))
+                await asyncio.sleep(0.002)                     # each is requested after the one before
             await asyncio.gather(*tasks)
             with self.subTest(trial=trial):
                 self.assertEqual(ex.balance, 105.0)            # the read begun last
@@ -139,15 +144,15 @@ class ReadingIsDatedFromItsRequest(unittest.IsolatedAsyncioTestCase):
         slow = Gate(100.0)
         ex = execution(slow)
         ex.balance = ex.balance_at = None
-        ex.PRE_START_OK_S = 0.1
+        ex.PRE_START_OK_S = 0.5
         task = asyncio.create_task(ex._read_balance())
         await until(slow.entered)
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.8)
         slow.release.set()
         await task
-        start = slow.entered_wall + 0.15                        # the round began while it was asked
-        self.assertFalse(ex._cash_read_for(start))              # asked 0.15s before: older than 0.1s
-        self.assertTrue(ex._cash_read_for(slow.entered_wall))
+        start = slow.entered_wall + 0.6                         # the round began while it was asked
+        self.assertFalse(ex._cash_read_for(start))              # asked 0.6s before: older than 0.5s
+        self.assertTrue(ex._cash_read_for(slow.entered_wall))   # but it does count for a round begun then
 
     async def test_a_dropped_reply_changes_nothing(self):
         old = Gate(100.0)
