@@ -2234,6 +2234,12 @@ class LiveExecution:
         self._risk_lock = threading.RLock()
         self._risk_orders: dict = {}        # client id -> full all-in reservation until fully reconciled
         self._balance_revision = 0
+        # Collateral reads overlap (the 30s loop, the pre-start and settlement reads, the
+        # guard's recovery checks): each is numbered when it begins, and a reply older
+        # than the one applied is dropped (2026-10-26: an older reply landing last put
+        # back the cash from before a payout or a debit, dated as read just then).
+        self._balance_read_seq = 0
+        self._balance_applied_seq = 0
         self.awaiting: dict = {}            # order id -> what we expect the ledger to confirm
         self.fak_orders: dict = {}          # retained metadata for validating partial-fill updates
         # token -> its FAK order ids, so prepare() visits one market's orders, not every FAK
@@ -2401,7 +2407,15 @@ class LiveExecution:
                 hold = await asyncio.to_thread(self._awaiting_hold)
             except Exception:  # noqa: BLE001 - no hold known: the strict rule below
                 self.n["balance hold errors"] += 1
+        # Numbered and dated as the request goes out (no await before it): the order
+        # replies apply in, and the reading is no newer than its request.
+        self._balance_read_seq = seq = getattr(self, "_balance_read_seq", 0) + 1
+        requested_at = time.monotonic()
         bal = await asyncio.to_thread(self.balance_fetch)
+        if seq <= getattr(self, "_balance_applied_seq", 0):
+            # A read requested later has already been applied: this reply may predate it.
+            self.n["balance stale reads dropped"] += 1
+            return
         if isinstance(bal, dict) and bal.get("balance") is not None and bal.get("allowance") is not None:
             # Spendable is the smaller of what we hold and what the exchange may move.
             try:
@@ -2435,7 +2449,8 @@ class LiveExecution:
                     available = max(0.0, available - hold)
                 rule = "strict" if hold is None else "held"
             self.balance = available
-            self.balance_at = time.monotonic()
+            self.balance_at = requested_at
+            self._balance_applied_seq = seq
             self.last_balance_read = {"wallet": round(wallet, 6), "applied": round(available, 6), "rule": rule,
                                       "hold": None if hold is None else round(hold, 6),
                                       "awaiting": len(self.awaiting)}
