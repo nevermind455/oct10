@@ -1714,7 +1714,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # 2026-10-25 (live-log analysis): prepare() reads only its token's FAK orders (an index by token,
     # rebuilt when fak_orders changes behind _put_fak) instead of every FAK of the session; the live
     # build proves direct EIP-712 signing at start and logs 'LIVE signing: ...'. Every check unchanged.
-    "sniper_live.py": "d859d7174c317fd9e05423a33337b8e645c9e9b2abc1824a3ae5ca2853dda688",
+    # 2026-10-26: overlapping collateral reads apply in request order - a reply older than the
+    # one applied is dropped (it put back the cash from before a payout or a debit), and a
+    # reading is dated from its request, never its reply. No sizing rule changed.
+    "sniper_live.py": "ab96e71c3b591a82d6ca7bfb007c7b13f73a6da752cf9f0dcb88a096588deaf4",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads
