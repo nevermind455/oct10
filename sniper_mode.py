@@ -993,6 +993,11 @@ class Settings:
         # 10-15..10-21 lost $20.96 on $106 where Kelly wanted 1.08 shares on average; on, it is
         # still never taken in a realized drawdown (the hybrid scale under 1).
         self.kelly_min_entry = _env_bool("SNIPER_KELLY_MIN_ENTRY", False)
+        # How deep a realized drawdown a minimum entry may still be taken in (2026-10-26, the
+        # operator's choice): 0 = never below the high-water mark (the M3 default); 0.10 = up to
+        # 10% below it. The 0533fa9 run's minimum entries by drawdown: 0% +$18.59 on 79 fills,
+        # 0-5% +$4.11 on 83, 5-10% -$1.80 on 62, 10-15% -$3.37 on 56, 15-20% -$13.25 on 24.
+        self.min_entry_max_drawdown = _env_float("SNIPER_MIN_ENTRY_MAX_DRAWDOWN", 0.0)
         try:
             self.hybrid_policy = HybridPolicy(
                 vol_baseline_bp=_env_float("SNIPER_HYBRID_VOL_BASELINE_BP", 1.0),
@@ -1159,7 +1164,9 @@ class Settings:
             (0 <= self.fair_margin < 0.5, f"SNIPER_FAIR_MARGIN={self.fair_margin:g} (must be 0 to 0.49)"),
             (self.fair_vol_s >= 60, f"SNIPER_FAIR_VOL_S={self.fair_vol_s:g} (must be >= 60)"),
             (0 <= self.fair_fee_rate < 0.25, f"SNIPER_FAIR_FEE_RATE={self.fair_fee_rate:g} (must be 0 to 0.25)"),
-            (0 < self.kelly_fraction <= 1, f"SNIPER_KELLY_FRACTION={self.kelly_fraction:g} (must be above 0, at most 1)")) if not ok]
+            (0 < self.kelly_fraction <= 1, f"SNIPER_KELLY_FRACTION={self.kelly_fraction:g} (must be above 0, at most 1)"),
+            (0 <= self.min_entry_max_drawdown < 1,
+             f"SNIPER_MIN_ENTRY_MAX_DRAWDOWN={self.min_entry_max_drawdown:g} (a fraction: 0 to below 1)")) if not ok]
         if bad:
             raise ValueError("invalid SNIPER_* settings: " + "; ".join(bad))
 
@@ -1203,6 +1210,9 @@ class Settings:
                   if self.hybrid_sizing and self.kelly and self.order_type == "FAK" else "")
         if self.kelly_min_entry and self.kelly and self.order_type == "FAK" and self.order_sizing == "shares":
             hybrid += "; one minimum-size entry per side/round may exceed the hybrid target"
+            if self.hybrid_sizing:
+                hybrid += (f" (in a realized drawdown up to {self.min_entry_max_drawdown:.0%})"
+                           if self.min_entry_max_drawdown > 0 else " (never below the equity high-water mark)")
         cap_text = ("optional hybrid per-order cap" if self.hybrid_sizing and (
                     self.hybrid_policy.risk_fraction or self.hybrid_policy.max_order_usd)
                     else "no additional per-order cap")
@@ -3674,7 +3684,7 @@ class Sniper:
                         return self._skip("venue minimum unavailable", row)
                 held, opposite = self._kelly_inventory(cond, end, side, token, down if side == "UP" else up)
                 fraction = self.s.kelly_fraction
-                drawdown_scale = 1.0
+                drawdown_scale, drawdown = 1.0, 0.0
                 if getattr(self.s, "hybrid_sizing", False):
                     try:
                         hybrid = self._hybrid_factors()
@@ -3684,6 +3694,9 @@ class Sniper:
                     row["hybrid"] = hybrid
                     fraction = hybrid["effective_fraction"]
                     drawdown_scale = float(hybrid.get("drawdown_scale", 1.0))
+                    drawdown = hybrid.get("drawdown")
+                    drawdown = (float(drawdown) if drawdown is not None else
+                                (1.0 - drawdown_scale) * float(self.s.hybrid_policy.drawdown_stop))
                     risk_budget = hybrid["risk_budget_usd"]
                     if fraction <= 0:
                         return self._skip("hybrid drawdown stop", row)
@@ -3702,10 +3715,11 @@ class Sniper:
                         return self._skip("minimum entry state unavailable", row)
                     if minimum_key in self._minimum_entry_keys:
                         return self._skip("minimum entry already attempted this side and round", row)
-                    if drawdown_scale < 1.0:
+                    if drawdown_scale < 1.0 and drawdown > float(getattr(self.s, "min_entry_max_drawdown", 0.0)) + 1e-12:
                         # M3 (2026-10-25): in a realized drawdown the hybrid scale is what cuts the
                         # risk - a minimum entry bought 5 shares at an 18.7% drawdown (scale 0.064)
-                        # where Kelly said 0. No minimum entry below the high-water mark.
+                        # where Kelly said 0. None deeper than SNIPER_MIN_ENTRY_MAX_DRAWDOWN (0: none
+                        # below the high-water mark).
                         row["minimum_entry_blocked"] = "realized drawdown"
                     elif held <= 1e-9 and f > 0 and fraction > 0 and bank > 0 and room + 1e-9 >= share_floor:
                         shares = float(share_floor)

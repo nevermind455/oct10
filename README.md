@@ -349,6 +349,7 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | `SNIPER_KELLY` / `SNIPER_KELLY_FRACTION` | 1 / 0.25 | quarter-Kelly base allocation; existing inventory is subtracted after the hybrid modifiers |
 | `SNIPER_HYBRID_SIZING` | 1 | enable volatility and realized-drawdown reductions; required by the live specification |
 | `SNIPER_KELLY_MIN_ENTRY` | 0 | strict sizing (default since 2026-10-25); 1 allows one venue-minimum attempt per side/round for an eligible positive target below minimum, never in a realized drawdown; can exceed the hybrid target |
+| `SNIPER_MIN_ENTRY_MAX_DRAWDOWN` | 0 | how deep a realized drawdown (fraction below the equity high-water mark) a minimum entry may still be taken in; 0 = never below the mark. The `0533fa9` run's minimum entries by drawdown: 0% +$18.59 on 79 fills, 0-5% +$4.11 on 83, 5-10% -$1.80 on 62, 10-15% -$3.37 on 56, 15-20% -$13.25 on 24 |
 | `SNIPER_HYBRID_VOL_BASELINE_BP` | 1.0 | volatility baseline in bp per sqrt(second); exposure multiplier `min(1, baseline / sigma)` |
 | `SNIPER_HYBRID_DRAWDOWN_STOP` | 0.20 | allocation scales linearly to zero at this realized-equity drawdown from its persisted high-water mark |
 | `SNIPER_HYBRID_RISK_FRACTION` | 0 | optional maximum all-in new-order spend as a fraction of realized equity; 0 disables |

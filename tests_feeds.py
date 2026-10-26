@@ -1616,7 +1616,9 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # dashboard frame hold up a tick: 10.4ms p50 vs 2.4ms in bench_execution's wakeup); fast_signer
     # holds the libsecp256k1 key once (same call, same bytes); paper's throwaway builder proves the
     # direct signing path before its first order, as live does. No decision, size or price changed.
-    "sniper_mode.py": "5cb26beebd5f217645484bef44726ad836d868e182aff25f4149d2755edd4e20",
+    # 2026-10-26 (the operator's choice): SNIPER_MIN_ENTRY_MAX_DRAWDOWN (default 0 = as before) sets how
+    # deep a realized drawdown a minimum entry may still be taken in. No other sizing rule changed.
+    "sniper_mode.py": "7631fd2104ae5afb1ad891a12ffc67e2fe77180725dd39d39d6f8f3903273c74",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.

@@ -506,6 +506,39 @@ class HybridStrategy(I.PaperIOCBase):
         self.assertIn('kelly size under', row['reason'])
         self.assertEqual(self.sn.n['orders'], 0)
 
+    def test_minimum_entry_is_taken_in_a_drawdown_within_the_set_limit(self):
+        # 2026-10-26, the operator's choice: SNIPER_MIN_ENTRY_MAX_DRAWDOWN=0.10 allows it to 10% below the peak.
+        self.enable_small_entry(SNIPER_MIN_ENTRY_MAX_DRAWDOWN='0.10')
+        self.realize('minimum-shallow', loss=1)                  # 5% below the peak
+        snapshot = self.refresh()
+        self.assertLess(snapshot['equity'], snapshot['high_water'])
+        plan, row = self.plan()
+        self.assertIsNotNone(plan, row)
+        self.assertTrue(row.get('minimum_entry'), row)
+        self.assertNotIn('minimum_entry_blocked', row)
+        self.assertEqual(plan['shares'], 5)
+
+    def test_minimum_entry_is_blocked_beyond_the_set_limit(self):
+        self.enable_small_entry(SNIPER_MIN_ENTRY_MAX_DRAWDOWN='0.04')
+        self.realize('minimum-deeper', loss=1)                   # 5% below the peak: past 4%
+        self.refresh()
+        plan, row = self.plan()
+        self.assertIsNone(plan, row)
+        self.assertEqual(row.get('minimum_entry_blocked'), 'realized drawdown')
+        self.assertFalse(row.get('minimum_entry', False))
+
+    def test_minimum_entry_drawdown_limit_is_validated_and_shown(self):
+        for bad in ('-0.01', '1', '1.5', 'abc', 'nan'):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                I.settings(SNIPER_MIN_ENTRY_MAX_DRAWDOWN=bad)
+        on = I.settings(SNIPER_FAIR='1', SNIPER_KELLY='1', SNIPER_KELLY_MIN_ENTRY='1', SNIPER_HYBRID_SIZING='1',
+                        SNIPER_ORDER_SIZING='shares', SNIPER_MIN_ENTRY_MAX_DRAWDOWN='0.1')
+        self.assertIn('in a realized drawdown up to 10%', on.fair_text())
+        strict = I.settings(SNIPER_FAIR='1', SNIPER_KELLY='1', SNIPER_KELLY_MIN_ENTRY='1', SNIPER_HYBRID_SIZING='1',
+                            SNIPER_ORDER_SIZING='shares')
+        self.assertEqual(strict.min_entry_max_drawdown, 0.0)
+        self.assertIn('never below the equity high-water mark', strict.fair_text())
+
     def test_minimum_entry_cannot_override_an_optional_risk_cap(self):
         self.enable_small_entry(SNIPER_HYBRID_MAX_ORDER_USD='2')
         plan, row = self.plan()

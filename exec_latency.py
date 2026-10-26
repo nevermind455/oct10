@@ -150,10 +150,12 @@ def effective_config_lines(settings, *, live: bool, canary_max_shares=None) -> l
             "0 disables each additional cap (SNIPER_HYBRID_RISK_FRACTION / SNIPER_HYBRID_MAX_ORDER_USD)",
             "  confidence    neutral 1.0; no validated predictive-accuracy estimate supplied",
         ])
+    max_dd = float(getattr(settings, "min_entry_max_drawdown", 0.0) or 0.0)
     lines.append("  minimum entry " + (
-        "one venue-minimum attempt per side/round; may exceed hybrid target"
+        "one venue-minimum attempt per side/round; may exceed hybrid target; "
+        + (f"also in a realized drawdown up to {max_dd:.0%}" if max_dd > 0 else "never below the high-water mark")
         if getattr(settings, "kelly_min_entry", False) else "off; strict hybrid target")
-        + " (SNIPER_KELLY_MIN_ENTRY)")
+        + " (SNIPER_KELLY_MIN_ENTRY / SNIPER_MIN_ENTRY_MAX_DRAWDOWN)")
     extra = tuple(getattr(settings, "extra_feeds", ()) or ())
     lines.append(f"  {'2nd trigger':13s} {','.join(extra) or 'none':16s} (SNIPER_EXTRA_FEEDS; whichever feed "
                  f"signals first)" + ("" if extra in LIVE_EXTRA_FEEDS else "   <- not accepted live"))
