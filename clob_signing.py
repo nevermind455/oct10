@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_FLOOR
@@ -126,6 +127,7 @@ class Signer:
         self.account = Account.from_key(private_key)
         self.private_key = private_key
         self.chain_id = int(chain_id)
+        self.secp_key = None         # fast_signer: a held libsecp256k1 key (sign() below)
 
     def address(self) -> str:
         return self.account.address
@@ -138,7 +140,12 @@ class Signer:
         raw = bytes.fromhex(message_hash.removeprefix("0x")) if isinstance(message_hash, str) else message_hash
         if len(raw) != 32:
             raise ValueError("a signing digest must contain exactly 32 bytes")
-        if hasattr(self.private_key, "sign_msg_hash"):
+        secp = getattr(self, "secp_key", None)
+        if secp is not None:
+            # the call eth_keys' coincurve backend makes, on a key built once instead of per signature
+            recoverable = secp.sign_recoverable(raw, hasher=None)
+            encoded = recoverable[:64] + bytes([recoverable[64] + 27])
+        elif hasattr(self.private_key, "sign_msg_hash"):
             signature = self.private_key.sign_msg_hash(raw)
             encoded = (signature.r.to_bytes(32, "big") + signature.s.to_bytes(32, "big")
                        + bytes([signature.v + 27]))
@@ -191,6 +198,11 @@ class OrderBuilder:
         self.last_order_hash = None
         self.last_sign_ns = None
         self._wallet_classification = None
+        # The direct EIP-712 path (order_typed_digest + the cached key): None until the
+        # first eligible order proves it byte-identical to sign_typed_data, then True
+        # (used) or False (never again in this process). SNIPER_FAST_SIGN=0 turns it off.
+        self.fast_sign: bool | None = None
+        self.fast_sign_note = ""
 
     def _environment(self):
         from polymarket._internal.environment import PRODUCTION_CONFIG
@@ -235,6 +247,26 @@ class OrderBuilder:
         return self._wallet_classification
 
     def _build(self, args, options, *, market: bool, version: int):
+        from polymarket._internal.actions.orders.orders import create_signed_order
+        from polymarket._internal.actions.orders.typed_data import build_order_signature, build_order_typed_data
+        from polymarket._internal.wallet import wrap_deposit_wallet_signature
+        from polymarket.types import HexString
+
+        unsigned, wallet = self._unsigned(args, options, market=market, version=version)
+        start = time.perf_counter_ns()
+        raw_signature, order_hash = self._sign_unsigned(unsigned, build_order_typed_data)
+        signature = HexString(raw_signature if raw_signature.startswith("0x") else "0x" + raw_signature)
+        signature = wrap_deposit_wallet_signature(
+            signer=self.signer.address(), signer_type=wallet.signer_type,
+            signature=build_order_signature(unsigned, signature))
+        self.last_sign_ns = (start, time.perf_counter_ns())
+        sdk_order = create_signed_order(unsigned, signature)
+        self.last_order_hash = order_hash or _unsigned_order_hash(unsigned)
+        return SignedOrder(sdk_order, unsigned, self.last_order_hash)
+
+    def _unsigned(self, args, options, *, market: bool, version: int):
+        """(the SDK's unsigned order, the wallet classification): every amount,
+        routing and validation step of an order, without its signature."""
         from polymarket._internal.actions.exchange_asset import resolve_asset_id
         from polymarket._internal.actions.orders.context import (
             MIN_SUPPORTED_TICK_SIZE, resolve_order_exchange_address,
@@ -242,12 +274,10 @@ class OrderBuilder:
         )
         from polymarket._internal.actions.orders.limit import _compute_limit_order_amounts
         from polymarket._internal.actions.orders.market import _compute_market_order_amounts
-        from polymarket._internal.actions.orders.orders import create_signed_order, create_unsigned_order
-        from polymarket._internal.actions.orders.typed_data import build_order_signature, build_order_typed_data
+        from polymarket._internal.actions.orders.orders import create_unsigned_order
         from polymarket._internal.actions.orders.types import OrderDraft
         from polymarket._internal.validation import validate_builder_code
-        from polymarket._internal.wallet import wrap_deposit_wallet_signature
-        from polymarket.types import EvmAddress, HexString
+        from polymarket.types import EvmAddress
 
         if version != 2:
             raise ValueError("legacy protocol-v1 signing is unsupported by the unified SDK")
@@ -305,23 +335,185 @@ class OrderBuilder:
                            signer=EvmAddress(self.signer.address()), requested_amount=requested,
                            asset_id=asset, builder_code=validate_builder_code(args.builder_code))
         unsigned = create_unsigned_order(draft, wallet=EvmAddress(self.funder), wallet_type=wallet.wallet_type)
-        typed_data = build_order_typed_data(unsigned)
-        start = time.perf_counter_ns()
-        raw_signature = self.signer.sign_typed_data(full_message=typed_data).signature.hex()
-        signature = HexString(raw_signature if raw_signature.startswith("0x") else "0x" + raw_signature)
-        signature = wrap_deposit_wallet_signature(
-            signer=self.signer.address(), signer_type=wallet.signer_type,
-            signature=build_order_signature(unsigned, signature))
-        self.last_sign_ns = (start, time.perf_counter_ns())
-        sdk_order = create_signed_order(unsigned, signature)
-        self.last_order_hash = _unsigned_order_hash(unsigned)
-        return SignedOrder(sdk_order, unsigned, self.last_order_hash)
+        return unsigned, wallet
+
+    def _sign_unsigned(self, unsigned, build_order_typed_data) -> tuple[str, str | None]:
+        """(signature hex, order hash or None). The standard order typed data
+        (signature types 0-2) is signed from its digest, encoded directly
+        (order_typed_digest) - the bytes sign_typed_data produces at about a tenth of
+        its cost (2026-10-25: ~1.0ms of the VPS's 8ms decided -> wire). Until one
+        order of this builder has been signed both ways and compared byte for byte,
+        and for anything else (type 3, SNIPER_FAST_SIGN=0, an encoding the direct
+        path does not take, a failed comparison), the SDK's own path signs."""
+        digest = None
+        if (self.fast_sign is not False and _fast_sign_enabled()
+                and getattr(unsigned, "signature_type", None) in (0, 1, 2)):
+            try:
+                digest = order_typed_digest(unsigned)
+            except Exception as exc:  # noqa: BLE001 - the SDK path below decides this order
+                self.fast_sign_note = f"direct digest unavailable ({type(exc).__name__}); SDK signing"[:160]
+        if digest is not None and self.fast_sign:
+            return self.signer.sign(digest), "0x" + digest.hex()
+        raw = self.signer.sign_typed_data(full_message=build_order_typed_data(unsigned)).signature.hex()
+        raw = raw if raw.startswith("0x") else "0x" + raw
+        if digest is not None:
+            self._prove_fast_sign(unsigned, digest, raw)
+        return raw, None
+
+    def _prove_fast_sign(self, unsigned, digest: bytes, raw: str) -> None:
+        """First use: the direct digest must equal the SDK's order hash and the
+        cached key's signature of it the exact string sign_typed_data returned."""
+        try:
+            same_hash = "0x" + digest.hex() == _unsigned_order_hash(unsigned)
+            same_sig = self.signer.sign(digest) == raw
+        except Exception as exc:  # noqa: BLE001 - unproven means unused
+            same_hash = same_sig = False
+            detail = f"proof raised {type(exc).__name__}"
+        else:
+            detail = (f"digest {'ok' if same_hash else 'differs'}, "
+                      f"signature {'ok' if same_sig else 'differs'} from sign_typed_data")
+        self.fast_sign = same_hash and same_sig
+        self.fast_sign_note = ("direct EIP-712 signing verified byte-identical to sign_typed_data"
+                               if self.fast_sign else f"direct EIP-712 signing DISABLED: {detail}")
 
     def build_market_order(self, order_args, options, version: int = 2, fee_rate_bps=None):
         return self._build(order_args, options, market=True, version=version)
 
+    def prove_fast_signing(self) -> str:
+        """Settle the direct signing path at start-up, so the first live order does
+        not pay for the proof - without the key signing any order. An order of this
+        wallet (maker, signer, signature type, exchange) is built and NOT signed: its
+        direct digest must equal the SDK's order hash and eth_account's digest of its
+        typed data (what sign_typed_data signs). The held key's signature of a digest
+        must equal sign_typed_data's on a self-test message no contract accepts (no
+        chain id, no verifying contract). Returns what was settled (start-up log)."""
+        if self.fast_sign is not None or not _fast_sign_enabled():
+            return self.fast_sign_note or ("" if _fast_sign_enabled() else
+                                           "direct EIP-712 signing off (SNIPER_FAST_SIGN=0)")
+        try:
+            unsigned, _wallet = self._unsigned(
+                MarketOrderArgsV2(token_id=PROOF_TOKEN_ID, amount=1.0, side=BUY, price=0.5, order_type=OrderType.FAK),
+                CreateOrderOptions(tick_size="0.01", neg_risk=False), market=True, version=2)
+        except Exception as exc:  # noqa: BLE001 - the SDK path stays; a real order raises its own error
+            self.fast_sign_note = f"start-up signing proof failed ({type(exc).__name__}); the first order proves it"
+            return self.fast_sign_note
+        if unsigned.signature_type not in (0, 1, 2):
+            self.fast_sign = False
+            self.fast_sign_note = "signature type 3 signs its nested TypedDataSign: SDK signing"
+            return self.fast_sign_note
+        try:
+            from eth_account.messages import encode_typed_data
+            from eth_utils.crypto import keccak
+            from polymarket._internal.actions.orders.typed_data import build_order_typed_data
+
+            def eip712_digest(typed: dict) -> bytes:
+                message = encode_typed_data(full_message=typed)
+                return keccak(b"\x19" + message.version + message.header + message.body)
+            digest = order_typed_digest(unsigned)
+            same_hash = "0x" + digest.hex() == _unsigned_order_hash(unsigned)
+            same_typed = digest == eip712_digest(build_order_typed_data(unsigned))
+            probe = {"types": {"EIP712Domain": [{"name": "name", "type": "string"}],
+                               "SigningSelfTest": [{"name": "digest", "type": "bytes32"}]},
+                     "primaryType": "SigningSelfTest", "domain": {"name": SELF_TEST_DOMAIN},
+                     "message": {"digest": digest}}
+            reference = self.signer.sign_typed_data(full_message=probe).signature.hex()
+            reference = reference if reference.startswith("0x") else "0x" + reference
+            same_sig = self.signer.sign(eip712_digest(probe)) == reference
+        except Exception as exc:  # noqa: BLE001 - unproven means unused
+            same_hash = same_typed = same_sig = False
+            detail = f"proof raised {type(exc).__name__}"
+        else:
+            detail = (f"digest {'ok' if same_hash and same_typed else 'differs'}, "
+                      f"signature {'ok' if same_sig else 'differs'} from sign_typed_data")
+        self.fast_sign = same_hash and same_typed and same_sig
+        self.fast_sign_note = ("direct EIP-712 signing verified at start (digest = SDK order hash = eth_account "
+                               "typed-data digest; held-key signature = sign_typed_data)" if self.fast_sign
+                               else f"direct EIP-712 signing DISABLED: {detail}")
+        return self.fast_sign_note
+
     def build_order(self, order_args, options, version: int = 2, fee_rate_bps=None):
         return self._build(order_args, options, market=False, version=version)
+
+
+def _fast_sign_enabled() -> bool:
+    """SNIPER_FAST_SIGN=0 keeps every order on the SDK's sign_typed_data path."""
+    return str(os.environ.get("SNIPER_FAST_SIGN", "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
+# The start-up proof's token: a legacy-namespace position id (bits 40-103 set), so its
+# unsigned order routes to the same exchange and protocol version as the live 5-minute
+# markets. No registered token; the order is never signed or sent.
+PROOF_TOKEN_ID = str((1 << 255) | (0x5EED << 64) | 1)
+# The self-test message's EIP-712 domain: a name only - no chain id, no verifying
+# contract - so its signature authorizes nothing anywhere.
+SELF_TEST_DOMAIN = "sniperBTC signing self-test - authorizes nothing"
+
+_DOMAIN_SEPARATORS: dict = {}
+_CHECKED_ADDRESSES: dict = {}
+
+
+def _word_uint(value, bits: int = 256) -> bytes:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"expected an integer, got {type(value).__name__}")
+    if not 0 <= value < (1 << bits):
+        raise ValueError(f"uint{bits} out of range")
+    return value.to_bytes(32, "big")
+
+
+def _word_address(value) -> bytes:
+    """An address word exactly as eth_abi encodes it: 20 bytes, left-padded (eth_abi
+    takes what eth_utils.is_address takes; so does this)."""
+    if isinstance(value, (bytes, bytearray)):
+        if len(value) != 20:
+            raise ValueError("invalid address")
+        return bytes(value).rjust(32, b"\x00")
+    text = str(value)
+    word = _CHECKED_ADDRESSES.get(text)
+    if word is None:
+        from eth_utils import is_address
+        if not is_address(text):
+            raise ValueError("invalid address")
+        raw = bytes.fromhex(text[2:] if text[:2] in ("0x", "0X") else text)
+        if len(raw) != 20:
+            raise ValueError("invalid address")
+        word = raw.rjust(32, b"\x00")
+        if len(_CHECKED_ADDRESSES) < 64:            # a wallet's own two addresses, in practice
+            _CHECKED_ADDRESSES[text] = word
+    return word
+
+
+def _word_bytes32(value) -> bytes:
+    """Only the canonical form - "0x" and 64 hex digits, as the SDK validates a builder
+    code and writes zero metadata - which the SDK's hash and eth_account both take
+    alike; any other form is left to the SDK path to accept or refuse."""
+    if not isinstance(value, str) or len(value) != 66 or not value.startswith("0x"):
+        raise ValueError("bytes32 field is not 0x + 64 hex digits")
+    return bytes.fromhex(value[2:])
+
+
+def order_typed_digest(unsigned) -> bytes:
+    """The EIP-712 digest of a standard order's typed data - keccak(0x1901 ||
+    domain separator || hashStruct(Order)) - with the struct encoded directly:
+    every Order field is one static 32-byte word, so eth_abi's generic encoder
+    adds only cost. The domain separator is the SDK's own, kept per exchange.
+    Signature type 3 (deposit wallets) signs a nested TypedDataSign: not this."""
+    from eth_utils.crypto import keccak
+    from polymarket._internal.actions.orders import typed_data as td
+    if unsigned.signature_type not in (0, 1, 2):
+        raise ValueError("only signature types 0-2 sign the standard order typed data")
+    version = unsigned.protocol_version
+    key = (version, unsigned.chain_id, str(unsigned.exchange_address))
+    domain = _DOMAIN_SEPARATORS.get(key)
+    if domain is None:
+        domain = bytes.fromhex(td._app_domain_separator(unsigned, protocol_version=version)[2:])
+        _DOMAIN_SEPARATORS[key] = domain
+    struct = keccak(b"".join((
+        td._ORDER_TYPE_HASH, _word_uint(unsigned.salt), _word_address(unsigned.maker),
+        _word_address(unsigned.signer), _word_uint(int(unsigned.token_id)), _word_uint(unsigned.maker_amount),
+        _word_uint(unsigned.taker_amount), _word_uint(td._encode_side(unsigned.side), 8),
+        _word_uint(unsigned.signature_type, 8), _word_uint(unsigned.timestamp),
+        _word_bytes32(unsigned.metadata), _word_bytes32(unsigned.builder))))
+    return keccak(b"\x19\x01" + domain + struct)
 
 
 def _unsigned_order_hash(unsigned) -> str:

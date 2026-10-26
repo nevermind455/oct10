@@ -491,6 +491,21 @@ class HybridStrategy(I.PaperIOCBase):
         self.assertEqual(row['reason'], 'hybrid drawdown stop')
         self.assertEqual(self.sn.n['orders'], 0)
 
+    def test_minimum_entry_is_never_taken_in_a_realized_drawdown(self):
+        # AUDIT_20261023.md M3 (fixed 2026-10-25): an 18.7% drawdown (scale 0.064) still bought a
+        # 5-share minimum where Kelly said 0. Below the high-water mark the hybrid scale decides alone.
+        self.enable_small_entry()
+        self.realize('minimum-drawdown', loss=1)                 # 5% below the peak: scale 0.75, no stop
+        snapshot = self.refresh()
+        self.assertLess(snapshot['equity'], snapshot['high_water'])
+        plan, row = self.plan()
+        self.assertIsNone(plan, row)
+        self.assertTrue(0 < row['kelly_shares'] < 5 and row['kelly_f'] > 0, row)   # a minimum entry used to fire
+        self.assertEqual(row.get('minimum_entry_blocked'), 'realized drawdown')
+        self.assertFalse(row.get('minimum_entry', False))
+        self.assertIn('kelly size under', row['reason'])
+        self.assertEqual(self.sn.n['orders'], 0)
+
     def test_minimum_entry_cannot_override_an_optional_risk_cap(self):
         self.enable_small_entry(SNIPER_HYBRID_MAX_ORDER_USD='2')
         plan, row = self.plan()

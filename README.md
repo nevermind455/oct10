@@ -91,9 +91,12 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
     no opposing hedge credit. Lower volatility never raises the base above quarter
     Kelly. Cash, venue minimums, round limits and live canary limits still apply.
     Optional new per-order risk and dollar caps are both disabled by default, as
-    requested. `SNIPER_KELLY_MIN_ENTRY=1` allows one venue-minimum attempt per side
-    and round when an otherwise eligible positive target is too small and that
-    side has no inventory or pending risk. This exception can exceed the hybrid
+    requested. `SNIPER_KELLY_MIN_ENTRY` is off (0) by default since 2026-10-25: a
+    target under the venue minimum is skipped. With 1 it allows one venue-minimum
+    attempt per side and round when an otherwise eligible positive target is too
+    small and that side has no inventory or pending risk, never below the equity
+    high-water mark (its 37 fills of 10-15..10-21 lost $20.96 on $106, one at an
+    18.7% drawdown where Kelly said 0). This exception can exceed the hybrid
     target; cash, the fair-value margin, drawdown stop and existing limits still
     apply. There is no carry in Kelly mode. See [hybrid sizing](HYBRID_SIZING.md)
     for formulas, settings and limitations. The fair model still needs empirical
@@ -101,7 +104,12 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
   - **FOK.** `SNIPER_ORDER_TYPE=FOK` keeps the old all-or-nothing order with no carry.
 - **Paper fills.** Paper fills against Polymarket's book at the modelled match
   instant. With `SNIPER_DELAY_SOURCE=live`, each order's delay is drawn from real
-  live orders.
+  live orders, and paper meets the book `SNIPER_PAPER_EXTRA_MS` (200ms) later than
+  that: the recorded book lags what the venue matched. On live's own 1,154 orders,
+  +0ms had paper earn +$210.68 where live made +$1.42; +200ms matched live's 21% fill
+  rate. `SNIPER_PAPER_EXTRA_MS=0` is the old, optimistic paper. Rebuild the delay
+  sample from the live journal now and then (`refresh_delays.py`): an old, fast
+  sample makes paper fill more than live.
 - **Exit.** Every position is held to settlement.
 
 ## Execution latency
@@ -340,7 +348,7 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | `SNIPER_FAIR` / `SNIPER_FAIR_MARGIN` | 1 / 0.01 | every buy at or under the market-anchored fair value − fee − margin (the limit capped there) |
 | `SNIPER_KELLY` / `SNIPER_KELLY_FRACTION` | 1 / 0.25 | quarter-Kelly base allocation; existing inventory is subtracted after the hybrid modifiers |
 | `SNIPER_HYBRID_SIZING` | 1 | enable volatility and realized-drawdown reductions; required by the live specification |
-| `SNIPER_KELLY_MIN_ENTRY` | 1 | allow one venue-minimum attempt per side/round for an eligible positive target below minimum; can exceed the hybrid target; 0 restores strict sizing |
+| `SNIPER_KELLY_MIN_ENTRY` | 0 | strict sizing (default since 2026-10-25); 1 allows one venue-minimum attempt per side/round for an eligible positive target below minimum, never in a realized drawdown; can exceed the hybrid target |
 | `SNIPER_HYBRID_VOL_BASELINE_BP` | 1.0 | volatility baseline in bp per sqrt(second); exposure multiplier `min(1, baseline / sigma)` |
 | `SNIPER_HYBRID_DRAWDOWN_STOP` | 0.20 | allocation scales linearly to zero at this realized-equity drawdown from its persisted high-water mark |
 | `SNIPER_HYBRID_RISK_FRACTION` | 0 | optional maximum all-in new-order spend as a fraction of realized equity; 0 disables |
@@ -351,7 +359,8 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | `SNIPER_MAX_FILLS_ROUND` / `SNIPER_MAX_SIDE_SHARES` | 20 / 200 | per-round caps |
 | `MIN_BUY_PRICE` / `MAX_BUY_PRICE` | 0.05 / 0.95 | the asks the bot may buy |
 | `TRADE_LAST_SECONDS` / `MIN_SECONDS_TO_EXPIRY` | 300 / 10 | the whole round, down to 10s left |
-| `SNIPER_DELAY_SOURCE` / `SNIPER_DELAY_JOURNAL` | live / `data/live_delays_2026-10-04.jsonl` | paper delays drawn from >= 30 real live orders: the shipped copy of 238 canary orders (reply times only, no ids, prices or addresses) |
+| `SNIPER_DELAY_SOURCE` / `SNIPER_DELAY_JOURNAL` | live / `data/live_delays_2026-10-04.jsonl` | paper delays drawn from >= 30 real live orders: the shipped copy of 238 canary orders (reply times only, no ids, prices or addresses); `refresh_delays.py` rebuilds it from the live journal |
+| `SNIPER_PAPER_EXTRA_MS` | 200 | paper meets the book this much later than each drawn delay (the book's lag behind the venue, calibrated on 1,154 live orders); 0 = the old optimistic paper; never live |
 | `SNIPER_LIVE_CANARY` | 1 | `--live` sends real orders (with `SNIPER_ONLY=1`) |
 | `ASSUMED_MATCH_DELAY_SECONDS` | 5 | Polymarket's taker delay; live refuses to start without it |
 | `USER_WS` / `RECONCILE` | on / auto | live fills come from the private channel, with REST as backup |
@@ -361,7 +370,8 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | `PAPER_LEDGER_PATH` / `PAPER_ACCOUNT_PATH` / `PAPER_AUDIT_PATH` | paper_*.json(l) | paper state files; the sniper journal is `<audit>_sniper.jsonl` |
 | `POSITION_MANAGER_ENABLED` / `_LIVE_ENABLED` | 0 / 0 | the Position Manager (paper orders; LIVE shadow-only) / real manager orders (refused for now) |
 | `SNIPER_HOLD_MS` | 250 | paper's modelled taker hold; the venue's crypto delay is 150ms since 2026-09-04 |
-| `SNIPER_SWITCH_MS` | unset (5ms) | Python's GIL switch interval: how long another thread (a dashboard frame) can hold up a tick |
+| `SNIPER_SWITCH_MS` | 1 | Python's GIL switch interval in ms: how long another thread (a dashboard frame) can hold up a tick. 1 since 2026-10-25 (Python's own 5ms: a packet waited 10.4ms p50 behind a frame build, 2.4ms at 1ms); 0 keeps Python's default |
+| `SNIPER_FAST_SIGN` | 1 | orders (signature types 0-2) are signed from their EIP-712 digest encoded directly, with the key held once: build+sign ~0.1ms instead of ~0.6ms, the same bytes. Each start proves it on a throwaway order (never sent) against the SDK's `sign_typed_data` and logs `LIVE signing: ...`; any difference, and type 3, keep the SDK path. 0 = always the SDK path |
 | `SETTLE_ONCHAIN` | on (unset) | read results from the chain first; `0` = the CLOB + Gamma mirrors only (5-13 min later) |
 | `POLYGON_RPC` | publicnode | the Polygon RPC for those reads (may embed an API key) |
 | `SETTLE_RPC_TIMEOUT` / `SETTLE_API_EVERY_S` / `SETTLE_TIMEOUT_S` | 8 / 5 / 900 | one RPC read's limit; how often a market asks the mirrors when the chain cannot answer; when a pending market raises SETTLEMENT_TIMEOUT (it keeps being checked) |
@@ -410,6 +420,7 @@ To stop any bot cleanly without a console (on Windows a background process canno
 .venv/bin/python sniper_deep.py          # where the edge comes from (--daily, --hourly, --gates, --live)
 .venv/bin/python live_check.py           # the live canary: fills, prices paid, latency, halts vs paper
 .venv/bin/python live_reconcile.py       # why the live ledger refused a fill (venue trades vs authorizations)
+.venv/bin/python refresh_delays.py       # rebuild paper's delay sample from the last 7 days of live replies
 .venv/bin/python live_preflight.py       # before --live: settings, keys, clock, collateral; must say READY
 .venv/bin/python kraken_race.py          # Kraken vs Binance: which tells this machine first
 ```

@@ -50,8 +50,9 @@ class LiveDelays(unittest.TestCase):
 
 class PaperSniper(unittest.TestCase):
     def env(self, path, **extra):
+        # the drawn delays themselves; the 200ms paper calibration on top is tests_paper_realism's
         return patch.dict(os.environ, {"SNIPER_DELAY_SOURCE": "live", "SNIPER_DELAY_JOURNAL": path,
-                                       "SNIPER_LATENCY_MS": "", **extra})
+                                       "SNIPER_LATENCY_MS": "", "SNIPER_PAPER_EXTRA_MS": "0", **extra})
 
     def test_each_paper_order_draws_a_real_live_delay(self):
         ms = [100.0 + 10 * i for i in range(40)]
@@ -85,7 +86,8 @@ class PaperSniper(unittest.TestCase):
             sn = S.Sniper(None, None, settings=st)
         d, parts = sn.latency_plan()
         self.assertEqual(parts["latency_mode"], "live-like")
-        self.assertAlmostEqual(d, st.net_default_ms + st.hold_ms + st.server_ms)
+        self.assertEqual(st.paper_extra_ms, 200.0)                        # the paper calibration, by default
+        self.assertAlmostEqual(d, st.net_default_ms + st.hold_ms + st.server_ms + st.paper_extra_ms)
 
 
 if __name__ == "__main__":

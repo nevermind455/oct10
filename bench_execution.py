@@ -183,9 +183,16 @@ class _env:
                 os.environ[k] = v
 
 
-async def make_live(tmp: str):
+async def make_live(tmp: str, *, ledger_src: str | None = None, session_start: float | None = None,
+                    durable: bool = False):
     """The production sender (FastOrderBuilder + FastH2 on a warm connection)
-    and LiveExecution, against a local HTTP/2 fake CLOB."""
+    and LiveExecution, against a local HTTP/2 fake CLOB.
+
+    ledger_src: a COPY of a real ledger (its .journal too) - the order path's
+    loss-budget read visits the positions settled since session_start, so an
+    empty ledger hides what a long-running canary pays (2026-10-25: 3.9ms
+    decided -> wire on 10-15, 8.3ms on 10-25). durable: a real CanarySession,
+    so every order writes and fsyncs its intent as live does."""
     import base64
     import secrets
     import uuid
@@ -204,16 +211,29 @@ async def make_live(tmp: str):
     rules = L.RoundRules(lambda c, u, d: T.rules_fetch(c, u, d))
     limits = L.CanaryLimits(max_order_shares=25, max_orders=10 ** 9, max_fills=10 ** 9, max_rounds=10 ** 9,
                             max_exposure_usd=1e12, max_daily_loss_usd=1e12)
-    sender = L.LeanSender(builder=S.FastOrderBuilder(OrderBuilder(signer)), signer=signer, creds=creds,
+    builder = S.FastOrderBuilder(OrderBuilder(signer))
+    prove = getattr(builder.b, "prove_fast_signing", None)             # as build_live_execution does at start
+    if prove is not None:                                              # (absent before 2026-10-25: compare runs)
+        prove()
+    sender = L.LeanSender(builder=builder, signer=signer, creds=creds,
                           host=fake.url, http=http, clock=clock, rules=rules, limits=limits, kill=L.KillSwitch(None),
                           journal=lambda row: None, timeout_s=3.0)
     await clock.refresh(http, fake.url + "/time")                      # opens the connection, off the hot path
     await rules.prefetch(T.COND, T.UP, T.DN)
+    if ledger_src:
+        import shutil
+        for suffix in ("", ".journal"):
+            src = pathlib.Path(ledger_src + suffix)
+            if src.exists():
+                shutil.copy(src, os.path.join(tmp, "ledger.json" + suffix))
     ledger = Ledger(path=os.path.join(tmp, "ledger.json"))
 
     def sink(receipt):
-        ledger.authorize_order(receipt["order_id"], receipt, venue_min_shares=5.0, price_cap=0.95)
-        return ledger.save()
+        # as run.make_order_observer: one fsynced journal line per accepted order, not
+        # a rewrite of the whole ledger (which, from a real ledger, is ~1.7MB a time)
+        if not ledger.authorize_order_durable(receipt["order_id"], receipt, venue_min_shares=5.0, price_cap=0.95):
+            raise RuntimeError("accepted order id cannot be authorized in the bench ledger")
+        return True
     shim = L.LiveBrokerShim(lambda cid: T.paper_rules(), min_buy_price=0.05, max_buy_price=0.95, max_spread=0.25,
                             trade_window_seconds=600.0, min_seconds_to_expiry=10.0)
     shim._rules(T.COND)
@@ -222,13 +242,20 @@ async def make_live(tmp: str):
                          balance_fetch=lambda: {"balance": 1e9, "allowance": 1e9}, clock_url=fake.url + "/time",
                          fills=store, assumed_delay_s=1.0)
     await ex._read_balance()
+    if session_start is not None:
+        ex.session_start = float(session_start)
+    if durable:
+        session = L.CanarySession(pathlib.Path(tmp) / "canary_state.json", "bench-wallet")
+        session.open(limits, sender.kill, ledger, new_session=True)     # a deliberate fresh budget
+        sender.session = ex.session = session
     return fake, ex, store
 
 
 async def bench_live(m: int, matched_every: int = 5, with_pm: bool = False, pm_stress: bool = False,
-                     with_fair: bool = False) -> dict:
+                     with_fair: bool = False, ledger_src: str | None = None, session_start: float | None = None,
+                     durable: bool = False) -> dict:
     tmp = tempfile.mkdtemp(prefix="bench_live_")
-    fake, ex, store = await make_live(tmp)
+    fake, ex, store = await make_live(tmp, ledger_src=ledger_src, session_start=session_start, durable=durable)
     if with_pm:
         # inventory to manage, so the manager does full evaluations (both sides, every size)
         ex.ledger.record_fill("seed-up", T.UP, shares=20, price=0.45, condition_id=T.COND, fee=0.16)
@@ -376,14 +403,20 @@ def bench_signing(n: int) -> dict:
     from clob_sdk import CreateOrderOptions, MarketOrderArgsV2, OrderType
     from clob_signing import OrderBuilder
     from clob_signing import BUY
-    out = {"signing_path": "eth_account.LocalAccount.sign_typed_data",
-           "default_backend": "unverified", "backend_verified": False}
     raw = secrets.token_hex(32)
-    # Changing signer.private_key does not change signer.account, which owns
-    # typed-data signing. Measure the production path without relabeling it
-    # as a different ECDSA backend based on that unrelated cached key.
+    # The production builder, proven at start as live and paper prove it: with
+    # SNIPER_FAST_SIGN on (default) and the proof passed, orders sign their directly
+    # encoded EIP-712 digest with the held key; otherwise sign_typed_data.
     signer = S.fast_signer("0x" + raw, 137)
     builder = S.FastOrderBuilder(OrderBuilder(signer))
+    prove = getattr(builder.b, "prove_fast_signing", None)
+    note = prove() if prove is not None else ""
+    direct = getattr(builder.b, "fast_sign", None) is True
+    out = {"signing_path": ("direct EIP-712 digest + held libsecp256k1 key"
+                            if direct and getattr(signer, "secp_key", None) is not None
+                            else "direct EIP-712 digest + eth_keys key" if direct
+                            else "eth_account.LocalAccount.sign_typed_data"),
+           "fast_sign_note": note, "default_backend": "unverified", "backend_verified": False}
     per = []
     for i in range(n):
         args = MarketOrderArgsV2(token_id=T.UP, amount=S.signing_amount(5.0 + (i % 50) / 10),
@@ -402,12 +435,16 @@ def bench_journal(n: int) -> dict:
            "reason": "cooldown", "round_end": 1, "left_s": 100.0, "condition_id": T.COND}
     for label, d in (("temp_dir", tempfile.mkdtemp(prefix="bench_j_")), ("bot_dir", str(ROOT))):
         path = os.path.join(d, f"bench_journal_{os.getpid()}.jsonl")
-        sn = types.SimpleNamespace(journal=path, n={"journal errors": 0})
+        # Sniper._write appends through a kept-open descriptor since audit L9: the
+        # journal path's own methods and recheck interval, on a bare instance.
+        sn = S.Sniper.__new__(S.Sniper)
+        sn.journal, sn.n = path, {"journal errors": 0}
         per = []
         for _ in range(n):
             t = time.perf_counter_ns()
             S.Sniper._write(sn, row)
             per.append((time.perf_counter_ns() - t) / 1e6)
+        sn._journal_close()
         try:
             os.unlink(path)
         except OSError:
@@ -515,7 +552,8 @@ async def main_async(args) -> dict:
     res["ticks"] = bench_ticks(args.updates)
     res["position_manager"] = args.pm
     res["live"] = await bench_live(args.orders, with_pm=args.pm != "off", pm_stress=args.pm == "stress",
-                                   with_fair=args.fair)
+                                   with_fair=args.fair, ledger_src=args.ledger, session_start=args.session_start,
+                                   durable=args.durable)
     res["signing"] = bench_signing(args.sign)
     res["journal"] = bench_journal(args.journal)
     res["wakeup_us"] = {"idle": await bench_wakeup(args.wakeup, dashboard=False),
@@ -539,6 +577,13 @@ def main(argv=None) -> int:
     ap.add_argument("--pm", choices=("off", "on", "stress"), default="off",
                     help="Position Manager beside the sniper: off, on (5ms polls, an evaluation whenever the state changed), "
                          "stress (a full evaluation every 5ms). Use a fresh process per setting.")
+    ap.add_argument("--ledger", default=None,
+                    help="a real ledger to COPY into the run (e.g. the VPS's live_ledger.json): the order path's "
+                         "loss-budget read grows with the positions settled since --session-start")
+    ap.add_argument("--session-start", type=float, default=None,
+                    help="the canary session's start (unix seconds; live_canary_state.json started_wall)")
+    ap.add_argument("--durable", action="store_true",
+                    help="a real canary session: every order writes and fsyncs its send intent, as live does")
     ap.add_argument("--uvloop", action="store_true",
                     help="run on uvloop (Linux/macOS, pip install uvloop) - compare with a run without it "
                          "before setting SNIPER_UVLOOP=1 (audit L10)")

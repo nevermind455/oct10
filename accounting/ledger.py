@@ -205,6 +205,15 @@ class Ledger:
         self._open_pos: dict[str, Position] = {}
         self._settled: list = []
         self._settled_n = 0
+        # realized_since() results by since_wall, valid while _settled_rev holds
+        # (2026-10-25: the live loss budget asks for the realized P/L since the
+        # canary session began, 3x per order - a walk of every position settled
+        # in a 10-day session, 3.9ms -> 8.3ms decided -> wire on the VPS). Every
+        # change to what the walk would see bumps _settled_rev: a settlement or
+        # its rollback, a reopened position, a reindex. Tools and tests that edit
+        # positions in place call invalidate_caches().
+        self._settled_rev = 0
+        self._realized_cache: dict[float, tuple[int, float]] = {}
         self._by_condition: dict[str, list[str]] = {}
         self._lot_by_trade: dict[str, Lot] = {}
         self._indexed = None
@@ -658,6 +667,7 @@ class Ledger:
                 pos.payout_per_share = None
                 pos.realized = None
                 pos.settled_wall = None
+                self._settled_rev += 1
             if order_side == "SELL":
                 # An exit can only ever reduce inventory we actually hold.
                 # Probing FIFO first means a short is refused before any lot
@@ -930,6 +940,7 @@ class Ledger:
                         pos.settled = False
                         pos.settled_wall = None
                         self._open_pos[pos.token_id] = pos
+                    self._settled_rev += 1
                     self._hybrid_risk = previous_hybrid
                     self._hybrid_realized_total = previous_hybrid_realized
                     raise RuntimeError("settlement could not be persisted")
@@ -1088,6 +1099,7 @@ class Ledger:
         """Rebuild every index from `positions` (load, a rollback, or state
         changed behind the ledger's back)."""
         self._open_pos, self._settled, self._settled_n = {}, [], 0
+        self._settled_rev += 1
         self._by_condition, self._lot_by_trade = {}, {}
         for key, p in self.positions.items():
             self._by_condition.setdefault(str(p.condition_id), []).append(key)
@@ -1119,6 +1131,7 @@ class Ledger:
         self._indexed = (id(self.positions), len(self.positions))
 
     def _note_settled_locked(self, pos: Position) -> None:
+        self._settled_rev += 1
         wall = pos.settled_wall
         try:
             wall = float(wall)
@@ -1170,8 +1183,25 @@ class Ledger:
         with self._lock:
             return self._realized_since_locked(since_wall)
 
+    def invalidate_caches(self) -> None:
+        """For tools and tests that edit positions in place, behind the ledger's
+        back: the next realized_since() / risk_view() walks the history again."""
+        with self._lock:
+            self._settled_rev += 1
+
     def _realized_since_locked(self, since_wall: float) -> float:
         self._open_positions_locked()           # index anything settled since the last read
+        rev = self._settled_rev
+        hit = self._realized_cache.get(since_wall)
+        if hit is not None and hit[0] == rev:
+            return hit[1]
+        total = self._realized_walk_locked(since_wall)
+        if len(self._realized_cache) >= 8:
+            self._realized_cache.clear()
+        self._realized_cache[since_wall] = (rev, total)
+        return total
+
+    def _realized_walk_locked(self, since_wall: float) -> float:
         total, counted = 0.0, set()
         start = bisect.bisect_left(self._settled, (since_wall, -1), key=lambda e: (e[0], e[1]))
         for wall, _n, p in self._settled[start:]:

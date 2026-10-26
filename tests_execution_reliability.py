@@ -190,6 +190,117 @@ class TimeoutThisRun(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.by_hand())
 
 
+# =========================================================================== H1: the record's window (2026-10-25)
+# The resolver was handed its row before LeanSender._after stamped "wall", so the send time
+# fell back to the clock AFTER ~120s of get_order lookups and the trade record was read from
+# ~0.9s after the send: a FAK that matched in its first second - the usual case - was settled
+# as zero execution (reservation released, never booked). TimeoutThisRun could not see it: it
+# shortens the lookups to 0.01s and its record ignores `after`. The record is now read for the
+# whole round, whatever the send time says, and the resolver gets the reply's time.
+def match_filter(trades):
+    """The CLOB's own `after` filter on TradeParams(after=int(after)): matched after it."""
+    asked = []
+
+    def account_trades(market, after):
+        asked.append(after)
+        return [r for r in trades if int(r["match_time"]) > int(after)]
+    return account_trades, asked
+
+
+class HistoryWindow(unittest.TestCase):
+    HASH = "0x" + "ab" * 32
+
+    def test_the_whole_round_is_read_whatever_the_send_time_says(self):
+        now = time.time()
+        end = now - 600.0                                                  # closed ten minutes ago
+        executed = dict(trade_row(self.HASH), match_time=end - 100.0)      # matched inside its round
+        for sent in (end - 100.4, now, None, "not a time"):               # true, late, missing, malformed
+            with self.subTest(sent=sent):
+                ex = L.LiveExecution.__new__(L.LiveExecution)
+                ex.account_trades, asked = match_filter([executed])
+                verdict = ex._trade_history_verdict(order_hash=self.HASH, token=T.UP, condition=T.COND,
+                                                    end=end, sent_wall=sent)
+                self.assertIsNotNone(verdict)
+                self.assertEqual((verdict[0], [r["id"] for r in verdict[1]]), (L.MATCHED, ["t-h1"]))
+                self.assertLessEqual(asked[0], end - 300.0 - 60.0)        # from before the round began
+
+
+class TimeoutThisRunProductionDelays(unittest.IsolatedAsyncioTestCase):
+    """A send timeout end to end with what TimeoutThisRun shortcuts: the production lookup
+    delays (0.5..60s, on a virtual clock - nothing waits) and a trade record that applies its
+    `after` filter. The order executed: its trade matched 0.3s after the send."""
+    asyncSetUp, asyncTearDown, plan = Inc.Live.asyncSetUp, Inc.Live.asyncTearDown, Inc.Live.plan
+
+    def virtual_clock(self):
+        """sniper_live's clock only: its sleeps advance it at once."""
+        offset = [0.0]
+        real_time, real_sleep = time.time, asyncio.sleep
+
+        class Clock:
+            def __getattr__(self, name):
+                return getattr(time, name)
+
+            def time(self):
+                return real_time() + offset[0]
+
+        class Loop:
+            def __getattr__(self, name):
+                return getattr(asyncio, name)
+
+            async def sleep(self, delay, *args, **kwargs):
+                offset[0] += max(0.0, float(delay))
+                await real_sleep(0)
+
+        saved = (L.time, L.asyncio)
+
+        def restore():
+            L.time, L.asyncio = saved
+        self.addCleanup(restore)
+        L.time, L.asyncio = Clock(), Loop()
+        return offset
+
+    async def timed_out(self):
+        ex = self.ex
+        ex.sender.timeout_s = 0.2                    # production 10s; the window does not depend on it
+        self.fake.script.append(("hang", 1.0))
+        p = ex.prepare(self.plan(3.0))
+        sent = time.time()
+        row = await ex.send(p)
+        self.assertEqual(row["kind"], L.AMBIGUOUS)
+        return p, sent
+
+    async def test_the_resolver_is_handed_the_reply_time(self):
+        seen = []
+        self.ex.sender.ambiguity_resolver = lambda p, row: seen.append(row)
+        p, sent = await self.timed_out()
+        self.assertEqual(len(seen), 1)
+        self.assertIn("wall", seen[0])
+        self.assertGreaterEqual(seen[0]["wall"], sent)
+        self.assertLessEqual(seen[0]["wall"], time.time())
+
+    async def test_an_executed_fak_whose_reply_timed_out_is_found_and_authorized(self):
+        ex = self.ex
+        self.assertEqual(ex.ambiguity_delays_s, (0.5, 1.0, 2.0, 4.0, 8.0, 15.0, 30.0, 60.0))   # production
+        self.assertEqual((ex.HISTORY_AFTER_END_S, ex.HISTORY_RETRY_S), (180.0, 60.0))
+        offset, trades = None, []
+
+        def order_status(order_hash):                # the CLOB's null for a FAK, after a REST round trip
+            if offset is not None:
+                offset[0] += 0.05
+            return None
+        ex.order_status = order_status
+        ex.account_trades, asked = match_filter(trades)
+        p, sent = await self.timed_out()
+        trades.append(dict(trade_row(p.order_hash, size="4", price="0.33"), match_time=sent + 0.3))
+        offset = self.virtual_clock()
+        await asyncio.wait_for(asyncio.gather(*list(ex._order_tasks), return_exceptions=True), 10)
+        self.assertEqual(ex.n["unknown outcome resolved NO_MATCH"], 0)   # it executed: never a zero
+        self.assertEqual(ex.n["unknown outcome resolved MATCHED"], 1)
+        self.assertLess(asked[0], sent)                                  # the record from before the send
+        self.assertEqual(ex.awaiting[p.order_hash]["final_size"], 4.0)
+        self.assertIn(p.client_order_id, ex._risk_orders)                # its cash held until it is booked
+
+
 # =========================================================================== H1: after a restart
 class TimeoutAfterRestart(unittest.IsolatedAsyncioTestCase):
     asyncSetUp, reboot, HASH, crashed_run = (W.DurableWarmDispatch.asyncSetUp, W.DurableWarmDispatch.reboot,

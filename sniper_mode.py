@@ -791,6 +791,14 @@ def fast_signer(private_key: str, chain_id: int):
     signer = Signer(private_key, chain_id)
     raw = private_key[2:] if private_key.startswith("0x") else private_key
     signer.private_key = keys.PrivateKey(bytes.fromhex(raw), backend=get_backend())
+    try:
+        # eth_keys' coincurve backend rebuilds the libsecp256k1 key (two curve
+        # operations) inside every signature; held once, a signature costs ~21us
+        # instead of ~56us here, with the same call and the same bytes (2026-10-25).
+        import coincurve
+        signer.secp_key = coincurve.PrivateKey(bytes.fromhex(raw))
+    except Exception:  # noqa: BLE001 - no coincurve: the eth_keys key above signs
+        signer.secp_key = None
     return signer
 
 
@@ -945,7 +953,9 @@ class Settings:
         # filled 31% of live's own orders (live 21%) for +$210.68 (live +$1.42), +$202 of it on
         # fills live never got. Meeting the book 200ms later than each order's measured delay
         # matched live: 21% vs 21%, +$7.00 vs +$1.42. Paper only (live's orders meet the real venue).
-        self.paper_extra_ms = _env_float("SNIPER_PAPER_EXTRA_MS", 0.0)
+        # Default 200 since 2026-10-25 (was 0: every default paper run was the optimistic one);
+        # SNIPER_PAPER_EXTRA_MS=0 brings that back. Still an assumption, not a measured lag.
+        self.paper_extra_ms = _env_float("SNIPER_PAPER_EXTRA_MS", 200.0)
         if not math.isfinite(self.paper_extra_ms) or not 0.0 <= self.paper_extra_ms <= 5000.0:
             raise ValueError(f"invalid SNIPER_PAPER_EXTRA_MS {self.paper_extra_ms!r}: 0..5000 ms")
         self.delay_note = ""                   # set by a paper Sniper once the live delays are loaded
@@ -979,7 +989,10 @@ class Settings:
         self.kelly = _env_bool("SNIPER_KELLY", True)
         self.kelly_fraction = _env_float("SNIPER_KELLY_FRACTION", 0.25)
         self.hybrid_sizing = _env_bool("SNIPER_HYBRID_SIZING", True)
-        self.kelly_min_entry = _env_bool("SNIPER_KELLY_MIN_ENTRY", True)
+        # Off by default since 2026-10-25 (AUDIT_20261023.md M3): the 37 minimum entries of
+        # 10-15..10-21 lost $20.96 on $106 where Kelly wanted 1.08 shares on average; on, it is
+        # still never taken in a realized drawdown (the hybrid scale under 1).
+        self.kelly_min_entry = _env_bool("SNIPER_KELLY_MIN_ENTRY", False)
         try:
             self.hybrid_policy = HybridPolicy(
                 vol_baseline_bp=_env_float("SNIPER_HYBRID_VOL_BASELINE_BP", 1.0),
@@ -2799,6 +2812,7 @@ class Sniper:
             from clob_signing import BUY
             signer = fast_signer("0x" + secrets.token_hex(32), 137)    # as the live sender signs
             builder = FastOrderBuilder(OrderBuilder(signer))
+            builder.b.prove_fast_signing()                              # as live: proven before the first order
         except Exception:  # noqa: BLE001 - no library: latency stays live-like, signing is skipped
             return None, {}
         clob = {"MarketOrderArgsV2": MarketOrderArgsV2, "OrderArgsV2": OrderArgsV2,
@@ -3660,6 +3674,7 @@ class Sniper:
                         return self._skip("venue minimum unavailable", row)
                 held, opposite = self._kelly_inventory(cond, end, side, token, down if side == "UP" else up)
                 fraction = self.s.kelly_fraction
+                drawdown_scale = 1.0
                 if getattr(self.s, "hybrid_sizing", False):
                     try:
                         hybrid = self._hybrid_factors()
@@ -3668,6 +3683,7 @@ class Sniper:
                         return self._skip("hybrid risk unavailable", row)
                     row["hybrid"] = hybrid
                     fraction = hybrid["effective_fraction"]
+                    drawdown_scale = float(hybrid.get("drawdown_scale", 1.0))
                     risk_budget = hybrid["risk_budget_usd"]
                     if fraction <= 0:
                         return self._skip("hybrid drawdown stop", row)
@@ -3686,7 +3702,12 @@ class Sniper:
                         return self._skip("minimum entry state unavailable", row)
                     if minimum_key in self._minimum_entry_keys:
                         return self._skip("minimum entry already attempted this side and round", row)
-                    if held <= 1e-9 and f > 0 and fraction > 0 and bank > 0 and room + 1e-9 >= share_floor:
+                    if drawdown_scale < 1.0:
+                        # M3 (2026-10-25): in a realized drawdown the hybrid scale is what cuts the
+                        # risk - a minimum entry bought 5 shares at an 18.7% drawdown (scale 0.064)
+                        # where Kelly said 0. No minimum entry below the high-water mark.
+                        row["minimum_entry_blocked"] = "realized drawdown"
+                    elif held <= 1e-9 and f > 0 and fraction > 0 and bank > 0 and room + 1e-9 >= share_floor:
                         shares = float(share_floor)
                         minimum_entry = True
                         row.update(minimum_entry=True, minimum_entry_attempted=False,
@@ -4827,11 +4848,15 @@ class Sniper:
         if getattr(self.s, "hybrid_sizing", False) and self.s.fair and self.s.kelly:
             await asyncio.to_thread(self._refresh_hybrid_risk)
             self._spawn(self._hybrid_risk_loop())
-        switch_ms = _env_float("SNIPER_SWITCH_MS", 0)
+        switch_ms = _env_float("SNIPER_SWITCH_MS", 1.0)
         if switch_ms > 0:
             # How long another thread may hold the GIL before the event loop
-            # gets it back (Python default 5ms). Shorter = the loop waits less
-            # behind ledger/dashboard work; those threads switch more often.
+            # gets it back (Python's own default 5ms; 0 keeps it). Shorter = the
+            # loop waits less behind ledger/dashboard work; those threads switch
+            # more often. 2026-10-25: 1ms by default - the VPS builds dashboard
+            # frames on its worker threads, and with one building, a packet
+            # waited 10.4ms (p50) for the loop at 5ms vs 2.4ms at 1ms
+            # (bench_execution.py wakeup); fills fall off within milliseconds.
             sys.setswitchinterval(switch_ms / 1000.0)
         # Marks a restart in the journal: the checker reports from here by default.
         self._write({"wall": time.time(), "result": "start", "code": self.code, "live": self.live is not None,
