@@ -14,14 +14,8 @@ _clock_checked_mono = None
 _clock_result = None
 # local_mid - CLOB_server.  CLOB-aligned time is local - offset.
 _clock_offset = 0.0
-_clock_measured = False
 _clock_sample_wall = None
 _clock_sample_mono = None
-
-
-def clock_measured() -> bool:
-    with _clock_lock:
-        return _clock_measured
 
 
 def unix(ts: float | None = None) -> float:
@@ -114,23 +108,6 @@ def window_start(ts: float | None = None, window: int = 300) -> int:
     return current - current % window
 
 
-def current_round_window_et(ts: float | None = None):
-    now = now_et(ts)
-    start_min = (now.minute // 5) * 5
-    end_min = start_min + 5
-    start_h, end_h = now.hour, now.hour
-    if end_min >= 60:
-        end_min -= 60
-        end_h = (end_h + 1) % 24
-
-    def fmt(h, m):
-        suffix = "AM" if h < 12 else "PM"
-        h12 = h % 12 or 12
-        return f"{h12}:{m:02d}{suffix}"
-
-    return f"{fmt(start_h, start_min)}-{fmt(end_h, end_min)} ET"
-
-
 def check_clock(host: str, max_drift_s: float = 2.0, *, cache_s: float = 30.0,
                 timeout: float = 4.0) -> tuple[bool, str, float | None]:
     """Compare the local wall clock with the CLOB server's public clock.
@@ -139,7 +116,7 @@ def check_clock(host: str, max_drift_s: float = 2.0, *, cache_s: float = 30.0,
     Network failure is fail-closed for live order entry.  The midpoint of the
     local request interval removes most request latency from the drift estimate.
     """
-    global _clock_checked_mono, _clock_result, _clock_offset, _clock_measured
+    global _clock_checked_mono, _clock_result, _clock_offset
     global _clock_sample_wall, _clock_sample_mono
     now_mono = time.monotonic()
     with _clock_lock:
@@ -189,17 +166,4 @@ def check_clock(host: str, max_drift_s: float = 2.0, *, cache_s: float = 30.0,
         _clock_sample_mono = sampled_mono
         if offset is not None:
             _clock_offset = offset
-            _clock_measured = True
     return result
-
-
-def reset_clock_cache() -> None:
-    global _clock_checked_mono, _clock_result, _clock_offset, _clock_measured
-    global _clock_sample_wall, _clock_sample_mono
-    with _clock_lock:
-        _clock_checked_mono = None
-        _clock_result = None
-        _clock_offset = 0.0
-        _clock_measured = False
-        _clock_sample_wall = None
-        _clock_sample_mono = None

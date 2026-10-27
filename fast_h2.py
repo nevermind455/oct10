@@ -165,7 +165,8 @@ class _Proto(asyncio.Protocol):
             # write() may have handed bytes to the kernel before failing. Return
             # the failed stream so start() cannot turn this into a second POST.
             self.alive = False
-            self._fail_all(lambda old: ConnectionError(f"transport write failed: {type(exc).__name__}"))
+            reason = f"transport write failed: {type(exc).__name__}"   # exc is unbound after the block
+            self._fail_all(lambda old: ConnectionError(reason))
             self.transport.close()
             return s
         s.events.append(("http2.send_request_body.complete", time.perf_counter_ns()))
@@ -247,7 +248,8 @@ class _Proto(asyncio.Protocol):
                 self.transport.write(out)
             except Exception as exc:
                 self.alive = False
-                self._fail_all(lambda old: ConnectionError(f"HTTP/2 control write failed: {type(exc).__name__}"))
+                reason = f"HTTP/2 control write failed: {type(exc).__name__}"
+                self._fail_all(lambda old: ConnectionError(reason))
                 self.transport.close()
 
 

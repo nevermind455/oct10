@@ -250,33 +250,6 @@ def get_orderbook_snapshot(token_id, timeout=8.0):
     return _get_orderbook(token_id, timeout, with_metadata=True)
 
 
-def liquidity_signal(bids, asks):
-    def volume(levels):
-        total, count = 0.0, 0
-        for level in levels or ():
-            try:
-                size = float(level.get("size"))
-            except (AttributeError, TypeError, ValueError):
-                continue
-            if math.isfinite(size) and size > 0:
-                candidate = total + size
-                if not math.isfinite(candidate):
-                    return 0.0, 0
-                total = candidate
-                count += 1
-        return total, count
-
-    bid_volume, bid_count = volume(bids)
-    ask_volume, ask_count = volume(asks)
-    # A one-sided book is not a depth comparison.  Near expiry the winning
-    # token keeps only bids and the losing token only asks, so an empty side
-    # would otherwise cast a confident vote for the token that cannot be
-    # bought at all.  Abstain and let the other signals decide.
-    if not bid_count or not ask_count:
-        return None
-    return "UP" if bid_volume >= ask_volume else "DOWN"
-
-
 def validate_buy_liquidity(token_id, amount, max_price, max_spread, min_price=0.0,
                            book=None):
     """Fail closed before signing when the selected token is unfillable/unsafe.

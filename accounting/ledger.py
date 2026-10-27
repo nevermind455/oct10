@@ -403,37 +403,6 @@ class Ledger:
             shares = float(position.shares)
             return shares if math.isfinite(shares) and shares > 0 else 0.0
 
-    def open_leg_basis(self, condition_id: str | None,
-                       token_id: str | None) -> tuple[float, float] | None:
-        """Entry price and paid fee-per-share for one unsettled leg.
-
-        Returns ``(avg_price, fee_per_share)`` with the price excluding fees,
-        or ``None`` when this condition holds no open shares of that token.
-        The pair-lock guard needs both halves: what the held leg cost and the
-        fee already sunk into it, because a matched pair only redeems for
-        $1.00 and every cent paid on either leg comes out of that.
-        """
-        condition = str(condition_id or "")
-        token = str(token_id or "")
-        if not condition or not token:
-            return None
-        with self._lock:
-            for position in (self.positions.get(token),):     # positions are keyed by their token
-                if (position is None or position.condition_id != condition
-                        or position.token_id != token
-                        or position.settled or position.shares <= 0):
-                    continue
-                price = position.avg_price
-                fee_per_share = position.fees / position.shares
-                # A basis the guard cannot trust must read as "no basis", never
-                # as a cheap one: the caller treats None as a refusal.
-                if (price is None or not math.isfinite(price) or price <= 0
-                        or not math.isfinite(fee_per_share)
-                        or fee_per_share < 0):
-                    return None
-                return float(price), float(fee_per_share)
-        return None
-
     def recovery_conditions(self, *, now: float | None = None,
                             lookback_s: float = RECOVERY_LOOKBACK_SECONDS,
                             ) -> tuple[str, ...]:
@@ -566,9 +535,13 @@ class Ledger:
                     condition_id=None, status="CONFIRMED", theta=None,
                     source="user_ws", fee=None, fee_exponent: int = 1,
                     order_id=None, wall: float | None = None,
-                    reported_price: float | None = None) -> bool:
+                    reported_price: float | None = None, replay: bool = False) -> bool:
         """Idempotent. Returns True only if this trade id was new. `wall` is
-        the lot's time; only a journal replay passes it (the original one)."""
+        the lot's time; only a journal replay passes it (the original one).
+        `replay` re-applies a fill this ledger already booked: allow_sells
+        gates new exits only, so a SELL booked while exits were on still
+        replays after they are switched off (refusing it failed the load and
+        the bot would not start)."""
         try:
             lot_wall = time.time() if wall is None else float(wall)
         except (TypeError, ValueError, OverflowError):
@@ -597,7 +570,7 @@ class Ledger:
                 self.skipped_status += 1
                 return False
             if order_side == "SELL":
-                if not self.allow_sells:
+                if not (self.allow_sells or replay):
                     self.skipped_side += 1
                     return False
             elif order_side != "BUY":
@@ -698,7 +671,9 @@ class Ledger:
                     pos.settled = True
                     pos.payout_per_share = None
                     pos.realized = pos.realized_from_sales
-                    pos.settled_wall = time.time()
+                    # The sale's own time: a replay must not re-date it to the
+                    # restart and move its P/L into a later loss-budget window.
+                    pos.settled_wall = lot_wall
                 self.seen.add(tid)
                 self._seen_rev += 1
                 self._index_fill_locked(pos)
@@ -1047,7 +1022,7 @@ class Ledger:
         lines = raw.split(b"\n")
         torn = lines.pop()                    # b"" when the file ends with a newline
         entries = []
-        for i, line in enumerate(lines):
+        for line in lines:
             if not line.strip():
                 raise ValueError("blank line inside the ledger journal")
             entries.append(_journal_entry(json.loads(line.decode("utf-8"), parse_constant=_reject_json_constant)))
@@ -1077,7 +1052,8 @@ class Ledger:
                 if not self.record_fill(e["trade_id"], e["token_id"], shares=e["shares"], price=e["price"],
                                         side=e["side"], condition_id=e["condition_id"], status=e["status"],
                                         source=e["source"], fee=e["fee"], order_id=e["order_id"],
-                                        wall=e["wall"], reported_price=e.get("reported_price")):
+                                        wall=e["wall"], reported_price=e.get("reported_price"),
+                                        replay=True):
                     raise ValueError(f"ledger journal fill {e['seq']} does not apply")
             else:
                 targets = [p for p in self.positions.values()
@@ -1405,58 +1381,57 @@ class Ledger:
             counters = (len(self.seen), self.duplicates, self.skipped_status, self.skipped_side,
                         self.skipped_unauthorized, self.skipped_authorization_mismatch,
                         self.last_persistence_error, self.last_ingest_error, self.integrity_error)
-        if True:
-            settled = [p for p in everything if id(p) not in open_ids and p.settled]
-            realized = sum(p.realized or 0.0 for p in settled)
-            # Grade one market once. If the strategy bought both outcomes in
-            # a round, counting the winner token as a win and the loser token
-            # as a loss makes the reported win rate meaningless; the round's
-            # net PnL is the result that matters.
-            market_results: dict[str, float] = {}
-            for p in settled:
-                key = p.condition_id or f"token:{p.token_id}"
-                market_results[key] = market_results.get(key, 0.0) + (p.realized or 0.0)
-            wins = sum(1 for pnl in market_results.values() if pnl > 0)
-            losses = sum(1 for pnl in market_results.values() if pnl <= 0)
-            open_cost = {id(p): row[4] for p, row in zip(open_, open_rows)}
-            open_fees = {id(p): row[5] for p, row in zip(open_, open_rows)}
-            staked = sum(open_cost.get(id(p), p.cost) for p in everything)
-            (fills_counted, duplicates, skipped_status, skipped_side, skipped_unauthorized,
-             skipped_mismatch, persistence_error, ingest_error, integrity_error) = counters
-            out = {
-                "realized_pnl": realized,
-                "settled_positions": len(settled),
-                "settled_markets": len(market_results),
-                "open_positions": len(open_),
-                "pending_cost": sum(row[4] for row in open_rows),
-                "wins": wins,
-                "losses": losses,
-                "win_rate": (wins / (wins + losses)) if (wins + losses) else None,
-                "fees_paid": sum(open_fees.get(id(p), p.fees) for p in everything),
-                "total_cost": staked,
-                "fills_counted": fills_counted,
-                "duplicates_suppressed": duplicates,
-                "skipped_not_a_fill": skipped_status,
-                "skipped_non_buy": skipped_side,
-                "skipped_unauthorized": skipped_unauthorized,
-                "skipped_authorization_mismatch": skipped_mismatch,
-                "persistence_error": persistence_error,
-                "ingest_error": ingest_error,
-                "integrity_error": integrity_error,
-                "open_position_details": [
-                    {
-                        "token_id": token,
-                        "condition_id": condition,
-                        "shares": shares,
-                        "average_entry_price": avg,
-                        "cost": cost,
-                        "fees": fees,
-                        "latest_fill_wall": latest,
-                    }
-                    for token, condition, shares, avg, cost, fees, latest in open_rows
-                ],
-            }
-            out["realized_after_fees"] = realized   # fees already inside cost
+        settled = [p for p in everything if id(p) not in open_ids and p.settled]
+        realized = sum(p.realized or 0.0 for p in settled)
+        # Grade one market once. If the strategy bought both outcomes in
+        # a round, counting the winner token as a win and the loser token
+        # as a loss makes the reported win rate meaningless; the round's
+        # net PnL is the result that matters.
+        market_results: dict[str, float] = {}
+        for p in settled:
+            key = p.condition_id or f"token:{p.token_id}"
+            market_results[key] = market_results.get(key, 0.0) + (p.realized or 0.0)
+        wins = sum(1 for pnl in market_results.values() if pnl > 0)
+        losses = sum(1 for pnl in market_results.values() if pnl <= 0)
+        open_cost = {id(p): row[4] for p, row in zip(open_, open_rows)}
+        open_fees = {id(p): row[5] for p, row in zip(open_, open_rows)}
+        staked = sum(open_cost.get(id(p), p.cost) for p in everything)
+        (fills_counted, duplicates, skipped_status, skipped_side, skipped_unauthorized,
+         skipped_mismatch, persistence_error, ingest_error, integrity_error) = counters
+        out = {
+            "realized_pnl": realized,
+            "settled_positions": len(settled),
+            "settled_markets": len(market_results),
+            "open_positions": len(open_),
+            "pending_cost": sum(row[4] for row in open_rows),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": (wins / (wins + losses)) if (wins + losses) else None,
+            "fees_paid": sum(open_fees.get(id(p), p.fees) for p in everything),
+            "total_cost": staked,
+            "fills_counted": fills_counted,
+            "duplicates_suppressed": duplicates,
+            "skipped_not_a_fill": skipped_status,
+            "skipped_non_buy": skipped_side,
+            "skipped_unauthorized": skipped_unauthorized,
+            "skipped_authorization_mismatch": skipped_mismatch,
+            "persistence_error": persistence_error,
+            "ingest_error": ingest_error,
+            "integrity_error": integrity_error,
+            "open_position_details": [
+                {
+                    "token_id": token,
+                    "condition_id": condition,
+                    "shares": shares,
+                    "average_entry_price": avg,
+                    "cost": cost,
+                    "fees": fees,
+                    "latest_fill_wall": latest,
+                }
+                for token, condition, shares, avg, cost, fees, latest in open_rows
+            ],
+        }
+        out["realized_after_fees"] = realized   # fees already inside cost
         if mark is not None:
             u, unmarkable, cycle_error = 0.0, 0, None
             # Sample every token exactly once. Calling a moving book twice made
@@ -1537,37 +1512,36 @@ class Ledger:
             payouts = [(float(p.settled_wall), float(p.shares) * float(p.payout_per_share))
                        for p in self.positions.values()
                        if p.settled and p.settled_wall is not None and p.payout_per_share and p.shares > 0]
-        if True:
-            observed = b1 - b0
-            purchased = sum(
-                lot.cost for group in lots
-                for lot in group if lot.side == "BUY" and t0 <= lot.wall <= t1
-            )
-            sold = sum(
-                lot.notional - lot.fee for group in lots
-                for lot in group if lot.side == "SELL" and t0 <= lot.wall <= t1
-            )
-            expected = sold - purchased
-            payout_room = sum(amount for wall, amount in payouts if t0 - self.REDEEM_LAG_S <= wall <= t1)
-            tol = max(tolerance, abs(expected) * 0.01)
-            diff = observed - expected
-            low, high = observed < expected - tol, observed > expected + payout_room + tol
-            ok = not (low or high)
-            return {
-                "status": "OK" if ok else "MISMATCH",
-                "window_s": t1 - t0,
-                "balance_observed_delta": observed,
-                "expected_delta": expected,
-                "confirmed_buy_cost_in_window": purchased,
-                "confirmed_sell_proceeds_in_window": sold,
-                "payouts_possible_in_window": payout_room,
-                "difference": diff,
-                "detail": "" if ok else
-                          ("the wallet fell more than our confirmed fills explain: missing fills, a withdrawal "
-                           "or unrelated activity; investigate" if low else
-                           "the wallet rose more than our fills and payouts explain: a deposit, a redemption "
-                           "the ledger does not know, or unrelated activity; investigate"),
-            }
+        observed = b1 - b0
+        purchased = sum(
+            lot.cost for group in lots
+            for lot in group if lot.side == "BUY" and t0 <= lot.wall <= t1
+        )
+        sold = sum(
+            lot.notional - lot.fee for group in lots
+            for lot in group if lot.side == "SELL" and t0 <= lot.wall <= t1
+        )
+        expected = sold - purchased
+        payout_room = sum(amount for wall, amount in payouts if t0 - self.REDEEM_LAG_S <= wall <= t1)
+        tol = max(tolerance, abs(expected) * 0.01)
+        diff = observed - expected
+        low, high = observed < expected - tol, observed > expected + payout_room + tol
+        ok = not (low or high)
+        return {
+            "status": "OK" if ok else "MISMATCH",
+            "window_s": t1 - t0,
+            "balance_observed_delta": observed,
+            "expected_delta": expected,
+            "confirmed_buy_cost_in_window": purchased,
+            "confirmed_sell_proceeds_in_window": sold,
+            "payouts_possible_in_window": payout_room,
+            "difference": diff,
+            "detail": "" if ok else
+                      ("the wallet fell more than our confirmed fills explain: missing fills, a withdrawal "
+                       "or unrelated activity; investigate" if low else
+                       "the wallet rose more than our fills and payouts explain: a deposit, a redemption "
+                       "the ledger does not know, or unrelated activity; investigate"),
+        }
 
     # ---------------------------------------------------------- persistence
     def _payload_locked(self) -> dict:

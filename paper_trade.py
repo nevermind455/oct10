@@ -29,12 +29,10 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, replace as dataclass_replace
-from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, ROUND_UP
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
-
-import requests
 
 import http_pool
 import orderbook

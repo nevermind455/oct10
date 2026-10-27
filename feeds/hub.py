@@ -140,7 +140,6 @@ class FeedHub:
         self._resync_event = asyncio.Event()
         self._resync_loop_owner: asyncio.AbstractEventLoop | None = None
         self.rest_resyncs = 0
-        self.rest_fallbacks = 0
 
     # -------------------------------------------------------------- price
     def _on_price(self, price: float, mono: float, exchange_ts_ms: int | None = None) -> None:
@@ -432,7 +431,7 @@ class FeedHub:
                     # Legacy levels-only fixtures remain usable, but cannot
                     # invent the exchange timestamp needed by order entry.
                     bids, asks = result
-            except asyncio.TimeoutError as exc:
+            except asyncio.TimeoutError:
                 # A Python worker cannot be killed. Keep its handle so no
                 # replacement HTTP call accumulates behind a hung request.
                 # A timeout raised BY a completed HTTP worker is different:
@@ -451,6 +450,10 @@ class FeedHub:
                 self.market.health.mark_error(exc)
                 self._event("resync", f"REST snapshot failed for {token[-6:]}: "
                             f"{type(exc).__name__}: {exc}", "warn")
+                # A fast failure (HTTP error, refused reply) gets the same WS
+                # fallback as a timeout: while REST keeps failing, it is the
+                # only way this token becomes tradeable again.
+                self._request_ws_snapshot(token, self.book.view(token))
                 return
             if self.book.apply_snapshot(
                     token, bids, asks, only_if_unsynced=True,
@@ -466,11 +469,14 @@ class FeedHub:
                     self._resync_wanted.discard(token)
             else:
                 current = self.book.view(token)
-                # Ignored UNSYNCED deltas now fence REST. On a busy market
-                # every HTTP response can race; use a stream-ordered snapshot
-                # instead of waiting indefinitely for a quiet fetch interval.
-                if (current.status == UNSYNCED and current.generation == view.generation
-                        and current.receive_revision != view.receive_revision):
+                # REST did not sync this generation: a WS delta raced the
+                # fetch (ignored UNSYNCED deltas fence REST, and on a busy
+                # market every HTTP response can race) or the reply itself was
+                # refused (crossed, no venue timestamp). Use a stream-ordered
+                # snapshot instead of waiting for a REST reply that may never
+                # be usable. A newer generation is a reconnect or rotation,
+                # which brings its own snapshot.
+                if current.status == UNSYNCED and current.generation == view.generation:
                     self._request_ws_snapshot(token, current)
 
     def _request_ws_snapshot(self, token: str, view: BookView) -> bool:

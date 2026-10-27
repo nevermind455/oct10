@@ -408,30 +408,6 @@ class PolyUserFeed(SupervisedFeed):
         # authorize order submission.
         return self.refresh_status() == LIVE
 
-    def ready_reason_for_market(self, condition_id) -> str:
-        """Why ready_for_market would refuse, or "" when it would allow.
-
-        Mirrors ready_for_market's checks in the same order WITHOUT being the
-        gate: the gate stays exactly as it was, and this only explains it, so
-        telemetry can say which readiness input blocked a decision instead of
-        recording an undifferentiated False.
-        """
-        condition = str(condition_id or "")
-        if not condition:
-            return "no condition id"
-        if not self.authed:
-            return "private stream not authenticated"
-        if self._ws is None:
-            return "private stream socket is down"
-        with self._sub_lock:
-            subscribed = condition in self._sent
-        if not subscribed:
-            return "condition not subscribed on the private stream"
-        status = self.refresh_status()
-        if status != LIVE:
-            return f"private stream status is {status}, not LIVE"
-        return ""
-
     def set_markets(self, markets) -> None:
         markets = [str(m) for m in markets if m]
         with self._sub_lock:

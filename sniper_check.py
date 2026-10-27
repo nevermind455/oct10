@@ -69,6 +69,51 @@ def jsonl(path: Path) -> list[dict]:
     return rows
 
 
+def jsonl_scoped(path: Path, *, last_start: bool = False, since_wall: float | None = None,
+                 drop: tuple = ("book_trace",), need: str | None = None) -> tuple[list[dict], int, dict | None]:
+    """The journal rows a report needs, read line by line - never the whole file
+    in memory (2026-10-27: live_check.py and live_reconcile.py were killed by the
+    kernel on the 2 GB VPS: 216k rows load as ~1 GB of dicts beside the live bot).
+    last_start: the rows from the last start row on (it included); since_wall:
+    the rows from then on; neither: every row. drop: row types left out (the
+    9 KB book_trace rows no report reads); need: a raw substring a line must
+    hold to be read at all. Returns (rows, lines in the file, the last start row)."""
+    drop_raw = tuple(f'"result":{sep}"{d}"' for d in drop for sep in ("", " "))
+    rows: list[dict] = []
+    total, start = 0, None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                total += 1
+                if drop_raw and any(k in line for k in drop_raw):
+                    continue
+                if need is not None and need not in line and '"start"' not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(r, dict):
+                    continue
+                if r.get("result") == "start":
+                    start = r
+                    if last_start:
+                        rows = [r]
+                        continue
+                if need is not None and need not in line:
+                    continue
+                if since_wall is not None:
+                    try:
+                        if float(r.get("wall") or 0) < since_wall:
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+                rows.append(r)
+    except OSError:
+        pass
+    return rows, total, start
+
+
 def _git_head() -> str | None:
     try:
         import subprocess

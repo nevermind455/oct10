@@ -174,8 +174,8 @@ def main() -> int:
     else:
         audit = sc.state_path(env, "PAPER_AUDIT_PATH", "paper_orders.jsonl")
         path = audit.with_name(f"{audit.stem}_sniper.jsonl")
-    rows = sc.jsonl(path)
-    print(f"journal: {path}  ({len(rows)} rows)")
+    rows, total, _start = sc.jsonl_scoped(path, last_start=True)      # line by line: the 2 GB VPS
+    print(f"journal: {path}  ({total} rows)")
     if not rows:
         print("VERDICT: the journal is empty - the bot has never run with this journal (or writes elsewhere).")
         return 1

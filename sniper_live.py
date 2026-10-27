@@ -353,10 +353,6 @@ class VenueGuard:
         self._resume_if_due()
         return self.state
 
-    def hard_halt(self, reason: str) -> None:
-        # Compatibility for callers of the former hard-stop API.
-        self.pause_for(self.long_pause_s, reason)
-
     def status(self) -> dict:
         self._resume_if_due()
         return {"state": self.state, "strikes": len(self.strikes), "healthy_streak": self.healthy_streak,
@@ -2890,7 +2886,13 @@ class LiveExecution:
             self.kill.check()
 
     def own_risk_shares(self, token: str, condition: str) -> float:
-        """Booked plus uncertain own-side inventory; never hedge credit."""
+        """Booked plus uncertain own-side inventory; never hedge credit.
+
+        An unbooked order counts the most it is known to have delivered: its sizing
+        estimate, the venue's reply total and its trades on the private channel so
+        far, whatever their status (2026-10-27: a cheaper fill that delivered 20
+        shares counted as its 10-share estimate until the ledger booked it
+        CONFIRMED - Kelly could buy 7 more). Booked shares are never counted twice."""
         with self._risk_lock:
             reservations = [dict(a) for a in self._risk_orders.values()
                             if a["token"] == str(token) and a["condition"] == str(condition)]
@@ -2905,7 +2907,33 @@ class LiveExecution:
                 for lot in pos.lots:
                     if str(lot.side).upper() == "BUY" and getattr(lot, "order_id", None):
                         booked[lot.order_id] += float(lot.open_shares)
-        return held + sum(max(0.0, a["shares"] - booked.get(a.get("order_id"), 0.0)) for a in reservations)
+        total = held
+        for a in reservations:
+            oid = a.get("order_id")
+            delivered = float(a.get("shares") or 0.0)
+            if oid:
+                fak = self.fak_orders.get(oid)
+                if fak is not None and fak.get("final_size") is not None:
+                    delivered = max(delivered, float(fak["final_size"]))
+                delivered = max(delivered, self._seen_shares(oid))
+            total += max(0.0, delivered - booked.get(oid, 0.0))
+        return total
+
+    def _seen_shares(self, order_id) -> float:
+        """The shares of one order's trades on the private channel that may still
+        deliver: every status but FAILED (MATCHED is provisional, RETRYING is being
+        retried on chain; the ledger books CONFIRMED). Read-only."""
+        seen = 0.0
+        for f in fills_of_order(self.fills, order_id):
+            if str(getattr(f, "status", "") or "").upper() in ("RETRYING", "MATCHED", "MATCHED_NOT_BROADCASTED",
+                                                                "MINED", "CONFIRMED"):
+                try:
+                    size = float(f.size or 0)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(size) and size > 0:
+                    seen += size
+        return seen
 
     def _resolve_risk(self, a: dict, *, filled: bool, spent: float | None = None) -> None:
         key = a.get("client_order_id")
@@ -3983,9 +4011,14 @@ class LiveExecution:
              "kind": row["kind"], "client_order_id": p.client_order_id, "authorized": False,
              "trade_ids": set(resp.get("tradeIDs") or resp.get("trade_ids") or [])}
         self.awaiting[oid] = a
+        totals_seen = reply_totals(resp) if row["kind"] == MATCHED else None
         with self._risk_lock:
             if p.client_order_id in self._risk_orders:
-                self._risk_orders[p.client_order_id]["order_id"] = oid
+                held = self._risk_orders[p.client_order_id]
+                held["order_id"] = oid
+                if totals_seen is not None:
+                    # the venue's own share total for the execution: a cheaper fill buys more
+                    held["shares"] = max(float(held.get("shares") or 0.0), float(totals_seen[1]))
         if p.order_type == "FAK":
             a.update(order_type="FAK", cap=p.price, fee_rate=float(rules.get("fee_rate") or 0),
                      fee_exponent=int(rules.get("fee_exponent") or 1),

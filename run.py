@@ -112,7 +112,7 @@ def _drain_loop(loop: asyncio.AbstractEventLoop) -> None:
 def uvloop_wanted(env=None) -> bool:
     """SNIPER_UVLOOP=1: run on uvloop instead of asyncio's own loop (audit L10).
     Off by default and PAPER only until a Linux benchmark on the VPS shows a
-    measurable gain without regressions (bench_execution.py --uvloop)."""
+    measurable gain without regressions (tests/bench_execution.py --uvloop)."""
     env = os.environ if env is None else env
     return str(env.get("SNIPER_UVLOOP", "")).strip().lower() in ("1", "true", "yes", "on")
 
@@ -606,10 +606,10 @@ def _live_sniper_gate(paper: bool) -> bool:
                            "unless SNIPER_LIVE_CANARY=1 is set too")
     if uvloop_wanted():
         raise RuntimeError("SNIPER_UVLOOP=1 is PAPER only until a Linux benchmark shows a gain without "
-                           "regressions (bench_execution.py --uvloop on the VPS): unset it for --live")
+                           "regressions (tests/bench_execution.py --uvloop on the VPS): unset it for --live")
     if str(os.environ.get("POSITION_MANAGER_LIVE_ENABLED", "")).strip().lower() in ("1", "true", "yes", "on"):
         raise RuntimeError("POSITION_MANAGER_LIVE_ENABLED=1: real Position Manager orders are not implemented "
-                           "until its paper/replay results are reviewed (replay_ab.py). Unset it; with "
+                           "until its paper results are reviewed. Unset it; with "
                            "POSITION_MANAGER_ENABLED=1 the manager runs shadow-only in LIVE (decisions, no orders).")
     # The resolved settings must be the frozen spec: an old .env value (or a
     # missing one, falling back to a code default that is not the spec)

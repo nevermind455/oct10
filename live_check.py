@@ -113,12 +113,19 @@ def main() -> int:
     args = ap.parse_args()
     env = sc.read_env(Path(args.env))
     path = sc.state_path(env, "LIVE_SNIPER_JOURNAL", "live_sniper.jsonl")
-    rows = sc.jsonl(path)
+    # Line by line, only the rows in scope (the whole journal as dicts got the tool killed on the
+    # 2 GB VPS, 2026-10-27); --all still reads everything.
+    if args.all:
+        rows, _total, start = sc.jsonl_scoped(path, drop=())
+    elif args.hours:
+        rows, _total, start = sc.jsonl_scoped(path, since_wall=time.time() - args.hours * 3600)
+    else:
+        rows, _total, start = sc.jsonl_scoped(path, last_start=True)
     print(f"journal : {path}")
-    if not rows:
+    if not rows and start is None:
         print("no live journal rows yet (is the bot running with --live, SNIPER_ONLY=1, SNIPER_LIVE_CANARY=1?)")
         return 0
-    starts = [r for r in rows if r.get("result") == "start"]
+    starts = [start] if start is not None else []
     since = (time.time() - args.hours * 3600 if args.hours else 0.0 if args.all or not starts
              else float(starts[-1]["wall"]))
     rows = [r for r in rows if float(r.get("wall") or 0) >= since]
@@ -157,7 +164,7 @@ def main() -> int:
                                    if r.get("kind") == "MATCHED" or fills.get(r.get("order_id")))
     if set(per) - {"binance"}:
         print("  by the feed that fired: " + ", ".join(f"{f} {per_fill[f]}/{n} filled" for f, n in per.items())
-              + "   (sniper_deep.py --by-feed --live for markouts per feed)")
+)
 
     # the paper model's shadow fills on the same orders
     shadows = {r.get("id"): r.get("L") or {} for r in rows if r.get("result") == "shadow"}
@@ -255,11 +262,11 @@ def main() -> int:
         print(f"    {'group':12s} {'orders':>6s} {'venue reply ms p50':>18s} {'p90':>6s} {'BTC move bp':>12s} "
               f"{'by feed':>20s}")
         for g, rs in groups.items():
-            rep_ms = sorted(float(r["t_wire_to_reply_ms"]) for r in rs if r.get("t_wire_to_reply_ms") is not None)
-            p = (lambda k: rep_ms[min(len(rep_ms) - 1, int(len(rep_ms) * k / 100))] if rep_ms else float("nan"))
+            rep_ms = [float(r["t_wire_to_reply_ms"]) for r in rs if r.get("t_wire_to_reply_ms") is not None]
+            p50, p90 = (q(rep_ms, k) if rep_ms else float("nan") for k in (50, 90))
             bp = [abs(float(r.get("bp") or 0)) for r in rs]
             feeds_ = collections.Counter(r.get("feed") or "binance" for r in rs)
-            print(f"    {g:12s} {len(rs):>6d} {p(50):18.0f} {p(90):6.0f} "
+            print(f"    {g:12s} {len(rs):>6d} {p50:18.0f} {p90:6.0f} "
                   f"{(sum(bp) / len(bp)) if bp else float('nan'):12.2f} {dict(feeds_)!s:>20s}")
         print("    shadow-only replies as fast as the rest = someone else got there first (competition);"
               " clearly slower = the venue's slow tail")

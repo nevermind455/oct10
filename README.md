@@ -4,8 +4,7 @@ A Polymarket bot that trades one thing: Polymarket's 5-minute **btc-updown-5m**
 markets, the instant BTC moves. It runs in **paper** (simulated fills on the real book, the default) or as a capped **live canary** (real orders under hard limits).
 
 The trading integration now targets the supported `polymarket-client==0.13.0`
-unified SDK. See [migration and validation notes](SDK_UPGRADE_2026-10-19.md)
-before installing this update. Native SDK integration and live latency still
+unified SDK. Native SDK integration and live latency still
 require verification on the intended host.
 
 This repo is carved out of `spe24` at **aaff811**: b314d70's engine, plus
@@ -98,7 +97,7 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
     high-water mark (its 37 fills of 10-15..10-21 lost $20.96 on $106, one at an
     18.7% drawdown where Kelly said 0). This exception can exceed the hybrid
     target; cash, the fair-value margin, drawdown stop and existing limits still
-    apply. There is no carry in Kelly mode. See [hybrid sizing](HYBRID_SIZING.md)
+    apply. There is no carry in Kelly mode. See [hybrid sizing](docs/HYBRID_SIZING.md)
     for formulas, settings and limitations. The fair model still needs empirical
     probability calibration; passing formula tests does not establish a profitable edge.
   - **FOK.** `SNIPER_ORDER_TYPE=FOK` keeps the old all-or-nothing order with no carry.
@@ -122,12 +121,12 @@ panel shows every stage and LAST/AVG/P50/P95/P99/MAX for trigger -> send, -> ACK
 and -> fill known. Paper has no venue, so its ACK and fill are the model's,
 labelled `sim`.
 
-Measured on the live code path (`python bench_execution.py`: real signing, a warm
+Measured on the live code path (`python tests/bench_execution.py`: real signing, a warm
 HTTP/2 connection, a fake CLOB on 127.0.0.1), trigger -> send is about 0.4ms. What
 is left of trigger -> ACK is outside the process:
 
-- **The network.** Run `python bench_network.py` on the VPS: warm round trip to the
-  CLOB, TCP/TLS setup, and the Binance and Polymarket sockets.
+- **The network.** The order connection's warm round trip to the CLOB (the summary's
+  `clob_rtt_ms`; `live_check.py` shows the reply times).
 - **Polymarket's taker delay.** Crypto markets hold every taker order: 150ms since
   2026-09-04 14:00 UTC (docs changelog; 250ms until 2026-08-17). The reply waits for
   it, so trigger -> ACK cannot go below about 150ms plus one round trip.
@@ -215,30 +214,6 @@ positions table's `AVG` is the price paid without fees.
 **Live.** `POSITION_MANAGER_LIVE_ENABLED=1` refuses to start: real manager orders
 wait for the replay results to be reviewed. With `--live` and the engine on, it is
 shadow-only (decisions logged, no orders).
-
-**A/B replay.** `python replay_ab.py --data <recordings>` replays every recorded
-round twice: the sniper alone, then the sniper + manager. Both get identical events,
-each round settles on its venue result, and the output includes the manager's
-capital, its attributable P/L, the P/L per extra dollar, the extra drawdown and
-exposure, and any sniper order that differs. Record with
-`python -m latency_lab.recorder` (public data only). The replay triggers from the
-frozen spec's feed (Coinbase, the recorder's `xb` rows); `--feed binance` replays
-the Binance trigger instead. The recorder keeps a Coinbase ticker only when its
-best bid or ask changed, so the replay's rule restarts after quiet spells a
-little more often than live.
-
-The replay runs the frozen spec's hybrid sizing: it refreshes the realized-equity
-snapshot every 5 seconds of replay time, as the bot's worker does, and it fills a
-share-sized FAK by its signed dollars (shares x the limit), as paper and the venue do.
-
-Replay preserves recorded Coinbase exchange times and sequences when present;
-older rows receive deterministic sequences. It reports malformed inputs and
-accepted ticks, and warns when no signals, orders or fills were exercised. Cash
-is withheld until modelled settlement and redemption: defaults are 60 seconds
-after expiry and another 600 seconds until redemption, configurable with
-`--settlement-delay-s` and `--redemption-delay-s`. These are modelling assumptions,
-not observed venue guarantees. Historical research commands identify their older
-Binance/fixed-size strategy separately from this current replay.
 
 ## Settlement
 
@@ -349,6 +324,7 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | `SNIPER_KELLY` / `SNIPER_KELLY_FRACTION` | 1 / 0.25 | quarter-Kelly base allocation; existing inventory is subtracted after the hybrid modifiers |
 | `SNIPER_HYBRID_SIZING` | 1 | enable volatility and realized-drawdown reductions; required by the live specification |
 | `SNIPER_KELLY_MIN_ENTRY` | 0 | strict sizing (default since 2026-10-25); 1 allows one venue-minimum attempt per side/round for an eligible positive target below minimum, never in a realized drawdown; can exceed the hybrid target |
+| `SNIPER_MIN_ENTRY_MAX_DRAWDOWN` | 0 | how deep a realized drawdown (fraction below the equity high-water mark) a minimum entry may still be taken in; 0 = never below the mark. The `0533fa9` run's minimum entries by drawdown: 0% +$18.59 on 79 fills, 0-5% +$4.11 on 83, 5-10% -$1.80 on 62, 10-15% -$3.37 on 56, 15-20% -$13.25 on 24 |
 | `SNIPER_HYBRID_VOL_BASELINE_BP` | 1.0 | volatility baseline in bp per sqrt(second); exposure multiplier `min(1, baseline / sigma)` |
 | `SNIPER_HYBRID_DRAWDOWN_STOP` | 0.20 | allocation scales linearly to zero at this realized-equity drawdown from its persisted high-water mark |
 | `SNIPER_HYBRID_RISK_FRACTION` | 0 | optional maximum all-in new-order spend as a fraction of realized equity; 0 disables |
@@ -380,22 +356,7 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 
 A set `SNIPER_*` number that does not parse, or is NaN or infinite, stops the start and names the variable; so does a negative cooldown, minimum time left or book-wait, or a side cap or stale limit of 0. The `SNIPER_CANARY_MAX_*` caps must be finite numbers >= 0 (whole numbers for the counts). A bad value used to quietly become the default, and `nan` switched a canary cap off.
 
-## Real-time paper: the sniper and the Position Manager on live markets
-
-```bash
-python paper_realtime.py run --markets 25      # supervisor; stops after 25 settled markets
-python paper_realtime.py ctl restart           # clean restart (state restored from disk)
-python paper_realtime.py ctl hard-restart      # crash test: killed, then restarted
-python paper_realtime.py ctl stop
-python paper_realtime.py report                # per-market table, P/L by source, invariant checks
-```
-
-The supervisor starts two things in their own folder (`~/sniperbtc-realtime`; never your usual paper state):
-
-- `run.py --paper` with `POSITION_MANAGER_ENABLED=1`. Both the sniper and the manager trade the same paper account against the real Binance feed and real Polymarket books, rounds and results. Every fill is a **simulated paper fill**.
-- The market recorder, so the same stream can be replayed later as sniper-only vs sniper + manager (`replay_ab.py --data <dir>/lab`).
-
-Every 30 seconds it samples the bot's CPU, RAM, threads and handles, re-checks the paper invariants, and writes both to `monitor.jsonl`.
+## Paper mode
 
 At start, paper prints `TRADING MODE: REAL-TIME PAPER ... LIVE ORDER EXECUTION: DISABLED ... REAL MONEY RISK: $0`. Every order-capable live entry point is replaced by a refusal that is counted; the final report shows the count. That is 18 of the bot's own paths (the SDK adapter, the legacy helpers, the live sender and the HTTP/2 order write) plus, with the pinned `polymarket-client` installed, the SDK's own clients' order, cancel, fund-moving and credential calls: 58 in all for 0.13.0.
 
@@ -417,18 +378,11 @@ To stop any bot cleanly without a console (on Windows a background process canno
 ```bash
 .venv/bin/python sniper_why.py           # is it trading, and if not, which check stops it (--live: the canary)
 .venv/bin/python sniper_check.py         # paper plumbing + numbers vs the lab (fill rate, markouts)
-.venv/bin/python sniper_deep.py          # where the edge comes from (--daily, --hourly, --gates, --live)
 .venv/bin/python live_check.py           # the live canary: fills, prices paid, latency, halts vs paper
 .venv/bin/python live_reconcile.py       # why the live ledger refused a fill (venue trades vs authorizations)
+.venv/bin/python live_pnl.py            # where the money went, trade by trade
 .venv/bin/python refresh_delays.py       # rebuild paper's delay sample from the last 7 days of live replies
 .venv/bin/python live_preflight.py       # before --live: settings, keys, clock, collateral; must say READY
-.venv/bin/python kraken_race.py          # Kraken vs Binance: which tells this machine first
-```
-
-Research (read-only, heavy; run it beside the bot at low priority). It scores dynamic price limits and sizes against what the bot sends now, on the latency lab's recordings and the live canary's real orders:
-
-```bash
-LAB_DATA=/opt/lab_data nice -n 19 .venv/bin/python sniper_dynexec.py
 ```
 
 ## Run on a Windows PC (paper)
@@ -439,7 +393,7 @@ Paper runs fine on a PC; live belongs on the VPS (a home link is slow to the CLO
    - Nothing for the delays: `SNIPER_DELAY_SOURCE=live` reads the shipped `data/live_delays_2026-10-04.jsonl`.
    - `SNIPER_LIVE_CANARY=0`.
    - `PAPER_LEDGER_PATH`, `PAPER_ACCOUNT_PATH`, `PAPER_AUDIT_PATH` and `BOT_LOCK_PATH` pointing to a folder outside OneDrive. Its sync can lock a file at the moment the ledger replaces it.
-2. Double-click `run_paper.cmd`, or run `python run.py --paper --dash` in Windows Terminal. Ctrl+C stops it.
+2. Run `python run.py --paper --dash` in Windows Terminal. Ctrl+C stops it.
 3. Check it with the same daily tools: `python sniper_why.py`, `python sniper_check.py`.
 
 If the start prints `[DNS] Polymarket name resolution is redirected`, set Windows' DNS to 1.1.1.1 or 8.8.8.8, or enable DNS-over-HTTPS. Otherwise discovery and every venue call fail.
@@ -526,13 +480,13 @@ To run under systemd instead of tmux, copy `/etc/systemd/system/btcbot.service` 
 ## Tests
 
 ```bash
-python run_tests.py              # every tests_*.py in its own process; exit 0 = all passed
+python run_tests.py              # every tests/tests_*.py in its own process; exit 0 = all passed
 python run_tests.py run feeds    # just tests_run.py and tests_feeds.py
 ```
 
 - **No network, no wallet.** The suites never read `.env`: `testing_env.py` turns the load off for the test process and removes the bot's settings from the inherited environment.
-- **Hash-locked trading files.** `tests_feeds.py` locks the trading files to their approved SHA-256 (since 2026-10-20 also the SDK adapter and signing, `clob_client.py`, `clob_signing.py`, `clob_sdk.py`, and `hybrid_sizing.py`). Any change to a trading file needs review, a new digest, and a comment beside it saying what changed.
-- **The final audit (2026-10-07).** `tests_final_audit.py` checks every rule against expected values the test computes itself (Decimal/Fraction), never with the production function. `tests_stress.py` runs 10,000 concurrent order races and 10,000 full-system scenarios, then 600 market rotations for resource growth. That suite takes about 5 minutes; `STRESS_SCALE=0.1` runs a tenth. `bench_loop_costs.py` measures what the event loop pays as the ledger grows. `bench_execution.py --pm off|on|stress` compares the order path with the Position Manager off and on.
+- **Hash-locked trading files.** `tests/tests_feeds.py` locks the trading files to their approved SHA-256 (since 2026-10-20 also the SDK adapter and signing, `clob_client.py`, `clob_signing.py`, `clob_sdk.py`, and `hybrid_sizing.py`). Any change to a trading file needs review, a new digest, and a comment beside it saying what changed.
+- **The final audit (2026-10-07).** `tests_final_audit.py` checks every rule against expected values the test computes itself (Decimal/Fraction), never with the production function. `tests_stress.py` runs 10,000 concurrent order races and 10,000 full-system scenarios, then 600 market rotations for resource growth. That suite takes about 5 minutes; `STRESS_SCALE=0.1` runs a tenth. `tests/bench_execution.py` runs the live order path against a local fake CLOB (`--ledger`/`--durable` on a copy of a real ledger).
 - **Regression tests carried over.**
   - b50cb59: a 400 FOK miss is NO_MATCH (`tests_sniper_recovery`).
   - 8abe70f: fill cost comes from the maker legs (`tests_fill_cost`).
@@ -550,7 +504,7 @@ python run_tests.py run feeds    # just tests_run.py and tests_feeds.py
   suite on Python 3.12 with `requirements.lock.txt`; update pins only alongside
   a complete test run. Historical ledger costs are kept when their original
   execution-leg evidence is unavailable.
-- **The Coinbase trigger (2026-10-10).** `tests_sniper_coinbase.py`: the venue's message shapes, the ack, out-of-order and malformed tickers, heartbeats that do not carry the price, the freshness gate, the socket loop against a local server (silence, starvation, errors, reconnects), and the replay. `tests_latency.py` checks the Coinbase-triggered sniper decides exactly as the old Binance one on the same mids.
+- **The Coinbase trigger (2026-10-10).** `tests_sniper_coinbase.py`: the venue's message shapes, the ack, out-of-order and malformed tickers, heartbeats that do not carry the price, the freshness gate, the socket loop against a local server (silence, starvation, errors, reconnects). `tests_latency.py` checks the Coinbase-triggered sniper decides exactly as the old Binance one on the same mids.
 
 ## Keeping up with spe24
 
@@ -571,14 +525,14 @@ Then update the changed digests in `BASELINE_SHA` (`tests_feeds.py`), run `pytho
 | `sniper_mode.py` | the sniper: trigger, gates, sizing, paper execution, journal |
 | `sniper_live.py`, `fast_h2.py` | live canary: lean signed sender on HTTP/2, limits, kill switch, reconciliation |
 | `exec_latency.py` | T0..T7 latency, execution quality, the frozen spec and the effective-config check |
-| `position_manager.py`, `replay_ab.py` | the optional Position Manager, and its A/B replay on recorded markets |
-| `bench_execution.py`, `bench_network.py` | latency benchmarks: the live code path in-process, and this box's network to the venue |
+| `position_manager.py` | the optional Position Manager |
 | `paper_trade.py` | paper broker: fills against Polymarket's book at the modelled match instant |
 | `polymarket_trade.py`, `orderbook.py`, `market_discovery.py` | venue client, book parsing, round discovery |
 | `feeds/` | Polymarket market and user channels, book state, REST reconcile, supervision |
 | `accounting/` | ledger, fees, resolution, settlement |
 | `config.py`, `timer.py`, `http_pool.py`, `onchain_resolution.py` | settings, clock, HTTP, on-chain settlement |
 | `dashboard/` | renderer, widgets and theme (from spe24), plus `sniper_layout.py` and `console.py` |
-| `sniper_why.py` ... `kraken_race.py` | the daily read-only tools |
-| `sniper_dynexec.py`, `sniper_rescore.py`, `latency_lab/load.py` | research: dynamic execution scored on the lab recordings (`LAB_DATA`) and live orders; needs numpy |
+| `sniper_why.py`, `live_check.py`, `live_reconcile.py`, `live_pnl.py`, `sniper_check.py`, `refresh_delays.py`, `live_preflight.py`, `reconcile_order.py`, `ledger_compact.py`, `export_records.sh` | the daily read-only tools, preflight and repair helpers |
+| `tests/`, `run_tests.py` | the offline test suites and their runner; `tests/bench_execution.py` the latency harness |
+| `docs/` | hybrid sizing, security, the 2026-10-25 fixes and live analysis |
 | `setup.sh`, `.env.example`, `requirements.txt` | VPS install |

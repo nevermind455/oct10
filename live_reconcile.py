@@ -106,8 +106,13 @@ def show(t: dict, ours: dict, led: dict) -> None:
     m_usd = sum((_f(m.get("matched_amount")) or 0) * (_f(m.get("price")) or 0) for m in makers)
     oid = str(t.get("taker_order_id") or "")
     auth = led["authorized"].get(oid) or {}
+    try:
+        at = time.strftime("%m-%d %H:%M:%S UTC", time.gmtime(float(t.get("match_time"))))
+    except (TypeError, ValueError, OverflowError):
+        at = "time ?"
     print(f"  trade ...{str(t.get('id'))[-10:]}  status {t.get('status')}  {t.get('trader_side') or '?'} "
           f"{t.get('side')}  size {t.get('size')} @ {t.get('price')}  = ${(size or 0) * (price or 0):.4f}")
+    print(f"    matched {at}, outcome {t.get('outcome') or '?'}, market {str(t.get('market') or '?')[:14]}..")
     print(f"    taker order {oid[:14]}.. {'(ours)' if oid in ours else '(NOT one of our journalled orders)'}; "
           f"authorized notional {auth.get('requested_notional', '-')}; booked in ledger: "
           f"{'yes' if str(t.get('id')) in led['booked_trades'] else 'no'}")
@@ -134,8 +139,10 @@ def main() -> int:
         return 1
     led = load_ledger(ledger_path)
     since = time.time() - args.hours * 3600
-    rows = [r for r in sc.jsonl(state_path(Path(args.env), "LIVE_SNIPER_JOURNAL", "live_sniper.jsonl"))
-            if r.get("live") and r.get("order_id") and float(r.get("wall") or 0) >= since]
+    # line by line, only order rows of the window (the whole journal got it killed on the 2 GB VPS)
+    window, _total, _start = sc.jsonl_scoped(state_path(Path(args.env), "LIVE_SNIPER_JOURNAL", "live_sniper.jsonl"),
+                                             since_wall=since, need='"order_id"')
+    rows = [r for r in window if r.get("live") and r.get("order_id")]
     ours = {r["order_id"]: r for r in rows}
     matched = [r for r in rows if r.get("kind") == "MATCHED"]
     unconfirmed = [r for r in matched if r["order_id"] not in led["booked_orders"]]

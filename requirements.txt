@@ -19,7 +19,7 @@ socksio>=1.0.0,<2
 # of ~10min from the CLOB/Gamma mirrors). Optional at runtime: without it
 # SETTLE_ONCHAIN fails closed and settlement falls back to those APIs.
 web3>=7.0.0,<8
-# sniper_rescore.py / sniper_dynexec.py (research, read-only) and their tests.
+# The 5-minute summary's latency quantiles (sniper_mode.quantiles: numpy partition releases the GIL).
 numpy>=1.26,<3
 # Fast JSON for the feed handlers (sniper_mode falls back to json without it):
 # Binance futures sends ~200 messages/s, and slow parsing shows up as receive backlog.

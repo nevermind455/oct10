@@ -193,7 +193,7 @@ def _delay_probes(name: str) -> tuple[float, ...]:
             value = float(piece)
         except ValueError:
             raise ValueError(
-                f"{name} entries must be numbers of seconds, got {piece!r}")
+                f"{name} entries must be numbers of seconds, got {piece!r}") from None
         if not math.isfinite(value) or not 0 < value <= 60:
             raise ValueError(f"{name} entries must be between 0 and 60 seconds")
         out.append(value)
@@ -630,65 +630,6 @@ if not 0.0 <= STOP_LOSS_EXIT_CUTOFF_SECONDS < STOP_LOSS_ARM_SECONDS <= 300.0:
         "need 0 <= STOP_LOSS_EXIT_CUTOFF_SECONDS < STOP_LOSS_ARM_SECONDS <= 300")
 if not 0.2 <= STOP_LOSS_POLL_SECONDS <= 30.0:
     raise ValueError("STOP_LOSS_POLL_SECONDS must be between 0.2 and 30")
-
-# ---- PAPER/LIVE configuration parity ---------------------------------------
-# Settings that select WHAT to trade must be identical in both modes or the
-# two are not running the same strategy, and no paper result can predict a
-# live one. Settings that model HOW an order executes are expected to differ:
-# paper simulates what live does for real.
-#
-# Classification, not normalisation: a difference is reported, never silently
-# corrected, because which value is the intended one is the operator's call.
-PARITY_CLASSES = {
-    "STRATEGY": (),
-    "EXECUTION MODEL": (
-        ("PAPER_LATENCY_MS", None),
-        ("ASSUMED_MATCH_DELAY_SECONDS", None),
-    ),
-    "SAFETY": (
-        ("MAX_ROUND_EXPOSURE", None),
-        ("MAX_UNSETTLED_EXPOSURE", None),
-    ),
-    "TELEMETRY": (
-        ("PAPER_FILL_DELAY_PROBES", None),
-    ),
-}
-
-
-def strategy_parity() -> tuple[bool, list]:
-    """(passes, differences) over every paired STRATEGY setting.
-
-    A pair is (paper_name, live_name). Only STRATEGY pairs can fail: the
-    execution-model settings are supposed to differ, which is the whole point
-    of a simulator.
-    """
-    diffs = []
-    for paper_name, live_name in PARITY_CLASSES["STRATEGY"]:
-        if not live_name:
-            continue
-        paper_value = globals().get(paper_name)
-        live_value = globals().get(live_name)
-        if paper_value != live_value:
-            diffs.append({"setting": paper_name.replace("PAPER_", ""),
-                          "paper": paper_value, "live": live_value,
-                          "paper_setting": paper_name,
-                          "live_setting": live_name})
-    return (not diffs), diffs
-
-
-def parity_report_lines() -> list:
-    """Human-readable parity report, PASS or FAIL with every difference."""
-    ok, diffs = strategy_parity()
-    lines = [f"STRATEGY PARITY: {'PASS' if ok else 'FAIL'}"]
-    for d in diffs:
-        lines.append(f"  {d['setting']}: paper={d['paper']} live={d['live']} "
-                     f"({d['paper_setting']} vs {d['live_setting']})")
-    if not ok:
-        lines.append("  PAPER and LIVE are not running the same strategy; a "
-                     "paper result cannot predict the live one until this is "
-                     "resolved deliberately.")
-    return lines
-
 
 CANCEL_OPEN_BEFORE_TRADE = bool(_env_bool("CANCEL_OPEN_BEFORE_TRADE", False))
 ALLOW_GLOBAL_CANCEL_ALL = bool(_env_bool("ALLOW_GLOBAL_CANCEL_ALL", False))
