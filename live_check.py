@@ -113,12 +113,19 @@ def main() -> int:
     args = ap.parse_args()
     env = sc.read_env(Path(args.env))
     path = sc.state_path(env, "LIVE_SNIPER_JOURNAL", "live_sniper.jsonl")
-    rows = sc.jsonl(path)
+    # Line by line, only the rows in scope (the whole journal as dicts got the tool killed on the
+    # 2 GB VPS, 2026-10-27); --all still reads everything.
+    if args.all:
+        rows, _total, start = sc.jsonl_scoped(path, drop=())
+    elif args.hours:
+        rows, _total, start = sc.jsonl_scoped(path, since_wall=time.time() - args.hours * 3600)
+    else:
+        rows, _total, start = sc.jsonl_scoped(path, last_start=True)
     print(f"journal : {path}")
-    if not rows:
+    if not rows and start is None:
         print("no live journal rows yet (is the bot running with --live, SNIPER_ONLY=1, SNIPER_LIVE_CANARY=1?)")
         return 0
-    starts = [r for r in rows if r.get("result") == "start"]
+    starts = [start] if start is not None else []
     since = (time.time() - args.hours * 3600 if args.hours else 0.0 if args.all or not starts
              else float(starts[-1]["wall"]))
     rows = [r for r in rows if float(r.get("wall") or 0) >= since]

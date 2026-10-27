@@ -324,5 +324,41 @@ class Verdicts(unittest.TestCase):
         self.assertNotIn("old process cause", verdict)
 
 
+class ScopedJournal(unittest.TestCase):
+    """sniper_check.jsonl_scoped (2026-10-27): the reports read the journal line by line and keep
+    only their scope - the whole file as dicts got live_check/live_reconcile killed on a 2 GB VPS."""
+
+    def journal(self, rows, compact=True):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = pathlib.Path(tmp.name) / "j.jsonl"
+        sep = (",", ":") if compact else None
+        path.write_text("".join(json.dumps(r, separators=sep) + "\n" for r in rows) + "not json\n",
+                        encoding="utf-8")
+        return path
+
+    ROWS = [{"wall": 1, "result": "start", "code": "a"}, {"wall": 2, "result": "skipped", "reason": "x"},
+            {"wall": 3, "result": "start", "code": "b"}, {"wall": 4, "result": "book_trace", "flow": [1] * 50},
+            {"wall": 5, "result": "filled", "order_id": "0x1", "live": True}, {"wall": 6, "result": "summary"}]
+
+    def test_last_start_keeps_only_the_current_run_and_drops_book_traces(self):
+        for compact in (True, False):
+            rows, total, start = why.sc.jsonl_scoped(self.journal(self.ROWS, compact), last_start=True)
+            self.assertEqual([r["wall"] for r in rows], [3, 5, 6])
+            self.assertEqual((total, start["code"]), (7, "b"))
+
+    def test_since_wall_keeps_the_window_and_still_reports_the_last_start(self):
+        rows, _total, start = why.sc.jsonl_scoped(self.journal(self.ROWS), since_wall=4.5)
+        self.assertEqual([r["wall"] for r in rows], [5, 6])
+        self.assertEqual(start["code"], "b")
+
+    def test_need_reads_only_matching_lines_and_nothing_dropped_reads_all(self):
+        rows, _total, _start = why.sc.jsonl_scoped(self.journal(self.ROWS), need='"order_id"')
+        self.assertEqual([r["wall"] for r in rows], [5])
+        rows, _total, _start = why.sc.jsonl_scoped(self.journal(self.ROWS), drop=())
+        self.assertEqual(len(rows), 6)
+        self.assertEqual(why.sc.jsonl_scoped(pathlib.Path("/nonexistent/j.jsonl")), ([], 0, None))
+
+
 if __name__ == "__main__":
     unittest.main()
