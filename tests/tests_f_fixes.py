@@ -20,7 +20,6 @@ No network, no wallet, no .env. Expected values are computed here.
 from __future__ import annotations
 
 import asyncio
-import collections
 import json
 import os
 import pathlib
@@ -33,7 +32,6 @@ import types
 import unittest
 from decimal import Decimal as D
 from fractions import Fraction as F
-from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -42,11 +40,10 @@ import testing_env  # noqa: E402,F401 - first: tests never read the bot's .env
 import position_manager as PM  # noqa: E402
 import sniper_live as L  # noqa: E402
 import tests_sniper_ioc as I  # noqa: E402
-from accounting import ledger as LG  # noqa: E402
 from accounting import settlement as ST  # noqa: E402
 from accounting.ledger import Ledger, current_payload  # noqa: E402
 from accounting.resolution import RESOLVED, UNKNOWN, Resolution  # noqa: E402
-from paper_trade import MarketRules, PaperBroker  # noqa: E402
+from paper_trade import MarketRules  # noqa: E402
 
 
 # =========================================================================== F1

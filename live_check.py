@@ -262,11 +262,11 @@ def main() -> int:
         print(f"    {'group':12s} {'orders':>6s} {'venue reply ms p50':>18s} {'p90':>6s} {'BTC move bp':>12s} "
               f"{'by feed':>20s}")
         for g, rs in groups.items():
-            rep_ms = sorted(float(r["t_wire_to_reply_ms"]) for r in rs if r.get("t_wire_to_reply_ms") is not None)
-            p = (lambda k: rep_ms[min(len(rep_ms) - 1, int(len(rep_ms) * k / 100))] if rep_ms else float("nan"))
+            rep_ms = [float(r["t_wire_to_reply_ms"]) for r in rs if r.get("t_wire_to_reply_ms") is not None]
+            p50, p90 = (q(rep_ms, k) if rep_ms else float("nan") for k in (50, 90))
             bp = [abs(float(r.get("bp") or 0)) for r in rs]
             feeds_ = collections.Counter(r.get("feed") or "binance" for r in rs)
-            print(f"    {g:12s} {len(rs):>6d} {p(50):18.0f} {p(90):6.0f} "
+            print(f"    {g:12s} {len(rs):>6d} {p50:18.0f} {p90:6.0f} "
                   f"{(sum(bp) / len(bp)) if bp else float('nan'):12.2f} {dict(feeds_)!s:>20s}")
         print("    shadow-only replies as fast as the rest = someone else got there first (competition);"
               " clearly slower = the venue's slow tail")

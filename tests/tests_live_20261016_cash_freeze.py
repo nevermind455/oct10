@@ -21,7 +21,6 @@ payout stayed invisible and Kelly skipped nearly every signal.
 """
 from __future__ import annotations
 
-import os
 import sys
 import tempfile
 import unittest

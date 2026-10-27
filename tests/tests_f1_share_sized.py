@@ -22,7 +22,6 @@ import random
 import secrets
 import sys
 import tempfile
-import time
 import unittest
 from unittest.mock import patch
 from decimal import Decimal as D

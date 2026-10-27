@@ -35,7 +35,6 @@ import tempfile
 import time
 import types
 import unittest
-from decimal import Decimal as D
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent

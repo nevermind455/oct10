@@ -25,8 +25,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import json
-import tempfile
 import time
 import types
 import unittest
@@ -41,7 +39,6 @@ import tests_hybrid_strategy as HS
 import tests_live_20261014_incident as Inc
 import tests_live_20261016_cash_freeze as CF
 import tests_sniper_live as T
-from accounting import Ledger
 from feeds.poly_user import FillStore
 
 
@@ -164,7 +161,7 @@ class TimeoutThisRun(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_partial_fill_found_in_the_record_is_authorized_with_its_exact_size(self):
         self.arm(lambda n: [trade_row(self.hash, size="4", price="0.33")])
-        p = await self.timeout()
+        await self.timeout()
         await self.settle()
         a = self.ex.awaiting[self.hash]
         self.assertEqual((a["trade_ids"], a["final_size"]), ({"t-h1"}, 4.0))

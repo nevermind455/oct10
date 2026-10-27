@@ -12,12 +12,11 @@ import statistics
 import threading
 import time
 import unittest
-from unittest import mock
 
 import testing_env  # noqa: F401 - prevent credentials and venue network access
 
 from feeds.book import BookState
-from feeds.health import LIVE, UNSYNCED
+from feeds.health import LIVE
 from feeds.hub import FeedHub
 from feeds.poly_market import PolyMarketFeed
 from feeds.poly_user import FillStore

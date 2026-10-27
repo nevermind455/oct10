@@ -109,25 +109,17 @@ def sgr(style: Style) -> str:
 class Glyphs(NamedTuple):
     tl: str; tr: str; bl: str; br: str
     h: str; v: str
-    tee_d: str; tee_u: str; tee_r: str; tee_l: str; cross: str
-    arrow_d: str; arrow_r: str
-    block: str; half: str; light: str
-    up_tick: str; dn_tick: str
-    candle_body: str; candle_wick: str
+    block: str; light: str
 
 
 UNICODE = Glyphs(
     tl="\u250c", tr="\u2510", bl="\u2514", br="\u2518",
     h="\u2500", v="\u2502",
-    tee_d="\u252c", tee_u="\u2534", tee_r="\u251c", tee_l="\u2524", cross="\u253c",
-    arrow_d="\u25bc", arrow_r="\u25b6",
-    block="\u2588", half="\u2584", light="\u2591",
-    up_tick="\u25b2", dn_tick="\u25bc",
-    candle_body="\u2588", candle_wick="\u2502",
+    block="\u2588", light="\u2591",
 )
 
 # There is deliberately no second, "ASCII-safe" glyph set.  Swapping solid
-# blocks for repeated punctuation does not degrade a bar, a candle or a
+# blocks for repeated punctuation does not degrade a bar or a
 # numeral - it replaces it with something that only looks like one, and the
 # substitution used to be chosen by accident: the dashboard replaces
 # sys.stdout with an event sink whose `encoding` is None, so sniffing the

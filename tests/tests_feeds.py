@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
-import itertools
 import json
 import pathlib
 import random
@@ -1719,7 +1718,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # 2026-10-26: overlapping collateral reads apply in request order - a reply older than the
     # one applied is dropped (it put back the cash from before a payout or a debit), and a
     # reading is dated from its request, never its reply. No sizing rule changed.
-    "sniper_live.py": "ab96e71c3b591a82d6ca7bfb007c7b13f73a6da752cf9f0dcb88a096588deaf4",
+    # 2026-10-27: own_risk_shares counts an unbooked order at the most it is known to have
+    # delivered (its sizing estimate, the venue reply's total, its private-channel trades in any
+    # status but FAILED) less what the ledger booked - an order that delivered 20 counted as its
+    # 10-share estimate until CONFIRMED, and Kelly could buy 7 more; the unused hard_halt removed.
+    "sniper_live.py": "d2cdb03f83134e4072d59d49f3eebe2fd86f8ce2bf85de4d4e1df18ad831eb58",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads
@@ -1741,29 +1744,39 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # budget (shares x the limit, estimate_fak_shares) as the venue does, so a cheaper level buys
     # more shares; partial fills are classified by unspent dollars; the sniper's hybrid risk guard
     # is checked at the decision and again at booking (AUDIT_FIXES_20261020.md).
-    "paper_trade.py": "ddfb4b367409a25a5072bbb5c94178b0641021e27e9881973aa11eee4d59e6d8",
+    # 2026-10-27: two unused imports removed (requests, ROUND_UP). Nothing else changed.
+    "paper_trade.py": "686da884f93830e58880617ad694626f3d21fa6cb2add8c985bc57cb0a1c3ffb",
     # Re-approved 2026-10-12 (audit 20261012): a rejection that also carries acceptance evidence
     # is not definitive
     # Re-recorded 2026-10-20 (completion pass): the venue client is the unified-SDK adapter
     # (clob_client via clob_sdk), which configures its own transports; py-clob-client is retired
     # (SDK_UPGRADE_2026-10-19.md).
-    "polymarket_trade.py": "246f63a7c7a8de604549dceacc7af95babc9b2ad270f0fbba5ddc3a84d8a3125",
+    # 2026-10-27: unused market_fee_rate / reset_client removed and a repeated book_read_wall key
+    # in the attempt record dropped (same value). Nothing else changed.
+    "polymarket_trade.py": "b01d881488b4d4f19da608677e5fd9f7d9cabd0816373a7e8c36e83679fe0a04",
     # Re-approved 2026-10-12 (audit 20261012): supplied/cached books pass the same level
     # validation; crossed books refused
     # Re-recorded 2026-10-20 (completion pass): get_orderbook_snapshot keeps a public REST book's
     # venue timestamp, receipt time, tick and hash (RestBookSnapshot) for executable recovery
     # (BUGFIXES_2026-10-19.md).
-    "orderbook.py": "650e630fb13b9ae9a552a6e55a08cf4aa9c64723fbc163a178ea1f9c8f22506a",
+    # 2026-10-27: the unused liquidity_signal removed. Nothing else changed.
+    "orderbook.py": "2529c777eb3c881e962bbaa479f4465cfbab873ca08d46adcd2123816e92e5d6",
     # 2026-10-20: market_discovery.py, timer.py, fast_h2.py, accounting/fees.py, settlement.py,
     # resolution.py, feeds/poly_user.py and feeds/reconcile.py were unchanged; the uploaded copy
     # had gained one extra trailing blank line in 113 files, removed again so these match.
     "market_discovery.py": "ca15ccc4c1b0da18248abc91143604d15fe00b1638d727bf5209d6f9ff059dc1",
-    "timer.py": "3ca35cc64539d45f7e4b982cbe9b6153138f87ee1be79adfae0c8eaccc875d50",
+    # 2026-10-27: unused clock_measured / reset_clock_cache / current_round_window_et removed
+    # (and the flag only they read). check_clock and the offset are unchanged.
+    "timer.py": "5c3ee6a41bc548559791db87c891d85f08b511fa6826cbbf31ce44c2821784a2",
     # Re-recorded 2026-10-20 (completion pass): unified-SDK migration settings; signature type 3
     # (deposit wallet) stays refused pending its validation with the unified SDK
     # (SDK_UPGRADE_2026-10-19.md).
-    "config.py": "27c1aec5a5b914fe5a3c01123a569041825c13faa2e1ba119f99101a49497aee",
-    "fast_h2.py": "5b9f222bbc3e3ae134d28c13e28db0c8063a35e19ff98b0548d405f0b87cca71",
+    # 2026-10-27: the unused paper/live parity block (PARITY_CLASSES, strategy_parity,
+    # parity_report_lines - its STRATEGY list was empty) removed. No setting changed.
+    "config.py": "4b06e7d75a5cd00620c073e60c06114c38ccbea96390a75b312e2700128638ea",
+    # 2026-10-27: the two failure callbacks no longer close over the except-clause name (unbound
+    # after the block); the message is built first. Same behavior.
+    "fast_h2.py": "43e36f9b7fd69294ae386412c22927ca4adc2a08e8d6e85b0e37b2986b2986d8",
     # Re-approved (F2): fills and settlements append one fsynced journal line (the snapshot
     # records the entry it includes; load replays newer ones, validated, torn tail dropped,
     # gaps/corruption refused); snapshots every 500 entries and on save(). current_payload().
@@ -1786,7 +1799,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # rollback, a reopened position or a reindex bumps _settled_rev (invalidate_caches() for in-place
     # edits). The live loss budget walked every position settled since the 10-day-old canary session
     # start 3x per order: decided -> wire 3.9ms (10-15) -> 8.3ms (10-25). Values unchanged.
-    "accounting/ledger.py": "81a656b83b14857f1e43d9d9b67759270ccb15d1e359ee04650a2f0d8d2ba9f8",
+    # 2026-10-27: a journal replay re-applies a booked SELL even with exits off (allow_sells
+    # gates new exits only; refusing it failed the load and the bot would not start); a sale
+    # that closes a position is dated by the sale, not by the replay (realized_since). The unused
+    # open_leg_basis and two `if True:` wrappers removed (AST-identical otherwise).
+    "accounting/ledger.py": "60b8402ed3ed35001b2198b9ef34170945fc7cd7990c777395be5ce1fec98b10",
     "accounting/fees.py": "44e45be00c7c3b330ef0ff11950fa42944029ba83a61ec8066af3494c0956dc7",
     # Re-approved (settlement audit): one record per market (condition id), checked from
     # expiry, concurrently, on the worker's own pool; explicit lifecycle events and a journal;
@@ -1800,7 +1817,9 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved (F5): which token each payout slot pays is proven on chain (CTF position
     # ids); unproven, the chain result settles only when the CLOB + Gamma mirrors agree,
     # and a disagreement is RESULT_MISMATCH (UNKNOWN, never settled).
-    "accounting/resolution.py": "131566abda8c01fc8c1688e24a4348974ba8e63e0b90ad0cf6941158218fb45c",
+    # 2026-10-27: the per-market API throttle is bounded like _slots/_proof (it grew one entry
+    # per round forever); unused forget, UP/DOWN_LABELS and requests import removed.
+    "accounting/resolution.py": "e52c6bcd4ea6ecd867c4333ae6194c4956cf8b9c5752cffd05630ee32d7de9ef",
     # Re-approved (final audit, D5): a refused delta/snapshot (crossed result, malformed values,
     # refused timestamp) on a synced book desyncs its tokens (UNSYNCED until a fresh snapshot)
     # instead of leaving a LIVE book that silently missed a change.
@@ -1818,12 +1837,15 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved 2026-10-12 (audit 20261012): FillStore summary cached until the next mutation
     # 2026-10-22: separately timestamp when a complete trade becomes execution
     # evidence, so RETRYING and incomplete rows cannot backdate fill latency.
-    "feeds/poly_user.py": "b1a92f77feb3658f738bf32034c39595d4f7c61ccb5db40973230fdc9f45a1f6",
+    # 2026-10-27: the unused ready_reason_for_market removed. The gate is unchanged.
+    "feeds/poly_user.py": "d3a4d5014bdc04cb65260b12f27f907fd6cf907771e0f2165cb1a4819ed5467d",
     # Reviewed 2026-10-12: receive fencing and ordered public-token snapshot recovery.
     # hub.py and poly_market.py are listed, not locked (not in TRADING_FILES). Re-recorded
     # 2026-10-20: proactive REST recovery uses the metadata-preserving book read
     # (BUGFIXES_2026-10-19.md).
-    "feeds/hub.py": "78a4290e17723f430b869853559c5af5c391e332a13532209a1bcb10912d46a3",
+    # 2026-10-27: a REST recovery that fails fast or is refused requests the ordered WS snapshot
+    # (as a timeout already did) instead of leaving the token UNSYNCED and untradeable.
+    "feeds/hub.py": "730c7598dc421bd08929981e9ff1c74902a9652541a8dfd040d4845876cb0a7a",
     "feeds/poly_market.py": "82b4a0bd2a8cece33e6f5190acb8502cced9775b558d8e20aa2b30907d7392e0",
     "feeds/reconcile.py": "71dea5e832fb970e5cfac1880686cf5eff477a34c48c9b91ba961f77b3e9cb6f",
     # Added 2026-10-20 (the unified-SDK migration, SDK_UPGRADE_2026-10-19.md): the adapter that
@@ -1836,7 +1858,8 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # instead of ~0.6ms - once proven: at start without signing any order, or on a builder's first
     # order; type 3, SNIPER_FAST_SIGN=0 or any mismatch keep the SDK path (tests_fast_sign.py).
     "clob_signing.py": "49161cc2e45c684f82cace2da8f307ef1fd8136054de8cb064d87855364a034f",
-    "clob_sdk.py": "f03d066498ecde9e0afcb85ae3e4dcbfc0e18d5ffc1f483d3d0cdcf106382de5",
+    # 2026-10-27: __all__ names the re-exported surface. No import changed.
+    "clob_sdk.py": "0356ba9be23bbb755e8665b206db3331f1b6673b0184a129e07d461fffe95236",
     # 2026-10-22: at_drawdown_stop - sizing_factors' exact drawdown-stop test alone (no volatility),
     # for the drawdown pause.
     "hybrid_sizing.py": "939ccf5b1ecabdf8b0e3e46f8b012d9324997e8c50dcc927405a371b40eb3cd0",

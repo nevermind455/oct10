@@ -30,7 +30,6 @@ import run  # noqa: E402
 import tests_paper as TP  # noqa: E402  (PaperBroker fixtures: _broker, book, rules)
 from accounting import resolution as R  # noqa: E402
 from accounting import settlement as S  # noqa: E402
-from accounting.ledger import Ledger  # noqa: E402
 from dashboard import build  # noqa: E402
 from dashboard.theme import UNICODE  # noqa: E402
 

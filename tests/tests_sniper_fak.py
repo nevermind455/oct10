@@ -3,7 +3,6 @@
     python -m unittest -v tests_sniper_fak
 """
 import asyncio
-import json
 import os
 import tempfile
 import time

@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import collections
-import json
 import pathlib
 import sys
 import threading
@@ -25,7 +24,6 @@ import time
 import types
 import unittest
 from decimal import Decimal as D
-from unittest.mock import patch
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))

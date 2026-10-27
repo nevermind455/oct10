@@ -8,7 +8,6 @@ import time
 import types
 import unittest
 
-import fast_h2 as H
 import polymarket_trade as pt
 import sniper_live as L
 import tests_sniper_live as T

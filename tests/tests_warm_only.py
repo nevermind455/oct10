@@ -1,7 +1,6 @@
 """Warm-only sender behavior, with in-memory transport and no venue traffic."""
 import testing_env  # noqa: F401
 
-import asyncio
 import time
 import types
 import unittest

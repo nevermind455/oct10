@@ -118,23 +118,10 @@ def set_order_observer(callback) -> None:
         _order_observer = callback
 
 
-def market_fee_rate(token_id) -> float | None:
-    with _state_lock:
-        params = _market_fee_by_token.get(str(token_id))
-    return None if params is None else params[0]
-
-
 def market_fee_parameters(token_id) -> dict | None:
     with _state_lock:
         params = _market_fee_by_token.get(str(token_id))
     return None if params is None else {"rate": params[0], "exponent": params[1]}
-
-
-def reset_client():
-    global _client
-    with _execution_lock:
-        with _client_lock:
-            _client = None
 
 
 def _validate_live_host(host: str) -> str:
@@ -1142,7 +1129,6 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
             "book_source": (_meta or {}).get("source"),
             "book_source_ts_ms": (_meta or {}).get("exchange_ts_ms"),
             "book_updated_mono": (_meta or {}).get("updated_mono"),
-            "book_read_wall": book_read_wall,
             "book_age_at_decision_s": _book_age_s(
                 _meta, at_mono=book_read_mono),
             "condition_id": str(condition_id), "token_id": str(token_id),

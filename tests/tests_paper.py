@@ -294,7 +294,6 @@ def t_paper_tick_refresh_other_directions_and_failures():
 
 
 def t_sniper_signing_price_never_exceeds_the_cap_and_keeps_the_tick():
-    import math
     from decimal import Decimal as Dc
     import sniper_mode
     from clob_signing import round_down
@@ -666,7 +665,7 @@ def t_sniper_gc_runs_only_in_the_rounds_no_trade_seconds():
 
     class Hub:
         window_end = time.time() + 6.0            # 6s left: inside (2, min_left - 2) = (2, 8)
-    old = gc_threshold = __import__("gc").get_threshold()
+    old = __import__("gc").get_threshold()
 
     async def go():
         sn = sniper_mode.Sniper(Hub(), None, settings=_fixed_sniper_settings())
@@ -678,7 +677,7 @@ def t_sniper_gc_runs_only_in_the_rounds_no_trade_seconds():
         task.cancel()
         return sn
     try:
-        sn = asyncio.run(go())
+        asyncio.run(go())
         th = __import__("gc").get_threshold()
     finally:
         __import__("gc").set_threshold(*old)

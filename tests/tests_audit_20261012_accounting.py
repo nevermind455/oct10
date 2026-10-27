@@ -5,7 +5,6 @@ and a paper run against a fixed public-book fixture.
 """
 from __future__ import annotations
 
-import asyncio
 import concurrent.futures
 import contextlib
 import io

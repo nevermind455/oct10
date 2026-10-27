@@ -25,8 +25,6 @@ import time
 from dataclasses import dataclass
 from urllib.parse import quote, urlsplit
 
-import requests
-
 import http_pool
 import onchain_resolution
 
@@ -64,9 +62,6 @@ TOKEN_RE = re.compile(r"^[0-9]+$")
 PENDING = "PENDING"
 RESOLVED = "RESOLVED"
 UNKNOWN = "UNKNOWN"
-
-UP_LABELS = {"up", "yes", "higher", "above"}
-DOWN_LABELS = {"down", "no", "lower", "below"}
 
 
 @dataclass(frozen=True)
@@ -466,12 +461,6 @@ class Resolver:
         self.prove(cid)                                    # best effort here; retried at each check
         return True
 
-    def forget(self, condition_id: str) -> None:
-        with self._lock:
-            self._slots.pop(str(condition_id), None)
-            self._proof.pop(str(condition_id), None)
-            self._api_at.pop(str(condition_id), None)
-
     def __call__(self, condition_id: str) -> Resolution:
         cid = str(condition_id)
         if not CONDITION_RE.fullmatch(cid):
@@ -504,7 +493,13 @@ class Resolver:
         with self._lock:
             due = now - self._api_at.get(cid, -1e18) >= self.api_every_s
             if due:
+                # Bounded like _slots and _proof: one entry per round checked
+                # through the mirrors grew for as long as the process ran.
+                self._api_at.pop(cid, None)
                 self._api_at[cid] = now
+                if len(self._api_at) > 256:
+                    for old in list(self._api_at)[:128]:
+                        self._api_at.pop(old, None)
         if not due:
             return Resolution(cid, PENDING, {}, detail=(
                 f"{chain_detail}; API mirrors next in {self.api_every_s:g}s" if chain_detail
