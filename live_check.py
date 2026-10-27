@@ -164,7 +164,7 @@ def main() -> int:
                                    if r.get("kind") == "MATCHED" or fills.get(r.get("order_id")))
     if set(per) - {"binance"}:
         print("  by the feed that fired: " + ", ".join(f"{f} {per_fill[f]}/{n} filled" for f, n in per.items())
-              + "   (sniper_deep.py --by-feed --live for markouts per feed)")
+)
 
     # the paper model's shadow fills on the same orders
     shadows = {r.get("id"): r.get("L") or {} for r in rows if r.get("result") == "shadow"}

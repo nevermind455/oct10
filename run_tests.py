@@ -2,7 +2,7 @@
 """Run every test suite, each in its own process, and print one line per suite.
 
     python run_tests.py            # all suites
-    python run_tests.py feeds run  # only tests_feeds.py and tests_run.py
+    python run_tests.py feeds run  # only tests/tests_feeds.py and tests/tests_run.py
     python run_tests.py --require-native-sdk unified_sdk  # release check: no SDK skips
 
 No network, no wallet: the suites never read .env (see testing_env.py).
@@ -18,6 +18,7 @@ import sys
 import time
 
 ROOT = pathlib.Path(__file__).resolve().parent
+TESTS = ROOT / "tests"
 
 
 def native_sdk_problem() -> str | None:
@@ -44,19 +45,21 @@ def main(argv) -> int:
         if problem:
             print(f"FAIL  native SDK validation required: {problem}. Native checks did not run.", file=sys.stderr)
             return 1
-    suites = sorted(ROOT.glob("tests_*.py"))
+    suites = sorted(TESTS.glob("tests_*.py"))
     if argv:
         unknown = [a for a in argv if not any(s.stem in (a, f"tests_{a}") for s in suites)]
         if unknown:
             print(f"Unknown test suites: {', '.join(unknown)}", file=sys.stderr)
             return 2
         suites = [s for s in suites if any(s.stem == f"tests_{a}" or s.stem == a for a in argv)]
-        if require_native and ROOT / "tests_unified_sdk.py" not in suites:
-            suites.append(ROOT / "tests_unified_sdk.py")
+        if require_native and TESTS / "tests_unified_sdk.py" not in suites:
+            suites.append(TESTS / "tests_unified_sdk.py")
     if not suites:
         print("No test suites found", file=sys.stderr)
         return 2
-    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    # the suites in tests/ import the bot's modules from the repository root
+    env = dict(os.environ, PYTHONIOENCODING="utf-8",
+               PYTHONPATH=os.pathsep.join(p for p in (str(ROOT), os.environ.get("PYTHONPATH")) if p))
     return _run_suites(suites, env, require_native_sdk=require_native)
 
 
