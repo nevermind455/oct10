@@ -1706,6 +1706,8 @@ class LeanSender:
                      float(exact), tick, str(salt), body, headers, dict(rules), st, order_type)
         p.order_hash = order_hash
         p.shares = float(size) if size is not None else None
+        # SNIPER_VENUE_MIN_SHARES: an order under the published minimum - a refusal is the test's answer
+        p.below_published_minimum = size is not None and size < Decimal(str(rules["minimum"]))
         return p
 
     # ------------------------------------------------------------ the write, synchronous
@@ -1975,6 +1977,8 @@ class LeanSender:
     # Rejections that mean the round's prefetched rules are stale: drop them
     # so the next order is refused until a background refetch.
     STALE_RULES_ON = ("tick", "min size", "minimum", "min_size")
+    # A refusal of an order under the published minimum (SNIPER_VENUE_MIN_SHARES) for its size.
+    SIZE_REFUSAL_ON = ("size", "minimum", "min_")
 
     def _after(self, p: Prepared, row: dict, st: dict) -> None:
         kind = row["kind"]
@@ -1999,11 +2003,18 @@ class LeanSender:
                 row["auto_reconcile"] = True
                 resolver(p, dict(row))
         text = str(row["error"]).lower()
+        # SNIPER_VENUE_MIN_SHARES' test answered no: the venue refused an order under its published
+        # minimum for its size. Not stale rules and not an order error (3 in a row paused every
+        # order for 5 minutes, again and again): the sniper turns the test off.
+        min_refused = (kind == REJECTED and getattr(p, "below_published_minimum", False)
+                       and any(w in text for w in self.SIZE_REFUSAL_ON))
         if kind == REJECTED:
             hit = next((why for w, why in self.HALT_ON.items() if w in text), None)
             if hit or row["http_status"] in (401, 403):
                 self.kill.trip(f"venue rejected the order ({hit or 'HTTP %s' % row['http_status']}): {row['error']}")
-            if any(w in text for w in self.STALE_RULES_ON):
+            if min_refused:
+                row["venue_min_refused"] = True
+            elif any(w in text for w in self.STALE_RULES_ON):
                 self.rules.invalidate(p.condition)
                 row["rules_invalidated"] = True
         temporary = (kind == REJECTED and row["http_status"] == 503
@@ -2024,6 +2035,8 @@ class LeanSender:
             row["warning"] = "a new TCP/TLS connection was opened on the hot path"
         if kind in (MATCHED, PENDING, NO_MATCH) or temporary:
             self.consecutive_errors = 0
+        elif min_refused:
+            pass                                    # the test's answer, not an order error
         elif kind == NOT_SENT and row.get("warm_connection_unavailable"):
             # Background keep-warm owns reconnection. Skips neither hide
             # preceding transport errors nor count as new order errors.

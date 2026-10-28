@@ -914,6 +914,53 @@ def live_delays(path) -> tuple[list[float], float]:
     return out, one_way
 
 
+def live_account_tail(path, max_bytes: int = 8_000_000, chunk: int = 262_144) -> dict:
+    """SNIPER_PAPER_CASH_FROM: the live bot's latest Kelly cash and hybrid equity /
+    high-water, read backwards from the END of its journal - never the whole file
+    (it is hundreds of MB on a 2GB VPS). {"cash", "cash_wall", "equity",
+    "high_water", "hybrid_wall"}: None where nothing was found in max_bytes."""
+    out = {"cash": None, "cash_wall": None, "equity": None, "high_water": None, "hybrid_wall": None}
+
+    def num(v):
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
+
+    with open(path, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        pos, carry, scanned = fh.tell(), b"", 0
+        while pos > 0 and scanned < max_bytes and (out["cash"] is None or out["equity"] is None):
+            n = min(chunk, pos)
+            pos -= n
+            scanned += n
+            fh.seek(pos)
+            lines = (fh.read(n) + carry).split(b"\n")
+            carry = lines.pop(0) if pos > 0 else b""        # a line's start is in the chunk before
+            for line in reversed(lines):                       # newest first
+                if out["cash"] is None and (b'"kelly_cash"' in line or b'"bankroll"' in line):
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        r = None
+                    if isinstance(r, dict) and num(r.get("wall")) is not None:
+                        cash = num(r.get("kelly_cash")) if r.get("result") == "balance_read" else num(r.get("bankroll"))
+                        if cash is not None:
+                            out["cash"], out["cash_wall"] = cash, num(r["wall"])
+                if out["equity"] is None and (b'"hybrid"' in line or b'"hybrid_drawdown_reset"' in line):
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(r, dict) or num(r.get("wall")) is None:
+                        continue
+                    if r.get("result") == "hybrid_drawdown_reset" and num(r.get("equity")) is not None:
+                        out["equity"] = out["high_water"] = num(r["equity"])     # a fresh start from the equity
+                        out["hybrid_wall"] = num(r["wall"])
+                    elif isinstance(r.get("hybrid"), dict):
+                        e, h = num(r["hybrid"].get("equity")), num(r["hybrid"].get("high_water"))
+                        if e is not None and h is not None:
+                            out["equity"], out["high_water"], out["hybrid_wall"] = e, h, num(r["wall"])
+    return out
+
+
 class Settings:
     def __init__(self) -> None:
         # the frozen spec's trigger (exec_latency.FROZEN_SPEC): a 0.5bp move
@@ -986,6 +1033,14 @@ class Settings:
         # whether the venue takes a marketable FAK BUY under 5 shares (its reply
         # says so). The $1 floor on a marketable BUY always applies. Shares only.
         self.venue_min_shares = _env_float("SNIPER_VENUE_MIN_SHARES", 0)
+        # Paper only (2026-10-29, the operator's request): size from the LIVE bot's cash and
+        # drawdown, read from the end of its journal (this path), so paper's orders are the
+        # size live's are - paper50 had 7x live's cash and sent 78-share orders to live's 8.
+        # Paper's own cash still pays for its fills: the smaller of the two is used. A live
+        # reading older than SNIPER_PAPER_CASH_MAX_AGE_S (live stopped?) sizes nothing. Empty
+        # = off. Live refuses it (exec_latency.spec_violations).
+        self.paper_cash_from = str(os.environ.get("SNIPER_PAPER_CASH_FROM", "") or "").strip()
+        self.paper_cash_max_age_s = _env_float("SNIPER_PAPER_CASH_MAX_AGE_S", 900)
         self.fair_vol_s = _env_float("SNIPER_FAIR_VOL_S", 300)
         # Retained for environment compatibility; decisions use the prefetched
         # market's actual fee rate/exponent, never this former model assumption.
@@ -1178,6 +1233,7 @@ class Settings:
              f"SNIPER_VENUE_MIN_SHARES={self.venue_min_shares:g} (whole shares, 0 to 5; 0 = the venue's own)"),
             (self.venue_min_shares == 0 or self.order_sizing == "shares",
              "SNIPER_VENUE_MIN_SHARES needs SNIPER_ORDER_SIZING=shares"),
+            (self.paper_cash_max_age_s > 0, f"SNIPER_PAPER_CASH_MAX_AGE_S={self.paper_cash_max_age_s:g} (must be > 0)"),
             (self.fair_vol_s >= 60, f"SNIPER_FAIR_VOL_S={self.fair_vol_s:g} (must be >= 60)"),
             (0 <= self.fair_fee_rate < 0.25, f"SNIPER_FAIR_FEE_RATE={self.fair_fee_rate:g} (must be 0 to 0.25)"),
             (0 < self.kelly_fraction <= 1, f"SNIPER_KELLY_FRACTION={self.kelly_fraction:g} (must be above 0, at most 1)"),
@@ -1241,7 +1297,10 @@ class Settings:
                    if self.kelly and self.order_type == "FAK" else "") + hybrid
                 + (f"; WIDE CAP EXPERIMENT (paper only): limit ask+{self.wide_cap_c:g}c whatever the fair value says, "
                    f"and an ask above the fair limit still buys a fixed minimum-size order"
-                   if self.wide_cap_c > 0 else ""))
+                   if self.wide_cap_c > 0 else "")
+                + (f"; sized from LIVE's cash and drawdown ({self.paper_cash_from}, readings <= "
+                   f"{self.paper_cash_max_age_s:g}s old; paper's own cash if smaller)"
+                   if self.paper_cash_from and self.kelly and self.order_type == "FAK" else ""))
 
     def lines(self, live: bool = False) -> list[str]:
         if live:
@@ -1635,6 +1694,14 @@ class Sniper:
         self._live_delays: list = []
         if live is None and self.s.delay_source == "live":
             self._load_live_delays()
+        self._live_mirror: dict | None = None        # SNIPER_PAPER_CASH_FROM: live's cash and drawdown
+        self._live_mirror_error: str | None = None
+        if self._mirror_on():
+            try:
+                self._live_mirror = live_account_tail(self.s.paper_cash_from)
+            except OSError as exc:
+                raise ValueError(f"SNIPER_PAPER_CASH_FROM: cannot read the live journal "
+                                 f"{self.s.paper_cash_from}: {exc}") from exc
         if live is not None:
             live.attach(self)
 
@@ -1883,6 +1950,22 @@ class Sniper:
             return None
         return rate, exponent
 
+    def _venue_min_off(self, res: dict) -> None:
+        """SNIPER_VENUE_MIN_SHARES' live test answered NO: the venue refused an order
+        under its published minimum for its size (sniper_live marks it, and does not
+        count it as an order error). Back to the published minimum for this run; the
+        .env still says otherwise, so a restart tries once more."""
+        was = float(getattr(self.s, "venue_min_shares", 0) or 0)
+        if was <= 0:
+            return
+        self.s.venue_min_shares = 0
+        why = str(res.get("error") or "")[:200]
+        self._write({"wall": time.time(), "result": "venue_min_off", "was": was, "error": why,
+                     "client_order_id": res.get("client_order_id")})
+        self.on_event("sniper", f"SNIPER_VENUE_MIN_SHARES={was:g} turned OFF: the venue refused an order under its "
+                                f"published minimum ({why[:120]}). Back to the venue's minimum - remove it from .env",
+                      "warn")
+
     def _share_order_floor(self, condition, view, price_cap) -> int:
         """Read prefetched venue minimums; never fetch on the decision path."""
         override = int(getattr(self.s, "venue_min_shares", 0) or 0)
@@ -1978,7 +2061,40 @@ class Sniper:
             return self._read_bankroll()
         if self._bankroll is None or time.monotonic() - self._bankroll_at > self.BANKROLL_STALE_S:
             self._set_bankroll(self._read_bankroll(), time.monotonic())
+        if self._mirror_on():
+            # SNIPER_PAPER_CASH_FROM: live's cash, never more than paper's own (which pays)
+            try:
+                live_cash = self._live_mirror_now()["cash"]
+            except ValueError:
+                return None
+            return None if self._bankroll is None else min(self._bankroll, live_cash)
         return self._bankroll
+
+    def _mirror_on(self) -> bool:
+        return self.live is None and bool(getattr(self.s, "paper_cash_from", ""))
+
+    def _live_mirror_now(self) -> dict:
+        """SNIPER_PAPER_CASH_FROM: live's latest readings, or ValueError(why not)."""
+        m = self._live_mirror
+        if m is None:
+            raise ValueError(self._live_mirror_error or "the live journal not read yet")
+        age = float(getattr(self.s, "paper_cash_max_age_s", 900))
+        if m["cash"] is None or time.time() - m["cash_wall"] > age:
+            raise ValueError(self._live_mirror_error or f"no live cash reading in the last {age:g}s (is live running?)")
+        return m
+
+    def _refresh_live_mirror(self) -> None:
+        """Worker thread: re-read the end of the live journal."""
+        try:
+            self._live_mirror = live_account_tail(self.s.paper_cash_from)
+            self._live_mirror_error = None
+        except OSError as exc:                      # keep the last reading; its age still applies
+            self._live_mirror_error = f"cannot read {self.s.paper_cash_from}: {exc}"
+
+    async def _live_mirror_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.BANKROLL_EVERY_S)
+            await asyncio.to_thread(self._refresh_live_mirror)
 
     def _set_bankroll(self, v, read_at: float) -> None:
         """Paper cash less active workers and a short completed-order tail.
@@ -2121,11 +2237,18 @@ class Sniper:
         age = time.monotonic() - snapshot["observed_mono"]
         if not math.isfinite(age) or not 0 <= age <= self.HYBRID_RISK_STALE_S:
             raise ValueError("hybrid accounting stale")
-        equity = max(0.0, float(snapshot["equity"]))
+        equity, high_water, mirror = max(0.0, float(snapshot["equity"])), snapshot["high_water"], {}
+        if self._mirror_on():
+            # SNIPER_PAPER_CASH_FROM: size in the drawdown LIVE is in, not paper's own
+            m = self._live_mirror_now()
+            if m["equity"] is None or m["high_water"] is None:
+                raise ValueError("no live drawdown reading in the live journal's end (SNIPER_PAPER_CASH_FROM)")
+            equity, high_water = max(0.0, m["equity"]), m["high_water"]
+            mirror = {"live_mirror": True, "paper_equity": round(float(snapshot["equity"]), 4)}
         factors = sizing_factors(self.s.hybrid_policy, sigma=self.vol_model.vol(), equity=equity,
-                                 high_water=snapshot["high_water"], base_fraction=self.s.kelly_fraction)
-        return {**factors, "equity": equity, "high_water": snapshot["high_water"],
-                "accounting_age_s": age}
+                                 high_water=high_water, base_fraction=self.s.kelly_fraction)
+        return {**factors, "equity": equity, "high_water": high_water,
+                "accounting_age_s": age, **mirror}
 
     def _check_hybrid_order(self, plan, spend, fee_rate, quoted_fee=0) -> None:
         """Recheck cached risk before submission; cap only when explicitly enabled."""
@@ -3297,6 +3420,8 @@ class Sniper:
         try:
             res = await self.live.send(p, started)
             kind = res["kind"]
+            if res.get("venue_min_refused"):
+                self._venue_min_off(res)
             if plan.get("minimum_entry"):
                 row["minimum_entry_attempted"] = bool(p.stamps.get("budget_recorded"))
                 if kind == "NOT_SENT" and not row["minimum_entry_attempted"]:
@@ -3700,8 +3825,17 @@ class Sniper:
                 # determine how much to add. Existing inventory is not a fresh bet.
                 # Whole shares from the venue minimum to the available room; no carry.
                 bank = self._bankroll_now()
+                if bank is None and self._mirror_on():
+                    try:
+                        self._live_mirror_now()
+                    except ValueError as exc:
+                        row["detail"] = str(exc)
+                    return self._skip("kelly size unknown: no live cash reading", row)
                 if bank is None:
                     return self._skip("kelly size unknown: no cash reading", row)
+                if self._mirror_on() and (self._live_mirror or {}).get("cash") is not None:
+                    m = self._live_mirror
+                    row.update(live_cash=round(m["cash"], 2), live_cash_age_s=round(time.time() - m["cash_wall"], 1))
                 # No per-order cap (the operator's choice): only what is left of this
                 # side's per-market cap (SNIPER_MAX_SIDE_SHARES), and live, the canary's
                 # per-order cap - never a bigger order than the account's limits allow.
@@ -4938,6 +5072,8 @@ class Sniper:
         self._spawn(self._gc_schedule())
         if self.s.fair and self.s.kelly and self.live is None:
             self._spawn(self._bankroll_loop())          # live reads the sender's own figures each time
+        if self._mirror_on():
+            self._spawn(self._live_mirror_loop())
         stall_ms = _env_float("SNIPER_STALL_MS", 50)
         if stall_ms > 0 and self.journal is not None:
             self.stallwatch = StallWatch(asyncio.get_running_loop(), self._write, threshold_ms=stall_ms).start()

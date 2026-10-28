@@ -1624,7 +1624,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # default: a whole number 1-5 replaces the published share minimum (5) in the share floor and
     # the order plan carries it to both senders - the live test of whether the venue takes a
     # marketable FAK BUY under 5 shares. The $1 floor still applies. Nothing else changed.
-    "sniper_mode.py": "48486721630f8fa1183a2ca4e000fbfe38da6481e12b9d3b9bbdace0f0ddbc8d",
+    # 2026-10-29 (tests/tests_venue_min.py, tests/tests_paper_cash_mirror.py): a venue refusal of an
+    # order under the published minimum turns SNIPER_VENUE_MIN_SHARES off for the run (_venue_min_off);
+    # SNIPER_PAPER_CASH_FROM (paper only, live refuses it): Kelly cash and the hybrid drawdown come
+    # from the end of the LIVE journal (live_account_tail), paper's own cash if smaller.
+    "sniper_mode.py": "31a903e02e9c8ed84b937529b1c09588e537b183c9d434fa7bc095b9c35f3399",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
@@ -1732,7 +1736,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # 2026-10-29 (tests/tests_venue_min.py): the pre-send check and LeanSender.prepare hold a
     # share-sized order to the plan's venue_min_shares (SNIPER_VENUE_MIN_SHARES) when it has one,
     # else the published minimum as before. The $1 check is unchanged.
-    "sniper_live.py": "f663ea34a56cd2f4e2f1d4c7f1f6e89a1ead0ab0410acd22cfe97016bcf6be04",
+    # 2026-10-29 (tests/tests_venue_min.py): a size refusal of an order under the published minimum
+    # (Prepared.below_published_minimum) is marked venue_min_refused - not an order error, no rules
+    # reload. Every other refusal is handled as before.
+    "sniper_live.py": "291255e617e23f16ba9cd79f2861d66cb743fd32fd7e7264ca21f1d2a53f9756",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads

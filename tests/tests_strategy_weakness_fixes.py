@@ -19,7 +19,8 @@ from decimal import Decimal, ROUND_FLOOR
 def load_strategy():
     tree = ast.parse(pathlib.Path(__file__).resolve().parent.parent.joinpath("sniper_mode.py").read_text())
     helpers = {"taker_fee", "anchored_fair", "fair_limit", "kelly_shares"}
-    methods = {"_side_held", "_kelly_inventory", "_fair_fee_parameters", "_fair_anchor", "_decide", "ioc_spend"}
+    methods = {"_side_held", "_kelly_inventory", "_fair_fee_parameters", "_fair_anchor", "_decide", "ioc_spend",
+               "_mirror_on"}
     nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in helpers]
     sniper = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Sniper")
     cls = ast.ClassDef(name="Decision", bases=[], keywords=[], decorator_list=[],

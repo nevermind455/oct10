@@ -20,6 +20,7 @@ against the local fake CLOB (tests_sniper_live). No network.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import pathlib
 import sys
@@ -67,6 +68,38 @@ class Decision(F.Gate):
         self.assertEqual((floor("0.50"), floor("0.20")), (3, 5))
         self.make(SNIPER_ORDER_SIZING="shares")
         self.assertEqual((floor("0.50"), floor("0.90")), (5, 5))                     # the published 5
+
+
+    def test_the_venue_refusing_turns_it_off_for_the_run(self):
+        self.make(SNIPER_ORDER_SIZING="shares", SNIPER_VENUE_MIN_SHARES="1")
+        cond, view = self.m.condition_id, I.View(self.m.decision[str(self.m.up_token)])
+        self.sn._venue_min_off({"error": "Size (2) lower than the minimum: 5", "client_order_id": "c1"})
+        self.assertEqual(self.sn.s.venue_min_shares, 0)
+        self.assertEqual(self.sn._share_order_floor(cond, view, D("0.50")), 5)    # the published 5 again
+        self.assertIn("Kelly from 5 sh", self.sn.s.fair_text())
+        offs = [r for r in self.rows if r.get("result") == "venue_min_off"]
+        self.assertEqual((len(offs), offs[0]["was"], offs[0]["client_order_id"]), (1, 1.0, "c1"))
+        self.sn._venue_min_off({"error": "again"})                                 # already off: nothing more
+        self.assertEqual(len([r for r in self.rows if r.get("result") == "venue_min_off"]), 1)
+
+    def test_the_live_reply_handler_hands_the_refusal_over(self):
+        self.make(SNIPER_ORDER_SIZING="shares", SNIPER_VENUE_MIN_SHARES="1")
+        reply = {"kind": "REJECTED", "venue_min_refused": True, "error": "Size (2) lower than the minimum: 5",
+                 "client_order_id": "c2", "ts_us": {}}
+
+        class Stub:
+            async def send(self, p, started=None):
+                return reply
+        self.sn.live = Stub()
+        p = type("P", (), {"amount": 1.1, "cap": 0.55, "price": 0.55, "order_type": "FAK", "client_order_id": "c2",
+                           "order_hash": None, "stamps": {}, "estimate": None, "rules": {}})()
+        plan = {"end": self.m.window_end, "rd": None, "token": self.m.up_token, "decided_pc": 0, "minimum_entry": False}
+        try:
+            asyncio.run(self.sn._finish_live("UP", 1.0, {}, plan, p, 0))
+        except Exception:  # noqa: BLE001 - the stub carries only what the hand-off needs
+            pass
+        self.assertEqual(self.sn.s.venue_min_shares, 0)
+        self.assertTrue(any(r.get("result") == "venue_min_off" for r in self.rows), self.rows[-3:])
 
 
 # run only this file's tests, not every inherited tests_sniper_fair.Gate test again
@@ -143,6 +176,27 @@ class Live(unittest.IsolatedAsyncioTestCase):
             self.ex.sender.prepare(**args)
         self.assertIn("below the venue minimum 5", str(cm.exception))
         self.assertEqual(self.ex.sender.prepare(**args, min_shares=2).shares, 2.0)
+
+
+    async def test_a_size_refusal_is_the_tests_answer_not_an_order_error(self):
+        for _ in range(3):                                  # 3 in a row used to pause every order for 5 min
+            self.fake.script.append(("json", 400, {"error": "Size (2) lower than the minimum: 5"}))
+            row = await self.ex.send(self.ex.prepare(self.plan(2, venue_min_shares=2)))
+            self.assertEqual(row["kind"], L.REJECTED)
+            self.assertTrue(row.get("venue_min_refused"), row)
+            self.assertNotIn("rules_invalidated", row)       # the rules were right: no reload, no gap
+        self.assertEqual(self.ex.sender.consecutive_errors, 0)
+        self.assertFalse(self.ex.kill.tripped, self.ex.kill.reasons)
+
+    async def test_other_refusals_still_count(self):
+        self.fake.script.append(("json", 400, {"error": "invalid order payload"}))        # not about its size
+        row = await self.ex.send(self.ex.prepare(self.plan(2, venue_min_shares=2)))
+        self.assertNotIn("venue_min_refused", row)
+        self.assertEqual(self.ex.sender.consecutive_errors, 1)
+        self.fake.script.append(("json", 400, {"error": "Size (6) lower than the minimum: 5"}))
+        row = await self.ex.send(self.ex.prepare(self.plan(6)))                          # not under the published 5
+        self.assertNotIn("venue_min_refused", row)
+        self.assertEqual(self.ex.sender.consecutive_errors, 2)
 
 
 class SettingsLine(unittest.TestCase):

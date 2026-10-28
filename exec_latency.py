@@ -117,6 +117,9 @@ def spec_violations(settings, canary_max_shares=None) -> list[str]:
     if str(getattr(settings, "backlog_gate", "count")) != "count":
         out.append(f"backlog gate: SNIPER_BACKLOG_GATE={settings.backlog_gate} - live trades on the count gate "
                    f"until the age gate is approved")
+    if str(getattr(settings, "paper_cash_from", "") or "").strip():
+        out.append(f"paper cash mirror: SNIPER_PAPER_CASH_FROM={settings.paper_cash_from} - paper only "
+                   f"(live sizes from its own wallet)")
     if float(getattr(settings, "wide_cap_c", 0) or 0) > 0:
         out.append(f"wide cap experiment: SNIPER_WIDE_CAP_C={settings.wide_cap_c:g} - paper only "
                    f"(it buys past the fair value); live keeps ask + slip and the fair limit")
