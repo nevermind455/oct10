@@ -103,8 +103,10 @@ class PaperSniper(unittest.TestCase):
                 self.assertRaises(ValueError):
             S.Settings()
 
-    def test_default_stays_the_model(self):
-        with patch.dict(os.environ, {"SNIPER_DELAY_SOURCE": "", "SNIPER_LATENCY_MS": ""}):
+    def test_the_default_without_a_live_journal_is_the_model(self):
+        # the default is auto since 2026-10-29 (tests_paper_auto.py): the model when no live journal is there
+        with patch.dict(os.environ, {"SNIPER_DELAY_SOURCE": "", "SNIPER_LATENCY_MS": "",
+                                     "SNIPER_DELAY_JOURNAL": os.path.join(tempfile.mkdtemp(), "none.jsonl")}):
             st = S.Settings()
             sn = S.Sniper(None, None, settings=st)
         d, parts = sn.latency_plan()

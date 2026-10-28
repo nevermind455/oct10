@@ -882,7 +882,7 @@ def enabled() -> bool:
 MIN_LIVE_DELAYS = 30
 
 
-def live_delays(path) -> tuple[list[float], float]:
+def live_delays(path, days: float | None = None) -> tuple[list[float], float]:
     """(order-out -> match ms of every live order the matching engine
     answered - MATCHED or NO_MATCH - and the one-way taken off each reply).
 
@@ -893,9 +893,14 @@ def live_delays(path) -> tuple[list[float], float]:
     One pass, keeping only those numbers (2026-10-29): every row used to be
     kept, about 5x the file in memory - the whole 212MB live journal as
     SNIPER_DELAY_JOURNAL needed ~1GB on the 2GB VPS. Lines that cannot hold a
-    summary or a reply time are not parsed."""
+    summary or a reply time are not parsed. days: only the rows of the newest
+    order's last `days` days (rows without a time - refresh_delays files - stay)."""
     import statistics
-    rtts, replies = [], []
+    rtts, replies = [], []                         # (wall or None, value)
+
+    def wall(r):
+        w = r.get("wall")
+        return float(w) if isinstance(w, (int, float)) and not isinstance(w, bool) else None
     with open(path, encoding="utf-8") as fh:
         for line in fh:
             if '"summary"' not in line and '"t_wire_to_reply_ms"' not in line:
@@ -909,16 +914,22 @@ def live_delays(path) -> tuple[list[float], float]:
             if r.get("result") == "summary" and isinstance(r.get("live"), dict):
                 x = ((r["live"].get("clock") or {}).get("rtt_ms_p50"))
                 if isinstance(x, (int, float)) and x > 0:
-                    rtts.append(float(x))
+                    rtts.append((wall(r), float(x)))
             elif (r.get("live") is True and r.get("kind") in ("MATCHED", "NO_MATCH")
                     and r.get("result") in ("filled", "refused", "pending")):   # one row per order
                 try:
-                    replies.append(float(r["t_wire_to_reply_ms"]))
+                    replies.append((wall(r), float(r["t_wire_to_reply_ms"])))
                 except (KeyError, TypeError, ValueError):
                     continue
-    one_way = statistics.median(rtts) / 2.0 if rtts else 13.3
+    if days is not None:
+        walls = [w for w, _x in replies if w is not None]
+        if walls:
+            cut = max(walls) - float(days) * 86400.0
+            replies = [(w, x) for w, x in replies if w is None or w >= cut]
+            rtts = [(w, x) for w, x in rtts if w is None or w >= cut]
+    one_way = statistics.median([x for _w, x in rtts]) / 2.0 if rtts else 13.3
     out = []
-    for reply in replies:
+    for _w, reply in replies:
         ms = reply - one_way
         if math.isfinite(ms) and 0 <= ms < 60_000:
             out.append(ms)
@@ -998,14 +1009,19 @@ class Settings:
         # SNIPER_SERVER_MS, the same number for every order. "live": one delay
         # drawn per order from the live canary's own measured order-out ->
         # match times (SNIPER_DELAY_JOURNAL, default the live journal), slow
-        # tail included - what live orders really waited.
-        self.delay_source = str(os.environ.get("SNIPER_DELAY_SOURCE", "model")).strip().lower() or "model"
-        if self.delay_source not in ("model", "live"):
-            raise ValueError(f"invalid SNIPER_DELAY_SOURCE {self.delay_source!r}: model or live")
+        # tail included - what live orders really waited. "auto" (the default
+        # since 2026-10-29, the operator's request: paper as real as live):
+        # "live" from the last SNIPER_DELAY_DAYS days of that journal when it
+        # holds enough orders, else "model" - the settings line says which.
+        self.delay_source = str(os.environ.get("SNIPER_DELAY_SOURCE", "auto")).strip().lower() or "auto"
+        if self.delay_source not in ("auto", "model", "live"):
+            raise ValueError(f"invalid SNIPER_DELAY_SOURCE {self.delay_source!r}: auto, model or live")
+        self.delay_days = _env_float("SNIPER_DELAY_DAYS", 3)
         if self.delay_source == "live" and self.fixed_latency:
             raise ValueError("SNIPER_DELAY_SOURCE=live and SNIPER_LATENCY_MS are exclusive: unset SNIPER_LATENCY_MS")
         self.delay_journal = (os.environ.get("SNIPER_DELAY_JOURNAL") or os.environ.get("LIVE_SNIPER_JOURNAL")
                               or "live_sniper.jsonl")
+        self.live_journal = os.environ.get("LIVE_SNIPER_JOURNAL") or "live_sniper.jsonl"   # the live bot's, here
         # Paper realism (2026-10-16, calibrated on 1,154 live orders): the recorded book lags what
         # the venue matched - faster takers ahead of us in the hold are not in it yet - so paper
         # filled 31% of live's own orders (live 21%) for +$210.68 (live +$1.42), +$202 of it on
@@ -1045,13 +1061,22 @@ class Settings:
         # says so). The $1 floor on a marketable BUY always applies. Shares only.
         self.venue_min_shares = _env_float("SNIPER_VENUE_MIN_SHARES", 0)
         # Paper only (2026-10-29, the operator's request): size from the LIVE bot's cash and
-        # drawdown, read from the end of its journal (this path), so paper's orders are the
-        # size live's are - paper50 had 7x live's cash and sent 78-share orders to live's 8.
-        # Paper's own cash still pays for its fills: the smaller of the two is used. A live
-        # reading older than SNIPER_PAPER_CASH_MAX_AGE_S (live stopped?) sizes nothing. Empty
-        # = off. Live refuses it (exec_latency.spec_violations).
-        self.paper_cash_from = str(os.environ.get("SNIPER_PAPER_CASH_FROM", "") or "").strip()
+        # drawdown, read from the end of its journal, so paper's orders are the size live's
+        # are - paper50 had 7x live's cash and sent 78-share orders to live's 8. Paper's own
+        # cash still pays for its fills: the smaller of the two is used.
+        #   unset / auto (the default): the live journal in this folder (LIVE_SNIPER_JOURNAL)
+        #       while live runs - a reading <= SNIPER_PAPER_CASH_MAX_AGE_S old - else paper's own
+        #   a path: that journal, strictly - no fresh live reading sizes nothing
+        #   off: paper's own cash, as before
+        # Live refuses a path (exec_latency.spec_violations); auto and off are paper only.
+        raw = str(os.environ.get("SNIPER_PAPER_CASH_FROM", "") or "").strip()
+        self.paper_cash_mode = ("auto" if raw.lower() in ("", "auto") else
+                                "off" if raw.lower() in ("off", "0", "no", "none") else "path")
+        self.paper_cash_from = raw if self.paper_cash_mode == "path" else ""
         self.paper_cash_max_age_s = _env_float("SNIPER_PAPER_CASH_MAX_AGE_S", 900)
+        self.paper_cash_note = (f"sized from LIVE's cash and drawdown ({raw}, readings <= "
+                                f"{self.paper_cash_max_age_s:g}s old; paper's own cash if smaller)"
+                                if self.paper_cash_mode == "path" else "")   # auto: set by a paper Sniper
         self.fair_vol_s = _env_float("SNIPER_FAIR_VOL_S", 300)
         # Retained for environment compatibility; decisions use the prefetched
         # market's actual fee rate/exponent, never this former model assumption.
@@ -1245,6 +1270,7 @@ class Settings:
             (self.venue_min_shares == 0 or self.order_sizing == "shares",
              "SNIPER_VENUE_MIN_SHARES needs SNIPER_ORDER_SIZING=shares"),
             (self.paper_cash_max_age_s > 0, f"SNIPER_PAPER_CASH_MAX_AGE_S={self.paper_cash_max_age_s:g} (must be > 0)"),
+            (self.delay_days > 0, f"SNIPER_DELAY_DAYS={self.delay_days:g} (must be > 0)"),
             (self.fair_vol_s >= 60, f"SNIPER_FAIR_VOL_S={self.fair_vol_s:g} (must be >= 60)"),
             (0 <= self.fair_fee_rate < 0.25, f"SNIPER_FAIR_FEE_RATE={self.fair_fee_rate:g} (must be 0 to 0.25)"),
             (0 < self.kelly_fraction <= 1, f"SNIPER_KELLY_FRACTION={self.kelly_fraction:g} (must be above 0, at most 1)"),
@@ -1309,9 +1335,8 @@ class Settings:
                 + (f"; WIDE CAP EXPERIMENT (paper only): limit ask+{self.wide_cap_c:g}c whatever the fair value says, "
                    f"and an ask above the fair limit still buys a fixed minimum-size order"
                    if self.wide_cap_c > 0 else "")
-                + (f"; sized from LIVE's cash and drawdown ({self.paper_cash_from}, readings <= "
-                   f"{self.paper_cash_max_age_s:g}s old; paper's own cash if smaller)"
-                   if self.paper_cash_from and self.kelly and self.order_type == "FAK" else ""))
+                + (f"; {self.paper_cash_note}" if self.paper_cash_note and self.kelly and self.order_type == "FAK"
+                   else ""))
 
     def lines(self, live: bool = False) -> list[str]:
         if live:
@@ -1703,16 +1728,30 @@ class Sniper:
         self._execution_faults: dict = {"count": 0, "last": None}
         self.code = code_version()
         self._live_delays: list = []
-        if live is None and self.s.delay_source == "live":
+        if live is None and (self.s.delay_source == "live"
+                             or (self.s.delay_source == "auto" and not self.s.fixed_latency)):
             self._load_live_delays()
         self._live_mirror: dict | None = None        # SNIPER_PAPER_CASH_FROM: live's cash and drawdown
         self._live_mirror_error: str | None = None
-        if self._mirror_on():
+        self._mirror_path: str | None = None
+        self._mirror_strict = False                  # a path: no fresh live reading sizes nothing
+        mode = getattr(self.s, "paper_cash_mode", "off")
+        if live is None and mode == "path":
+            self._mirror_path, self._mirror_strict = self.s.paper_cash_from, True
             try:
-                self._live_mirror = live_account_tail(self.s.paper_cash_from)
+                self._live_mirror = live_account_tail(self._mirror_path)
             except OSError as exc:
                 raise ValueError(f"SNIPER_PAPER_CASH_FROM: cannot read the live journal "
-                                 f"{self.s.paper_cash_from}: {exc}") from exc
+                                 f"{self._mirror_path}: {exc}") from exc
+        elif live is None and mode == "auto":
+            p = Path(self.s.live_journal)
+            if not p.is_absolute():
+                p = Path(__file__).resolve().parent / p
+            if p.exists():                           # a live bot in this folder: size as it does while it runs
+                self._mirror_path = str(p)
+                self._refresh_live_mirror()
+                self.s.paper_cash_note = (f"sized from LIVE's cash and drawdown while live runs ({p.name}, readings "
+                                          f"<= {self.s.paper_cash_max_age_s:g}s old), else paper's own cash")
         if live is not None:
             live.attach(self)
 
@@ -1735,16 +1774,30 @@ class Sniper:
 
     def _load_live_delays(self) -> None:
         """Paper with SNIPER_DELAY_SOURCE=live: refuse to start without enough
-        live orders rather than fall back to the model quietly."""
+        live orders rather than fall back to the model quietly. auto (the
+        default): the journal's last SNIPER_DELAY_DAYS days when they hold
+        enough orders, else the model - the settings line says which."""
         import random
+        auto = self.s.delay_source == "auto"
         p = Path(self.s.delay_journal)
         if not p.is_absolute():
             p = Path(__file__).resolve().parent / p
+        model = (f"the delay model (measured one-way + {self.s.hold_ms:.0f}ms hold + {self.s.server_ms:.0f}ms server; "
+                 f"auto: ")
+        if auto and not p.exists():
+            return                                   # no live bot in this folder: the model, as always
         try:
-            delays, one_way = live_delays(p)
+            delays, one_way = live_delays(p, days=self.s.delay_days if auto else None)
         except OSError as exc:
+            if auto:
+                self.s.delay_note = model + f"cannot read {p.name}: {exc})"
+                return
             raise ValueError(f"SNIPER_DELAY_SOURCE=live: cannot read the live journal {p}: {exc}") from exc
         if len(delays) < MIN_LIVE_DELAYS:
+            if auto:
+                self.s.delay_note = model + (f"only {len(delays)} live orders in the last {self.s.delay_days:g} days "
+                                             f"of {p.name}, need {MIN_LIVE_DELAYS})")
+                return
             raise ValueError(f"SNIPER_DELAY_SOURCE=live: {len(delays)} live orders with a venue reply in {p}, "
                              f"need >= {MIN_LIVE_DELAYS}")
         self._live_delays = delays
@@ -1752,7 +1805,8 @@ class Sniper:
         q = sorted(delays)
         pick = lambda f: q[min(len(q) - 1, int(len(q) * f))]  # noqa: E731
         self.s.delay_note = (f"each order's flight drawn from {len(q)} live orders' order-out -> match times "
-                             f"(p50 {pick(0.5):.0f}ms, p90 {pick(0.9):.0f}ms, max {q[-1]:.0f}ms; {p.name})")
+                             f"(p50 {pick(0.5):.0f}ms, p90 {pick(0.9):.0f}ms, max {q[-1]:.0f}ms; {p.name}"
+                             + (f", last {self.s.delay_days:g} days" if auto else "") + ")")
 
     def lines(self) -> list[str]:
         out = self.s.lines(live=self.live is not None)
@@ -2077,12 +2131,12 @@ class Sniper:
             try:
                 live_cash = self._live_mirror_now()["cash"]
             except ValueError:
-                return None
+                return None if self._mirror_strict else self._bankroll    # auto: live stopped - paper's own
             return None if self._bankroll is None else min(self._bankroll, live_cash)
         return self._bankroll
 
     def _mirror_on(self) -> bool:
-        return self.live is None and bool(getattr(self.s, "paper_cash_from", ""))
+        return self.live is None and bool(getattr(self, "_mirror_path", None))
 
     def _live_mirror_now(self) -> dict:
         """SNIPER_PAPER_CASH_FROM: live's latest readings, or ValueError(why not)."""
@@ -2097,10 +2151,10 @@ class Sniper:
     def _refresh_live_mirror(self) -> None:
         """Worker thread: re-read the end of the live journal."""
         try:
-            self._live_mirror = live_account_tail(self.s.paper_cash_from)
+            self._live_mirror = live_account_tail(self._mirror_path)
             self._live_mirror_error = None
         except OSError as exc:                      # keep the last reading; its age still applies
-            self._live_mirror_error = f"cannot read {self.s.paper_cash_from}: {exc}"
+            self._live_mirror_error = f"cannot read {self._mirror_path}: {exc}"
 
     async def _live_mirror_loop(self) -> None:
         while True:
@@ -2251,11 +2305,16 @@ class Sniper:
         equity, high_water, mirror = max(0.0, float(snapshot["equity"])), snapshot["high_water"], {}
         if self._mirror_on():
             # SNIPER_PAPER_CASH_FROM: size in the drawdown LIVE is in, not paper's own
-            m = self._live_mirror_now()
-            if m["equity"] is None or m["high_water"] is None:
-                raise ValueError("no live drawdown reading in the live journal's end (SNIPER_PAPER_CASH_FROM)")
-            equity, high_water = max(0.0, m["equity"]), m["high_water"]
-            mirror = {"live_mirror": True, "paper_equity": round(float(snapshot["equity"]), 4)}
+            try:
+                m = self._live_mirror_now()
+                if m["equity"] is None or m["high_water"] is None:
+                    raise ValueError("no live drawdown reading in the live journal's end (SNIPER_PAPER_CASH_FROM)")
+                equity, high_water = max(0.0, m["equity"]), m["high_water"]
+                mirror = {"live_mirror": True, "paper_equity": round(float(snapshot["equity"]), 4)}
+            except ValueError:
+                if self._mirror_strict:
+                    raise
+                mirror = {"live_mirror": False}      # auto: live stopped - paper's own drawdown
         factors = sizing_factors(self.s.hybrid_policy, sigma=self.vol_model.vol(), equity=equity,
                                  high_water=high_water, base_fraction=self.s.kelly_fraction)
         return {**factors, "equity": equity, "high_water": high_water,
@@ -3836,7 +3895,7 @@ class Sniper:
                 # determine how much to add. Existing inventory is not a fresh bet.
                 # Whole shares from the venue minimum to the available room; no carry.
                 bank = self._bankroll_now()
-                if bank is None and self._mirror_on():
+                if bank is None and self._mirror_on() and self._mirror_strict:
                     try:
                         self._live_mirror_now()
                     except ValueError as exc:
@@ -3844,9 +3903,13 @@ class Sniper:
                     return self._skip("kelly size unknown: no live cash reading", row)
                 if bank is None:
                     return self._skip("kelly size unknown: no cash reading", row)
-                if self._mirror_on() and (self._live_mirror or {}).get("cash") is not None:
-                    m = self._live_mirror
-                    row.update(live_cash=round(m["cash"], 2), live_cash_age_s=round(time.time() - m["cash_wall"], 1))
+                if self._mirror_on():
+                    m = self._live_mirror or {}
+                    if m.get("cash") is not None and time.time() - m["cash_wall"] <= self.s.paper_cash_max_age_s:
+                        row.update(live_cash=round(m["cash"], 2), live_cash_age_s=round(time.time() - m["cash_wall"], 1),
+                                   cash_source="live")
+                    else:
+                        row["cash_source"] = "paper (no fresh live reading)"
                 # No per-order cap (the operator's choice): only what is left of this
                 # side's per-market cap (SNIPER_MAX_SIDE_SHARES), and live, the canary's
                 # per-order cap - never a bigger order than the account's limits allow.

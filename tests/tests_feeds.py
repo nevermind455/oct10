@@ -1631,7 +1631,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # 2026-10-29 (tests/tests_paper_delay.py): live_delays reads the delay journal in one pass,
     # keeping only round trips and reply times - it kept every row (~5x the file; the 212MB live
     # journal needed ~1GB). Same delays, same one-way. Nothing else changed.
-    "sniper_mode.py": "d09a2c57765837c10730a1f51a6470a05e9b276953f8dded7aeddc112f9dd451",
+    # 2026-10-29 (tests/tests_paper_auto.py): paper is live-like by default - SNIPER_DELAY_SOURCE=auto
+    # draws delays from the live journal's last SNIPER_DELAY_DAYS days (else the model), and
+    # SNIPER_PAPER_CASH_FROM unset = auto sizes from live's cash and drawdown while live runs (else
+    # paper's own). An explicit path stays strict and live-refused; live decisions are unchanged.
+    "sniper_mode.py": "6874d31258fa307a3b4234f73926f5a465fe48c905c8884b1a0c16e3363059f0",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
