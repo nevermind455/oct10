@@ -888,29 +888,40 @@ def live_delays(path) -> tuple[list[float], float]:
 
     A reply comes back one network leg after the match, so the match was
     reply - one-way after the first byte left; one-way is half the median of
-    the canary's own warm round trips (13.3ms until a summary lands)."""
+    the canary's own warm round trips (13.3ms until a summary lands).
+
+    One pass, keeping only those numbers (2026-10-29): every row used to be
+    kept, about 5x the file in memory - the whole 212MB live journal as
+    SNIPER_DELAY_JOURNAL needed ~1GB on the 2GB VPS. Lines that cannot hold a
+    summary or a reply time are not parsed."""
     import statistics
-    rows = []
+    rtts, replies = [], []
     with open(path, encoding="utf-8") as fh:
         for line in fh:
+            if '"summary"' not in line and '"t_wire_to_reply_ms"' not in line:
+                continue
             try:
-                rows.append(json.loads(line))
+                r = json.loads(line)
             except ValueError:
                 continue
-    rtts = [((r.get("live") or {}).get("clock") or {}).get("rtt_ms_p50") for r in rows
-            if r.get("result") == "summary" and isinstance(r.get("live"), dict)]
-    rtts = [float(x) for x in rtts if isinstance(x, (int, float)) and x > 0]
+            if not isinstance(r, dict):
+                continue
+            if r.get("result") == "summary" and isinstance(r.get("live"), dict):
+                x = ((r["live"].get("clock") or {}).get("rtt_ms_p50"))
+                if isinstance(x, (int, float)) and x > 0:
+                    rtts.append(float(x))
+            elif (r.get("live") is True and r.get("kind") in ("MATCHED", "NO_MATCH")
+                    and r.get("result") in ("filled", "refused", "pending")):   # one row per order
+                try:
+                    replies.append(float(r["t_wire_to_reply_ms"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
     one_way = statistics.median(rtts) / 2.0 if rtts else 13.3
     out = []
-    for r in rows:
-        if (r.get("live") is True and r.get("kind") in ("MATCHED", "NO_MATCH")
-                and r.get("result") in ("filled", "refused", "pending")):   # one row per order
-            try:
-                ms = float(r["t_wire_to_reply_ms"]) - one_way
-            except (KeyError, TypeError, ValueError):
-                continue
-            if math.isfinite(ms) and 0 <= ms < 60_000:
-                out.append(ms)
+    for reply in replies:
+        ms = reply - one_way
+        if math.isfinite(ms) and 0 <= ms < 60_000:
+            out.append(ms)
     return out, one_way
 
 

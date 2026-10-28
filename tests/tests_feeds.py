@@ -1628,7 +1628,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # order under the published minimum turns SNIPER_VENUE_MIN_SHARES off for the run (_venue_min_off);
     # SNIPER_PAPER_CASH_FROM (paper only, live refuses it): Kelly cash and the hybrid drawdown come
     # from the end of the LIVE journal (live_account_tail), paper's own cash if smaller.
-    "sniper_mode.py": "31a903e02e9c8ed84b937529b1c09588e537b183c9d434fa7bc095b9c35f3399",
+    # 2026-10-29 (tests/tests_paper_delay.py): live_delays reads the delay journal in one pass,
+    # keeping only round trips and reply times - it kept every row (~5x the file; the 212MB live
+    # journal needed ~1GB). Same delays, same one-way. Nothing else changed.
+    "sniper_mode.py": "d09a2c57765837c10730a1f51a6470a05e9b276953f8dded7aeddc112f9dd451",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.

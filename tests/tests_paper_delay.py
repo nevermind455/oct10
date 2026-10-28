@@ -47,6 +47,29 @@ class LiveDelays(unittest.TestCase):
         self.assertEqual(one_way, 13.3)
         self.assertAlmostEqual(delays[0], 100.0)
 
+    def test_a_big_journal_is_read_line_by_line(self):
+        # 2026-10-29: every row used to be kept, about 5x the file in memory - the 212MB
+        # live journal as SNIPER_DELAY_JOURNAL needed ~1GB on the 2GB VPS.
+        import tracemalloc
+        filler = json.dumps({"result": "skipped", "reason": "ask not below fair value", "pad": "x" * 200}) + "\n"
+        fh = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, encoding="utf-8")
+        fh.write(json.dumps(SUMMARY) + "\n" + '["summary", "t_wire_to_reply_ms"]\n')   # not a row: skipped
+        for i in range(20_000):
+            fh.write(filler)
+            if i % 1000 == 0:
+                fh.write(json.dumps(order("MATCHED", "filled", 112.0)) + "\n")
+        fh.close()
+        size = os.path.getsize(fh.name)
+        tracemalloc.start()
+        try:
+            delays, one_way = S.live_delays(fh.name)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+            os.unlink(fh.name)
+        self.assertEqual((len(delays), one_way, delays[0]), (20, 12.0, 100.0))
+        self.assertLess(peak, size / 5, f"peak {peak:,} bytes reading a {size:,}-byte journal")
+
 
 class PaperSniper(unittest.TestCase):
     def env(self, path, **extra):
