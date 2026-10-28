@@ -117,6 +117,9 @@ def spec_violations(settings, canary_max_shares=None) -> list[str]:
     if str(getattr(settings, "backlog_gate", "count")) != "count":
         out.append(f"backlog gate: SNIPER_BACKLOG_GATE={settings.backlog_gate} - live trades on the count gate "
                    f"until the age gate is approved")
+    if float(getattr(settings, "wide_cap_c", 0) or 0) > 0:
+        out.append(f"wide cap experiment: SNIPER_WIDE_CAP_C={settings.wide_cap_c:g} - paper only "
+                   f"(it buys past the fair value); live keeps ask + slip and the fair limit")
     if getattr(settings, "feed_coalesce", False):
         out.append("feed coalescing: SNIPER_FEED_COALESCE=1 - live evaluates every tick until coalescing is approved")
     target = float(getattr(settings, "max_target_shares", 0) or 0)

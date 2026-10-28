@@ -1617,7 +1617,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # direct signing path before its first order, as live does. No decision, size or price changed.
     # 2026-10-26 (the operator's choice): SNIPER_MIN_ENTRY_MAX_DRAWDOWN (default 0 = as before) sets how
     # deep a realized drawdown a minimum entry may still be taken in. No other sizing rule changed.
-    "sniper_mode.py": "7631fd2104ae5afb1ad891a12ffc67e2fe77180725dd39d39d6f8f3903273c74",
+    # 2026-10-28 (the operator's request - tests/tests_wide_cap.py): SNIPER_WIDE_CAP_C, a PAPER
+    # experiment, off by default and refused live: the limit is ask + that many cents whatever the
+    # fair value says, and an ask above the fair limit buys a fixed minimum-size order.
+    "sniper_mode.py": "1fb9fef47e241676133a2a91a1674bc1990e6d1464420f9cd7ff2613a9db983a",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
