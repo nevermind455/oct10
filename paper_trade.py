@@ -540,8 +540,9 @@ def minimum_spend_at_limit(book: BookSnapshot, rules: MarketRules, max_price) ->
 
 
 def estimate_fok(book: BookSnapshot, amount, max_price,
-                 rules: MarketRules, min_price=0) -> FillQuote:
-    """Walk live asks and return a full-fill quote or raise ``PaperRejected``."""
+                 rules: MarketRules, min_price=0, min_shares=None) -> FillQuote:
+    """Walk live asks and return a full-fill quote or raise ``PaperRejected``.
+    min_shares (SNIPER_VENUE_MIN_SHARES) replaces the book's and rules' minimum."""
     wanted = _decimal(amount, name="amount").quantize(MONEY, rounding=ROUND_HALF_UP)
     configured_cap = _decimal(max_price, name="maximum buy price")
     configured_floor = _decimal(min_price, name="minimum buy price")
@@ -597,6 +598,8 @@ def estimate_fok(book: BookSnapshot, amount, max_price,
 
     minimums = [v for v in (book.min_order_size, rules.min_order_size) if v is not None]
     minimum = max(minimums) if minimums else None
+    if min_shares is not None:
+        minimum = _decimal(min_shares, name="minimum shares")
     if minimum is not None and total_shares < minimum:
         raise PaperRejected(
             f"order size {total_shares:.6f} shares is below venue minimum {minimum}")
@@ -607,7 +610,7 @@ def estimate_fok(book: BookSnapshot, amount, max_price,
 
 
 def estimate_fak(book: BookSnapshot, amount, max_price, rules: MarketRules, min_price=0,
-                 min_partial_shares=0) -> FillQuote:
+                 min_partial_shares=0, min_shares=None) -> FillQuote:
     """Fill-and-kill BUY: estimate_fok's walk, but whatever the levels at or
     under the cap hold is taken and the rest cancelled. A full fill is
     exactly estimate_fok's quote. A partial returns what was SPENT as its
@@ -616,7 +619,7 @@ def estimate_fak(book: BookSnapshot, amount, max_price, rules: MarketRules, min_
     estimate_fok's own. The venue's share/$ minimums are checked on the
     order as placed (the pre-send check), not on each partial match."""
     try:
-        return estimate_fok(book, amount, max_price, rules, min_price=min_price)
+        return estimate_fok(book, amount, max_price, rules, min_price=min_price, min_shares=min_shares)
     except PaperRejected as exc:
         if "fok no-fill" not in str(exc).lower():
             raise
@@ -648,7 +651,7 @@ def estimate_fak(book: BookSnapshot, amount, max_price, rules: MarketRules, min_
 
 
 def estimate_fak_shares(book: BookSnapshot, shares, max_price, rules: MarketRules,
-                        min_price=0) -> FillQuote:
+                        min_price=0, min_shares=None) -> FillQuote:
     """Quote a FAK whose maker budget was sized as shares times the limit.
 
     A BUY's signed taker amount is not a maximum share fill. The venue may
@@ -679,7 +682,7 @@ def estimate_fak_shares(book: BookSnapshot, shares, max_price, rules: MarketRule
         raise PaperRejected("share-sized stake is not a whole-cent amount at the price cap")
     if not book.asks:
         raise PaperRejected("FAK no-fill: no asks on the book at the match")
-    return estimate_fak(book, spend, cap, rules, min_price=configured_floor)
+    return estimate_fak(book, spend, cap, rules, min_price=configured_floor, min_shares=min_shares)
 
 
 def _start_daemon_timer(delay_s: float, fn: Callable[[], None]) -> None:
@@ -696,6 +699,7 @@ class PaperBroker:
     supports_size_at_limit = True    # place_trade(size_at_limit=...) - the sniper sizes as its live sender
     supports_share_sized = True      # shares= sizes the fixed maker stake at its limit
     supports_hybrid_risk_guard = True
+    supports_venue_min_override = True   # place_trade(venue_min_shares=...) - SNIPER_VENUE_MIN_SHARES
 
     mode = "PAPER"
 
@@ -1136,7 +1140,8 @@ class PaperBroker:
                     pre_submit_guard=None, latency_ms: float | None = None,
                     tag: str | None = None, latency_from_pc: int | None = None,
                     arrival_book=None, fak: bool = False, size_at_limit: bool = False,
-                    shares: float | None = None, hybrid_risk_guard=None) -> bool:
+                    shares: float | None = None, hybrid_risk_guard=None,
+                    venue_min_shares: float | None = None) -> bool:
         """Run one simulated FOK; reject concurrent duplicate submissions.
 
         `shares` (with fak=True) sizes the maker stake as whole shares times
@@ -1222,7 +1227,7 @@ class PaperBroker:
                                      latency_ms=latency_ms, tag=tag, timing=timing,
                                      latency_from_pc=latency_from_pc, arrival_book=arrival_book,
                                      fak=fak, size_at_limit=size_at_limit, shares=shares,
-                                     hybrid_risk_guard=hybrid_risk_guard)
+                                     hybrid_risk_guard=hybrid_risk_guard, venue_min_shares=venue_min_shares)
         finally:
             entry_lock.release()
 
@@ -1257,7 +1262,7 @@ class PaperBroker:
                      tag: str | None = None, timing: dict | None = None,
                      latency_from_pc: int | None = None, arrival_book=None,
                      fak: bool = False, size_at_limit: bool = False, shares: float | None = None,
-                     hybrid_risk_guard=None) -> bool:
+                     hybrid_risk_guard=None, venue_min_shares: float | None = None) -> bool:
         side = str(side or "").upper()
         if shares is not None and not fak:
             return self._reject(side, amount, "a share-sized order is a fill-and-kill")
@@ -1323,13 +1328,17 @@ class PaperBroker:
             if decision_spread > Decimal(str(self.max_spread)):
                 raise PaperRejected(
                     f"spread {decision_spread:.6f} exceeds paper limit {self.max_spread:.6f}")
-            size = None
+            size = min_override = None
             if shares is not None:
                 # F1: whole shares at the signed limit; its amount is shares x limit
                 size = _decimal(shares, name="shares")
                 tick = rules.tick_size
                 limit = (min(Decimal(str(cap)), ONE - tick) / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
                 minimums = [v for v in (decision_book.min_order_size, rules.min_order_size) if v is not None]
+                if venue_min_shares:
+                    # SNIPER_VENUE_MIN_SHARES: the operator's minimum replaces the published one
+                    min_override = _decimal(venue_min_shares, name="venue minimum shares")
+                    minimums = [min_override]
                 if size != size.to_integral_value() or size <= ZERO:
                     raise PaperRejected("a share-sized order is whole shares")
                 if minimums and size < max(minimums):
@@ -1358,7 +1367,7 @@ class PaperBroker:
             # book before signing. An arrival book must not rescue an order
             # live would never have submitted.
             if size is not None:
-                estimate_fak_shares(decision_book, size, cap, rules, min_price=floor)
+                estimate_fak_shares(decision_book, size, cap, rules, min_price=floor, min_shares=min_override)
             else:
                 (estimate_fak if fak else estimate_fok)(decision_book, spend, cap, rules, min_price=floor)
             if size is None and spend > Decimal(str(amount)):
@@ -1393,12 +1402,14 @@ class PaperBroker:
                     woke = self._book_fetch(str(token_id))
                 except PaperRejected:
                     woke = None
-                woke = self._quote_outcome(woke, side, spend, cap, rules, floor, shares=size, fak=fak)
+                woke = self._quote_outcome(woke, side, spend, cap, rules, floor, shares=size, fak=fak,
+                                           min_shares=min_override)
                 arrived, info = arrival_book(str(token_id))
                 info = dict(info or {})
                 info["wake"] = woke
                 for name, alt in (info.pop("alternatives", None) or {}).items():
-                    info[name] = self._quote_outcome(alt, side, spend, cap, rules, floor, shares=size, fak=fak)
+                    info[name] = self._quote_outcome(alt, side, spend, cap, rules, floor, shares=size, fak=fak,
+                                                     min_shares=min_override)
                 if timing is not None:
                     timing["book_ready_pc"] = time.perf_counter_ns()
                     timing["arrival"] = info
@@ -1430,7 +1441,7 @@ class PaperBroker:
             # or fell in between decides only the price paid: a FOK fills at
             # any price up to the cap and refuses past it, which is exactly
             # what the venue does with a signed limit order.
-            quote = self._quote(book, spend, cap, rules, floor, fak, size)
+            quote = self._quote(book, spend, cap, rules, floor, fak, size, min_override)
             partial = bool(fak and quote.notional < spend.quantize(MONEY, rounding=ROUND_HALF_UP))
             if timer.unix() >= end - self.min_seconds_to_expiry:
                 raise PaperRejected("paper quote reached the round cutoff")
@@ -1449,7 +1460,7 @@ class PaperBroker:
                     if not book.asks:
                         raise PaperRejected(f"{'FAK' if fak else 'FOK'} no-fill: our own order on this "
                                             f"token took the depth first")
-                    quote = self._quote(book, spend, cap, rules, floor, fak, size)
+                    quote = self._quote(book, spend, cap, rules, floor, fak, size, min_override)
                     partial = bool(fak and quote.notional < spend.quantize(MONEY, rounding=ROUND_HALF_UP))
                 if self.cash_balance() + 1e-9 < float(quote.total_cost):
                     raise PaperRejected(
@@ -1702,15 +1713,17 @@ class PaperBroker:
         return dataclass_replace(book, asks=asks)
 
     @staticmethod
-    def _quote(book, spend, cap, rules, floor, fak, size):
+    def _quote(book, spend, cap, rules, floor, fak, size, min_shares=None):
         """Match the fixed signed stake, including share-derived FAK budgets.
 
         Do not rebuild spend from size at arrival: refreshed tick metadata
         must not change the dollars that were signed at the decision.
         """
-        return (estimate_fak if fak else estimate_fok)(book, spend, cap, rules, min_price=floor)
+        return (estimate_fak if fak else estimate_fok)(book, spend, cap, rules, min_price=floor,
+                                                        min_shares=min_shares)
 
-    def _quote_outcome(self, book, side, spend, cap, rules, floor, shares=None, fak=False) -> dict:
+    def _quote_outcome(self, book, side, spend, cap, rules, floor, shares=None, fak=False,
+                       min_shares=None) -> dict:
         """Would this book have filled the order? A counterfactual only:
         {"fill": True, "px": ...} or {"fill": False, "why": ...}; fill None
         when there was no book to ask."""
@@ -1723,7 +1736,7 @@ class PaperBroker:
                 raise PaperRejected("public order book has no bid")
             if book.asks[0][0] - book.best_bid > Decimal(str(self.max_spread)):
                 raise PaperRejected("spread exceeds paper limit")
-            q = self._quote(book, spend, cap, rules, floor, fak, shares)
+            q = self._quote(book, spend, cap, rules, floor, fak, shares, min_shares)
         except PaperRejected as exc:
             return {"fill": False, "why": str(exc)[:80],
                     "ask": float(book.asks[0][0]) if getattr(book, "asks", None) else None}

@@ -975,6 +975,17 @@ class Settings:
         # history, or no market mid, skips: never guessed.
         self.fair = _env_bool("SNIPER_FAIR", True)
         self.fair_margin = _env_float("SNIPER_FAIR_MARGIN", 0.01)
+        # PAPER EXPERIMENT (2026-10-28, the operator's request; live refuses it -
+        # exec_latency.spec_violations): the price limit is ask + this many cents,
+        # whatever the fair value says, and a signal whose ask is above the fair
+        # limit still buys a fixed minimum-size order (Kelly says 0 there). 0 = off.
+        self.wide_cap_c = _env_float("SNIPER_WIDE_CAP_C", 0)
+        # The share minimum an order is held to (2026-10-29, the operator's
+        # request): 0 = the venue's published one (the market's `mos`, 5 on the
+        # BTC 5-minute markets). A whole number replaces it - the live test of
+        # whether the venue takes a marketable FAK BUY under 5 shares (its reply
+        # says so). The $1 floor on a marketable BUY always applies. Shares only.
+        self.venue_min_shares = _env_float("SNIPER_VENUE_MIN_SHARES", 0)
         self.fair_vol_s = _env_float("SNIPER_FAIR_VOL_S", 300)
         # Retained for environment compatibility; decisions use the prefetched
         # market's actual fee rate/exponent, never this former model assumption.
@@ -1162,6 +1173,11 @@ class Settings:
              "SNIPER_COINBASE_STALE_MS / _UNKNOWN_MS / _SILENT_S must be > 0, _BACKLOG_MAX >= 0"),
             (1 <= self.coinbase_conns <= 4, f"SNIPER_COINBASE_CONNS={self.coinbase_conns} (1 to 4)"),
             (0 <= self.fair_margin < 0.5, f"SNIPER_FAIR_MARGIN={self.fair_margin:g} (must be 0 to 0.49)"),
+            (0 <= self.wide_cap_c <= 50, f"SNIPER_WIDE_CAP_C={self.wide_cap_c:g} (cents, must be 0 to 50)"),
+            (0 <= self.venue_min_shares <= 5 and self.venue_min_shares == int(self.venue_min_shares),
+             f"SNIPER_VENUE_MIN_SHARES={self.venue_min_shares:g} (whole shares, 0 to 5; 0 = the venue's own)"),
+            (self.venue_min_shares == 0 or self.order_sizing == "shares",
+             "SNIPER_VENUE_MIN_SHARES needs SNIPER_ORDER_SIZING=shares"),
             (self.fair_vol_s >= 60, f"SNIPER_FAIR_VOL_S={self.fair_vol_s:g} (must be >= 60)"),
             (0 <= self.fair_fee_rate < 0.25, f"SNIPER_FAIR_FEE_RATE={self.fair_fee_rate:g} (must be 0 to 0.25)"),
             (0 < self.kelly_fraction <= 1, f"SNIPER_KELLY_FRACTION={self.kelly_fraction:g} (must be above 0, at most 1)"),
@@ -1218,9 +1234,14 @@ class Settings:
                     else "no additional per-order cap")
         return (f"; every buy at or under the market-anchored fair value - fee - ${self.fair_margin:.2f} "
                 f"(the market's mid moved by the BTC move over {self.fair_vol_s:.0f}s volatility and the time left)"
-                + (f"; size {self.kelly_fraction:g} Kelly from {KELLY_MIN_SHARES} sh, {cap_text} "
+                + (f"; size {self.kelly_fraction:g} Kelly from "
+                   + (f"{self.venue_min_shares:g} sh and $1 (SNIPER_VENUE_MIN_SHARES - not the venue's published "
+                      f"minimum)" if self.venue_min_shares > 0 else f"{KELLY_MIN_SHARES} sh") + f", {cap_text} "
                    f"(<= {self.max_side_shares:.0f} sh/side per round)"
-                   if self.kelly and self.order_type == "FAK" else "") + hybrid)
+                   if self.kelly and self.order_type == "FAK" else "") + hybrid
+                + (f"; WIDE CAP EXPERIMENT (paper only): limit ask+{self.wide_cap_c:g}c whatever the fair value says, "
+                   f"and an ask above the fair limit still buys a fixed minimum-size order"
+                   if self.wide_cap_c > 0 else ""))
 
     def lines(self, live: bool = False) -> list[str]:
         if live:
@@ -1864,6 +1885,10 @@ class Sniper:
 
     def _share_order_floor(self, condition, view, price_cap) -> int:
         """Read prefetched venue minimums; never fetch on the decision path."""
+        override = int(getattr(self.s, "venue_min_shares", 0) or 0)
+        if override > 0:
+            # SNIPER_VENUE_MIN_SHARES replaces the published minimum; $1 and whole cents still apply
+            return minimum_entry_shares(price_cap, override, MIN_ORDER_USD)
         cached = getattr(self.broker, "cached_rules", None)
         if callable(cached):
             rules = cached(str(condition))
@@ -2628,6 +2653,10 @@ class Sniper:
             if not getattr(self.broker, "supports_share_sized", False):
                 raise ValueError("broker does not support the decided share-sized order")
             kw["shares"] = plan["shares"]
+        if plan.get("venue_min_shares"):
+            if not getattr(self.broker, "supports_venue_min_override", False):
+                raise ValueError("broker does not support SNIPER_VENUE_MIN_SHARES")
+            kw["venue_min_shares"] = plan["venue_min_shares"]
         if plan.get("hybrid"):
             if not getattr(self.broker, "supports_hybrid_risk_guard", False):
                 raise ValueError("broker does not support hybrid risk checks")
@@ -3610,6 +3639,8 @@ class Sniper:
         # The price ceiling is fixed here, once, from the ask this decision saw:
         # never recomputed from a later ask, so it cannot chase the book.
         cap = min(0.99, round(ask + self.s.slip, 4))
+        above_fair = False
+        wide_c = float(getattr(self.s, "wide_cap_c", 0) or 0)      # the paper wide-cap experiment; 0 = off
         fair = None
         fee_rate = fee_exponent = None
         if self.s.fair:
@@ -3639,9 +3670,16 @@ class Sniper:
             self.last_fair = {"side": side, "market_mid": round(float(mkt), 4), "anchor": anchor, "fair": round(fair, 4),
                               "limit": limit, "ask": ask, "wall": time.time()}
             if ask > limit + 1e-9:
-                row.update(ask_seen=ask)
-                return self._skip("ask not below fair value", row)
-            cap = min(cap, limit)
+                if wide_c <= 0:
+                    row.update(ask_seen=ask)
+                    return self._skip("ask not below fair value", row)
+                above_fair = True                       # the wide-cap experiment buys it anyway, fixed size
+            if wide_c <= 0:
+                cap = min(cap, limit)
+        if wide_c > 0:
+            # PAPER EXPERIMENT: ask + SNIPER_WIDE_CAP_C cents, never past the account's MAX_BUY_PRICE
+            cap = min(hi, round(ask + wide_c / 100.0, 4))
+            row.update(wide_cap_c=wide_c, wide_cap_mode="above_fair_fixed" if above_fair else "kelly")
         if lo > 0 and cap <= lo + 1e-9:
             # An ask at MIN_BUY_PRICE whose ceiling is that same price: the paper
             # broker refuses a cap at or below the floor ("order price cap ... is at
@@ -3702,34 +3740,44 @@ class Sniper:
                         return self._skip("hybrid drawdown stop", row)
                     if risk_budget is not None:
                         room = min(room, shares_within_budget(risk_budget, cap, fee_rate))
-                shares, f = kelly_shares(fair, ask, fee_rate, fraction, bank,
-                                         max(room, 0.0), held_shares=held, opposite_shares=opposite,
-                                         fee_exponent=fee_exponent)
-                row.update(kelly_f=round(f, 4), bankroll=round(bank, 2), kelly_shares=shares,
-                           kelly_held_shares=round(held, 4), kelly_opposite_shares=round(opposite, 4))
-                self.last_fair["shares"] = shares
-                required = share_floor or KELLY_MIN_SHARES
-                if shares < required and getattr(self.s, "kelly_min_entry", False) and share_floor is not None:
-                    if self._minimum_entry_seed_error:
-                        row["detail"] = self._minimum_entry_seed_error
-                        return self._skip("minimum entry state unavailable", row)
-                    if minimum_key in self._minimum_entry_keys:
-                        return self._skip("minimum entry already attempted this side and round", row)
-                    if drawdown_scale < 1.0 and drawdown > float(getattr(self.s, "min_entry_max_drawdown", 0.0)) + 1e-12:
-                        # M3 (2026-10-25): in a realized drawdown the hybrid scale is what cuts the
-                        # risk - a minimum entry bought 5 shares at an 18.7% drawdown (scale 0.064)
-                        # where Kelly said 0. None deeper than SNIPER_MIN_ENTRY_MAX_DRAWDOWN (0: none
-                        # below the high-water mark).
-                        row["minimum_entry_blocked"] = "realized drawdown"
-                    elif held <= 1e-9 and f > 0 and fraction > 0 and bank > 0 and room + 1e-9 >= share_floor:
-                        shares = float(share_floor)
-                        minimum_entry = True
-                        row.update(minimum_entry=True, minimum_entry_attempted=False,
-                                   minimum_entry_key=list(minimum_key),
-                                   minimum_entry_shares=share_floor)
-                if shares < required:
-                    row.update(ask_seen=ask)
-                    return self._skip(f"kelly size under the {required}-share minimum", row)
+                if above_fair:
+                    # PAPER EXPERIMENT: Kelly says 0 above the fair limit; buy the venue's
+                    # minimum, within this side's room and the cash, never more.
+                    shares = float(share_floor or KELLY_MIN_SHARES)
+                    f = 0.0
+                    row.update(bankroll=round(bank, 2), kelly_shares=None, wide_cap_fixed_shares=shares)
+                    if room + 1e-9 < shares:
+                        row.update(ask_seen=ask, room_shares=round(room, 4))
+                        return self._skip("wide cap: room under the fixed size", row)
+                else:
+                    shares, f = kelly_shares(fair, ask, fee_rate, fraction, bank,
+                                             max(room, 0.0), held_shares=held, opposite_shares=opposite,
+                                             fee_exponent=fee_exponent)
+                    row.update(kelly_f=round(f, 4), bankroll=round(bank, 2), kelly_shares=shares,
+                               kelly_held_shares=round(held, 4), kelly_opposite_shares=round(opposite, 4))
+                    self.last_fair["shares"] = shares
+                    required = share_floor or KELLY_MIN_SHARES
+                    if shares < required and getattr(self.s, "kelly_min_entry", False) and share_floor is not None:
+                        if self._minimum_entry_seed_error:
+                            row["detail"] = self._minimum_entry_seed_error
+                            return self._skip("minimum entry state unavailable", row)
+                        if minimum_key in self._minimum_entry_keys:
+                            return self._skip("minimum entry already attempted this side and round", row)
+                        if drawdown_scale < 1.0 and drawdown > float(getattr(self.s, "min_entry_max_drawdown", 0.0)) + 1e-12:
+                            # M3 (2026-10-25): in a realized drawdown the hybrid scale is what cuts the
+                            # risk - a minimum entry bought 5 shares at an 18.7% drawdown (scale 0.064)
+                            # where Kelly said 0. None deeper than SNIPER_MIN_ENTRY_MAX_DRAWDOWN (0: none
+                            # below the high-water mark).
+                            row["minimum_entry_blocked"] = "realized drawdown"
+                        elif held <= 1e-9 and f > 0 and fraction > 0 and bank > 0 and room + 1e-9 >= share_floor:
+                            shares = float(share_floor)
+                            minimum_entry = True
+                            row.update(minimum_entry=True, minimum_entry_attempted=False,
+                                       minimum_entry_key=list(minimum_key),
+                                       minimum_entry_shares=share_floor)
+                    if shares < required:
+                        row.update(ask_seen=ask)
+                        return self._skip(f"kelly size under the {required}-share minimum", row)
                 target, carry, kelly = shares, 0.0, True
             else:
                 # IOC: a share target - the base clip plus what this side's last
@@ -3849,6 +3897,9 @@ class Sniper:
                 "dispatch_deadline": float(end) - last,
                 "risk_shares": risk_shares, "fair_fee_rate": fee_rate, "fair_fee_exponent": fee_exponent,
                 "shares": order_shares, "hybrid": hybrid, "risk_budget_usd": risk_budget,
+                # SNIPER_VENUE_MIN_SHARES: the minimum both senders then hold this order to
+                "venue_min_shares": (int(getattr(self.s, "venue_min_shares", 0) or 0) or None
+                                     if order_shares is not None else None),
                 "minimum_entry": minimum_entry, "minimum_entry_key": minimum_key,
                 "hybrid_check": self._check_hybrid_order if hybrid is not None else None,
                 # a Kelly-sized order carries nothing to the next: each is sized fresh
