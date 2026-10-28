@@ -1620,7 +1620,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # 2026-10-28 (the operator's request - tests/tests_wide_cap.py): SNIPER_WIDE_CAP_C, a PAPER
     # experiment, off by default and refused live: the limit is ask + that many cents whatever the
     # fair value says, and an ask above the fair limit buys a fixed minimum-size order.
-    "sniper_mode.py": "1fb9fef47e241676133a2a91a1674bc1990e6d1464420f9cd7ff2613a9db983a",
+    # 2026-10-29 (the operator's request - tests/tests_venue_min.py): SNIPER_VENUE_MIN_SHARES, off by
+    # default: a whole number 1-5 replaces the published share minimum (5) in the share floor and
+    # the order plan carries it to both senders - the live test of whether the venue takes a
+    # marketable FAK BUY under 5 shares. The $1 floor still applies. Nothing else changed.
+    "sniper_mode.py": "48486721630f8fa1183a2ca4e000fbfe38da6481e12b9d3b9bbdace0f0ddbc8d",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
@@ -1725,7 +1729,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # delivered (its sizing estimate, the venue reply's total, its private-channel trades in any
     # status but FAILED) less what the ledger booked - an order that delivered 20 counted as its
     # 10-share estimate until CONFIRMED, and Kelly could buy 7 more; the unused hard_halt removed.
-    "sniper_live.py": "d2cdb03f83134e4072d59d49f3eebe2fd86f8ce2bf85de4d4e1df18ad831eb58",
+    # 2026-10-29 (tests/tests_venue_min.py): the pre-send check and LeanSender.prepare hold a
+    # share-sized order to the plan's venue_min_shares (SNIPER_VENUE_MIN_SHARES) when it has one,
+    # else the published minimum as before. The $1 check is unchanged.
+    "sniper_live.py": "f663ea34a56cd2f4e2f1d4c7f1f6e89a1ead0ab0410acd22cfe97016bcf6be04",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads
@@ -1748,7 +1755,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # more shares; partial fills are classified by unspent dollars; the sniper's hybrid risk guard
     # is checked at the decision and again at booking (AUDIT_FIXES_20261020.md).
     # 2026-10-27: two unused imports removed (requests, ROUND_UP). Nothing else changed.
-    "paper_trade.py": "686da884f93830e58880617ad694626f3d21fa6cb2add8c985bc57cb0a1c3ffb",
+    # 2026-10-29 (tests/tests_venue_min.py): place_trade(venue_min_shares=) - SNIPER_VENUE_MIN_SHARES
+    # replaces the published minimum for a share-sized FAK, through estimate_fok/fak/fak_shares'
+    # new min_shares (default None: as before). Nothing else changed.
+    "paper_trade.py": "c094b84f5223860fa63a3598316c2bc9df0f0f89061b4ef0ed8812880cd01013",
     # Re-approved 2026-10-12 (audit 20261012): a rejection that also carries acceptance evidence
     # is not definitive
     # Re-recorded 2026-10-20 (completion pass): the venue client is the unified-SDK adapter

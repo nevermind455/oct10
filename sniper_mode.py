@@ -980,6 +980,12 @@ class Settings:
         # whatever the fair value says, and a signal whose ask is above the fair
         # limit still buys a fixed minimum-size order (Kelly says 0 there). 0 = off.
         self.wide_cap_c = _env_float("SNIPER_WIDE_CAP_C", 0)
+        # The share minimum an order is held to (2026-10-29, the operator's
+        # request): 0 = the venue's published one (the market's `mos`, 5 on the
+        # BTC 5-minute markets). A whole number replaces it - the live test of
+        # whether the venue takes a marketable FAK BUY under 5 shares (its reply
+        # says so). The $1 floor on a marketable BUY always applies. Shares only.
+        self.venue_min_shares = _env_float("SNIPER_VENUE_MIN_SHARES", 0)
         self.fair_vol_s = _env_float("SNIPER_FAIR_VOL_S", 300)
         # Retained for environment compatibility; decisions use the prefetched
         # market's actual fee rate/exponent, never this former model assumption.
@@ -1168,6 +1174,10 @@ class Settings:
             (1 <= self.coinbase_conns <= 4, f"SNIPER_COINBASE_CONNS={self.coinbase_conns} (1 to 4)"),
             (0 <= self.fair_margin < 0.5, f"SNIPER_FAIR_MARGIN={self.fair_margin:g} (must be 0 to 0.49)"),
             (0 <= self.wide_cap_c <= 50, f"SNIPER_WIDE_CAP_C={self.wide_cap_c:g} (cents, must be 0 to 50)"),
+            (0 <= self.venue_min_shares <= 5 and self.venue_min_shares == int(self.venue_min_shares),
+             f"SNIPER_VENUE_MIN_SHARES={self.venue_min_shares:g} (whole shares, 0 to 5; 0 = the venue's own)"),
+            (self.venue_min_shares == 0 or self.order_sizing == "shares",
+             "SNIPER_VENUE_MIN_SHARES needs SNIPER_ORDER_SIZING=shares"),
             (self.fair_vol_s >= 60, f"SNIPER_FAIR_VOL_S={self.fair_vol_s:g} (must be >= 60)"),
             (0 <= self.fair_fee_rate < 0.25, f"SNIPER_FAIR_FEE_RATE={self.fair_fee_rate:g} (must be 0 to 0.25)"),
             (0 < self.kelly_fraction <= 1, f"SNIPER_KELLY_FRACTION={self.kelly_fraction:g} (must be above 0, at most 1)"),
@@ -1224,7 +1234,9 @@ class Settings:
                     else "no additional per-order cap")
         return (f"; every buy at or under the market-anchored fair value - fee - ${self.fair_margin:.2f} "
                 f"(the market's mid moved by the BTC move over {self.fair_vol_s:.0f}s volatility and the time left)"
-                + (f"; size {self.kelly_fraction:g} Kelly from {KELLY_MIN_SHARES} sh, {cap_text} "
+                + (f"; size {self.kelly_fraction:g} Kelly from "
+                   + (f"{self.venue_min_shares:g} sh and $1 (SNIPER_VENUE_MIN_SHARES - not the venue's published "
+                      f"minimum)" if self.venue_min_shares > 0 else f"{KELLY_MIN_SHARES} sh") + f", {cap_text} "
                    f"(<= {self.max_side_shares:.0f} sh/side per round)"
                    if self.kelly and self.order_type == "FAK" else "") + hybrid
                 + (f"; WIDE CAP EXPERIMENT (paper only): limit ask+{self.wide_cap_c:g}c whatever the fair value says, "
@@ -1873,6 +1885,10 @@ class Sniper:
 
     def _share_order_floor(self, condition, view, price_cap) -> int:
         """Read prefetched venue minimums; never fetch on the decision path."""
+        override = int(getattr(self.s, "venue_min_shares", 0) or 0)
+        if override > 0:
+            # SNIPER_VENUE_MIN_SHARES replaces the published minimum; $1 and whole cents still apply
+            return minimum_entry_shares(price_cap, override, MIN_ORDER_USD)
         cached = getattr(self.broker, "cached_rules", None)
         if callable(cached):
             rules = cached(str(condition))
@@ -2637,6 +2653,10 @@ class Sniper:
             if not getattr(self.broker, "supports_share_sized", False):
                 raise ValueError("broker does not support the decided share-sized order")
             kw["shares"] = plan["shares"]
+        if plan.get("venue_min_shares"):
+            if not getattr(self.broker, "supports_venue_min_override", False):
+                raise ValueError("broker does not support SNIPER_VENUE_MIN_SHARES")
+            kw["venue_min_shares"] = plan["venue_min_shares"]
         if plan.get("hybrid"):
             if not getattr(self.broker, "supports_hybrid_risk_guard", False):
                 raise ValueError("broker does not support hybrid risk checks")
@@ -3877,6 +3897,9 @@ class Sniper:
                 "dispatch_deadline": float(end) - last,
                 "risk_shares": risk_shares, "fair_fee_rate": fee_rate, "fair_fee_exponent": fee_exponent,
                 "shares": order_shares, "hybrid": hybrid, "risk_budget_usd": risk_budget,
+                # SNIPER_VENUE_MIN_SHARES: the minimum both senders then hold this order to
+                "venue_min_shares": (int(getattr(self.s, "venue_min_shares", 0) or 0) or None
+                                     if order_shares is not None else None),
                 "minimum_entry": minimum_entry, "minimum_entry_key": minimum_key,
                 "hybrid_check": self._check_hybrid_order if hybrid is not None else None,
                 # a Kelly-sized order carries nothing to the next: each is sized fresh

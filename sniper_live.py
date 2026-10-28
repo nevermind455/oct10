@@ -1622,7 +1622,7 @@ class LeanSender:
     # ------------------------------------------------------------ hot path, synchronous
     def prepare(self, *, side: str, token: str, up: str, down: str, condition: str, end: float,
                 amount: float, cap: float, decided_pc: int | None = None, order_type: str = "FOK",
-                shares: float | None = None) -> Prepared:
+                shares: float | None = None, min_shares=None) -> Prepared:
         st = {"decided_pc": decided_pc, "prepare_pc": time.perf_counter_ns()}
         if order_type not in ("FOK", "FAK"):
             raise Refused(f"unknown order type {order_type!r}")
@@ -1662,8 +1662,10 @@ class LeanSender:
                 raise Refused(f"{size} shares at {exact} is not a whole-cent amount")
             amount = float(maker)
         n_shares = size if size is not None else Decimal(str(amount)) / exact
-        if n_shares < Decimal(str(rules["minimum"])):
-            raise Refused(f"{n_shares:.4f} shares at {exact} is below the venue minimum {rules['minimum']}")
+        # min_shares: SNIPER_VENUE_MIN_SHARES on a share-sized order (the venue's reply judges it)
+        minimum = Decimal(str(min_shares if min_shares is not None and size is not None else rules["minimum"]))
+        if n_shares < minimum:
+            raise Refused(f"{n_shares:.4f} shares at {exact} is below the venue minimum {minimum}")
         self.limits.check(float(amount), float(n_shares), str(condition), self.kill,
                           self.realized_loss() if self.realized_loss else None)
         lib = self._lib
@@ -3379,12 +3381,17 @@ class LiveExecution:
             if book.asks[0][0] - book.best_bid > Decimal(str(self.shim.max_spread)):
                 raise PaperRejected("spread exceeds the limit")
             price = (Decimal(str(cap)) / rules.tick_size).to_integral_value(rounding=ROUND_FLOOR) * rules.tick_size
-            size = None
+            size = min_override = None
             if plan.get("shares") is not None and order_type == "FAK":
                 # Whole shares at the limit determine the fixed maker stake.
                 # Actual FAK fills can contain more shares at improved prices.
                 size = Decimal(str(plan["shares"]))
                 minimums = [v for v in (book.min_order_size, rules.min_order_size) if v is not None]
+                if plan.get("venue_min_shares"):
+                    # SNIPER_VENUE_MIN_SHARES (the operator's live test): this minimum
+                    # replaces the published one; the venue's reply says if it takes it
+                    min_override = Decimal(str(plan["venue_min_shares"]))
+                    minimums = [min_override]
                 if minimums and size < max(minimums):
                     raise PaperRejected(f"order size {size} shares is below venue minimum {max(minimums)}")
                 spend = size * price
@@ -3392,7 +3399,8 @@ class LiveExecution:
                     raise PaperRejected(f"{size} shares at {price} is not a whole-cent amount")
                 if spend < MIN_MARKETABLE_BUY_USD:
                     raise PaperRejected(f"invalid amount for a marketable BUY order (${spend:.2f}), min size: $1")
-                quote = estimate_fak_shares(book, size, float(price), rules, min_price=self.shim.min_buy_price)
+                quote = estimate_fak_shares(book, size, float(price), rules, min_price=self.shim.min_buy_price,
+                                            min_shares=min_override)
             else:
                 spend = size_to_venue_minimum(amount, book, rules, cap)
                 # The SDK signs BUY size at the limit, not the visible average.
@@ -3424,7 +3432,8 @@ class LiveExecution:
         self._check_loss_budget(spend + reserve_fee)
         p = self.sender.prepare(side=side, token=token, up=str(up), down=str(down), condition=cond, end=end,
                                 amount=spend, cap=cap, decided_pc=decided_pc, order_type=order_type,
-                                shares=float(size) if size is not None else None)
+                                shares=float(size) if size is not None else None,
+                                min_shares=min_override)
         p.reserve = spend + reserve_fee
         p.minimum_entry = minimum_entry
         p.estimate = {"shares": float(quote.shares), "price": float(quote.average_price), "fee": fee}
