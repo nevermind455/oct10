@@ -953,6 +953,115 @@ def live_delays(path, days: float | None = None, *, now: float | None = None) ->
     return out, one_way
 
 
+# Honest paper fills (2026-10-29, the operator's request "make paper honest"). Live misses
+# are not random: makers pull their quotes when the price is about to run our way, faster
+# than our copy of the book shows it. On 1,157 live orders (10-15..21) of the orders our
+# book copy filled, live filled 71-76% when the price 5s later was below our fill, 20% when
+# it was 6c or more above. Paper took those winners: fit on the first half of the days and
+# checked on the second (live: 114 fills, -$24.40), paper as it was made 158 fills for
+# +$61.84; keeping each book fill at live's odds for its 5s markout made 94 for -$4.18.
+FILL_ODDS_EDGES_C = (-3.0, 0.0, 3.0, 6.0, 10.0)   # 5s markout buckets, cents per share
+FILL_ODDS_GRID_MS = 100.0      # a shadow point stands for an arrival within this many ms
+FILL_ODDS_DRAWS = 20           # arrival delays per live order (quantiles of the live delays)
+MIN_FILL_ODDS_ORDERS = 200     # live orders with a shadow book needed for the odds
+
+
+def fill_odds_bucket(markout_c) -> str:
+    """The 5s markout bucket of one fill ("none": no mid 5s later)."""
+    if markout_c is None:
+        return "none"
+    for edge in FILL_ODDS_EDGES_C:
+        if markout_c < edge:
+            return f"<{edge:g}"
+    return f">={FILL_ODDS_EDGES_C[-1]:g}"
+
+
+def live_fill_odds(path, *, delays, extra_ms: float, max_room: float, orders: int = 1000) -> dict:
+    """Live's fill odds for an order our book copy fills, by its 5s markout.
+
+    Pairs each live order the venue answered (MATCHED / NO_MATCH, its first
+    row) with its shadow row: the book copy at the shadow points and the mid
+    5s later (mk5). Paper draws its arrival from the live delays rather than
+    using an order's own reply time - misses reply later (median 299ms against
+    259ms), so the order's own time would leak its outcome - so each order is
+    weighed over FILL_ODDS_DRAWS quantiles of `delays` + extra_ms, the arrival
+    paper itself draws, at the nearest shadow point (an arrival past the last
+    point uses the last). Only orders whose limit room (cap - ask seen) is
+    within max_room + 0.5c; the newest `orders` of them. Odds per bucket are
+    (fills + 1) / (orders + 2) on the weighted counts; "all" is every bucket."""
+    def num(v):
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        try:
+            v = float(v)
+        except OverflowError:
+            return None
+        return v if math.isfinite(v) else None
+
+    sent, shadows = {}, {}
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            if '"shadow"' not in line and '"t_wire_to_reply_ms"' not in line:
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(r, dict) or not isinstance(r.get("id"), str):
+                continue
+            if r.get("result") == "shadow" and isinstance(r.get("L"), dict):
+                grid = {}
+                for k, q in r["L"].items():
+                    try:
+                        at = float(k)
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(q, dict) or q.get("miss") == "unknown book state" or not math.isfinite(at):
+                        continue
+                    f = q if num(q.get("sh")) else (q.get("fak") if isinstance(q.get("fak"), dict) else {})
+                    grid[at] = (bool(num(f.get("sh"))), num(f.get("mk5")))
+                if grid:
+                    shadows[r["id"]] = grid
+            elif (r.get("live") is True and r.get("kind") in ("MATCHED", "NO_MATCH")
+                  and r.get("result") in ("filled", "refused", "pending") and r["id"] not in sent):
+                wall, cap, ask = num(r.get("wall")), num(r.get("cap")), num(r.get("ask_seen"))
+                if None not in (wall, cap, ask):
+                    sent[r["id"]] = (wall, r["kind"] == "MATCHED", round(cap - ask, 4))
+    q = sorted(float(d) for d in delays if num(d) is not None)
+    if not q:
+        raise ValueError("no live delays to draw arrivals from")
+    arrivals = [q[min(len(q) - 1, int(len(q) * (i + 0.5) / FILL_ODDS_DRAWS))] + float(extra_ms)
+                for i in range(FILL_ODDS_DRAWS)]
+    picked, too_wide = [], 0
+    for oid, (wall, matched, room) in sent.items():
+        grid = shadows.get(oid)
+        if grid is None:
+            continue
+        if room > float(max_room) + 0.005:
+            too_wide += 1
+            continue
+        picked.append((wall, matched, room, grid))
+    picked.sort(key=lambda t: t[0])
+    picked = picked[-max(1, int(orders)):]
+    n, fills = {}, {}
+    for _wall, matched, _room, grid in picked:
+        top = max(grid)
+        for target in arrivals:
+            at = min(grid, key=lambda k: abs(k - target))
+            if abs(at - target) > FILL_ODDS_GRID_MS and target < top:
+                continue                                  # a gap in this order's shadow points
+            book_fill, mk = grid[at]
+            if book_fill:
+                for b in (fill_odds_bucket(mk), "all"):
+                    n[b] = n.get(b, 0.0) + 1.0 / FILL_ODDS_DRAWS
+                    fills[b] = fills.get(b, 0.0) + float(matched) / FILL_ODDS_DRAWS
+    return {"odds": {b: (fills[b] + 1.0) / (n[b] + 2.0) for b in n},
+            "weight": {b: round(n[b], 2) for b in n},
+            "orders": len(picked), "filled": sum(int(t[1]) for t in picked),
+            "first_wall": picked[0][0] if picked else None, "last_wall": picked[-1][0] if picked else None,
+            "widest_room": max((t[2] for t in picked), default=0.0), "too_wide": too_wide}
+
+
 def live_account_tail(path, max_bytes: int = 8_000_000, chunk: int = 262_144) -> dict:
     """SNIPER_PAPER_CASH_FROM: the live bot's latest Kelly cash and hybrid equity /
     high-water, read backwards from the END of its journal - never the whole file
@@ -1053,6 +1162,15 @@ class Settings:
         if not math.isfinite(self.paper_extra_ms) or not 0.0 <= self.paper_extra_ms <= 5000.0:
             raise ValueError(f"invalid SNIPER_PAPER_EXTRA_MS {self.paper_extra_ms!r}: 0..5000 ms")
         self.delay_note = ""                   # set by a paper Sniper once the live delays are loaded
+        # Honest paper fills (2026-10-29, see FILL_ODDS_EDGES_C): a book fill is kept at live's
+        # odds for its 5s markout, learned from the newest SNIPER_FILL_ODDS_ORDERS live orders in
+        # the delay journal. auto (default): on when that journal holds enough, else off and the
+        # settings line says so; live: refuse to start without them; off: every book fill fills.
+        self.fill_odds = str(os.environ.get("SNIPER_FILL_ODDS", "auto")).strip().lower() or "auto"
+        if self.fill_odds not in ("auto", "live", "off"):
+            raise ValueError(f"invalid SNIPER_FILL_ODDS {self.fill_odds!r}: auto, live or off")
+        self.fill_odds_orders = _env_float("SNIPER_FILL_ODDS_ORDERS", 1000)
+        self.fill_odds_note = ""               # set by a paper Sniper once the odds are loaded
         # Per side: an order on one side starts that side's cooldown only.
         self.cooldown_ms = _env_float("SNIPER_COOLDOWN_MS", 300)
         self.min_left_s = _env_float("SNIPER_MIN_LEFT_S", 10)
@@ -1300,6 +1418,9 @@ class Settings:
              "SNIPER_VENUE_MIN_SHARES needs SNIPER_ORDER_SIZING=shares"),
             (self.paper_cash_max_age_s > 0, f"SNIPER_PAPER_CASH_MAX_AGE_S={self.paper_cash_max_age_s:g} (must be > 0)"),
             (self.delay_days > 0, f"SNIPER_DELAY_DAYS={self.delay_days:g} (must be > 0)"),
+            (MIN_FILL_ODDS_ORDERS <= self.fill_odds_orders <= 100_000
+             and self.fill_odds_orders == int(self.fill_odds_orders),
+             f"SNIPER_FILL_ODDS_ORDERS={self.fill_odds_orders:g} (whole orders, {MIN_FILL_ODDS_ORDERS} to 100000)"),
             (self.fair_vol_s >= 60, f"SNIPER_FAIR_VOL_S={self.fair_vol_s:g} (must be >= 60)"),
             (0 <= self.fair_fee_rate < 0.25, f"SNIPER_FAIR_FEE_RATE={self.fair_fee_rate:g} (must be 0 to 0.25)"),
             (0 < self.kelly_fraction <= 1, f"SNIPER_KELLY_FRACTION={self.kelly_fraction:g} (must be above 0, at most 1)"),
@@ -1803,6 +1924,20 @@ class Sniper:
         elif live is None and (self.s.delay_source == "live"
                              or (self.s.delay_source == "auto" and not self.s.fixed_latency)):
             self._load_live_delays()
+        # Honest paper fills (SNIPER_FILL_ODDS): live's odds of each book fill by its 5s
+        # markout. An order waiting on its odds has met the book: its side is free again.
+        import random
+        self._fill_odds: dict | None = None
+        self._paper_gated: dict = {}                 # id(plan) -> its side, round and risk shares
+        self._odds_rng = random.Random()
+        self._match_pool = None                      # None: the loop's default executor, as before
+        if live is None and self.s.fill_odds != "off":
+            self._load_fill_odds()
+            # each order waiting on its odds holds its worker for 5s: paper matches get their
+            # own threads, so a burst can never make the next order queue for one (on a 1-2 vCPU
+            # VPS the default executor has 5-6) and meet the book late
+            from concurrent.futures import ThreadPoolExecutor
+            self._match_pool = ThreadPoolExecutor(max_workers=32, thread_name_prefix="paper-match")
         self._live_mirror: dict | None = None        # SNIPER_PAPER_CASH_FROM: live's cash and drawdown
         self._live_mirror_error: str | None = None
         self._mirror_path: str | None = None
@@ -1886,12 +2021,81 @@ class Sniper:
                              f"(p50 {pick(0.5):.0f}ms, p90 {pick(0.9):.0f}ms, max {q[-1]:.0f}ms; {p.name}"
                              + (f", last {self.s.delay_days:g} days" if auto else "") + ")")
 
+    FILL_ODDS_REFRESH_S = 1800.0   # one pass over the live journal (hundreds of MB): every 30 min
+
+    def _paper_room(self) -> float:
+        """The widest limit room this paper bot can use (dollars over the ask seen)."""
+        return max(float(self.s.slip), float(getattr(self.s, "wide_cap_c", 0) or 0) / 100.0)
+
+    def _load_fill_odds(self) -> None:
+        """Paper: live's fill odds by 5s markout (live_fill_odds) from the live bot's
+        journal (LIVE_SNIPER_JOURNAL - the shadow rows are there, never in a delay-only
+        SNIPER_DELAY_JOURNAL). SNIPER_FILL_ODDS=live refuses to start without them; auto
+        runs without and the settings line says paper is optimistic. The arrivals are
+        drawn as paper draws its own: the loaded live delays + SNIPER_PAPER_EXTRA_MS."""
+        p = Path(self.s.live_journal)
+        if not p.is_absolute():
+            p = Path(__file__).resolve().parent / p
+        if self.s.fixed_latency:
+            delays, extra = [float(self.s.latency_ms)], 0.0
+        else:
+            delays, extra = list(self._live_delays), float(self.s.paper_extra_ms)
+        why, odds = None, None
+        if not delays:
+            why = "no live order delays loaded (paper's arrivals would not be live's)"
+        elif not p.exists():
+            why = f"no live journal {p.name} here"
+        else:
+            try:
+                odds = live_fill_odds(p, delays=delays, extra_ms=extra, max_room=self._paper_room(),
+                                      orders=int(self.s.fill_odds_orders))
+            except (OSError, ValueError) as exc:
+                why = f"cannot read {p.name}: {exc}"
+        if odds is not None and (odds["orders"] < MIN_FILL_ODDS_ORDERS or odds["weight"].get("all", 0) < 20):
+            why = (f"only {odds['orders']} live orders with a shadow book within ask+{self._paper_room():.2f} "
+                   f"in {p.name}, need {MIN_FILL_ODDS_ORDERS}")
+            odds = None
+        if odds is None:
+            if self.s.fill_odds == "live":
+                raise ValueError(f"SNIPER_FILL_ODDS=live: {why}")
+            self._fill_odds = None
+            self.s.fill_odds_note = ("PAPER FILL ODDS OFF: every book fill fills - live misses the orders whose "
+                                     f"price runs our way, so this paper beats live ({why})")
+            return
+        day = lambda w: datetime.fromtimestamp(w).strftime("%m-%d")   # noqa: E731
+        shown = " ".join(f"{b} {odds['odds'][b]:.0%}" for b in
+                         [fill_odds_bucket(e - 0.5) for e in FILL_ODDS_EDGES_C] + [f">={FILL_ODDS_EDGES_C[-1]:g}"]
+                         if b in odds["odds"])
+        wider = self._paper_room() > odds["widest_room"] + 0.005
+        self._fill_odds = odds
+        self.s.fill_odds_note = (
+            f"PAPER FILL ODDS: a book fill is kept at live's odds for its 5s markout ({shown}; "
+            f"{odds['orders']} live orders {day(odds['first_wall'])}..{day(odds['last_wall'])}, "
+            f"{odds['filled']} filled)"
+            + (f" - EXTRAPOLATED: live's widest limit there ask+{odds['widest_room']:.2f}, "
+               f"this paper's ask+{self._paper_room():.2f}" if wider else ""))
+
+    def _refresh_fill_odds(self) -> None:
+        try:
+            self._load_fill_odds()
+        except ValueError as exc:               # SNIPER_FILL_ODDS=live: keep the odds already learned
+            self.n["fill odds refresh failed"] += 1
+            self.s.fill_odds_note = (self.s.fill_odds_note.split(" [refresh")[0]
+                                     + f" [refresh failed, odds kept: {exc}]")
+
+    async def _fill_odds_loop(self):
+        while True:
+            await asyncio.sleep(self.FILL_ODDS_REFRESH_S)
+            await asyncio.to_thread(self._refresh_fill_odds)
+
     def lines(self) -> list[str]:
         out = self.s.lines(live=self.live is not None)
         if self.live is None:
             out.append("PAPER STRICT COMPARISON: fresh live controls required; simulated fills remain unvalidated"
                        if self._paper_parity else
                        "PAPER MODEL EXPERIMENT: independent simulation; not validated against live fills")
+            if self.s.fill_odds_note:
+                out.append(self.s.fill_odds_note)
         if self.live is not None:
             out.append(self.live.limits_line())
         return out
@@ -2131,6 +2335,9 @@ class Sniper:
             for row, plan in self._fak_pending.values():
                 if plan.get("cond") == str(condition) and row.get("side") == side:
                     own += float(plan.get("risk_shares") or 0.0)
+            for gated in getattr(self, "_paper_gated", {}).values():
+                if gated.get("cond") == str(condition) and gated.get("side") == side:
+                    own += float(gated.get("risk_shares") or 0.0)   # met the book, waiting on its odds
         if not all(math.isfinite(v) and v >= 0 for v in (own, opposite)):
             raise ValueError("invalid Kelly inventory")
         return own, opposite
@@ -3148,6 +3355,9 @@ class Sniper:
             arrival_ms = plan["sent_wall"] * 1000.0 + float(latency_ms) + self.s.venue_offset_ms
             arrival_mono = plan["sent_mono"] + float(latency_ms) / 1000.0
             kw["arrival_book"] = lambda token: self._arrival_book(token, arrival_ms, arrival_mono)
+            odds = getattr(self, "_fill_odds", None)
+            if odds is not None and getattr(self.broker, "supports_fill_gate", False):
+                kw["fill_gate"] = self._fill_gate(plan, side, _token, arrival_ms, arrival_mono, odds)
         ok = self.broker.place_trade(side, amount, up, down, cond, end, cap, None,
                                      latency_ms=latency_ms, tag="sniper", **kw)
         # This order's own outcome, read on the thread that placed it: with
@@ -3157,6 +3367,71 @@ class Sniper:
                           "error": getattr(self.broker, "last_error", None)}
         st.update(getattr(self.broker, "last_timing", None) or {})
         return ok, sign_ms, None, st
+
+    def _fill_gate(self, plan, side, token, arrival_ms, arrival_mono, odds):
+        """The broker's fill_gate for one paper order (worker thread): keep the book
+        fill at live's odds for its 5s markout - the bought side's mid 5s after the
+        match, less price and fee per share, as the shadow's mk5 the odds were
+        learned on. The side is handed back to the event loop first, as live's
+        reply frees it; the order's cash stays held until it books or misses."""
+        def gate(fill):
+            shares = float(fill.get("shares") or 0)
+            loop = plan.get("loop")
+            try:
+                if loop is not None:
+                    loop.call_soon_threadsafe(self._paper_gate_open, side, plan, shares)
+            except RuntimeError:               # the loop is closing: the side stays held, as before
+                pass
+            try:
+                at = self.SHADOW_MARK_S
+                time.sleep(max(0.0, arrival_mono + at - time.monotonic()))
+                mid = self._mid_at(token, arrival_ms + at * 1000.0, arrival_mono + at)
+            except Exception:  # noqa: BLE001 - no mid: the "none" odds, never a fault in the broker
+                mid = None
+            mk = None
+            if mid is not None and shares > 0:
+                mk = (float(mid) - float(fill["average_price"]) - float(fill.get("fee") or 0) / shares) * 100.0
+            bucket = fill_odds_bucket(mk)
+            p = odds["odds"].get(bucket, odds["odds"].get("all", 0.5))
+            draw = self._odds_rng.random()
+            plan["fill_odds"] = {"markout_5s_c": None if mk is None else round(mk, 3), "bucket": bucket,
+                                 "odds": round(p, 4), "draw": round(draw, 4), "kept": draw < p}
+            if draw < p:
+                return None
+            return (f"{self.s.order_type} no-fill: makers pulled (live fill odds {p:.0%} at a "
+                    + ("unknown" if mk is None else f"{mk:+.1f}c") + " 5s markout)")
+        return gate
+
+    def _paper_gate_open(self, side, plan, shares) -> None:
+        """Event loop: this paper order met the book and waits on its odds. Its side
+        is free for the next order, as a live reply frees it; its shares count as
+        same-side risk for Kelly until it books or misses (_kelly_inventory)."""
+        if plan.get("gated"):
+            return
+        plan["gated"] = True
+        self._paper_gated[id(plan)] = {"side": side, "end": plan["end"], "cond": str(plan["cond"]),
+                                       "amount": float(plan["amount"]),
+                                       "risk_shares": max(float(plan.get("risk_shares") or 0.0), shares)}
+        if self.inflight.get(side) is plan.get("inflight"):
+            self.inflight[side] = None
+
+    def _mid_at(self, token, venue_ms, mono):
+        """Worker thread: the book's mid at an instant (None if unknown), read as
+        _book_at reads it - the exchange clock waits up to book_wait_ms for the feed."""
+        book = self._history_book()
+        if book is None:
+            view = self.hub.book.view(token)
+        elif self.s.book_clock == "local":
+            view = book.view_at_mono(token, mono)
+        else:
+            deadline = time.monotonic() + self.s.book_wait_ms / 1000.0
+            while True:
+                view, info = book.view_at(token, venue_ms)
+                if (view is not None or not str(info.get("why", "")).startswith("the feed has not yet")
+                        or time.monotonic() >= deadline):
+                    break
+                time.sleep(0.005)
+        return getattr(view, "mid", None)
 
     @staticmethod
     def _stages(tick_pc, start_pc, call_pc, st) -> dict:
@@ -3270,6 +3545,8 @@ class Sniper:
         arrival = row.get("arrival") or {}
         if "unknown book state" in r:
             return "UNKNOWN_BOOK_STATE"
+        if "makers pulled (live fill odds" in r:
+            return "LIVE_ODDS_MISS"                   # the book filled it; live's odds for its markout did not
         if "fok no-fill" in r or "fak no-fill" in r:
             ask = arrival.get("best_ask")
             if ask is None:
@@ -3643,8 +3920,10 @@ class Sniper:
                 # bankroll spend those fees again on the next side's order.
                 reserve = float(risk_total(plan["amount"], plan.get("fair_fee_rate") or 0.0))
                 self._bankroll_spent(reserve, plan=plan)
+                # for a fill_gate: the loop that frees this side, and the side's own reservation
+                plan["loop"], plan["inflight"] = loop, self.inflight.get(side)
                 try:
-                    fut = loop.run_in_executor(None, self._match, plan, sign_ms, st)
+                    fut = loop.run_in_executor(getattr(self, "_match_pool", None), self._match, plan, sign_ms, st)
                 except BaseException:
                     # Submission infrastructure failed after recording the
                     # attempt. Do not return its cash/claim and try again from
@@ -4435,6 +4714,10 @@ class Sniper:
                                             "error": getattr(self.broker, "last_error", None)}
             fill = result["fill"] or {}
             filled = bool(ok and fill.get("tag") == "sniper")
+            if plan.get("fill_odds"):
+                row["fill_odds"] = plan["fill_odds"]
+                self.n["paper book fills kept at live odds" if plan["fill_odds"]["kept"]
+                       else "paper book fills missed at live odds"] += 1
             self._latency_paper(row, plan, st, filled=filled and float(fill.get("shares") or 0) > 0)
             self._trace_response(plan, mono=self._pc_to_mono(st.get("matched_pc")), source="SIMULATED",
                                  order_type=plan.get("order_type"), order_id=fill.get("order_id") if filled else None,
@@ -4503,7 +4786,10 @@ class Sniper:
             self._write(row)
         finally:
             self._trace_response(plan, mono=None, source="no reply")
-            self._release(side)
+            if plan.get("gated"):
+                self._paper_gated.pop(id(plan), None)      # its side was freed when it met the book
+            else:
+                self._release(side)
 
     # ---------------------------------------------------------------- T0..T7 (after the send)
     SIMULATED = ("send_to_ack", "trigger_to_ack", "ack_to_fill", "trigger_to_fill")
@@ -5441,6 +5727,8 @@ class Sniper:
             self._spawn(self._live_mirror_loop())
         if self._paper_parity:
             self._spawn(self._paper_delay_loop())
+        if self.live is None and self.s.fill_odds != "off":
+            self._spawn(self._fill_odds_loop())
         if self.live is not None:
             self._spawn(self._execution_reference_loop())
         stall_ms = _env_float("SNIPER_STALL_MS", 50)

@@ -1644,6 +1644,8 @@ def _reserved_cash(rt) -> float:
     for v in list((getattr(sn, "inflight", None) or {}).values()):
         if isinstance(v, dict):
             total += float(v.get("amount") or 0.0)
+    for v in list((getattr(sn, "_paper_gated", None) or {}).values()):   # paper: waiting on live's fill odds
+        total += float(v.get("amount") or 0.0)
     pm = getattr(rt, "pm", None)
     if pm is not None and getattr(pm.cfg, "enabled", False):
         try:
