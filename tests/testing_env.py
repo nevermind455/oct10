@@ -84,3 +84,12 @@ os.environ["SNIPER_PRINTS_LOG"] = "0"
 # minute of volatility samples that order-path tests do not build: off here, on in
 # tests_sniper_fair.py and wherever a test resolves the frozen spec (clear env / SPEC).
 os.environ["SNIPER_FAIR"] = "0"
+# Paper reads the LIVE journal in its folder by default (2026-10-29: SNIPER_DELAY_SOURCE=auto,
+# SNIPER_PAPER_CASH_FROM unset = auto). No suite may depend on whether a live_sniper.jsonl sits
+# next to the code (it does on the VPS): the fixed model and paper's own cash here, as before;
+# tests_paper_auto.py turns auto on around journals of its own.
+os.environ["SNIPER_DELAY_SOURCE"] = "model"
+os.environ["SNIPER_PAPER_CASH_FROM"] = "off"
+# Historical fixtures intentionally exercise the independent model. Strict
+# comparison tests opt in around synthetic live references of their own.
+os.environ["SNIPER_PAPER_LIVE_PARITY"] = "0"

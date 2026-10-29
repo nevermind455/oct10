@@ -1453,7 +1453,7 @@ def t_paper_state_paths_are_isolated_and_configurable():
 # market_discovery.py, timer.py and config.py carry the same digests spe8's own
 # baseline approved. An intentional change to any of them needs review and a
 # new digest here (and in tests_dashboard, which reads this table).
-TRADING_FILES = ["sniper_mode.py", "sniper_live.py", "paper_trade.py", "polymarket_trade.py",
+TRADING_FILES = ["sniper_mode.py", "sniper_live.py", "paper_trade.py", "paper_parity.py", "polymarket_trade.py",
                  "orderbook.py", "market_discovery.py", "timer.py", "config.py", "fast_h2.py",
                  "accounting/ledger.py", "accounting/fees.py", "accounting/settlement.py",
                  "accounting/resolution.py", "feeds/book.py", "feeds/poly_user.py", "feeds/reconcile.py",
@@ -1624,7 +1624,33 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # default: a whole number 1-5 replaces the published share minimum (5) in the share floor and
     # the order plan carries it to both senders - the live test of whether the venue takes a
     # marketable FAK BUY under 5 shares. The $1 floor still applies. Nothing else changed.
-    "sniper_mode.py": "48486721630f8fa1183a2ca4e000fbfe38da6481e12b9d3b9bbdace0f0ddbc8d",
+    # 2026-10-29 (tests/tests_venue_min.py, tests/tests_paper_cash_mirror.py): a venue refusal of an
+    # order under the published minimum turns SNIPER_VENUE_MIN_SHARES off for the run (_venue_min_off);
+    # SNIPER_PAPER_CASH_FROM (paper only, live refuses it): Kelly cash and the hybrid drawdown come
+    # from the end of the LIVE journal (live_account_tail), paper's own cash if smaller.
+    # 2026-10-29 (tests/tests_paper_delay.py): live_delays reads the delay journal in one pass,
+    # keeping only round trips and reply times - it kept every row (~5x the file; the 212MB live
+    # journal needed ~1GB). Same delays, same one-way. Nothing else changed.
+    # 2026-10-29 (tests/tests_paper_auto.py): paper is live-like by default - SNIPER_DELAY_SOURCE=auto
+    # draws delays from the live journal's last SNIPER_DELAY_DAYS days (else the model), and
+    # SNIPER_PAPER_CASH_FROM unset = auto sizes from live's cash and drawdown while live runs (else
+    # paper's own). An explicit path stays strict and live-refused; live decisions are unchanged.
+    # 2026-10-29 (tests/tests_paper_auto.py, tests/tests_paper_cash_mirror.py): validate the
+    # live drawdown's own timestamp; fresh cash cannot renew an expired hybrid snapshot.
+    # 2026-10-29 (the operator's request, tests/tests_wide_cap_live.py): SNIPER_WIDE_CAP_LIVE=1 makes the
+    # wide limit a capped LIVE test - off for good once the realized P&L since the test began reaches
+    # -SNIPER_WIDE_CAP_LIVE_STOP_USD (state wide_cap_live_test.json); paper and default live unchanged.
+    # 2026-10-29 (the operator's second live test): the same switch allows a wider ask + SNIPER_SLIP
+    # (0.05-0.10) with the fair value still checked (Sniper._slip_now); the stop returns it to the
+    # frozen ask + 0.05. Default live and paper unchanged.
+    # 2026-10-29 (tests/tests_paper_parity.py): strict paper comparison requires fresh cached live
+    # controls, matching settings and current delays; shares live pauses, share limits and test stops.
+    # Live adds diagnostic reference rows only; its order decisions and durable account state are unchanged.
+    # Pre-push review: references are market-bound, include cached live readiness and known
+    # balance/clock expiry; malformed delay rows cannot crash background refresh.
+    "sniper_mode.py": "79d05f9594678493e41a8e72eabb386730400862c062e09373bf141d2b5f5179",
+    # Read-only reference schema, configuration checks and freshness validation for paper.
+    "paper_parity.py": "7c5935e641ca4147d0551da53a4ab16efef64a2fd7dcff323d554382584269c5",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
@@ -1732,7 +1758,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # 2026-10-29 (tests/tests_venue_min.py): the pre-send check and LeanSender.prepare hold a
     # share-sized order to the plan's venue_min_shares (SNIPER_VENUE_MIN_SHARES) when it has one,
     # else the published minimum as before. The $1 check is unchanged.
-    "sniper_live.py": "f663ea34a56cd2f4e2f1d4c7f1f6e89a1ead0ab0410acd22cfe97016bcf6be04",
+    # 2026-10-29 (tests/tests_venue_min.py): a size refusal of an order under the published minimum
+    # (Prepared.below_published_minimum) is marked venue_min_refused - not an order error, no rules
+    # reload. Every other refusal is handled as before.
+    "sniper_live.py": "291255e617e23f16ba9cd79f2861d66cb743fd32fd7e7264ca21f1d2a53f9756",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads

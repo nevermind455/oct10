@@ -66,8 +66,9 @@ def heartbeat() -> str:
 
 
 def env(**kw):
-    """The environment with every SNIPER_* variable removed, then kw set."""
+    """Isolated feed fixture: independent model mode, then caller overrides."""
     base = {k: v for k, v in os.environ.items() if not k.startswith("SNIPER_") and k != "BOT_LOCK_PATH"}
+    base["SNIPER_PAPER_LIVE_PARITY"] = "0"
     base.update(kw)
     return patch.dict(os.environ, base, clear=True)
 

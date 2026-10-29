@@ -882,36 +882,122 @@ def enabled() -> bool:
 MIN_LIVE_DELAYS = 30
 
 
-def live_delays(path) -> tuple[list[float], float]:
+def live_delays(path, days: float | None = None, *, now: float | None = None) -> tuple[list[float], float]:
     """(order-out -> match ms of every live order the matching engine
     answered - MATCHED or NO_MATCH - and the one-way taken off each reply).
 
     A reply comes back one network leg after the match, so the match was
     reply - one-way after the first byte left; one-way is half the median of
-    the canary's own warm round trips (13.3ms until a summary lands)."""
+    the canary's own warm round trips (13.3ms until a summary lands).
+
+    One pass, keeping only those numbers (2026-10-29): every row used to be
+    kept, about 5x the file in memory - the whole 212MB live journal as
+    SNIPER_DELAY_JOURNAL needed ~1GB on the 2GB VPS. Lines that cannot hold a
+    summary or a reply time are not parsed. days: only the rows of the newest
+    order's last `days` days (rows without a time - refresh_delays files - stay)."""
     import statistics
-    rows = []
+    rtts, replies = [], []                         # (wall or None, value)
+
+    def wall(r):
+        w = r.get("wall")
+        if not isinstance(w, (int, float)) or isinstance(w, bool):
+            return None
+        try:
+            value = float(w)
+        except OverflowError:
+            return None
+        return value if math.isfinite(value) else None
     with open(path, encoding="utf-8") as fh:
         for line in fh:
+            if '"summary"' not in line and '"t_wire_to_reply_ms"' not in line:
+                continue
             try:
-                rows.append(json.loads(line))
+                r = json.loads(line)
             except ValueError:
                 continue
-    rtts = [((r.get("live") or {}).get("clock") or {}).get("rtt_ms_p50") for r in rows
-            if r.get("result") == "summary" and isinstance(r.get("live"), dict)]
-    rtts = [float(x) for x in rtts if isinstance(x, (int, float)) and x > 0]
-    one_way = statistics.median(rtts) / 2.0 if rtts else 13.3
-    out = []
-    for r in rows:
-        if (r.get("live") is True and r.get("kind") in ("MATCHED", "NO_MATCH")
-                and r.get("result") in ("filled", "refused", "pending")):   # one row per order
-            try:
-                ms = float(r["t_wire_to_reply_ms"]) - one_way
-            except (KeyError, TypeError, ValueError):
+            if not isinstance(r, dict):
                 continue
-            if math.isfinite(ms) and 0 <= ms < 60_000:
-                out.append(ms)
+            if r.get("result") == "summary" and isinstance(r.get("live"), dict):
+                clock = r["live"].get("clock")
+                x = clock.get("rtt_ms_p50") if isinstance(clock, dict) else None
+                if not isinstance(x, (int, float)) or isinstance(x, bool):
+                    continue
+                try:
+                    value = float(x)
+                except OverflowError:
+                    continue
+                if math.isfinite(value) and value > 0:
+                    rtts.append((wall(r), value))
+            elif (r.get("live") is True and r.get("kind") in ("MATCHED", "NO_MATCH")
+                    and r.get("result") in ("filled", "refused", "pending")):   # one row per order
+                try:
+                    if isinstance(r["t_wire_to_reply_ms"], bool):
+                        continue
+                    replies.append((wall(r), float(r["t_wire_to_reply_ms"])))
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    continue
+    if days is not None:
+        walls = [w for w, _x in replies if w is not None]
+        if walls or now is not None:
+            cut = (max(walls) if now is None else now) - float(days) * 86400.0
+            in_window = lambda w: (w is None if now is None else False) or (
+                w is not None and cut <= w and (now is None or w <= now))
+            replies = [(w, x) for w, x in replies if in_window(w)]
+            rtts = [(w, x) for w, x in rtts if in_window(w)]
+    one_way = statistics.median([x for _w, x in rtts]) / 2.0 if rtts else 13.3
+    out = []
+    for _w, reply in replies:
+        ms = reply - one_way
+        if math.isfinite(ms) and 0 <= ms < 60_000:
+            out.append(ms)
     return out, one_way
+
+
+def live_account_tail(path, max_bytes: int = 8_000_000, chunk: int = 262_144) -> dict:
+    """SNIPER_PAPER_CASH_FROM: the live bot's latest Kelly cash and hybrid equity /
+    high-water, read backwards from the END of its journal - never the whole file
+    (it is hundreds of MB on a 2GB VPS). {"cash", "cash_wall", "equity",
+    "high_water", "hybrid_wall"}: None where nothing was found in max_bytes."""
+    out = {"cash": None, "cash_wall": None, "equity": None, "high_water": None, "hybrid_wall": None}
+
+    def num(v):
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
+
+    with open(path, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        pos, carry, scanned = fh.tell(), b"", 0
+        while pos > 0 and scanned < max_bytes and (out["cash"] is None or out["equity"] is None):
+            n = min(chunk, pos)
+            pos -= n
+            scanned += n
+            fh.seek(pos)
+            lines = (fh.read(n) + carry).split(b"\n")
+            carry = lines.pop(0) if pos > 0 else b""        # a line's start is in the chunk before
+            for line in reversed(lines):                       # newest first
+                if out["cash"] is None and (b'"kelly_cash"' in line or b'"bankroll"' in line):
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        r = None
+                    if isinstance(r, dict) and num(r.get("wall")) is not None:
+                        cash = num(r.get("kelly_cash")) if r.get("result") == "balance_read" else num(r.get("bankroll"))
+                        if cash is not None:
+                            out["cash"], out["cash_wall"] = cash, num(r["wall"])
+                if out["equity"] is None and (b'"hybrid"' in line or b'"hybrid_drawdown_reset"' in line):
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(r, dict) or num(r.get("wall")) is None:
+                        continue
+                    if r.get("result") == "hybrid_drawdown_reset" and num(r.get("equity")) is not None:
+                        out["equity"] = out["high_water"] = num(r["equity"])     # a fresh start from the equity
+                        out["hybrid_wall"] = num(r["wall"])
+                    elif isinstance(r.get("hybrid"), dict):
+                        e, h = num(r["hybrid"].get("equity")), num(r["hybrid"].get("high_water"))
+                        if e is not None and h is not None:
+                            out["equity"], out["high_water"], out["hybrid_wall"] = e, h, num(r["wall"])
+    return out
 
 
 class Settings:
@@ -940,14 +1026,22 @@ class Settings:
         # SNIPER_SERVER_MS, the same number for every order. "live": one delay
         # drawn per order from the live canary's own measured order-out ->
         # match times (SNIPER_DELAY_JOURNAL, default the live journal), slow
-        # tail included - what live orders really waited.
-        self.delay_source = str(os.environ.get("SNIPER_DELAY_SOURCE", "model")).strip().lower() or "model"
-        if self.delay_source not in ("model", "live"):
-            raise ValueError(f"invalid SNIPER_DELAY_SOURCE {self.delay_source!r}: model or live")
+        # tail included - what live orders really waited. "auto" (the default
+        # since 2026-10-29, the operator's request: paper as real as live):
+        # "live" from the last SNIPER_DELAY_DAYS days of that journal when it
+        # holds enough orders, else "model" - the settings line says which.
+        self.delay_source = str(os.environ.get("SNIPER_DELAY_SOURCE", "auto")).strip().lower() or "auto"
+        if self.delay_source not in ("auto", "model", "live"):
+            raise ValueError(f"invalid SNIPER_DELAY_SOURCE {self.delay_source!r}: auto, model or live")
+        self.delay_days = _env_float("SNIPER_DELAY_DAYS", 3)
         if self.delay_source == "live" and self.fixed_latency:
             raise ValueError("SNIPER_DELAY_SOURCE=live and SNIPER_LATENCY_MS are exclusive: unset SNIPER_LATENCY_MS")
         self.delay_journal = (os.environ.get("SNIPER_DELAY_JOURNAL") or os.environ.get("LIVE_SNIPER_JOURNAL")
                               or "live_sniper.jsonl")
+        self.live_journal = os.environ.get("LIVE_SNIPER_JOURNAL") or "live_sniper.jsonl"   # the live bot's, here
+        # Default paper requires cached live controls and recent observed delays.
+        # Set 0 explicitly for an independent, unvalidated model experiment.
+        self.paper_live_parity = _env_bool("SNIPER_PAPER_LIVE_PARITY", True)
         # Paper realism (2026-10-16, calibrated on 1,154 live orders): the recorded book lags what
         # the venue matched - faster takers ahead of us in the hold are not in it yet - so paper
         # filled 31% of live's own orders (live 21%) for +$210.68 (live +$1.42), +$202 of it on
@@ -980,12 +1074,36 @@ class Settings:
         # whatever the fair value says, and a signal whose ask is above the fair
         # limit still buys a fixed minimum-size order (Kelly says 0 there). 0 = off.
         self.wide_cap_c = _env_float("SNIPER_WIDE_CAP_C", 0)
+        # A small LIVE test (2026-10-29, the operator's requests): with this opt-in live
+        # accepts SNIPER_WIDE_CAP_C, a wider SNIPER_SLIP (0.05-0.10, the fair value still
+        # checked) and a 0.5-1.0bp trigger; the test returns the limit to the frozen ask +
+        # 0.05 for good once its realized loss reaches SNIPER_WIDE_CAP_LIVE_STOP_USD
+        # (Sniper._live_test_on). The wallet is the hard cap.
+        self.wide_cap_live = _env_bool("SNIPER_WIDE_CAP_LIVE", False)
+        self.wide_cap_live_stop_usd = _env_float("SNIPER_WIDE_CAP_LIVE_STOP_USD", 25)
         # The share minimum an order is held to (2026-10-29, the operator's
         # request): 0 = the venue's published one (the market's `mos`, 5 on the
         # BTC 5-minute markets). A whole number replaces it - the live test of
         # whether the venue takes a marketable FAK BUY under 5 shares (its reply
         # says so). The $1 floor on a marketable BUY always applies. Shares only.
         self.venue_min_shares = _env_float("SNIPER_VENUE_MIN_SHARES", 0)
+        # Paper only (2026-10-29, the operator's request): size from the LIVE bot's cash and
+        # drawdown, read from the end of its journal, so paper's orders are the size live's
+        # are - paper50 had 7x live's cash and sent 78-share orders to live's 8. Paper's own
+        # cash still pays for its fills: the smaller of the two is used.
+        #   unset / auto (the default): the live journal in this folder (LIVE_SNIPER_JOURNAL)
+        #       while live runs - a reading <= SNIPER_PAPER_CASH_MAX_AGE_S old - else paper's own
+        #   a path: that journal, strictly - no fresh live reading sizes nothing
+        #   off: paper's own cash, as before
+        # Live refuses a path (exec_latency.spec_violations); auto and off are paper only.
+        raw = str(os.environ.get("SNIPER_PAPER_CASH_FROM", "") or "").strip()
+        self.paper_cash_mode = ("auto" if raw.lower() in ("", "auto") else
+                                "off" if raw.lower() in ("off", "0", "no", "none") else "path")
+        self.paper_cash_from = raw if self.paper_cash_mode == "path" else ""
+        self.paper_cash_max_age_s = _env_float("SNIPER_PAPER_CASH_MAX_AGE_S", 900)
+        self.paper_cash_note = (f"sized from LIVE's cash and drawdown ({raw}, readings <= "
+                                f"{self.paper_cash_max_age_s:g}s old; paper's own cash if smaller)"
+                                if self.paper_cash_mode == "path" else "")   # auto: set by a paper Sniper
         self.fair_vol_s = _env_float("SNIPER_FAIR_VOL_S", 300)
         # Retained for environment compatibility; decisions use the prefetched
         # market's actual fee rate/exponent, never this former model assumption.
@@ -1174,10 +1292,14 @@ class Settings:
             (1 <= self.coinbase_conns <= 4, f"SNIPER_COINBASE_CONNS={self.coinbase_conns} (1 to 4)"),
             (0 <= self.fair_margin < 0.5, f"SNIPER_FAIR_MARGIN={self.fair_margin:g} (must be 0 to 0.49)"),
             (0 <= self.wide_cap_c <= 50, f"SNIPER_WIDE_CAP_C={self.wide_cap_c:g} (cents, must be 0 to 50)"),
+            (self.wide_cap_live_stop_usd > 0,
+             f"SNIPER_WIDE_CAP_LIVE_STOP_USD={self.wide_cap_live_stop_usd:g} (dollars, must be > 0)"),
             (0 <= self.venue_min_shares <= 5 and self.venue_min_shares == int(self.venue_min_shares),
              f"SNIPER_VENUE_MIN_SHARES={self.venue_min_shares:g} (whole shares, 0 to 5; 0 = the venue's own)"),
             (self.venue_min_shares == 0 or self.order_sizing == "shares",
              "SNIPER_VENUE_MIN_SHARES needs SNIPER_ORDER_SIZING=shares"),
+            (self.paper_cash_max_age_s > 0, f"SNIPER_PAPER_CASH_MAX_AGE_S={self.paper_cash_max_age_s:g} (must be > 0)"),
+            (self.delay_days > 0, f"SNIPER_DELAY_DAYS={self.delay_days:g} (must be > 0)"),
             (self.fair_vol_s >= 60, f"SNIPER_FAIR_VOL_S={self.fair_vol_s:g} (must be >= 60)"),
             (0 <= self.fair_fee_rate < 0.25, f"SNIPER_FAIR_FEE_RATE={self.fair_fee_rate:g} (must be 0 to 0.25)"),
             (0 < self.kelly_fraction <= 1, f"SNIPER_KELLY_FRACTION={self.kelly_fraction:g} (must be above 0, at most 1)"),
@@ -1217,7 +1339,7 @@ class Settings:
         return (f" + {self.paper_extra_ms:.0f}ms calibration (the book's lag behind the venue, from live)"
                 if self.paper_extra_ms else "")
 
-    def fair_text(self) -> str:
+    def fair_text(self, live: bool = False) -> str:
         if not self.fair:
             return ""
         hybrid = (f"; hybrid: volatility baseline {self.hybrid_policy.vol_baseline_bp:g} bp/sqrt(s), "
@@ -1239,9 +1361,18 @@ class Settings:
                       f"minimum)" if self.venue_min_shares > 0 else f"{KELLY_MIN_SHARES} sh") + f", {cap_text} "
                    f"(<= {self.max_side_shares:.0f} sh/side per round)"
                    if self.kelly and self.order_type == "FAK" else "") + hybrid
-                + (f"; WIDE CAP EXPERIMENT (paper only): limit ask+{self.wide_cap_c:g}c whatever the fair value says, "
-                   f"and an ask above the fair limit still buys a fixed minimum-size order"
-                   if self.wide_cap_c > 0 else ""))
+                + ((f"; WIDE CAP LIVE TEST: limit ask+{self.wide_cap_c:g}c whatever the fair value says, an ask "
+                    f"above the fair limit buys a fixed minimum-size order; stops after a "
+                    f"${self.wide_cap_live_stop_usd:g} realized loss since the test began (SNIPER_WIDE_CAP_LIVE)"
+                    if live and self.wide_cap_live else
+                    f"; WIDE CAP EXPERIMENT (paper only): limit ask+{self.wide_cap_c:g}c whatever the fair value says, "
+                    f"and an ask above the fair limit still buys a fixed minimum-size order")
+                   if self.wide_cap_c > 0 else
+                   (f"; LIVE TEST: limit ask+{self.slip:.2f}, the fair value still checked; back to the frozen "
+                    f"ask+0.05 after a ${self.wide_cap_live_stop_usd:g} realized loss since the test began "
+                    f"(SNIPER_WIDE_CAP_LIVE)" if live and self.wide_cap_live else ""))
+                + (f"; {self.paper_cash_note}" if self.paper_cash_note and self.kelly and self.order_type == "FAK"
+                   else ""))
 
     def lines(self, live: bool = False) -> list[str]:
         if live:
@@ -1249,7 +1380,7 @@ class Settings:
                     f"{self.shares:.0f} sh{self.carry_text()} at ask+{self.slip:.2f}{self.sizing_text()}, "
                     f"cooldown {self.cooldown_ms:.0f}ms per side, "
                     f">= {self.min_left_s:.0f}s left, <= {self.max_fills_round} fills and "
-                    f"{self.max_side_shares:.0f} sh/side per round" + self.fair_text()
+                    f"{self.max_side_shares:.0f} sh/side per round" + self.fair_text(live=True)
                     + (f"; shadow fills at {','.join(map(str, self.shadow_ms))}ms (arithmetic only)"
                        if self.shadow_ms else "") + self.feeds_text()]
         return [f"SNIPER paper-only{self.lead_text()}: spot mid >= {self.k_bp}bp within {self.window_ms:.0f}ms -> {self.order_type} "
@@ -1526,6 +1657,38 @@ class Sniper:
         self.broker = broker
         self.on_event = on_event or (lambda *a, **k: None)
         self.s = settings or Settings()
+        self._paper_parity = live is None and self.s.paper_live_parity
+        self._paper_reference = None
+        self._paper_reference_error = "waiting for live execution reference"
+        self._paper_delay_error = None
+        self._paper_delays_read_at = 0.0
+        import paper_parity
+        self._comparison_config = paper_parity.comparison_config(self.s, (
+            float(getattr(broker, "min_buy_price", 0.0) or 0.0),
+            float(getattr(broker, "max_buy_price", 1.0) or 1.0)), broker)
+        if self._paper_parity:
+            if _flag("POSITION_MANAGER_ENABLED"):
+                raise ValueError("strict paper comparison requires POSITION_MANAGER_ENABLED=0: "
+                                 "live manager orders are shadow-only")
+            if self.s.book_quiet or self.s.book_clock != "exchange":
+                raise ValueError("strict paper comparison requires SNIPER_BOOK_CLOCK=exchange and "
+                                 "SNIPER_BOOK_QUIET=0; unknown books cannot be assumed executable")
+            if self.s.fixed_latency or self.s.delay_source == "model" or self.s.paper_cash_mode == "off":
+                raise ValueError("strict paper comparison requires live delays and cash: unset SNIPER_LATENCY_MS, "
+                                 "use SNIPER_DELAY_SOURCE=auto and SNIPER_PAPER_CASH_FROM=auto; "
+                                 "SNIPER_PAPER_LIVE_PARITY=0 explicitly selects an unvalidated model experiment")
+            from sniper_live import limits_from_env
+            limits = limits_from_env()
+            problems = [v for v in exec_latency.spec_violations(self.s, limits.max_order_shares)
+                        if not v.startswith("paper cash mirror:")]
+            if problems:
+                raise ValueError("paper settings would be refused live: " + "; ".join(problems))
+            root = Path(__file__).resolve().parent
+            resolve = lambda p: (root / p).resolve()
+            reference = resolve(self.s.live_journal)
+            if (resolve(self.s.delay_journal) != reference or
+                    (self.s.paper_cash_from and resolve(self.s.paper_cash_from) != reference)):
+                raise ValueError("strict paper comparison must use LIVE_SNIPER_JOURNAL for delays and cash")
         if live is not None and self.s.primary_feed == "kraken" and not kraken_live():
             raise ValueError("SNIPER_PRIMARY_FEED=kraken is paper-only: the live canary triggers from "
                              "Kraken only with SNIPER_KRAKEN_LIVE=1 set")
@@ -1627,14 +1790,45 @@ class Sniper:
         self._tasks: set = set()
         self._order_tasks: set = set()
         self._closing = False
+        self._wide_cap_state: dict | None = None    # the live wide-limit test (see _wide_cap_now)
+        self._wide_cap_checked = -1e18
         # M2 (2026-10-23): a stop of all decisions is never silent - its reason is
         # journalled, announced and in the summary; order-path faults likewise.
         self.stopped: dict | None = None
         self._execution_faults: dict = {"count": 0, "last": None}
         self.code = code_version()
         self._live_delays: list = []
-        if live is None and self.s.delay_source == "live":
+        if self._paper_parity:
+            self._refresh_paper_delays()
+        elif live is None and (self.s.delay_source == "live"
+                             or (self.s.delay_source == "auto" and not self.s.fixed_latency)):
             self._load_live_delays()
+        self._live_mirror: dict | None = None        # SNIPER_PAPER_CASH_FROM: live's cash and drawdown
+        self._live_mirror_error: str | None = None
+        self._mirror_path: str | None = None
+        self._mirror_strict = False                  # a path: no fresh live reading sizes nothing
+        mode = getattr(self.s, "paper_cash_mode", "off")
+        if self._paper_parity:
+            self._mirror_path = str((Path(__file__).resolve().parent / self.s.live_journal).resolve())
+            self._mirror_strict = True
+            self._refresh_live_mirror()
+            self.s.paper_cash_note = "STRICT live comparison: waits for matching live controls, cash and drawdown"
+        elif live is None and mode == "path":
+            self._mirror_path, self._mirror_strict = self.s.paper_cash_from, True
+            try:
+                self._live_mirror = live_account_tail(self._mirror_path)
+            except OSError as exc:
+                raise ValueError(f"SNIPER_PAPER_CASH_FROM: cannot read the live journal "
+                                 f"{self._mirror_path}: {exc}") from exc
+        elif live is None and mode == "auto":
+            p = Path(self.s.live_journal)
+            if not p.is_absolute():
+                p = Path(__file__).resolve().parent / p
+            if p.exists():                           # a live bot in this folder: size as it does while it runs
+                self._mirror_path = str(p)
+                self._refresh_live_mirror()
+                self.s.paper_cash_note = (f"sized from LIVE's cash and drawdown while live runs ({p.name}, readings "
+                                          f"<= {self.s.paper_cash_max_age_s:g}s old), else paper's own cash")
         if live is not None:
             live.attach(self)
 
@@ -1657,16 +1851,31 @@ class Sniper:
 
     def _load_live_delays(self) -> None:
         """Paper with SNIPER_DELAY_SOURCE=live: refuse to start without enough
-        live orders rather than fall back to the model quietly."""
+        live orders rather than fall back to the model quietly. auto (the
+        default): the journal's last SNIPER_DELAY_DAYS days when they hold
+        enough orders, else the model - the settings line says which."""
         import random
+        auto = self.s.delay_source == "auto" and not self._paper_parity
         p = Path(self.s.delay_journal)
         if not p.is_absolute():
             p = Path(__file__).resolve().parent / p
+        model = (f"the delay model (measured one-way + {self.s.hold_ms:.0f}ms hold + {self.s.server_ms:.0f}ms server; "
+                 f"auto: ")
+        if auto and not p.exists():
+            return                                   # no live bot in this folder: the model, as always
         try:
-            delays, one_way = live_delays(p)
+            delays, one_way = live_delays(p, days=self.s.delay_days if auto or self._paper_parity else None,
+                                         now=time.time() if self._paper_parity else None)
         except OSError as exc:
+            if auto:
+                self.s.delay_note = model + f"cannot read {p.name}: {exc})"
+                return
             raise ValueError(f"SNIPER_DELAY_SOURCE=live: cannot read the live journal {p}: {exc}") from exc
         if len(delays) < MIN_LIVE_DELAYS:
+            if auto:
+                self.s.delay_note = model + (f"only {len(delays)} live orders in the last {self.s.delay_days:g} days "
+                                             f"of {p.name}, need {MIN_LIVE_DELAYS})")
+                return
             raise ValueError(f"SNIPER_DELAY_SOURCE=live: {len(delays)} live orders with a venue reply in {p}, "
                              f"need >= {MIN_LIVE_DELAYS}")
         self._live_delays = delays
@@ -1674,13 +1883,81 @@ class Sniper:
         q = sorted(delays)
         pick = lambda f: q[min(len(q) - 1, int(len(q) * f))]  # noqa: E731
         self.s.delay_note = (f"each order's flight drawn from {len(q)} live orders' order-out -> match times "
-                             f"(p50 {pick(0.5):.0f}ms, p90 {pick(0.9):.0f}ms, max {q[-1]:.0f}ms; {p.name})")
+                             f"(p50 {pick(0.5):.0f}ms, p90 {pick(0.9):.0f}ms, max {q[-1]:.0f}ms; {p.name}"
+                             + (f", last {self.s.delay_days:g} days" if auto else "") + ")")
 
     def lines(self) -> list[str]:
         out = self.s.lines(live=self.live is not None)
+        if self.live is None:
+            out.append("PAPER STRICT COMPARISON: fresh live controls required; simulated fills remain unvalidated"
+                       if self._paper_parity else
+                       "PAPER MODEL EXPERIMENT: independent simulation; not validated against live fills")
         if self.live is not None:
             out.append(self.live.limits_line())
         return out
+
+    PAPER_DELAY_REFRESH_S = 300.0
+
+    def _refresh_paper_delays(self):
+        started = time.monotonic()
+        try:
+            self._load_live_delays()
+            self._paper_delay_error = None
+        except (OSError, ValueError) as exc:
+            self._live_delays = []
+            self._paper_delay_error = str(exc)
+        self._paper_delays_read_at = started
+
+    async def _paper_delay_loop(self):
+        while True:
+            await asyncio.sleep(self.PAPER_DELAY_REFRESH_S)
+            await asyncio.to_thread(self._refresh_paper_delays)
+
+    def _paper_parity_problem(self):
+        if not getattr(self, "_paper_parity", False):
+            return None
+        if self._paper_delay_error or not self._live_delays:
+            return self._paper_delay_error or "recent live delay observations unavailable"
+        if not 0 <= time.monotonic() - self._paper_delays_read_at <= 2 * self.PAPER_DELAY_REFRESH_S:
+            return "live delay refresh stale"
+        try:
+            self._live_mirror_now()
+        except ValueError as exc:
+            return str(exc)
+        return None
+
+    def _order_share_cap(self):
+        if getattr(self, "_paper_parity", False):
+            return (self._paper_reference or {}).get("max_order_shares", 0)
+        return getattr(getattr(getattr(self.live, "sender", None), "limits", None), "max_order_shares", None)
+
+    def _publish_execution_reference(self):
+        """Cached public risk fields only; no network, ledger reads or order decisions."""
+        if self.live is None:
+            return
+        import paper_parity
+        wall = time.time()
+        risk = self._hybrid_risk
+        hybrid = None if risk is None else {
+            "equity": risk["equity"], "high_water": risk["high_water"],
+            "wall": wall - (time.monotonic() - risk["observed_mono"])}
+        kill = getattr(self.live, "kill", None)
+        pauses = kill.active() if callable(getattr(kill, "active", None)) else ["live controls unavailable"]
+        if self.stopped:
+            pauses = [*pauses, "live sniper stopped"]
+        state = self._wide_cap_state
+        self._write({"result": "execution_reference", "version": 1, "live": True, "wall": wall,
+                     "config": self._comparison_config, "cash": self._read_bankroll(), "hybrid": hybrid,
+                     "max_order_shares": self._order_share_cap(), "venue_min_shares": self.s.venue_min_shares,
+                     "pauses": pauses, "wide_active": bool(state is not None and not state.get("off")),
+                     "wide_ready": not self.s.wide_cap_live or state is not None,
+                     **paper_parity.execution_state(self.live, self.hub, now=wall)})
+
+    async def _execution_reference_loop(self):
+        import paper_parity
+        while True:
+            self._publish_execution_reference()
+            await asyncio.sleep(paper_parity.REFERENCE_EVERY_S)
 
     # ---------------------------------------------------------------- journal
     def _write(self, row: dict) -> None:
@@ -1883,6 +2160,22 @@ class Sniper:
             return None
         return rate, exponent
 
+    def _venue_min_off(self, res: dict) -> None:
+        """SNIPER_VENUE_MIN_SHARES' live test answered NO: the venue refused an order
+        under its published minimum for its size (sniper_live marks it, and does not
+        count it as an order error). Back to the published minimum for this run; the
+        .env still says otherwise, so a restart tries once more."""
+        was = float(getattr(self.s, "venue_min_shares", 0) or 0)
+        if was <= 0:
+            return
+        self.s.venue_min_shares = 0
+        why = str(res.get("error") or "")[:200]
+        self._write({"wall": time.time(), "result": "venue_min_off", "was": was, "error": why,
+                     "client_order_id": res.get("client_order_id")})
+        self.on_event("sniper", f"SNIPER_VENUE_MIN_SHARES={was:g} turned OFF: the venue refused an order under its "
+                                f"published minimum ({why[:120]}). Back to the venue's minimum - remove it from .env",
+                      "warn")
+
     def _share_order_floor(self, condition, view, price_cap) -> int:
         """Read prefetched venue minimums; never fetch on the decision path."""
         override = int(getattr(self.s, "venue_min_shares", 0) or 0)
@@ -1978,7 +2271,67 @@ class Sniper:
             return self._read_bankroll()
         if self._bankroll is None or time.monotonic() - self._bankroll_at > self.BANKROLL_STALE_S:
             self._set_bankroll(self._read_bankroll(), time.monotonic())
+        if self._mirror_on():
+            # SNIPER_PAPER_CASH_FROM: live's cash, never more than paper's own (which pays)
+            try:
+                live_cash = self._live_mirror_now()["cash"]
+            except ValueError:
+                return None if self._mirror_strict else self._bankroll    # auto: live stopped - paper's own
+            return None if self._bankroll is None else min(self._bankroll, live_cash)
         return self._bankroll
+
+    def _mirror_on(self) -> bool:
+        return self.live is None and bool(getattr(self, "_mirror_path", None))
+
+    def _live_mirror_now(self) -> dict:
+        """SNIPER_PAPER_CASH_FROM: live's latest readings, or ValueError(why not)."""
+        if self._paper_parity:
+            import paper_parity
+            if self._paper_reference is None:
+                raise ValueError(self._paper_reference_error)
+            market = paper_parity.market_key(self.hub)
+            if market is None:
+                raise ValueError("current paper market unavailable")
+            paper_parity.validate_reference(self._paper_reference, self._comparison_config, market=market)
+        m = self._live_mirror
+        if m is None:
+            raise ValueError(self._live_mirror_error or "the live journal not read yet")
+        age = float(getattr(self.s, "paper_cash_max_age_s", 900))
+        if m["cash"] is None or not 0 <= time.time() - m["cash_wall"] <= age:
+            raise ValueError(self._live_mirror_error or f"no live cash reading in the last {age:g}s (is live running?)")
+        return m
+
+    def _refresh_live_mirror(self) -> None:
+        """Worker thread: re-read the end of the live journal."""
+        if self._paper_parity:
+            import paper_parity
+            try:
+                market = paper_parity.market_key(self.hub)
+                if market is None:
+                    raise ValueError("current paper market unavailable")
+                reference = paper_parity.validate_reference(
+                    paper_parity.read_reference(self._mirror_path), self._comparison_config, market=market)
+                h = reference.get("hybrid") or {}
+                self._live_mirror = {"cash": reference["cash"], "cash_wall": reference["wall"],
+                                     "equity": h.get("equity"), "high_water": h.get("high_water"),
+                                     "hybrid_wall": h.get("wall")}
+                self._paper_reference = reference
+                self._paper_reference_error = None
+                self.s.venue_min_shares = reference["venue_min_shares"]
+            except (OSError, ValueError) as exc:
+                self._paper_reference = self._live_mirror = None
+                self._paper_reference_error = str(exc)
+            return
+        try:
+            self._live_mirror = live_account_tail(self._mirror_path)
+            self._live_mirror_error = None
+        except OSError as exc:                      # keep the last reading; its age still applies
+            self._live_mirror_error = f"cannot read {self._mirror_path}: {exc}"
+
+    async def _live_mirror_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.BANKROLL_EVERY_S)
+            await asyncio.to_thread(self._refresh_live_mirror)
 
     def _set_bankroll(self, v, read_at: float) -> None:
         """Paper cash less active workers and a short completed-order tail.
@@ -2121,11 +2474,28 @@ class Sniper:
         age = time.monotonic() - snapshot["observed_mono"]
         if not math.isfinite(age) or not 0 <= age <= self.HYBRID_RISK_STALE_S:
             raise ValueError("hybrid accounting stale")
-        equity = max(0.0, float(snapshot["equity"]))
+        equity, high_water, mirror = max(0.0, float(snapshot["equity"])), snapshot["high_water"], {}
+        if self._mirror_on():
+            # SNIPER_PAPER_CASH_FROM: size in the drawdown LIVE is in, not paper's own
+            try:
+                m = self._live_mirror_now()
+                if m["equity"] is None or m["high_water"] is None:
+                    raise ValueError("no live drawdown reading in the live journal's end (SNIPER_PAPER_CASH_FROM)")
+                # Cash and drawdown come from separate rows. A recent balance
+                # read must not renew an older hybrid snapshot's freshness.
+                max_age = self.s.paper_cash_max_age_s
+                if m["hybrid_wall"] is None or not 0 <= time.time() - m["hybrid_wall"] <= max_age:
+                    raise ValueError(f"no live drawdown reading in the last {max_age:g}s (SNIPER_PAPER_CASH_FROM)")
+                equity, high_water = max(0.0, m["equity"]), m["high_water"]
+                mirror = {"live_mirror": True, "paper_equity": round(float(snapshot["equity"]), 4)}
+            except ValueError:
+                if self._mirror_strict:
+                    raise
+                mirror = {"live_mirror": False}      # auto: live stopped - paper's own drawdown
         factors = sizing_factors(self.s.hybrid_policy, sigma=self.vol_model.vol(), equity=equity,
-                                 high_water=snapshot["high_water"], base_fraction=self.s.kelly_fraction)
-        return {**factors, "equity": equity, "high_water": snapshot["high_water"],
-                "accounting_age_s": age}
+                                 high_water=high_water, base_fraction=self.s.kelly_fraction)
+        return {**factors, "equity": equity, "high_water": high_water,
+                "accounting_age_s": age, **mirror}
 
     def _check_hybrid_order(self, plan, spend, fee_rate, quoted_fee=0) -> None:
         """Recheck cached risk before submission; cap only when explicitly enabled."""
@@ -2198,6 +2568,110 @@ class Sniper:
             self.on_event("sniper", detail, "bad")
         except Exception:
             self.n["event errors"] += 1
+
+    WIDE_CAP_STATE = "wide_cap_live_test.json"     # beside the live ledger
+    # the frozen spec's ask + slip: the live test's limit once it stops
+    FROZEN_SLIP = next(want for attr, _var, want, *_ in exec_latency.FROZEN_SPEC if attr == "slip")
+
+    def _live_test_on(self) -> bool:
+        """The operator's capped live test (SNIPER_WIDE_CAP_LIVE=1) is running: opted
+        in, and the realized P&L since the test began still above
+        -SNIPER_WIDE_CAP_LIVE_STOP_USD - else it is off for good: the state file beside
+        the live ledger keeps it off across restarts (delete it to start a new test).
+        Checked at most once a second; an unreadable state or P&L fails off. Live only."""
+        if self.live is None or not getattr(self.s, "wide_cap_live", False):
+            return False
+        st = self._wide_cap_live_state()
+        if st is None or st.get("off"):
+            return False
+        now = time.monotonic()
+        if now - self._wide_cap_checked >= 1.0:
+            self._wide_cap_checked = now
+            try:
+                realized = float(self.live.ledger.realized_since(float(st["started_wall"])))
+            except Exception as exc:  # noqa: BLE001 - no P&L reading: the test cannot be bounded
+                self._wide_cap_live_off(st, None, f"realized P&L unreadable ({type(exc).__name__})")
+                return False
+            st["realized"] = round(realized, 4)
+            if not realized > -float(self.s.wide_cap_live_stop_usd):
+                self._wide_cap_live_off(st, realized, "the stop was reached")
+                return False
+        return True
+
+    def _wide_cap_now(self) -> float:
+        """The wide limit for this decision, in cents (0 = off: ask + slip and the fair
+        limit). Paper: SNIPER_WIDE_CAP_C. Live: only while the capped live test runs."""
+        c = float(getattr(self.s, "wide_cap_c", 0) or 0)
+        if getattr(self, "_paper_parity", False) and self.s.wide_cap_live:
+            return c if (self._paper_reference or {}).get("wide_active") else 0.0
+        if c <= 0 or self.live is None:
+            return c
+        return c if self._live_test_on() else 0.0      # live refuses it without the opt-in at start
+
+    def _slip_now(self) -> float:
+        """How far above the ask seen the limit goes (never past the fair limit).
+        Paper and normal live: SNIPER_SLIP (live: the frozen 0.05). A wider slip on
+        live only while the capped live test runs - then the frozen 0.05 for good."""
+        slip = float(self.s.slip)
+        if getattr(self, "_paper_parity", False) and self.s.wide_cap_live:
+            return slip if (self._paper_reference or {}).get("wide_active") else float(self.FROZEN_SLIP)
+        if self.live is None or not getattr(self.s, "wide_cap_live", False) or not slip > self.FROZEN_SLIP:
+            return slip
+        return slip if self._live_test_on() else float(self.FROZEN_SLIP)
+
+    def _wide_cap_live_state(self) -> dict | None:
+        st = self._wide_cap_state
+        if st is not None:
+            return st
+        path = Path(self.live.ledger.path).with_name(self.WIDE_CAP_STATE)
+        try:
+            st = json.loads(path.read_text(encoding="utf-8"))
+            if (not isinstance(st, dict) or not isinstance(st.get("off"), bool)
+                    or not math.isfinite(float(st["started_wall"]))):
+                raise ValueError("malformed")
+        except FileNotFoundError:
+            st = {"started_wall": time.time(), "off": False}
+            if not self._wide_cap_save(path, st):
+                st["off"] = True                    # an unrecorded test start cannot be bounded
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            st = {"started_wall": time.time(), "off": True}
+            self._write({"wall": time.time(), "result": "wide_cap_off", "reason": f"state unreadable: {exc}"[:160]})
+            self.on_event("sniper", f"LIVE TEST off: {path.name} is unreadable - fix or delete it", "bad")
+        st["path"] = str(path)
+        self._wide_cap_state = st
+        return st
+
+    def _wide_cap_save(self, path: Path, st: dict) -> bool:
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            tmp.write_text(json.dumps({k: v for k, v in st.items() if k != "path"}), encoding="utf-8")
+            import durable_io
+            durable_io.replace_atomic(tmp, path)
+            return True
+        except OSError as exc:
+            self.n["wide cap state write errors"] += 1
+            self.on_event("sniper", f"LIVE TEST off: cannot write {path.name} ({type(exc).__name__})", "bad")
+            return False
+
+    def _wide_cap_live_off(self, st: dict, realized, why: str) -> None:
+        st.update(off=True, off_wall=time.time(), realized=None if realized is None else round(realized, 4))
+        self._wide_cap_save(Path(st["path"]), st)
+        self.n["wide cap live test stops"] += 1
+        self._write({"wall": time.time(), "result": "wide_cap_off", "reason": why, "realized": st["realized"],
+                     "stop_usd": float(self.s.wide_cap_live_stop_usd), "since": st["started_wall"]})
+        self.on_event("sniper", f"LIVE TEST stopped ({why}): realized "
+                                + ("unknown" if realized is None else f"${realized:+.2f}")
+                                + f" since the test began, stop -${float(self.s.wide_cap_live_stop_usd):g}; "
+                                  f"back to ask+{float(self.FROZEN_SLIP):.2f} and the fair limit", "bad")
+
+    def _wide_cap_view(self) -> dict | None:
+        """The live test for the summary and the dashboard; None when it is not running."""
+        if self.live is None or not getattr(self.s, "wide_cap_live", False):
+            return None
+        st = self._wide_cap_state or {}
+        return {"c": float(self.s.wide_cap_c), "slip": float(self.s.slip), "off": bool(st.get("off")),
+                "realized": st.get("realized"), "stop_usd": float(self.s.wide_cap_live_stop_usd),
+                "since": st.get("started_wall")}
 
     def _stop(self, reason: str) -> None:
         """Stop all new decisions where no kill switch can pause them instead (paper,
@@ -2595,6 +3069,8 @@ class Sniper:
         """
         if self.s.fixed_latency:
             return self.s.latency_ms, {"latency_mode": "fixed"}
+        if getattr(self, "_paper_parity", False) and (self._paper_delay_error or not self._live_delays):
+            return 0.0, {"latency_mode": "unavailable", "reason": self._paper_delay_error}
         # SNIPER_PAPER_EXTRA_MS: paper only - a live order meets the real venue
         extra = float(getattr(self.s, "paper_extra_ms", 0.0) or 0.0) if self.live is None else 0.0
         tag = {"extra_ms": extra} if extra else {}
@@ -3297,6 +3773,8 @@ class Sniper:
         try:
             res = await self.live.send(p, started)
             kind = res["kind"]
+            if res.get("venue_min_refused"):
+                self._venue_min_off(res)
             if plan.get("minimum_entry"):
                 row["minimum_entry_attempted"] = bool(p.stamps.get("budget_recorded"))
                 if kind == "NOT_SENT" and not row["minimum_entry_attempted"]:
@@ -3589,6 +4067,13 @@ class Sniper:
 
     def _decide(self, side: str, row: dict, t_ms: float):
         """Every check and every field of the order; None (skip journalled) if it must not trade."""
+        problem = self._paper_parity_problem()
+        if problem:
+            row["detail"] = problem
+            return self._skip("paper/live comparison unavailable", row)
+        if getattr(self, "_paper_parity", False):
+            row["execution_model"] = "strict comparison; simulated fill, not a venue execution"
+            row["live_reference_age_s"] = round(time.time() - self._paper_reference["wall"], 3)
         self._sync_live_fak()
         hub = self.hub
         up, down, cond, end = hub.up_token, hub.down_token, hub.condition_id, hub.window_end
@@ -3638,9 +4123,9 @@ class Sniper:
             return self._skip("ask outside price band", row)
         # The price ceiling is fixed here, once, from the ask this decision saw:
         # never recomputed from a later ask, so it cannot chase the book.
-        cap = min(0.99, round(ask + self.s.slip, 4))
+        cap = min(0.99, round(ask + self._slip_now(), 4))
         above_fair = False
-        wide_c = float(getattr(self.s, "wide_cap_c", 0) or 0)      # the paper wide-cap experiment; 0 = off
+        wide_c = self._wide_cap_now()           # the wide limit: paper experiment / capped live test; 0 = off
         fair = None
         fee_rate = fee_exponent = None
         if self.s.fair:
@@ -3700,13 +4185,26 @@ class Sniper:
                 # determine how much to add. Existing inventory is not a fresh bet.
                 # Whole shares from the venue minimum to the available room; no carry.
                 bank = self._bankroll_now()
+                if bank is None and self._mirror_on() and self._mirror_strict:
+                    try:
+                        self._live_mirror_now()
+                    except ValueError as exc:
+                        row["detail"] = str(exc)
+                    return self._skip("kelly size unknown: no live cash reading", row)
                 if bank is None:
                     return self._skip("kelly size unknown: no cash reading", row)
+                if self._mirror_on():
+                    m = self._live_mirror or {}
+                    if m.get("cash") is not None and time.time() - m["cash_wall"] <= self.s.paper_cash_max_age_s:
+                        row.update(live_cash=round(m["cash"], 2), live_cash_age_s=round(time.time() - m["cash_wall"], 1),
+                                   cash_source="live")
+                    else:
+                        row["cash_source"] = "paper (no fresh live reading)"
                 # No per-order cap (the operator's choice): only what is left of this
                 # side's per-market cap (SNIPER_MAX_SIDE_SHARES), and live, the canary's
                 # per-order cap - never a bigger order than the account's limits allow.
                 room = self.s.max_side_shares - self._side_held(end, side, token)
-                live_cap = getattr(getattr(getattr(self.live, "sender", None), "limits", None), "max_order_shares", None)
+                live_cap = self._order_share_cap()
                 if live_cap is not None:
                     room = min(room, float(live_cap))
                 if self.s.order_sizing == "shares":
@@ -3862,8 +4360,7 @@ class Sniper:
                 bound = room
             else:
                 bound = self.s.max_side_shares - rd[side]
-                live_cap = getattr(getattr(getattr(self.live, "sender", None), "limits", None),
-                                   "max_order_shares", None)
+                live_cap = self._order_share_cap()
                 if live_cap is not None:
                     bound = min(bound, float(live_cap))
             if order_shares > max(bound, 0.0) + 1e-9:
@@ -4817,6 +5314,7 @@ class Sniper:
                     book.feed_age_summary() if hasattr(book, "feed_age_summary") else None),
                 "live": self.live.status() if self.live is not None else None,
                 "stopped": dict(self.stopped) if self.stopped else None,
+                "wide_cap_live": self._wide_cap_view(),
                 "execution_faults": {"count": self._execution_faults["count"],
                                      "last": dict(self._execution_faults["last"] or {}) or None}}
 
@@ -4873,6 +5371,7 @@ class Sniper:
                                      ({k: v for k, v in quantiles(book_age).items() if k != "p95"}
                                       if book_age else None)),
                 "stopped": snap.get("stopped"), "execution_faults": snap.get("execution_faults"),
+                "wide_cap_live": snap.get("wide_cap_live"),
                 **({"pending": n["pending"], "live": snap["live"]} if self.live is not None else {})}
 
     def _lag_summary(self, xs=None):
@@ -4938,6 +5437,12 @@ class Sniper:
         self._spawn(self._gc_schedule())
         if self.s.fair and self.s.kelly and self.live is None:
             self._spawn(self._bankroll_loop())          # live reads the sender's own figures each time
+        if self._mirror_on():
+            self._spawn(self._live_mirror_loop())
+        if self._paper_parity:
+            self._spawn(self._paper_delay_loop())
+        if self.live is not None:
+            self._spawn(self._execution_reference_loop())
         stall_ms = _env_float("SNIPER_STALL_MS", 50)
         if stall_ms > 0 and self.journal is not None:
             self.stallwatch = StallWatch(asyncio.get_running_loop(), self._write, threshold_ms=stall_ms).start()
