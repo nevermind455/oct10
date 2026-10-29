@@ -2126,8 +2126,10 @@ class DashView:
             since = (time.strftime("%m-%d %H:%M", time.gmtime(float(wide["since"])))
                      if wide.get("since") else "--")
             realized = wide.get("realized")
-            rows.append(("WIDE CAP", "FAIL" if wide.get("off") else "WARN",
-                         ("OFF (stopped) " if wide.get("off") else f"LIVE TEST ask+{wide['c']:g}c ")
+            limit = (f"ask+{wide['c']:g}c, fair ignored" if wide.get("c") else
+                     f"ask+{float(wide.get('slip') or 0.05):.2f}, fair checked")
+            rows.append(("LIVE TEST", "FAIL" if wide.get("off") else "WARN",
+                         ("OFF (stopped) " if wide.get("off") else f"{limit} ")
                          + f"realized {'--' if realized is None else f'${realized:+.2f}'} of -${wide['stop_usd']:g}"
                          f" since {since} UTC"))
         b = summary.get("binance") or {}

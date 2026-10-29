@@ -102,13 +102,17 @@ def spec_violations(settings, canary_max_shares=None) -> list[str]:
     """Every way the resolved settings differ from FROZEN_SPEC, named with the
     variable that set it. Empty when they match."""
     out = []
-    # The operator's capped live test of the wide limit (2026-10-29, SNIPER_WIDE_CAP_LIVE=1)
-    # also allows the trigger it was tested with in paper: 0.5 to 1.0bp. Nothing else.
+    # The operator's capped live test (2026-10-29, SNIPER_WIDE_CAP_LIVE=1) also allows a
+    # 0.5 to 1.0bp trigger and an ask + 0.05 to 0.10 slip (the fair value still checked).
+    # Nothing else.
     wide_live = bool(getattr(settings, "wide_cap_live", False))
     for attr, var, want, label, fmt in FROZEN_SPEC:
         got = getattr(settings, attr, None)
         if (wide_live and attr == "k_bp" and isinstance(got, (int, float))
                 and 0.5 - 1e-9 <= float(got) <= 1.0 + 1e-9):
+            continue
+        if (wide_live and attr == "slip" and isinstance(got, (int, float))
+                and 0.05 - 1e-9 <= float(got) <= 0.10 + 1e-9):
             continue
         if not _same(got, want):
             src = f"{var}={os.environ.get(var)!r}" if os.environ.get(var) not in (None, "") else f"{var} unset (code default)"
@@ -131,9 +135,9 @@ def spec_violations(settings, canary_max_shares=None) -> list[str]:
         out.append(f"wide cap experiment: SNIPER_WIDE_CAP_C={settings.wide_cap_c:g} - paper only "
                    f"(it buys past the fair value); live keeps ask + slip and the fair limit "
                    f"(SNIPER_WIDE_CAP_LIVE=1 makes it a capped live test)")
-    if wide_live and not wide_c > 0:
-        out.append("wide cap live test: SNIPER_WIDE_CAP_LIVE=1 without SNIPER_WIDE_CAP_C - set the limit "
-                   "or remove the opt-in")
+    if wide_live and not wide_c > 0 and not float(getattr(settings, "slip", 0.05) or 0) > 0.05 + 1e-9:
+        out.append("live test: SNIPER_WIDE_CAP_LIVE=1 widens no limit - set SNIPER_WIDE_CAP_C or a "
+                   "SNIPER_SLIP above 0.05 (up to 0.10), or remove the opt-in")
     if getattr(settings, "feed_coalesce", False):
         out.append("feed coalescing: SNIPER_FEED_COALESCE=1 - live evaluates every tick until coalescing is approved")
     target = float(getattr(settings, "max_target_shares", 0) or 0)
@@ -173,12 +177,16 @@ def effective_config_lines(settings, *, live: bool, canary_max_shares=None) -> l
         + (f"also in a realized drawdown up to {max_dd:.0%}" if max_dd > 0 else "never below the high-water mark")
         if getattr(settings, "kelly_min_entry", False) else "off; strict hybrid target")
         + " (SNIPER_KELLY_MIN_ENTRY / SNIPER_MIN_ENTRY_MAX_DRAWDOWN)")
-    if float(getattr(settings, "wide_cap_c", 0) or 0) > 0:
-        lines.append(f"  {'wide cap':13s} ask+{settings.wide_cap_c:g}c "
-                     + (f"LIVE TEST (SNIPER_WIDE_CAP_LIVE=1): off for good after a "
-                        f"${getattr(settings, 'wide_cap_live_stop_usd', 0):g} realized loss "
-                        f"(SNIPER_WIDE_CAP_LIVE_STOP_USD; wide_cap_live_test.json)"
-                        if getattr(settings, "wide_cap_live", False) else "paper experiment (SNIPER_WIDE_CAP_C)"))
+    wide_c = float(getattr(settings, "wide_cap_c", 0) or 0)
+    if getattr(settings, "wide_cap_live", False):
+        lines.append(f"  {'live test':13s} "
+                     + (f"ask+{wide_c:g}c whatever the fair value says" if wide_c > 0 else
+                        f"ask+${float(getattr(settings, 'slip', 0.05)):.2f}, the fair value still checked")
+                     + f" (SNIPER_WIDE_CAP_LIVE=1): back to the frozen ask+$0.05 after a "
+                       f"${getattr(settings, 'wide_cap_live_stop_usd', 0):g} realized loss "
+                       f"(SNIPER_WIDE_CAP_LIVE_STOP_USD; wide_cap_live_test.json)")
+    elif wide_c > 0:
+        lines.append(f"  {'wide cap':13s} ask+{wide_c:g}c paper experiment (SNIPER_WIDE_CAP_C)")
     extra = tuple(getattr(settings, "extra_feeds", ()) or ())
     lines.append(f"  {'2nd trigger':13s} {','.join(extra) or 'none':16s} (SNIPER_EXTRA_FEEDS; whichever feed "
                  f"signals first)" + ("" if extra in LIVE_EXTRA_FEEDS else "   <- not accepted live"))

@@ -1640,7 +1640,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # 2026-10-29 (the operator's request, tests/tests_wide_cap_live.py): SNIPER_WIDE_CAP_LIVE=1 makes the
     # wide limit a capped LIVE test - off for good once the realized P&L since the test began reaches
     # -SNIPER_WIDE_CAP_LIVE_STOP_USD (state wide_cap_live_test.json); paper and default live unchanged.
-    "sniper_mode.py": "cc18e0162fee04e4974160889d8e1593cb0359d2a023b17928f966a7e09aa361",
+    # 2026-10-29 (the operator's second live test): the same switch allows a wider ask + SNIPER_SLIP
+    # (0.05-0.10) with the fair value still checked (Sniper._slip_now); the stop returns it to the
+    # frozen ask + 0.05. Default live and paper unchanged.
+    "sniper_mode.py": "84c1a7b05392225821b46636f6dc973d05827404bec296d545fb7997b32672c8",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.

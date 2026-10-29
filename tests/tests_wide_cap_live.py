@@ -40,6 +40,8 @@ import tests_sniper_ioc as I  # noqa: E402
 from accounting.ledger import Ledger  # noqa: E402
 
 TEST = dict(SNIPER_FAIR="1", SNIPER_WIDE_CAP_C="15", SNIPER_WIDE_CAP_LIVE="1", SNIPER_K_BP="0.7")
+# 2026-10-29, the operator's second test: ask + 8c, the fair value still checked (SNIPER_SLIP)
+SLIP_TEST = dict(SNIPER_FAIR="1", SNIPER_WIDE_CAP_LIVE="1", SNIPER_SLIP="0.08")
 
 
 class LiveOptIn(unittest.TestCase):
@@ -58,13 +60,26 @@ class LiveOptIn(unittest.TestCase):
 
     def test_the_opt_in_keeps_every_other_frozen_setting(self):
         for name, value, label in (("SNIPER_K_BP", "1.2", "trigger"), ("SNIPER_K_BP", "0.4", "trigger"),
-                                   ("SNIPER_SLIP", "0.10", "slip"), ("SNIPER_KELLY_FRACTION", "0.5", "kelly fraction")):
+                                   ("SNIPER_SLIP", "0.12", "slip"), ("SNIPER_SLIP", "0.03", "slip"),
+                                   ("SNIPER_KELLY_FRACTION", "0.5", "kelly fraction")):
             bad = X.spec_violations(I.settings(**dict(TEST, **{name: value})))
             self.assertTrue(any(v.startswith(label) for v in bad), (name, value, bad))
 
-    def test_the_opt_in_without_a_wide_limit_is_refused(self):
+    def test_an_opt_in_that_widens_no_limit_is_refused(self):
         bad = X.spec_violations(I.settings(SNIPER_FAIR="1", SNIPER_WIDE_CAP_LIVE="1"))
         self.assertTrue(any("SNIPER_WIDE_CAP_LIVE" in v for v in bad), bad)
+
+    def test_the_opt_in_allows_a_wider_slip_with_the_fair_value_checked(self):
+        self.assertEqual(X.spec_violations(I.settings(**SLIP_TEST)), self.base())
+        self.assertEqual(X.spec_violations(I.settings(**dict(SLIP_TEST, SNIPER_SLIP="0.10"))), self.base())
+        bad = X.spec_violations(I.settings(SNIPER_FAIR="1", SNIPER_SLIP="0.08"))       # no opt-in: refused
+        self.assertTrue(any(v.startswith("slip") for v in bad), bad)
+
+    def test_the_slip_test_settings_line_says_so(self):
+        line = I.settings(**SLIP_TEST).lines(live=True)[0]
+        self.assertIn("at ask+0.08", line)
+        self.assertIn("LIVE TEST: limit ask+0.08, the fair value still checked", line)
+        self.assertIn("after a $25 realized loss", line)
 
     def test_the_live_settings_line_names_the_test_and_its_stop(self):
         line = I.settings(**TEST).lines(live=True)[0]
@@ -120,7 +135,7 @@ class LiveStop(unittest.TestCase):
         self.assertEqual(sn._wide_cap_now(), 0.0)
         (row,) = self.offs()                                           # journalled once
         self.assertAlmostEqual(row["realized"], -30.0)
-        self.assertTrue(any(level == "bad" and "WIDE CAP TEST stopped" in text for text, level in sn.events))
+        self.assertTrue(any(level == "bad" and "LIVE TEST stopped" in text for text, level in sn.events))
         self.assertTrue(self.state()["off"])
         self.assertTrue(sn.summary_snapshot()["wide_cap_live"]["off"])
 
@@ -151,7 +166,7 @@ class LiveStop(unittest.TestCase):
         (self.path.parent / S.Sniper.WIDE_CAP_STATE).write_text("{not json", encoding="utf-8")
         sn = self.sniper()
         self.assertEqual(sn._wide_cap_now(), 0.0)
-        self.assertTrue(any("WIDE CAP" in text for text, level in sn.events))
+        self.assertTrue(any("LIVE TEST" in text for text, level in sn.events))
 
     def test_live_without_the_opt_in_never_trades_it(self):
         sn = self.sniper(SNIPER_WIDE_CAP_LIVE="0")
@@ -165,6 +180,53 @@ class LiveStop(unittest.TestCase):
 
     def test_the_decision_uses_it(self):
         self.assertIn("self._wide_cap_now()", inspect.getsource(S.Sniper._decide))
+        self.assertIn("ask + self._slip_now()", inspect.getsource(S.Sniper._decide))
+
+
+class SlipStop(LiveStop):
+    """ask + 8c with the fair value checked: the same stop, back to the frozen ask + 5c."""
+
+    def sniper(self, **env):
+        self.fixture.make(**dict(SLIP_TEST, **env))
+        sn = self.fixture.sn
+        sn.live = types.SimpleNamespace(ledger=self.ledger, status=lambda: {})
+        sn.events = []
+        sn.on_event = lambda src, text, level="info": sn.events.append((text, level))
+        return sn
+
+    def test_the_wider_slip_runs_until_the_stop_then_ask_plus_5c_for_good(self):
+        sn = self.sniper()
+        self.assertEqual((sn._slip_now(), sn._wide_cap_now()), (0.08, 0.0))
+        self.lose("a", 30)
+        sn._wide_cap_checked = -1e18
+        self.assertEqual(sn._slip_now(), 0.05)
+        (row,) = self.offs()
+        self.assertAlmostEqual(row["realized"], -30.0)
+        view = sn.summary_snapshot()["wide_cap_live"]
+        self.assertEqual((view["slip"], view["c"], view["off"]), (0.08, 0.0, True))
+        self.assertEqual(self.sniper()._slip_now(), 0.05)               # a restart keeps it off
+
+    def test_a_smaller_loss_keeps_the_wider_slip(self):
+        sn = self.sniper()
+        sn._slip_now()
+        self.lose("a", 10)
+        sn._wide_cap_checked = -1e18
+        self.assertEqual(sn._slip_now(), 0.08)
+
+    def test_paper_keeps_its_own_slip(self):
+        sn = self.sniper()
+        sn.live = None
+        self.assertEqual(sn._slip_now(), 0.08)
+
+    # the wide-limit cases above do not apply to this test's settings
+    test_the_wide_limit_runs_until_the_stop_then_is_off_for_good = None
+    test_a_restart_keeps_it_off = None
+    test_a_smaller_loss_keeps_it_on = None
+    test_losses_before_the_test_began_do_not_count = None
+    test_an_unreadable_state_fails_off = None
+    test_live_without_the_opt_in_never_trades_it = None
+    test_paper_is_unchanged = None
+    test_the_decision_uses_it = None
 
 
 if __name__ == "__main__":

@@ -1054,10 +1054,11 @@ class Settings:
         # whatever the fair value says, and a signal whose ask is above the fair
         # limit still buys a fixed minimum-size order (Kelly says 0 there). 0 = off.
         self.wide_cap_c = _env_float("SNIPER_WIDE_CAP_C", 0)
-        # The wide limit as a small LIVE test (2026-10-29, the operator's request): live
-        # accepts SNIPER_WIDE_CAP_C (and a 0.5-1.0bp trigger) only with this opt-in, and
-        # the test turns the wide limit off for good once its realized loss reaches
-        # SNIPER_WIDE_CAP_LIVE_STOP_USD (Sniper._wide_cap_now). The wallet is the hard cap.
+        # A small LIVE test (2026-10-29, the operator's requests): with this opt-in live
+        # accepts SNIPER_WIDE_CAP_C, a wider SNIPER_SLIP (0.05-0.10, the fair value still
+        # checked) and a 0.5-1.0bp trigger; the test returns the limit to the frozen ask +
+        # 0.05 for good once its realized loss reaches SNIPER_WIDE_CAP_LIVE_STOP_USD
+        # (Sniper._live_test_on). The wallet is the hard cap.
         self.wide_cap_live = _env_bool("SNIPER_WIDE_CAP_LIVE", False)
         self.wide_cap_live_stop_usd = _env_float("SNIPER_WIDE_CAP_LIVE_STOP_USD", 25)
         # The share minimum an order is held to (2026-10-29, the operator's
@@ -1346,7 +1347,10 @@ class Settings:
                     if live and self.wide_cap_live else
                     f"; WIDE CAP EXPERIMENT (paper only): limit ask+{self.wide_cap_c:g}c whatever the fair value says, "
                     f"and an ask above the fair limit still buys a fixed minimum-size order")
-                   if self.wide_cap_c > 0 else "")
+                   if self.wide_cap_c > 0 else
+                   (f"; LIVE TEST: limit ask+{self.slip:.2f}, the fair value still checked; back to the frozen "
+                    f"ask+0.05 after a ${self.wide_cap_live_stop_usd:g} realized loss since the test began "
+                    f"(SNIPER_WIDE_CAP_LIVE)" if live and self.wide_cap_live else ""))
                 + (f"; {self.paper_cash_note}" if self.paper_cash_note and self.kelly and self.order_type == "FAK"
                    else ""))
 
@@ -2412,22 +2416,20 @@ class Sniper:
             self.n["event errors"] += 1
 
     WIDE_CAP_STATE = "wide_cap_live_test.json"     # beside the live ledger
+    # the frozen spec's ask + slip: the live test's limit once it stops
+    FROZEN_SLIP = next(want for attr, _var, want, *_ in exec_latency.FROZEN_SPEC if attr == "slip")
 
-    def _wide_cap_now(self) -> float:
-        """The wide limit for this decision, in cents (0 = off: ask + slip and the fair
-        limit). Paper: SNIPER_WIDE_CAP_C. Live: only the operator's capped test
-        (SNIPER_WIDE_CAP_LIVE=1), and only until the realized P&L since the test began
-        reaches -SNIPER_WIDE_CAP_LIVE_STOP_USD - then off for good: the state file
-        beside the live ledger keeps it off across restarts (delete it to start a
-        new test). Checked at most once a second; an unreadable state fails off."""
-        c = float(getattr(self.s, "wide_cap_c", 0) or 0)
-        if c <= 0 or self.live is None:
-            return c
-        if not getattr(self.s, "wide_cap_live", False):
-            return 0.0                              # live refuses this at start; never trade it here
+    def _live_test_on(self) -> bool:
+        """The operator's capped live test (SNIPER_WIDE_CAP_LIVE=1) is running: opted
+        in, and the realized P&L since the test began still above
+        -SNIPER_WIDE_CAP_LIVE_STOP_USD - else it is off for good: the state file beside
+        the live ledger keeps it off across restarts (delete it to start a new test).
+        Checked at most once a second; an unreadable state or P&L fails off. Live only."""
+        if self.live is None or not getattr(self.s, "wide_cap_live", False):
+            return False
         st = self._wide_cap_live_state()
         if st is None or st.get("off"):
-            return 0.0
+            return False
         now = time.monotonic()
         if now - self._wide_cap_checked >= 1.0:
             self._wide_cap_checked = now
@@ -2435,12 +2437,29 @@ class Sniper:
                 realized = float(self.live.ledger.realized_since(float(st["started_wall"])))
             except Exception as exc:  # noqa: BLE001 - no P&L reading: the test cannot be bounded
                 self._wide_cap_live_off(st, None, f"realized P&L unreadable ({type(exc).__name__})")
-                return 0.0
+                return False
             st["realized"] = round(realized, 4)
             if not realized > -float(self.s.wide_cap_live_stop_usd):
                 self._wide_cap_live_off(st, realized, "the stop was reached")
-                return 0.0
-        return c
+                return False
+        return True
+
+    def _wide_cap_now(self) -> float:
+        """The wide limit for this decision, in cents (0 = off: ask + slip and the fair
+        limit). Paper: SNIPER_WIDE_CAP_C. Live: only while the capped live test runs."""
+        c = float(getattr(self.s, "wide_cap_c", 0) or 0)
+        if c <= 0 or self.live is None:
+            return c
+        return c if self._live_test_on() else 0.0      # live refuses it without the opt-in at start
+
+    def _slip_now(self) -> float:
+        """How far above the ask seen the limit goes (never past the fair limit).
+        Paper and normal live: SNIPER_SLIP (live: the frozen 0.05). A wider slip on
+        live only while the capped live test runs - then the frozen 0.05 for good."""
+        slip = float(self.s.slip)
+        if self.live is None or not getattr(self.s, "wide_cap_live", False) or not slip > self.FROZEN_SLIP:
+            return slip
+        return slip if self._live_test_on() else float(self.FROZEN_SLIP)
 
     def _wide_cap_live_state(self) -> dict | None:
         st = self._wide_cap_state
@@ -2459,7 +2478,7 @@ class Sniper:
         except (OSError, ValueError, KeyError, TypeError) as exc:
             st = {"started_wall": time.time(), "off": True}
             self._write({"wall": time.time(), "result": "wide_cap_off", "reason": f"state unreadable: {exc}"[:160]})
-            self.on_event("sniper", f"LIVE WIDE CAP TEST off: {path.name} is unreadable - fix or delete it", "bad")
+            self.on_event("sniper", f"LIVE TEST off: {path.name} is unreadable - fix or delete it", "bad")
         st["path"] = str(path)
         self._wide_cap_state = st
         return st
@@ -2473,7 +2492,7 @@ class Sniper:
             return True
         except OSError as exc:
             self.n["wide cap state write errors"] += 1
-            self.on_event("sniper", f"LIVE WIDE CAP TEST off: cannot write {path.name} ({type(exc).__name__})", "bad")
+            self.on_event("sniper", f"LIVE TEST off: cannot write {path.name} ({type(exc).__name__})", "bad")
             return False
 
     def _wide_cap_live_off(self, st: dict, realized, why: str) -> None:
@@ -2482,18 +2501,19 @@ class Sniper:
         self.n["wide cap live test stops"] += 1
         self._write({"wall": time.time(), "result": "wide_cap_off", "reason": why, "realized": st["realized"],
                      "stop_usd": float(self.s.wide_cap_live_stop_usd), "since": st["started_wall"]})
-        self.on_event("sniper", f"LIVE WIDE CAP TEST stopped ({why}): realized "
+        self.on_event("sniper", f"LIVE TEST stopped ({why}): realized "
                                 + ("unknown" if realized is None else f"${realized:+.2f}")
                                 + f" since the test began, stop -${float(self.s.wide_cap_live_stop_usd):g}; "
-                                  f"back to ask+{self.s.slip:.2f} and the fair limit", "bad")
+                                  f"back to ask+{float(self.FROZEN_SLIP):.2f} and the fair limit", "bad")
 
     def _wide_cap_view(self) -> dict | None:
         """The live test for the summary and the dashboard; None when it is not running."""
-        if self.live is None or not getattr(self.s, "wide_cap_live", False) or not self.s.wide_cap_c > 0:
+        if self.live is None or not getattr(self.s, "wide_cap_live", False):
             return None
         st = self._wide_cap_state or {}
-        return {"c": float(self.s.wide_cap_c), "off": bool(st.get("off")), "realized": st.get("realized"),
-                "stop_usd": float(self.s.wide_cap_live_stop_usd), "since": st.get("started_wall")}
+        return {"c": float(self.s.wide_cap_c), "slip": float(self.s.slip), "off": bool(st.get("off")),
+                "realized": st.get("realized"), "stop_usd": float(self.s.wide_cap_live_stop_usd),
+                "since": st.get("started_wall")}
 
     def _stop(self, reason: str) -> None:
         """Stop all new decisions where no kill switch can pause them instead (paper,
@@ -3936,7 +3956,7 @@ class Sniper:
             return self._skip("ask outside price band", row)
         # The price ceiling is fixed here, once, from the ask this decision saw:
         # never recomputed from a later ask, so it cannot chase the book.
-        cap = min(0.99, round(ask + self.s.slip, 4))
+        cap = min(0.99, round(ask + self._slip_now(), 4))
         above_fair = False
         wide_c = self._wide_cap_now()           # the wide limit: paper experiment / capped live test; 0 = off
         fair = None
