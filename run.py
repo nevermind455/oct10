@@ -2121,6 +2121,15 @@ class DashView:
             last = faults.get("last") or {}
             rows.append(("EXEC FAULT", "WARN", f"{faults['count']} - last {last.get('stage')}: "
                                                + safe_log_text(last.get("error"), limit=50)))
+        wide = summary.get("wide_cap_live")
+        if wide:
+            since = (time.strftime("%m-%d %H:%M", time.gmtime(float(wide["since"])))
+                     if wide.get("since") else "--")
+            realized = wide.get("realized")
+            rows.append(("WIDE CAP", "FAIL" if wide.get("off") else "WARN",
+                         ("OFF (stopped) " if wide.get("off") else f"LIVE TEST ask+{wide['c']:g}c ")
+                         + f"realized {'--' if realized is None else f'${realized:+.2f}'} of -${wide['stop_usd']:g}"
+                         f" since {since} UTC"))
         b = summary.get("binance") or {}
         primary = rt.sniper.s.primary_feed if rt.sniper is not None else None
         if primary == "coinbase":

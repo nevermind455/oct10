@@ -1637,7 +1637,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # paper's own). An explicit path stays strict and live-refused; live decisions are unchanged.
     # 2026-10-29 (tests/tests_paper_auto.py, tests/tests_paper_cash_mirror.py): validate the
     # live drawdown's own timestamp; fresh cash cannot renew an expired hybrid snapshot.
-    "sniper_mode.py": "f54177cb1cac6a1b4f5985d089226756bfac8248f6b79fe754a9a4456d3db098",
+    # 2026-10-29 (the operator's request, tests/tests_wide_cap_live.py): SNIPER_WIDE_CAP_LIVE=1 makes the
+    # wide limit a capped LIVE test - off for good once the realized P&L since the test began reaches
+    # -SNIPER_WIDE_CAP_LIVE_STOP_USD (state wide_cap_live_test.json); paper and default live unchanged.
+    "sniper_mode.py": "cc18e0162fee04e4974160889d8e1593cb0359d2a023b17928f966a7e09aa361",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
