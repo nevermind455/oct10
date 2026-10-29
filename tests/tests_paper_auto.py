@@ -176,6 +176,18 @@ class Cash(F.Gate):
         self.assertGreater(r["bankroll"], 500)
         self.assertNotIn("cash_source", r)
 
+    def test_old_live_drawdown_falls_back_even_when_live_cash_is_fresh(self):
+        now = time.time()
+        journal(self.lj, [
+            {"wall": now - 2_000, "result": "skipped", "hybrid": {"equity": 40.0, "high_water": 50.0}},
+            {"wall": now - 5, "result": "balance_read", "kelly_cash": 40.0},
+        ])
+        self.make(SNIPER_PAPER_CASH_FROM="", LIVE_SNIPER_JOURNAL=self.lj, SNIPER_HYBRID_SIZING="1")
+        self.sn._hybrid_risk = {"equity": 500.0, "high_water": 500.0, "observed_mono": time.monotonic()}
+        self.assertEqual(self.sn._bankroll_now(), 40.0)
+        h = self.sn._hybrid_factors()
+        self.assertEqual((h["equity"], h["high_water"], h["live_mirror"]), (500.0, 500.0, False))
+
 
 # run only this file's tests, not every inherited tests_sniper_fair.Gate test again
 for _name in [n for n in dir(F.Gate) if n.startswith("test") and n not in Cash.__dict__]:

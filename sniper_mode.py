@@ -2309,6 +2309,11 @@ class Sniper:
                 m = self._live_mirror_now()
                 if m["equity"] is None or m["high_water"] is None:
                     raise ValueError("no live drawdown reading in the live journal's end (SNIPER_PAPER_CASH_FROM)")
+                # Cash and drawdown come from separate rows. A recent balance
+                # read must not renew an older hybrid snapshot's freshness.
+                max_age = self.s.paper_cash_max_age_s
+                if m["hybrid_wall"] is None or not 0 <= time.time() - m["hybrid_wall"] <= max_age:
+                    raise ValueError(f"no live drawdown reading in the last {max_age:g}s (SNIPER_PAPER_CASH_FROM)")
                 equity, high_water = max(0.0, m["equity"]), m["high_water"]
                 mirror = {"live_mirror": True, "paper_equity": round(float(snapshot["equity"]), 4)}
             except ValueError:

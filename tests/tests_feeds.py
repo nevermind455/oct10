@@ -1635,7 +1635,9 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # draws delays from the live journal's last SNIPER_DELAY_DAYS days (else the model), and
     # SNIPER_PAPER_CASH_FROM unset = auto sizes from live's cash and drawdown while live runs (else
     # paper's own). An explicit path stays strict and live-refused; live decisions are unchanged.
-    "sniper_mode.py": "6874d31258fa307a3b4234f73926f5a465fe48c905c8884b1a0c16e3363059f0",
+    # 2026-10-29 (tests/tests_paper_auto.py, tests/tests_paper_cash_mirror.py): validate the
+    # live drawdown's own timestamp; fresh cash cannot renew an expired hybrid snapshot.
+    "sniper_mode.py": "f54177cb1cac6a1b4f5985d089226756bfac8248f6b79fe754a9a4456d3db098",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.

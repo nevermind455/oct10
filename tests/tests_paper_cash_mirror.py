@@ -144,6 +144,24 @@ class Paper(F.Gate):
         with self.assertRaises(ValueError):
             self.sn._hybrid_factors()
 
+    def test_fresh_cash_does_not_make_an_old_drawdown_fresh(self):
+        now = time.time()
+        journal(self.lj, [
+            {"wall": now - 2_000, "result": "skipped", "hybrid": {"equity": 40.0, "high_water": 50.0}},
+            {"wall": now - 5, "result": "balance_read", "kelly_cash": 40.0},
+        ])
+        self.make(SNIPER_PAPER_CASH_FROM=self.lj, SNIPER_HYBRID_SIZING="1")
+        self.sn._hybrid_risk = {"equity": 500.0, "high_water": 500.0, "observed_mono": time.monotonic()}
+        self.assertEqual(self.sn._bankroll_now(), 40.0)
+        with self.assertRaisesRegex(ValueError, "live drawdown reading"):
+            self.sn._hybrid_factors()
+
+        # The configured freshness window applies independently to the drawdown.
+        self.make(SNIPER_PAPER_CASH_FROM=self.lj, SNIPER_HYBRID_SIZING="1",
+                  SNIPER_PAPER_CASH_MAX_AGE_S="3000")
+        self.sn._hybrid_risk = {"equity": 500.0, "high_water": 500.0, "observed_mono": time.monotonic()}
+        self.assertEqual(self.sn._hybrid_factors()["equity"], 40.0)
+
     def test_an_unreadable_journal_stops_the_start(self):
         with self.assertRaises(ValueError) as cm:
             self.make(SNIPER_PAPER_CASH_FROM=os.path.join(self.ltmp.name, "missing.jsonl"))
