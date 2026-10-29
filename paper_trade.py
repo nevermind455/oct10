@@ -700,6 +700,7 @@ class PaperBroker:
     supports_share_sized = True      # shares= sizes the fixed maker stake at its limit
     supports_hybrid_risk_guard = True
     supports_venue_min_override = True   # place_trade(venue_min_shares=...) - SNIPER_VENUE_MIN_SHARES
+    supports_fill_gate = True        # place_trade(fill_gate=...) - the sniper's live fill odds
 
     mode = "PAPER"
 
@@ -813,6 +814,7 @@ class PaperBroker:
         self.last_fill: dict | None = None
         self.filled_orders = 0
         self.rejected_orders = 0
+        self._gate_reserved = 0.0        # cost of priced orders waiting on a fill_gate (not yet booked)
         self.started_wall = time.time()
         self.start_balance = self._load_or_create_account(start_balance)
 
@@ -1141,7 +1143,7 @@ class PaperBroker:
                     tag: str | None = None, latency_from_pc: int | None = None,
                     arrival_book=None, fak: bool = False, size_at_limit: bool = False,
                     shares: float | None = None, hybrid_risk_guard=None,
-                    venue_min_shares: float | None = None) -> bool:
+                    venue_min_shares: float | None = None, fill_gate=None) -> bool:
         """Run one simulated FOK; reject concurrent duplicate submissions.
 
         `shares` (with fak=True) sizes the maker stake as whole shares times
@@ -1183,6 +1185,15 @@ class PaperBroker:
         refused as "unknown book state", never filled. What the old rule
         (and any alternative books in info["alternatives"]) would have done
         is recorded in last_timing["arrival"].
+
+        `fill_gate(fill) -> None | reason` runs once the order has been
+        priced at the arrival book and before it is booked; it may block
+        (the sniper's live fill odds wait out a 5s markout). `fill` holds the
+        priced shares, average_price, fee and total_cost. A reason refuses
+        the order as that no-fill. While the gate runs the token's order slot
+        is free for the next order and the priced cost stays reserved; the
+        round cutoff is not re-checked after it (the order matched before
+        it). Without it nothing changes.
         """
         if latency_ms is not None:
             latency_ms = float(latency_ms)
@@ -1216,6 +1227,13 @@ class PaperBroker:
                         del self._execution_locks[key]
         if not owns_slot:
             return self._reject(side, amount, "another paper order is already in flight on this token")
+        freed = []
+
+        def free_slot():
+            # once: a fill_gate frees the slot early, the finally then has nothing to do
+            if not freed:
+                freed.append(True)
+                entry_lock.release()
         try:
             self.last_fill = None
             self.last_error = None
@@ -1227,9 +1245,10 @@ class PaperBroker:
                                      latency_ms=latency_ms, tag=tag, timing=timing,
                                      latency_from_pc=latency_from_pc, arrival_book=arrival_book,
                                      fak=fak, size_at_limit=size_at_limit, shares=shares,
-                                     hybrid_risk_guard=hybrid_risk_guard, venue_min_shares=venue_min_shares)
+                                     hybrid_risk_guard=hybrid_risk_guard, venue_min_shares=venue_min_shares,
+                                     fill_gate=fill_gate, free_slot=free_slot)
         finally:
-            entry_lock.release()
+            free_slot()
 
     # -- per-order outcome: see _results in __init__
     def _result(self, name):
@@ -1262,7 +1281,8 @@ class PaperBroker:
                      tag: str | None = None, timing: dict | None = None,
                      latency_from_pc: int | None = None, arrival_book=None,
                      fak: bool = False, size_at_limit: bool = False, shares: float | None = None,
-                     hybrid_risk_guard=None, venue_min_shares: float | None = None) -> bool:
+                     hybrid_risk_guard=None, venue_min_shares: float | None = None,
+                     fill_gate=None, free_slot=None) -> bool:
         side = str(side or "").upper()
         if shares is not None and not fak:
             return self._reject(side, amount, "a share-sized order is a fill-and-kill")
@@ -1445,6 +1465,24 @@ class PaperBroker:
             partial = bool(fak and quote.notional < spend.quantize(MONEY, rounding=ROUND_HALF_UP))
             if timer.unix() >= end - self.min_seconds_to_expiry:
                 raise PaperRejected("paper quote reached the round cutoff")
+            gated = fill_gate is not None
+            if gated:
+                # The order has met the book at its arrival; the gate decides
+                # whether live would have been filled there. Its cost is held
+                # from the other orders' cash checks until it books or misses.
+                held = float(quote.total_cost)
+                with self._lock:
+                    self._gate_reserved = getattr(self, "_gate_reserved", 0.0) + held
+                if free_slot is not None:
+                    free_slot()
+                try:
+                    why = fill_gate({"shares": float(quote.shares), "average_price": float(quote.average_price),
+                                     "fee": float(quote.fee), "total_cost": held})
+                finally:
+                    with self._lock:
+                        self._gate_reserved -= held
+                if why is not None:
+                    raise PaperRejected(str(why))
             with self._lock:
                 if self._context() != (condition_id, context_up, context_down):
                     raise PaperRejected("paper market changed before order booking")
@@ -1462,9 +1500,10 @@ class PaperBroker:
                                             f"token took the depth first")
                     quote = self._quote(book, spend, cap, rules, floor, fak, size, min_override)
                     partial = bool(fak and quote.notional < spend.quantize(MONEY, rounding=ROUND_HALF_UP))
-                if self.cash_balance() + 1e-9 < float(quote.total_cost):
+                cash = self.cash_balance() - getattr(self, "_gate_reserved", 0.0)
+                if cash + 1e-9 < float(quote.total_cost):
                     raise PaperRejected(
-                        f"paper cash ${self.cash_balance():.6f} is below total cost "
+                        f"paper cash ${cash:.6f} is below total cost "
                         f"${quote.total_cost:.6f}")
                 if hybrid_risk_guard is not None:
                     try:
@@ -1474,7 +1513,7 @@ class PaperBroker:
                 guard_error = _pre_submit_guard_error(pre_submit_guard)
                 if guard_error is not None:
                     raise PaperRejected(guard_error)
-                if timer.unix() >= end - self.min_seconds_to_expiry:
+                if not gated and timer.unix() >= end - self.min_seconds_to_expiry:
                     raise PaperRejected("pre-submit guard reached the round cutoff")
                 order_id = f"paper-{int(time.time() * 1000)}-{uuid.uuid4().hex[:12]}"
                 if timing is not None:

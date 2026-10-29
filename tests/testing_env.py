@@ -90,6 +90,9 @@ os.environ["SNIPER_FAIR"] = "0"
 # tests_paper_auto.py turns auto on around journals of its own.
 os.environ["SNIPER_DELAY_SOURCE"] = "model"
 os.environ["SNIPER_PAPER_CASH_FROM"] = "off"
+# Live's fill odds (SNIPER_FILL_ODDS, 2026-10-29) are learned from that journal too: off here,
+# so every book fill fills as before; tests_fill_odds.py turns them on around its own journals.
+os.environ["SNIPER_FILL_ODDS"] = "off"
 # Historical fixtures intentionally exercise the independent model. Strict
 # comparison tests opt in around synthetic live references of their own.
 os.environ["SNIPER_PAPER_LIVE_PARITY"] = "0"

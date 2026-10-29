@@ -1648,7 +1648,12 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Live adds diagnostic reference rows only; its order decisions and durable account state are unchanged.
     # Pre-push review: references are market-bound, include cached live readiness and known
     # balance/clock expiry; malformed delay rows cannot crash background refresh.
-    "sniper_mode.py": "79d05f9594678493e41a8e72eabb386730400862c062e09373bf141d2b5f5179",
+    # 2026-10-29 (the operator's request "make paper honest", tests/tests_fill_odds.py): paper keeps a
+    # book fill at live's odds for its 5s markout (live_fill_odds, SNIPER_FILL_ODDS auto/live/off,
+    # learned from the live journal's own orders and shadow rows); the side is free while it waits
+    # and its shares count as Kelly risk; paper matches run on their own 32 threads. Live's order path
+    # is unchanged.
+    "sniper_mode.py": "ae7648d9fa31f648c4f88b5bf6b20935356442b8f9e514813d0d5807de93744a",
     # Read-only reference schema, configuration checks and freshness validation for paper.
     "paper_parity.py": "7c5935e641ca4147d0551da53a4ab16efef64a2fd7dcff323d554382584269c5",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
@@ -1787,7 +1792,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # 2026-10-29 (tests/tests_venue_min.py): place_trade(venue_min_shares=) - SNIPER_VENUE_MIN_SHARES
     # replaces the published minimum for a share-sized FAK, through estimate_fok/fak/fak_shares'
     # new min_shares (default None: as before). Nothing else changed.
-    "paper_trade.py": "c094b84f5223860fa63a3598316c2bc9df0f0f89061b4ef0ed8812880cd01013",
+    # 2026-10-29 (tests/tests_fill_odds.py): place_trade(fill_gate=) - runs after pricing, before
+    # booking; a reason refuses the order; the token's slot is free and the priced cost held from
+    # other orders' cash checks meanwhile; no cutoff re-check after it. Without it nothing changes.
+    "paper_trade.py": "590eb16f7dd963f3403d177de1cdff81ba7469e7d3fec7ca05e6705f68ab258d",
     # Re-approved 2026-10-12 (audit 20261012): a rejection that also carries acceptance evidence
     # is not definitive
     # Re-recorded 2026-10-20 (completion pass): the venue client is the unified-SDK adapter
