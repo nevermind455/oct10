@@ -1453,7 +1453,7 @@ def t_paper_state_paths_are_isolated_and_configurable():
 # market_discovery.py, timer.py and config.py carry the same digests spe8's own
 # baseline approved. An intentional change to any of them needs review and a
 # new digest here (and in tests_dashboard, which reads this table).
-TRADING_FILES = ["sniper_mode.py", "sniper_live.py", "paper_trade.py", "polymarket_trade.py",
+TRADING_FILES = ["sniper_mode.py", "sniper_live.py", "paper_trade.py", "paper_parity.py", "polymarket_trade.py",
                  "orderbook.py", "market_discovery.py", "timer.py", "config.py", "fast_h2.py",
                  "accounting/ledger.py", "accounting/fees.py", "accounting/settlement.py",
                  "accounting/resolution.py", "feeds/book.py", "feeds/poly_user.py", "feeds/reconcile.py",
@@ -1643,7 +1643,14 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # 2026-10-29 (the operator's second live test): the same switch allows a wider ask + SNIPER_SLIP
     # (0.05-0.10) with the fair value still checked (Sniper._slip_now); the stop returns it to the
     # frozen ask + 0.05. Default live and paper unchanged.
-    "sniper_mode.py": "84c1a7b05392225821b46636f6dc973d05827404bec296d545fb7997b32672c8",
+    # 2026-10-29 (tests/tests_paper_parity.py): strict paper comparison requires fresh cached live
+    # controls, matching settings and current delays; shares live pauses, share limits and test stops.
+    # Live adds diagnostic reference rows only; its order decisions and durable account state are unchanged.
+    # Pre-push review: references are market-bound, include cached live readiness and known
+    # balance/clock expiry; malformed delay rows cannot crash background refresh.
+    "sniper_mode.py": "79d05f9594678493e41a8e72eabb386730400862c062e09373bf141d2b5f5179",
+    # Read-only reference schema, configuration checks and freshness validation for paper.
+    "paper_parity.py": "7c5935e641ca4147d0551da53a4ab16efef64a2fd7dcff323d554382584269c5",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.

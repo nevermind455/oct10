@@ -31,6 +31,7 @@ def env(**kw):
     """The process environment with every SNIPER_* variable removed, then kw set - so a
     developer's or the VPS's own .env cannot change what a test sees."""
     base = {k: v for k, v in os.environ.items() if not k.startswith("SNIPER_") and k != "BOT_LOCK_PATH"}
+    base["SNIPER_PAPER_LIVE_PARITY"] = "0"  # feed fixture, no live account reference
     base.update(kw)
     return patch.dict(os.environ, base, clear=True)
 

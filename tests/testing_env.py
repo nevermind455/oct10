@@ -90,3 +90,6 @@ os.environ["SNIPER_FAIR"] = "0"
 # tests_paper_auto.py turns auto on around journals of its own.
 os.environ["SNIPER_DELAY_SOURCE"] = "model"
 os.environ["SNIPER_PAPER_CASH_FROM"] = "off"
+# Historical fixtures intentionally exercise the independent model. Strict
+# comparison tests opt in around synthetic live references of their own.
+os.environ["SNIPER_PAPER_LIVE_PARITY"] = "0"

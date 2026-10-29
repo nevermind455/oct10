@@ -228,6 +228,13 @@ class LockTests(unittest.TestCase):
                 holder.kill()
                 holder.wait()
                 holder.stdout.close()
+            # Windows may retain the killed holder's byte-range lock briefly
+            # after wait(); compaction must still refuse until the OS releases it.
+            lock_path = pathlib.Path(str(path) + ".lock")
+            deadline = time.monotonic() + 1.0
+            while run.lock_held_elsewhere(lock_path) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertFalse(run.lock_held_elsewhere(lock_path), "a dead holder still owns the ledger lock")
             out = ledger_compact.compact(str(path))
             self.assertEqual((out["journal_entries_folded"], out["journal_left"]), (2, 0))
             self.assertEqual(journal.stat().st_size if journal.exists() else 0, 0)

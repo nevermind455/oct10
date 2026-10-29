@@ -7,6 +7,32 @@ The trading integration now targets the supported `polymarket-client==0.13.0`
 unified SDK. Native SDK integration and live latency still
 require verification on the intended host.
 
+Paper now defaults to **strict live comparison** (`SNIPER_PAPER_LIVE_PARITY=1`).
+Run the updated live and paper processes from the same folder with matching strategy
+settings. Live publishes cached cash, drawdown, pauses, share limits, venue-minimum
+fallback and wide-limit stop state every five seconds. Paper waits if this reference
+is missing, over 15 seconds old, from another market, or inconsistent with its
+configuration. It also requires live's balance, current-round cash read, private fill
+coverage, cached rules, clock and venue guard to be ready. A reference cannot outlive
+the balance or clock observation it describes. It also
+requires at least 30 dated live order delays from the last three wall-clock days,
+refreshes that sample every five minutes, and never falls back to model delays or
+its larger independent balance. Paper's own available cash still limits purchases.
+Matching broker price bands, spread limits and trading windows are checked too.
+Strict comparison requires exchange-timestamped arrival books with quiet-book
+inference disabled; unknown book states cannot become simulated fills.
+
+Existing `SNIPER_LATENCY_MS`, `SNIPER_DELAY_SOURCE=model`, alternate delay files, or
+`SNIPER_PAPER_CASH_FROM=off` conflict with strict comparison and produce an explicit
+startup error. Use `SNIPER_DELAY_SOURCE=auto` and `SNIPER_PAPER_CASH_FROM=auto`, with
+`LIVE_SNIPER_JOURNAL` naming the live process's journal. Position-manager paper orders
+are refused in strict mode because live runs that manager shadow-only.
+Set `SNIPER_PAPER_LIVE_PARITY=0` explicitly for a separate model experiment; startup
+labels that mode as unvalidated. Strict mode is also a simulation: cached controls
+can lag live, and independent inventory, signal delivery, venue competition and
+order execution can still differ. It does not guarantee identical fills or prevent
+live losses. Compare concurrent confirmed results before relying on a paper profit.
+
 This repo is carved out of `spe24` at **aaff811**: b314d70's engine, plus
 ace4d41 (the paper model's documented 250ms taker hold) and aaff811 (order rows
 journal their market and taker-delay flag). The trading engine was copied byte for
@@ -433,7 +459,7 @@ Re-running it is safe: it keeps `.env`, journals and ledgers.
 cd /opt/sniperbtc
 .venv/bin/python run_tests.py                                    # every suite passes, no network
 .venv/bin/python run.py --health                                 # Binance + the round's book connect
-tmux new -s sniper '.venv/bin/python -u run.py --paper --dash'   # let it trade an hour; detach: Ctrl+B D
+tmux new -s sniper 'SNIPER_PAPER_LIVE_PARITY=0 .venv/bin/python -u run.py --paper --dash' # independent smoke test only
 .venv/bin/python sniper_why.py                                   # signals, orders, fills, why skipped
 .venv/bin/python sniper_check.py --hours 1                       # 0 FAIL
 ```
@@ -446,6 +472,11 @@ tmux new -s sniper '.venv/bin/python -u run.py --paper --dash'   # let it trade 
 tmux new -s live '.venv/bin/python -u run.py --live --dash'
 .venv/bin/python live_check.py           # afterwards: what the canary measured
 ```
+
+The independent paper smoke test above checks the model and wiring; its simulated
+profit does not validate execution. Once the updated live process is running,
+start `run.py --paper --dash` in a second session from the same folder for strict
+comparison. Clear conflicting fixed/model-delay overrides as described above.
 
 Reaching a cumulative order, fill, round, spend or loss budget pauses new orders
 for five minutes. When that pause ends, the reached budget gains one increment
