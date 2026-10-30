@@ -1460,7 +1460,9 @@ TRADING_FILES = ["sniper_mode.py", "sniper_live.py", "paper_trade.py", "paper_pa
                  # Added 2026-10-20: since the unified-SDK migration these sign, build and post
                  # every order (they replaced the external py-clob-client), and hybrid_sizing.py
                  # sizes every Kelly order. They belong under the same review lock.
-                 "clob_client.py", "clob_signing.py", "clob_sdk.py", "hybrid_sizing.py"]
+                 "clob_client.py", "clob_signing.py", "clob_sdk.py", "hybrid_sizing.py",
+                 # Added 2026-10-30: the price to beat it computes decides the direction add-on's size.
+                 "price_to_beat.py"]
 BASELINE_SHA = {  # approved trading-file baseline; intentional changes require review
     # Reviewed 2026-10-11 deep audit: transport/dispatch ambiguity, freshness,
     # subscription and REST recovery races, paper slot publication, accounting
@@ -1660,10 +1662,19 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # SNIPER_DIR_ADD of its Kelly target more, only from the room the sniper's own limits leave
     # (live: also LiveExecution.addon_headroom); the sniper's trades and their sizes are unchanged,
     # Kelly leaves the add-on's filled shares out of its inventory.
-    "sniper_mode.py": "7aa59215c7cc843fbf88fd0a1d02716bd02d290aca5583d5cbb2db29d62d46b3",
+    # 2026-10-30 (the operator: "make sure price to beat is exact", tests/tests_dir_add.py): the price to
+    # beat is Chainlink's 60s TWAP at the start (Gamma cryptoMarketConfig), estimated as the trigger feed's
+    # own 60s TWAP plus a basis learned from Polymarket's published eventMetadata.priceToBeat (read after
+    # each close, journalled as ptb_official, restored from the journal); the add-on needs the side past it
+    # by more than SNIPER_PTB_MARGIN_BP and the estimate's largest error of the last 24 checks, after
+    # SNIPER_PTB_MIN_CHECKS checks. Off by default nothing trades differently.
+    "sniper_mode.py": "0e7c980c0119e839647eb39897495981c2859a2b658c3112d90231b2d6fcdae8",
     # Read-only reference schema, configuration checks and freshness validation for paper.
-    # 2026-10-30: the direction add-on's three settings are compared with live's as well.
-    "paper_parity.py": "8df7fff91c64011e40d6bd7d0bc444573c8a466b1551e58c899f7cbce4156684",
+    # 2026-10-30: the direction add-on's five settings are compared with live's as well.
+    "paper_parity.py": "8a7d4d8a3c83b794fd66ff49c5986da098c2490023a4bd2cc6e048dccece269e",
+    # 2026-10-30 (tests/tests_dir_add.py): pure - the 60s TWAP, the published value from a Gamma
+    # event, and the basis / error bookkeeping the direction add-on's margin rests on.
+    "price_to_beat.py": "44d3617aebbea9532c6c08256bac8b6b8746c8649cb21f1d73371258255cd6ad",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.

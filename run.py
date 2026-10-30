@@ -2000,8 +2000,8 @@ class DashView:
         end = hub.window_end
         ptb = sn.price_to_beat(end) if sn is not None and hasattr(sn, "price_to_beat") else None
         if ptb is not None:
-            # the sniper's own price to beat (the direction add-on's): the same idea, taken
-            # from the first trusted tick of the round instead of this screen's refresh
+            # the sniper's own price to beat (the direction add-on's): Chainlink's 60s TWAP at
+            # the start, estimated from the trigger feed and checked against Polymarket's values
             self._btc_start = ptb
         if trig:
             trig["btc_start"] = getattr(self, "_btc_start", None)

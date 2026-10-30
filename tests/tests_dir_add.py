@@ -4,14 +4,18 @@
     python tests/tests_dir_add.py
 
 "Keep the sniper strategy the same, add a little direction for profit." The
-sniper decides and sizes every order as before; when the side it buys is already
-beating the round's price to beat (the trigger feed's mid at the round's start),
-the same order buys SNIPER_DIR_ADD of its Kelly target more:
-  1  the price to beat is the first trusted trigger mid of each 5-minute round,
-     unknown if it came more than SNIPER_PTB_MAX_GAP_S after the start
-  2  a side beating it gets the add-on on top of the sniper's own shares
-  3  a side not beating it, an unknown price to beat or a stale mid: the
-     sniper's order exactly as without the add-on
+sniper decides and sizes every order as before; when the side it buys is past the
+round's price to beat by more than its estimate can be wrong, the same order buys
+SNIPER_DIR_ADD of its Kelly target more:
+  1  the price to beat is Chainlink's 60s TWAP at the round's start ("make sure it
+     is exact"): estimated live as the trigger feed's own 60s TWAP, corrected by and
+     checked against every value Polymarket publishes after the close; unknown when
+     the trigger prices do not cover the window
+  2  a side past it by more than the estimate's largest recent error (and the
+     SNIPER_PTB_MARGIN_BP floor), after SNIPER_PTB_MIN_CHECKS published rounds,
+     gets the add-on on top of the sniper's own shares
+  3  a side not past it, too close to call, not yet checked, an unknown price to
+     beat or a stale mid: the sniper's order exactly as without the add-on
   4  the add-on only uses room the sniper's own limits leave, and in LIVE only
      where the send checks the sniper's order passes still pass with it
   5  Kelly sizes the sniper's later orders without the add-on's filled shares
@@ -21,6 +25,7 @@ The real Sniper and paper broker (tests_sniper_fair.Gate). No network.
 """
 from __future__ import annotations
 
+import asyncio
 import math
 import pathlib
 import sys
@@ -36,6 +41,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 import testing_env  # noqa: E402,F401 - first: tests never read the bot's .env
 import exec_latency as X  # noqa: E402
 import paper_parity  # noqa: E402
+import price_to_beat as P  # noqa: E402
 import sniper_live as L  # noqa: E402
 import sniper_mode as S  # noqa: E402
 import tests_sniper_fair as F  # noqa: E402
@@ -47,57 +53,212 @@ PTB = 60_000.0
 T0 = 1_800_000_000.0           # a round start: a multiple of 300s
 
 
+class Twap(unittest.TestCase):
+    """price_to_beat.twap: Chainlink's 60s TWAP at the round's start, computed the same way on the trigger feed."""
+
+    def test_each_price_stands_until_the_next(self):
+        samples = [(T0 - 61, 100.0), (T0 - 30, 200.0), (T0 + 1, 999.0)]   # after the start: not used
+        self.assertEqual(P.twap(samples, T0, max_gap=60), (150.0, None))
+        flat = [(T0 - 60 + i, 80_000.0) for i in range(60)]
+        self.assertAlmostEqual(P.twap(flat, T0, max_gap=5)[0], 80_000.0)
+
+    def test_a_window_the_prices_do_not_cover_is_unknown(self):
+        late = [(T0 - 30 + i, 80_000.0) for i in range(30)]               # started 30s before the round
+        price, why = P.twap(late, T0, max_gap=5)
+        self.assertIsNone(price)
+        self.assertIn("60s before the round's start", why)
+        gap = [(T0 - 61, 1.0), (T0 - 40, 1.0), (T0 - 1, 1.0)]             # 21s and 39s without a price
+        price, why = P.twap(gap, T0, max_gap=5)
+        self.assertIsNone(price)
+        self.assertIn("39.0s gap", why)
+        stale_end = [(T0 - 60 + i, 1.0) for i in range(50)]               # nothing in the last 10s
+        self.assertIsNone(P.twap(stale_end, T0, max_gap=5)[0])
+
+    def test_it_is_the_markets_own_lookback(self):
+        import market_discovery
+        self.assertEqual(P.TWAP_S, market_discovery.EXPECTED_TWAP_LOOKBACK_SECONDS)
+
+
+class Published(unittest.TestCase):
+    """What Polymarket publishes after the close (Gamma eventMetadata), and the checks against it."""
+
+    def test_the_value_from_a_gamma_event(self):
+        self.assertEqual(P.official_from_event({"eventMetadata": {"priceToBeat": 80953.12, "finalPrice": "80961.5"}}),
+                         (80953.12, 80961.5))
+        self.assertEqual(P.official_from_event({"eventMetadata": '{"priceToBeat": "80953.12"}'}), (80953.12, None))
+        for event in (None, {}, {"eventMetadata": None}, {"eventMetadata": "{bad"},
+                      {"eventMetadata": {"priceToBeat": "n/a"}}, {"eventMetadata": {"priceToBeat": -1}},
+                      {"eventMetadata": {"priceToBeat": float("nan")}}):
+            self.assertIsNone(P.official_from_event(event)[0], event)
+        self.assertEqual(P.metadata_keys({"eventMetadata": {"b": 1, "a": 2}}), ["a", "b"])
+        self.assertEqual(P.metadata_keys({}), [])
+
+    def test_the_basis_corrects_and_the_error_is_measured_once_it_has_rounds(self):
+        c = P.Calibration()
+        self.assertEqual(c.estimate(80_000.0), (80_000.0, 0))
+        for i in range(3):                                       # Chainlink 8 dollars over our TWAP
+            est, n = c.estimate(80_000.0)
+            row = c.add(T0 + 300 * i, 80_000.0, est, n, 80_008.0)
+            self.assertIsNone(row["err_bp"])                     # no basis yet: not an error of the method
+        self.assertEqual(c.basis, 8.0)
+        self.assertEqual(c.checks, 0)
+        est, n = c.estimate(81_000.0)
+        self.assertEqual((est, n), (81_008.0, 3))
+        row = c.add(T0 + 900, 81_000.0, est, n, 81_016.1)        # 8.1 dollars off the estimate
+        self.assertAlmostEqual(row["err_bp"], 8.1 / 81_016.1 * 1e4, places=3)
+        self.assertEqual(c.checks, 1)
+        self.assertAlmostEqual(c.margin_bp(0.5), 8.1 / 81_016.1 * 1e4)
+        self.assertEqual(c.margin_bp(5.0), 5.0)                  # never under the operator's floor
+        self.assertEqual(c.add(T0 + 900, 81_000.0, est, n, 81_016.1), {})   # a round counts once
+        self.assertEqual(c.checks, 1)
+
+    def test_a_round_without_our_own_twap_still_counts_nothing_wrong(self):
+        c = P.Calibration()
+        row = c.add(T0, None, None, 0, 80_000.0)
+        self.assertEqual((row["raw"], row["err_bp"], c.basis, c.checks), (None, None, 0.0, 0))
+
+
 class PriceToBeat(unittest.TestCase):
     def sniper(self, **env):
-        return S.Sniper(I.Market(T0 + 300), None, settings=I.settings(**env))
+        sn = S.Sniper(I.Market(T0 + 600), None, settings=I.settings(**env))
+        sn.rows = []
+        sn._write = sn.rows.append
+        return sn
 
-    def test_the_first_trusted_mid_of_each_round_and_never_a_late_one(self):
+    def feed(self, sn, first, last, price=lambda t: 80_000.0, step=1.0):
+        t = first
+        while t <= last + 1e-9:
+            sn._note_primary_mid(price(t), t, t - T0)
+            t += step
+
+    def test_each_rounds_estimate_is_the_trigger_feeds_60s_twap_at_its_start(self):
         sn = self.sniper()
-        sn._note_primary_mid(60_000.0, T0 + 0.4, 1.0)
-        sn._note_primary_mid(60_100.0, T0 + 10.0, 2.0)            # later in the same round: not the price to beat
-        self.assertEqual(sn.price_to_beat(T0 + 300), 60_000.0)
-        self.assertEqual(sn.primary_mid, (60_100.0, 2.0))
-        sn._note_primary_mid(60_200.0, T0 + 300 + 7.0, 3.0)      # first heard 7s in (a restart): unknown
-        self.assertIsNone(sn.price_to_beat(T0 + 600))
-        self.assertEqual(sn.ptb_rounds[T0 + 300], (None, 7.0))
-        sn._note_primary_mid(60_300.0, T0 + 600 + 0.1, 4.0)
-        self.assertEqual(sn.price_to_beat(T0 + 900), 60_300.0)
-        self.assertIsNone(sn.price_to_beat(None))
-        self.assertIsNone(sn.price_to_beat(T0 + 3000))            # a round never seen
+        self.feed(sn, T0 + 200, T0 + 300.5, price=lambda t: 80_000.0 if t < T0 + 270 else 80_090.0)
+        rec = sn.ptb_rounds[T0 + 300]
+        self.assertAlmostEqual(rec["raw"], (80_000.0 * 30 + 80_090.0 * 30) / 60)   # 30s at each price
+        self.assertEqual((rec["est"], rec["basis_rounds"], rec["why"]), (rec["raw"], 0, None))
+        self.assertEqual(sn.price_to_beat(T0 + 600), rec["est"])
+        self.assertLessEqual(len(sn._ptb_hist), 70)                # only the last ~65s are kept
+        self.assertIn(T0 + 300, sn._ptb_pending)                    # waits for Polymarket's value
 
-    def test_the_allowed_gap_is_a_setting_and_old_rounds_go(self):
-        sn = self.sniper(SNIPER_PTB_MAX_GAP_S="10")
-        sn._note_primary_mid(60_200.0, T0 + 7.0, 1.0)
-        self.assertEqual(sn.price_to_beat(T0 + 300), 60_200.0)
-        for i in range(1, 7):
-            sn._note_primary_mid(60_000.0 + i, T0 + 300 * i + 0.2, 1.0 + i)
-        self.assertLessEqual(len(sn.ptb_rounds), 4)
-        self.assertEqual(sn.price_to_beat(T0 + 300 * 7), 60_006.0)
+    def test_unknown_after_a_start_too_close_to_the_round(self):
+        sn = self.sniper()
+        self.feed(sn, T0 + 280, T0 + 300.5)                         # 20s of prices before the start
+        rec = sn.ptb_rounds[T0 + 300]
+        self.assertIsNone(rec["est"])
+        beating, f = sn._ptb_view("UP", T0 + 600)
+        self.assertIsNone(beating)
+        self.assertIn("60s before the round's start", f["ptb_why"])
+        self.assertIsNone(sn.price_to_beat(T0 + 900))              # a round never seen
 
-    def test_a_coinbase_ticker_sets_it(self):
+    def test_a_coinbase_ticker_feeds_it(self):
         import tests_sniper_coinbase as C
         sn, _fired = C.make()
         sn.on_coinbase(C.ticker(60_000.0))
         self.assertAlmostEqual(sn.primary_mid[0], 60_000.0, places=6)
-        now = time.time()
-        self.assertIn(now - now % S.ROUND_S, sn.ptb_rounds)
+        self.assertEqual(len(sn._ptb_hist), 1)
 
-    def test_beating_is_measured_in_the_signals_direction(self):
+    def calibrated(self, sn, errors=(0.2,) * 6):
+        sn.ptb_calib.errors.extend(errors)
+        sn.ptb_rounds[T0 + 300] = {"est": PTB, "raw": PTB, "basis_rounds": 12, "why": None}
+
+    def test_only_past_the_estimates_largest_error_counts_as_beating(self):
         sn = self.sniper()
-        sn.ptb_rounds[T0] = (PTB, 0.2)
-        sn.primary_mid = (PTB * (1 + 3e-4), time.monotonic())    # 3bp above
-        beating, f = sn._ptb_view("UP", T0 + 300)
+        self.calibrated(sn, errors=(0.2, 1.5, 0.3, 0.1, 0.4, 0.2))  # margin: max(1.0 floor, 1.5)
+        sn.primary_mid = (PTB * (1 + 3e-4), time.monotonic())       # 3bp above
+        beating, f = sn._ptb_view("UP", T0 + 600)
         self.assertTrue(beating)
-        self.assertEqual(f, {"ptb": PTB, "ptb_dist_bp": 3.0})
-        beating, f = sn._ptb_view("DOWN", T0 + 300)
+        self.assertEqual(f, {"ptb": PTB, "ptb_dist_bp": 3.0, "ptb_margin_bp": 1.5, "ptb_checks": 6})
+        beating, f = sn._ptb_view("DOWN", T0 + 600)
         self.assertFalse(beating)
         self.assertEqual(f["ptb_dist_bp"], -3.0)
-        sn.primary_mid = (PTB, time.monotonic())                  # exactly at it: not beating
-        self.assertFalse(sn._ptb_view("UP", T0 + 300)[0])
+        sn.primary_mid = (PTB * (1 + 1e-4), time.monotonic())       # 1bp above: inside the 1.5bp error
+        beating, f = sn._ptb_view("UP", T0 + 600)
+        self.assertIsNone(beating)
+        self.assertEqual(f["ptb_why"], "within the estimate's error (+-1.50bp)")
+        sn.primary_mid = (PTB, time.monotonic())                    # exactly at it: not beating
+        self.assertFalse(sn._ptb_view("UP", T0 + 600)[0])
         sn.primary_mid = (PTB * 1.001, time.monotonic() - S.PTB_MID_MAX_AGE_S - 1)
-        self.assertEqual(sn._ptb_view("UP", T0 + 300), (None, {"ptb": PTB, "ptb_dist_bp": None}))
-        self.assertEqual(sn._ptb_view("UP", T0 + 600), (None, {"ptb": None}))
+        self.assertEqual(sn._ptb_view("UP", T0 + 600),
+                         (None, {"ptb": PTB, "ptb_dist_bp": None, "ptb_why": "no fresh trigger price"}))
 
+    def test_not_before_enough_published_rounds_checked_it(self):
+        sn = self.sniper()
+        self.calibrated(sn, errors=(0.2,) * 5)
+        sn.primary_mid = (PTB * 1.001, time.monotonic())
+        beating, f = sn._ptb_view("UP", T0 + 600)
+        self.assertIsNone(beating)
+        self.assertEqual(f["ptb_why"], "estimate checked against Polymarket's published price to beat on 5 of 6 rounds")
+        sn = self.sniper(SNIPER_PTB_MIN_CHECKS="5")
+        self.calibrated(sn, errors=(0.2,) * 5)
+        sn.primary_mid = (PTB * 1.001, time.monotonic())
+        self.assertTrue(sn._ptb_view("UP", T0 + 600)[0])
+
+    def test_polymarkets_published_value_checks_and_corrects_each_round(self):
+        sn = self.sniper()
+        asked = []
+        events = {}
+
+        def fetch(slug):
+            asked.append(slug)
+            return events.get(slug)
+        sn._ptb_pending = {T0: {"est": 80_000.0, "raw": 80_000.0, "basis_rounds": 0},
+                           T0 + 300: {"est": 80_100.0, "raw": 80_100.0, "basis_rounds": 0}}
+        clock = [T0 + 300 + 10.0]                                   # 10s after the first one closed: too soon
+        real_time = S.time.time
+        S.time.time = lambda: clock[0]
+        try:
+            asyncio.run(sn._ptb_official_once(fetch))
+            self.assertEqual(asked, [])
+            clock[0] = T0 + 300 + 30.0
+            events["btc-updown-5m-1800000000"] = {"eventMetadata": {"other": 1}}   # not published yet
+            asyncio.run(sn._ptb_official_once(fetch))
+            self.assertEqual(asked, ["btc-updown-5m-1800000000"])
+            self.assertEqual(sn._ptb_pending[T0]["keys"], ["other"])
+            events["btc-updown-5m-1800000000"] = {"eventMetadata": {"priceToBeat": 80_008.0, "finalPrice": 80_100.0}}
+            asyncio.run(sn._ptb_official_once(fetch))
+            self.assertNotIn(T0, sn._ptb_pending)
+            row = [r for r in sn.rows if r.get("result") == "ptb_official"][-1]
+            self.assertEqual((row["round_start"], row["official"], row["raw"], row["final"]),
+                             (T0, 80_008.0, 80_000.0, 80_100.0))
+            self.assertEqual(sn.ptb_calib.basis, 8.0)
+            clock[0] = T0 + 600 + S.PTB_GIVE_UP_S + 1                # never published: given up, journalled
+            asyncio.run(sn._ptb_official_once(fetch))
+            self.assertEqual(sn._ptb_pending, {})
+            self.assertEqual([r["result"] for r in sn.rows][-1], "ptb_official_missing")
+        finally:
+            S.time.time = real_time
+
+    def test_a_published_value_far_from_our_twap_is_journalled_not_used(self):
+        sn = self.sniper()
+        sn._ptb_pending = {T0: {"est": 80_000.0, "raw": 80_000.0, "basis_rounds": 0}}
+        real_time = S.time.time
+        S.time.time = lambda: T0 + 400.0
+        try:
+            asyncio.run(sn._ptb_official_once(lambda slug: {"eventMetadata": {"priceToBeat": 8_000.0}}))
+        finally:
+            S.time.time = real_time
+        self.assertEqual(sn.rows[-1]["result"], "ptb_official_suspect")
+        self.assertEqual((sn.ptb_calib.basis, len(sn.ptb_calib.seen)), (0.0, 0))
+
+    def test_a_restart_restores_the_checks_from_the_journal(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = pathlib.Path(d) / "live_sniper.jsonl"
+            with open(path, "w") as fh:
+                for i in range(10):
+                    fh.write(json.dumps({"wall": T0 + 300 * i, "result": "skipped", "reason": "x"}) + "\n")
+                    fh.write(json.dumps({"wall": T0 + 300 * i + 60, "result": "ptb_official", "round_start": T0 + 300 * i,
+                                         "official": 80_008.0, "raw": 80_000.0, "est": 80_008.5,
+                                         "basis_rounds": i}) + "\n")
+            sn = S.Sniper(I.Market(T0 + 600), None, settings=I.settings(), journal_path=path)
+            self.assertEqual(sn._restore_ptb_checks(), 10)
+            newest = S.journal_tail_rows(path, b'"ptb_official"', 4, chunk=64)   # tiny chunks: lines split across reads
+            self.assertEqual([r["round_start"] for r in newest], [T0 + 300 * i for i in range(6, 10)])
+        self.assertEqual(sn.ptb_calib.basis, 8.0)
+        self.assertEqual(sn.ptb_calib.checks, 7)                   # rounds whose basis had 3+ rounds
+        self.assertAlmostEqual(sn.ptb_calib.margin_bp(0.0), 0.5 / 80_008.0 * 1e4)
 
 class Decision(F.Gate):
     """Share sizing, as live runs it (the frozen spec), through the real decision and paper fill."""
@@ -108,9 +269,12 @@ class Decision(F.Gate):
         # 200-share cap, so there is room left for an add-on
         self.sn._read_bankroll = lambda: 100.0
 
-    def beat(self, bp: float, *, age_s: float = 0.0) -> None:
-        """The current round's price to beat, and the trigger mid now `bp` past it (UP's way)."""
-        self.sn.ptb_rounds[float(self.m.window_end) - S.ROUND_S] = (PTB, 0.2)
+    def beat(self, bp: float, *, age_s: float = 0.0, checks: int = 6) -> None:
+        """The current round's price to beat (checked on `checks` published rounds, each 0.2bp
+        off), and the trigger mid now `bp` past it (UP's way)."""
+        self.sn.ptb_rounds[float(self.m.window_end) - S.ROUND_S] = {"est": PTB, "raw": PTB, "basis_rounds": 12,
+                                                                      "why": None}
+        self.sn.ptb_calib.errors.extend([0.2] * checks)
         self.sn.primary_mid = (PTB * (1 + bp / 1e4), time.monotonic() - age_s)
 
     def base_shares(self, r) -> int:
@@ -158,7 +322,7 @@ class Decision(F.Gate):
         r = self.order("UP", [(0.41, 1000)], mid=0.40, move_bp=5.0)       # never heard this round's start
         self.assertEqual(r["result"], "filled", r)
         self.assertIsNone(r["ptb"])
-        self.assertEqual((r["dir_add_shares"], r["dir_add_why"]), (0, "price to beat unknown"))
+        self.assertEqual((r["dir_add_shares"], r["dir_add_why"]), (0, "this process did not see the round start"))
         self.assertEqual(r["order_shares"], self.base_shares(r))
 
     def test_a_stale_trigger_mid_adds_nothing(self):
@@ -167,7 +331,26 @@ class Decision(F.Gate):
         self.beat(+5.0, age_s=S.PTB_MID_MAX_AGE_S + 1)
         r = self.order("UP", [(0.41, 1000)], mid=0.40, move_bp=5.0)
         self.assertEqual(r["result"], "filled", r)
-        self.assertEqual((r["ptb_dist_bp"], r["dir_add_why"]), (None, "price to beat unknown"))
+        self.assertEqual((r["ptb_dist_bp"], r["dir_add_why"]), (None, "no fresh trigger price"))
+        self.assertEqual(r["order_shares"], self.base_shares(r))
+
+    def test_too_close_to_call_or_not_yet_checked_adds_nothing(self):
+        self.make(SNIPER_DIR_ADD="0.5")
+        self.pin_time_left()
+        self.beat(+0.5)                                            # past it, but inside the 1bp floor
+        r = self.order("UP", [(0.41, 1000)], mid=0.40, move_bp=5.0)
+        self.assertEqual(r["result"], "filled", r)
+        self.assertEqual((r["dir_add_shares"], r["dir_add_why"]), (0, "within the estimate's error (+-1.00bp)"))
+        self.assertEqual(r["order_shares"], self.base_shares(r))
+
+    def test_not_yet_checked_against_polymarket_adds_nothing(self):
+        self.make(SNIPER_DIR_ADD="0.5")
+        self.pin_time_left()
+        self.beat(+5.0, checks=0)
+        r = self.order("UP", [(0.41, 1000)], mid=0.40, move_bp=5.0)
+        self.assertEqual(r["result"], "filled", r)
+        self.assertEqual(r["dir_add_why"],
+                         "estimate checked against Polymarket's published price to beat on 0 of 6 rounds")
         self.assertEqual(r["order_shares"], self.base_shares(r))
 
     def test_the_add_on_never_takes_room_the_sniper_does_not_leave(self):
@@ -310,7 +493,9 @@ class SettingsAndLive(unittest.TestCase):
     def test_bad_values_stop_the_start(self):
         for env in ({"SNIPER_DIR_ADD": "-0.1"}, {"SNIPER_DIR_ADD": "1.5"}, {"SNIPER_DIR_ADD": "abc"},
                     {"SNIPER_ORDER_SIZING": "dollars"}, {"SNIPER_KELLY": "0"},
-                    {"SNIPER_PTB_MAX_GAP_S": "0"}, {"SNIPER_PTB_MAX_GAP_S": "61"}):
+                    {"SNIPER_PTB_MAX_GAP_S": "0"}, {"SNIPER_PTB_MAX_GAP_S": "61"},
+                    {"SNIPER_PTB_MARGIN_BP": "-1"}, {"SNIPER_PTB_MARGIN_BP": "51"},
+                    {"SNIPER_PTB_MIN_CHECKS": "0"}, {"SNIPER_PTB_MIN_CHECKS": "25"}, {"SNIPER_PTB_MIN_CHECKS": "2.5"}):
             with self.assertRaises(ValueError, msg=env):
                 I.settings(**{**self.ON, **env})
 
@@ -321,7 +506,7 @@ class SettingsAndLive(unittest.TestCase):
         self.assertNotIn("DIRECTION", off.lines()[0] + off.lines(live=True)[0])
 
     def test_strict_paper_comparison_matches_it_with_live(self):
-        for key in ("dir_add", "dir_add_live", "ptb_max_gap_s"):
+        for key in ("dir_add", "dir_add_live", "ptb_max_gap_s", "ptb_margin_bp", "ptb_min_checks"):
             self.assertIn(key, paper_parity.CONFIG_FIELDS)
 
     def test_the_pnl_report_splits_the_add_on_from_the_sniper(self):
@@ -340,6 +525,20 @@ class SettingsAndLive(unittest.TestCase):
         self.assertIn("side not beating:    1 trades, won 0 (0%), PnL $-3.00", text)
         self.assertIn("add-on bought on 1 orders: its own PnL $+2.00, the sniper's part of those orders $+4.00", text)
         self.assertIn("+25% $+0.50, +50% $+1.00", text)                 # on the sniper's own $+2.00 there
+
+    def test_the_pnl_report_shows_how_exact_the_price_to_beat_was(self):
+        import live_pnl
+        self.assertEqual(live_pnl.ptb_check_summary([{"result": "skipped"}]), [])
+        rows = [{"result": "ptb_official", "err_bp": None, "basis_now": 8.0},
+                {"result": "ptb_official", "err_bp": 0.4, "basis_now": 8.1},
+                {"result": "ptb_official", "err_bp": 1.2, "basis_now": 8.2},
+                {"result": "ptb_official_missing", "metadata_keys": ["finalPrice"]},
+                {"result": "ptb_official_suspect"}]
+        text = "\n".join(live_pnl.ptb_check_summary(rows))
+        self.assertIn("3 published, 1 never published, 1 set aside as implausible", text)
+        self.assertIn("estimate error, all 2: avg 0.80bp, largest 1.20bp", text)
+        self.assertIn("correction now: Polymarket's value - the trigger feed's TWAP = $+8.20", text)
+        self.assertIn("eventMetadata held ['finalPrice']", text)
 
     def test_the_dashboard_shows_the_price_to_beat(self):
         self.assertEqual(_beat_text({"btc_start": 60_000.0, "mid": 60_030.0}), "  to beat ~60,000 (+5.0bp)")

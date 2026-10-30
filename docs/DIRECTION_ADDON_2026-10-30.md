@@ -59,17 +59,62 @@ The add-on's daily PnL at +50% on 10-22..25 was +$7.6, +$14.5, -$5.4 and +$6.4. 
 probability range is a bootstrap over markets. Four test days are not enough to
 call the edge proven.
 
+## The price to beat: what it is, and how the bot makes sure of it
+
+**What it is.** A btc-updown-5m market resolves Up when Chainlink's BTC/USD
+60-second TWAP at the round's end is at or above the same TWAP at its start. That
+start value is the price to beat. Gamma declares this on every market
+(`cryptoMarketConfig`: `twapEnabled`, `twapLookbackSeconds` 60), and
+`market_discovery.py` already refuses any market that says otherwise. It is not a
+single price at the start, which is what the first version of this change used.
+
+**When Polymarket says it.** Polymarket publishes the exact value in the Gamma
+event's `eventMetadata.priceToBeat` only after the round closes. A third-party
+bot measured that at 30-300s after the close (alessiocriscio/PolyHarvest PR #8).
+The same source finds a round's price to beat equal to the previous round's
+`finalPrice`. So no exact value exists while a round can still be traded.
+
+Polymarket's own documentation could not be read from this environment (its hosts
+are blocked here), so the field name comes from that bot's code. It reports
+having verified it on a live response. If the field is elsewhere, nothing is ever
+calibrated and no add-on is bought: the journal's `ptb_official_missing` rows list
+the `eventMetadata` keys Gamma did return.
+
+**What the bot does** (`price_to_beat.py`, `Sniper._note_primary_mid`,
+`_ptb_view`, `_ptb_official_loop`):
+
+1. **Estimate.** At each round's first trusted trigger price, the bot computes
+   the trigger feed's own 60s TWAP ending at the start. That is the same
+   calculation on a different venue's prices: each price stands until the next.
+   It needs a price at or before the window's start and no gap over
+   `SNIPER_PTB_MAX_GAP_S` (5s); otherwise the round's price to beat is unknown.
+2. **Correction.** The estimate is that TWAP plus the basis: the median of
+   (published value - our TWAP) over the last 12 published rounds.
+3. **Check.** From 20s after each close, every 10s for up to 30 minutes, the bot
+   reads the round's published value from Gamma and journals a `ptb_official`
+   row: the published value, our TWAP, the estimate used live, its error in bp,
+   and the basis now. A published value over 100bp from our TWAP is journalled
+   (`ptb_official_suspect`) but never used. After a restart, these rows are read
+   back from the end of the journal, so the checks continue at once.
+4. **Decision.** The add-on needs the side past the estimate by more than both
+   `SNIPER_PTB_MARGIN_BP` (1bp) and the largest error over the last 24 checks,
+   after at least `SNIPER_PTB_MIN_CHECKS` (6) checks. An error counts once the
+   basis behind it had 3 published rounds. So the estimate would have to be
+   wrong by more than it has recently been wrong to turn "beating" into "not
+   beating". Too close, not yet checked, unknown or a stale price: no add-on,
+   and `dir_add_why` says which.
+
+`live_pnl.py` prints PRICE TO BEAT CHECKS: published, never published, set aside,
+the average and largest error, and the basis now. That is the evidence of how
+exact the estimate is on the VPS.
+
 ## The change
 
-1. **Price to beat.** Each trusted trigger-feed mid (those the volatility model
-   takes) is offered to `Sniper._note_primary_mid`. The first one at or after a
-   round's start becomes its price to beat, if it came within
-   `SNIPER_PTB_MAX_GAP_S` (5s). Otherwise the price to beat is unknown for that
-   round: after a restart mid-round, or a feed outage at the start.
-2. **Every decided signal** journals `ptb` and `ptb_dist_bp`: how far the trigger
-   mid is past it, in the signal's direction. This happens whether or not the
-   add-on is on. A mid older than 2s counts as unknown.
-3. **The add-on** (`Sniper._dir_add`) runs after Kelly has sized the sniper's order
+1. **Every decided signal** journals `ptb` (the estimate), `ptb_dist_bp` (how far
+   the trigger mid is past it, in the signal's direction), `ptb_margin_bp`,
+   `ptb_checks` and, when it cannot say, `ptb_why`. This happens whether or not
+   the add-on is on. A mid older than 2s counts as unknown.
+2. **The add-on** (`Sniper._dir_add`) runs after Kelly has sized the sniper's order
    and the order has been rounded to whole-cent shares. If the side is beating the
    price to beat, the order gets `floor(SNIPER_DIR_ADD x Kelly target)` more
    shares. The extra is limited to the room the sniper's own limits leave: the
@@ -79,15 +124,15 @@ call the edge proven.
    budget. If it would not, the add-on is dropped and `dir_add_why` says why. An
    order the sniper would skip stays skipped. A fixed-size order (a minimum entry,
    or the wide-cap experiment) gets nothing.
-4. **Kelly** sizes the sniper's later orders without the add-on's filled shares
+3. **Kelly** sizes the sniper's later orders without the add-on's filled shares
    (`_dir_book`, pro rata by shares, and undone on a retracted fill). So the
    sniper's own sizing stays as it was. The per-side cap is still shared. After a
    restart the add-on's earlier shares count as the sniper's for that round, which
    is the conservative direction.
-5. **Live** refuses `SNIPER_DIR_ADD` without `SNIPER_DIR_ADD_LIVE=1`, and above
-   0.5. Strict paper comparison includes the three settings, so paper with the
+4. **Live** refuses `SNIPER_DIR_ADD` without `SNIPER_DIR_ADD_LIVE=1`, and above
+   0.5. Strict paper comparison includes the five settings, so paper with the
    add-on beside a live bot without it needs `SNIPER_PAPER_LIVE_PARITY=0`.
-6. **Reporting.** `live_pnl.py` (and `--paper`) prints a DIRECTION ADD-ON section:
+5. **Reporting.** `live_pnl.py` (and `--paper`) prints a DIRECTION ADD-ON section:
    - fills beating vs not beating the price to beat;
    - the add-on's own PnL apart from the sniper's part of the same orders;
    - what +25% / +50% would have made at the same prices.
@@ -97,18 +142,24 @@ call the edge proven.
 ## Rollout
 
 1. **One week:** live with `SNIPER_DIR_ADD=0`, which only journals the price to
-   beat. Alongside it, paper with `SNIPER_DIR_ADD=0.5` and
-   `SNIPER_PAPER_LIVE_PARITY=0`. Check each with `live_pnl.py`.
+   beat and its checks. Alongside it, paper with `SNIPER_DIR_ADD=0.5` and
+   `SNIPER_PAPER_LIVE_PARITY=0`. Check each with `live_pnl.py`. Its PRICE TO BEAT
+   CHECKS section must show published values arriving, and an error well under
+   the distances the add-on acts on.
 2. **If the beating side keeps its edge in live's journal:** live
    `SNIPER_DIR_ADD=0.25`, `SNIPER_DIR_ADD_LIVE=1`.
 3. **Later:** 0.5, if the add-on's own PnL stays positive.
 
 ## Limits
 
-- The price to beat is the trigger feed's mid at the round's start, not the
-  Chainlink price the market settles on. The two can differ (not measured here),
-  so a fill very close to the price to beat can be on the wrong side of the real
-  one.
+- Live, the price to beat is an estimate from a different venue's prices. The
+  margin guards against its measured errors, but not against one larger than any
+  of the last 24. A sharper estimate would use Chainlink's own prices, for example
+  Polymarket's real-time data socket. That source could not be reached or checked
+  from here.
+- The evidence above used Coinbase's single price at the start, not the 60s TWAP
+  (the journal has no continuous price history to rebuild it). The beating /
+  not-beating split may shift a little with the exact definition.
 - The evidence covers filled orders only. A bigger order goes deeper into the
   book, so it pays a higher average price than the estimates assume.
 - There is no automatic stop for the add-on alone. The canary loss budget, the

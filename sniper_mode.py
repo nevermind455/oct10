@@ -102,6 +102,7 @@ from pathlib import Path
 import websockets
 
 import exec_latency
+import price_to_beat
 from hybrid_sizing import (HybridPolicy, at_drawdown_stop, cent_compatible_shares, enforce_order_budget, minimum_entry_shares,
                            risk_total, shares_within_budget, sizing_factors)
 from timer import now_et
@@ -548,6 +549,10 @@ FAIR_MID_CLAMP = 0.005        # a market mid is read as a probability inside [0.
 KELLY_MIN_SHARES = 5          # the venue's minimum order size
 ROUND_S = 300                 # btc-updown-5m: each round starts on a multiple of 300s of wall time
 PTB_MID_MAX_AGE_S = 2.0       # direction add-on: the trigger mid compared with the price to beat, at most this old
+# Polymarket's published price to beat (eventMetadata.priceToBeat) appears 30-300s after a round
+# closes: asked for from PTB_FIRST_ASK_S after the close, every PTB_POLL_S, until PTB_GIVE_UP_S.
+PTB_POLL_S, PTB_FIRST_ASK_S, PTB_GIVE_UP_S = 10.0, 20.0, 1800.0
+PTB_SUSPECT_BP = 100.0        # a published value this far from our own TWAP is journalled, never calibrated on
 _NORMAL = statistics.NormalDist()
 
 
@@ -1111,6 +1116,31 @@ def live_account_tail(path, max_bytes: int = 8_000_000, chunk: int = 262_144) ->
     return out
 
 
+def journal_tail_rows(path, marker: bytes, limit: int, max_bytes: int = 8_000_000, chunk: int = 262_144) -> list:
+    """The newest `limit` journal rows whose line holds `marker`, oldest first, read
+    backwards from the END of the journal (never the whole file) within max_bytes."""
+    found: list = []
+    with open(path, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        pos, carry, scanned = fh.tell(), b"", 0
+        while pos > 0 and scanned < max_bytes and len(found) < limit:
+            n = min(chunk, pos)
+            pos -= n
+            scanned += n
+            fh.seek(pos)
+            lines = (fh.read(n) + carry).split(b"\n")
+            carry = lines.pop(0) if pos > 0 else b""        # a line's start is in the chunk before
+            for line in reversed(lines):                       # newest first
+                if marker in line and len(found) < limit:
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(r, dict):
+                        found.append(r)
+    return found[::-1]
+
+
 class Settings:
     def __init__(self) -> None:
         # the frozen spec's trigger (exec_latency.FROZEN_SPEC): a 0.5bp move
@@ -1202,20 +1232,27 @@ class Settings:
         self.wide_cap_live = _env_bool("SNIPER_WIDE_CAP_LIVE", False)
         self.wide_cap_live_stop_usd = _env_float("SNIPER_WIDE_CAP_LIVE_STOP_USD", 25)
         # Direction add-on (2026-10-30, the operator's request): the sniper decides and sizes
-        # every order exactly as without it. When the side it buys is already beating the
-        # round's price to beat (the trigger feed's BTC mid at the round's start - an
-        # approximation: the market settles on Chainlink's price), the same order buys this
-        # fraction of its Kelly target more (0.5 = +50%), only from the room the sniper's own
-        # limits leave. Never a new trade, a skipped one or a smaller one; Kelly sizes the
-        # sniper's later orders without the add-on's shares. 0 = off - the price to beat and
-        # the distance are journalled on every signal anyway. Live records 10-15..25: fills on
-        # the side beating it +$93.11 on 538, the others -$64.48 on 363 (not yet proven).
+        # every order exactly as without it. When the side it buys is beating the round's
+        # price to beat (Chainlink's BTC/USD 60s TWAP at the round's start, which Polymarket
+        # publishes only after the close: estimated live from the trigger feed's own 60s TWAP,
+        # corrected and checked against every published value - price_to_beat.py) by more
+        # than the estimate's largest recent error, the same order buys this fraction of its
+        # Kelly target more (0.5 = +50%), only from the room the sniper's own limits leave.
+        # Never a new trade, a skipped one or a smaller one; Kelly sizes the sniper's later
+        # orders without the add-on's shares. 0 = off - the price to beat, the distance and
+        # the checks are journalled anyway. Live records 10-15..25 (Coinbase's price at the
+        # start): fills on the side beating it +$93.11 on 538, the others -$64.48 on 363.
         self.dir_add = _env_float("SNIPER_DIR_ADD", 0)
         # LIVE refuses SNIPER_DIR_ADD without this explicit opt-in, and accepts at most 0.5.
         self.dir_add_live = _env_bool("SNIPER_DIR_ADD_LIVE", False)
-        # A round's price to beat is the trigger feed's first fresh mid in it, when heard
-        # within this many seconds of the start; else (a start mid-round) unknown: no add-on.
+        # The estimate's 60s TWAP needs trusted trigger prices with no gap longer than this
+        # (s) in its window; else (a start or a feed outage inside it) unknown: no add-on.
         self.ptb_max_gap_s = _env_float("SNIPER_PTB_MAX_GAP_S", 5)
+        # The add-on needs the side past the estimate by more than this (bp), and by more than
+        # the estimate's largest error over the last 24 published rounds...
+        self.ptb_margin_bp = _env_float("SNIPER_PTB_MARGIN_BP", 1.0)
+        # ...of which there must be at least this many (after a restart, restored from the journal).
+        self.ptb_min_checks = _env_float("SNIPER_PTB_MIN_CHECKS", 6)
         # The share minimum an order is held to (2026-10-29, the operator's
         # request): 0 = the venue's published one (the market's `mos`, 5 on the
         # BTC 5-minute markets). A whole number replaces it - the live test of
@@ -1447,7 +1484,10 @@ class Settings:
             (self.dir_add == 0 or (self.fair and self.kelly and self.order_type == "FAK"
                                    and self.order_sizing == "shares"),
              "SNIPER_DIR_ADD needs SNIPER_FAIR=1, SNIPER_KELLY=1, SNIPER_ORDER_TYPE=FAK and SNIPER_ORDER_SIZING=shares"),
-            (0 < self.ptb_max_gap_s <= 60, f"SNIPER_PTB_MAX_GAP_S={self.ptb_max_gap_s:g} (seconds: above 0, at most 60)"))
+            (0 < self.ptb_max_gap_s <= 60, f"SNIPER_PTB_MAX_GAP_S={self.ptb_max_gap_s:g} (seconds: above 0, at most 60)"),
+            (0 <= self.ptb_margin_bp <= 50, f"SNIPER_PTB_MARGIN_BP={self.ptb_margin_bp:g} (bp: 0 to 50)"),
+            (1 <= self.ptb_min_checks <= price_to_beat.ERROR_ROUNDS and self.ptb_min_checks == int(self.ptb_min_checks),
+             f"SNIPER_PTB_MIN_CHECKS={self.ptb_min_checks:g} (whole rounds, 1 to {price_to_beat.ERROR_ROUNDS})"))
                if not ok]
         if bad:
             raise ValueError("invalid SNIPER_* settings: " + "; ".join(bad))
@@ -1523,8 +1563,9 @@ class Settings:
         if self.dir_add <= 0:
             return ""
         return (f"; DIRECTION ADD-ON{' (LIVE TEST, SNIPER_DIR_ADD_LIVE)' if live else ''}: +{self.dir_add:.0%} of the "
-                f"Kelly target when the side bought is beating the round's price to beat (the trigger feed's mid "
-                f"<= {self.ptb_max_gap_s:g}s after the start), only from the room the sniper's limits leave")
+                f"Kelly target when the side bought is past the round's price to beat (Chainlink's 60s TWAP, "
+                f"estimated and checked on >= {self.ptb_min_checks:g} published rounds) by more than "
+                f"{self.ptb_margin_bp:g}bp and the estimate's largest error, only from the room the sniper's limits leave")
 
     def lines(self, live: bool = False) -> list[str]:
         if live:
@@ -1848,12 +1889,18 @@ class Sniper:
         self.trigger = Trigger(self.s.k_bp, self.s.window_ms)       # the primary feed's mid
         self.last_mid: float | None = None         # the Kraken / Coinbase mid last heard
         # The direction add-on (SNIPER_DIR_ADD): each round's price to beat - its start ->
-        # (the trigger feed's first trusted mid in it or None, seconds after the start it came) -,
-        # the latest trusted trigger mid (mid, monotonic s), and the add-on's filled shares per
-        # (condition, token) -> [shares, round end], which Kelly leaves out of the sniper's inventory.
-        self.ptb_rounds: dict[float, tuple[float | None, float]] = {}
+        # {"est", "raw" (our 60s TWAP), "basis_rounds", "why" (when unknown)} -, the rounds
+        # still waiting for Polymarket's published value, the trusted trigger mids of the last
+        # ~70s (wall, mid), the latest one (mid, monotonic s), the checks against the published
+        # values, and the add-on's filled shares per (condition, token) -> [shares, round end],
+        # which Kelly leaves out of the sniper's inventory.
+        self.ptb_rounds: dict[float, dict] = {}
+        self._ptb_pending: dict[float, dict] = {}
         self._ptb_start: float | None = None
+        self._ptb_hist: collections.deque = collections.deque()
         self.primary_mid: tuple[float, float] | None = None
+        self.ptb_calib = price_to_beat.Calibration()
+        self._fetch_event = None                   # tests: Gamma event by slug (default market_discovery's)
         self._dir_filled: dict[tuple[str, str], list] = {}
         # Kraken feed quality (summary rows): arrival lag, gaps, the venue's own status.
         self.kraken_lag: collections.deque = collections.deque(maxlen=3000)
@@ -2355,34 +2402,112 @@ class Sniper:
 
     # ---------------------------------------------------------------- direction add-on (SNIPER_DIR_ADD)
     def _note_primary_mid(self, mid: float, wall: float, mono: float) -> None:
-        """A trusted trigger-feed mid (the ones the volatility model takes). Each round's
-        price to beat is the first one at or after its start, if heard within
-        SNIPER_PTB_MAX_GAP_S of it - else unknown for that round (no guess)."""
+        """A trusted trigger-feed mid (the ones the volatility model takes). At each round's
+        first one, the round's price to beat is estimated: our 60s TWAP ending at its start,
+        corrected by the basis learned from Polymarket's published values - unknown (no
+        guess) when the trigger prices do not cover that window."""
         self.primary_mid = (mid, mono)
         start = wall - wall % ROUND_S
+        hist = self._ptb_hist
         if start != self._ptb_start:
             self._ptb_start = start
-            gap = wall - start
-            self.ptb_rounds[start] = (mid if gap <= self.s.ptb_max_gap_s else None, gap)
+            raw, why = price_to_beat.twap(hist, start, max_gap=self.s.ptb_max_gap_s)
+            est, basis_rounds = self.ptb_calib.estimate(raw)
+            rec = {"est": est, "raw": raw, "basis_rounds": basis_rounds, "why": why}
+            self.ptb_rounds[start] = self._ptb_pending[start] = rec
             for old in sorted(self.ptb_rounds)[:-4]:
                 del self.ptb_rounds[old]
+        hist.append((wall, mid))
+        cut = wall - price_to_beat.TWAP_S - self.s.ptb_max_gap_s
+        while len(hist) > 1 and hist[1][0] <= cut:          # keep the last price standing before the window
+            hist.popleft()
 
     def price_to_beat(self, end) -> float | None:
-        """The round ending at `end`: the trigger feed's BTC mid at its start, None if unknown."""
+        """The round ending at `end`: our estimate of its price to beat, None if unknown."""
         rec = self.ptb_rounds.get(float(end) - ROUND_S) if end else None
-        return rec[0] if rec else None
+        return rec["est"] if rec else None
 
     def _ptb_view(self, side: str, end) -> tuple[bool | None, dict]:
-        """Is the side bought beating the round's price to beat (None: unknown), and the
-        journal fields - on every decided signal, whether or not the add-on is on."""
-        ptb = self.price_to_beat(end)
-        if ptb is None:
-            return None, {"ptb": None}
+        """Is the side bought past the round's price to beat by more than the estimate can be
+        wrong? True; False when not past it at all; None when unknown, not yet checked on
+        enough published rounds, or too close to call (ptb_why says which). With the journal
+        fields - on every decided signal, whether or not the add-on is on."""
+        rec = self.ptb_rounds.get(float(end) - ROUND_S) if end else None
+        if rec is None or rec["est"] is None:
+            return None, {"ptb": None, "ptb_why": (rec or {}).get("why") or "this process did not see the round start"}
+        ptb = rec["est"]
+        fields = {"ptb": round(ptb, 2)}
         now = self.primary_mid
         if now is None or time.monotonic() - now[1] > PTB_MID_MAX_AGE_S:
-            return None, {"ptb": round(ptb, 2), "ptb_dist_bp": None}
+            fields.update(ptb_dist_bp=None, ptb_why="no fresh trigger price")
+            return None, fields
         dist = (now[0] - ptb) / ptb * 1e4 * (1.0 if side == "UP" else -1.0)
-        return dist > 0, {"ptb": round(ptb, 2), "ptb_dist_bp": round(dist, 3)}
+        margin, checks = self.ptb_calib.margin_bp(self.s.ptb_margin_bp), self.ptb_calib.checks
+        fields.update(ptb_dist_bp=round(dist, 3), ptb_margin_bp=round(margin, 3), ptb_checks=checks)
+        if dist <= 0:
+            return False, fields
+        if checks < self.s.ptb_min_checks:
+            fields["ptb_why"] = (f"estimate checked against Polymarket's published price to beat on "
+                                 f"{checks} of {self.s.ptb_min_checks:g} rounds")
+            return None, fields
+        if dist <= margin:
+            fields["ptb_why"] = f"within the estimate's error (+-{margin:.2f}bp)"
+            return None, fields
+        return True, fields
+
+    async def _ptb_official_loop(self) -> None:
+        """Polymarket's published price to beat for every round this process saw start: asked
+        for from PTB_FIRST_ASK_S after the close until it appears (or PTB_GIVE_UP_S). Each one
+        checks and corrects the estimate (price_to_beat.Calibration) and is journalled
+        ("ptb_official"). Off the order path: a thread for each read."""
+        fetch = self._fetch_event
+        if fetch is None:
+            import market_discovery
+            fetch = market_discovery._fetch_slug
+        while not self._closing:
+            await asyncio.sleep(PTB_POLL_S)
+            await self._ptb_official_once(fetch)
+
+    async def _ptb_official_once(self, fetch) -> None:
+        now = time.time()
+        for start in sorted(self._ptb_pending):
+            rec, end = self._ptb_pending[start], start + ROUND_S
+            if now < end + PTB_FIRST_ASK_S:
+                continue
+            row = {"wall": now, "round_start": start, "round_end": end}
+            if now > end + PTB_GIVE_UP_S:
+                del self._ptb_pending[start]
+                self._write({**row, "result": "ptb_official_missing", "metadata_keys": rec.get("keys")})
+                continue
+            try:
+                event = await asyncio.to_thread(fetch, f"btc-updown-5m-{int(start)}")
+            except Exception:  # noqa: BLE001 - asked again on the next pass
+                self.n["price to beat reads failed"] += 1
+                continue
+            official, final = price_to_beat.official_from_event(event)
+            if official is None:
+                rec["keys"] = price_to_beat.metadata_keys(event)
+                continue
+            del self._ptb_pending[start]
+            raw = rec.get("raw")
+            if raw is not None and abs(official - raw) / official * 1e4 > PTB_SUSPECT_BP:
+                self._write({**row, "result": "ptb_official_suspect", "official": official, "raw": raw})
+                continue
+            fields = self.ptb_calib.add(start, raw, rec.get("est"), rec.get("basis_rounds", 0), official)
+            if fields:
+                self._write({**row, "result": "ptb_official", "final": final, **fields})
+
+    def _restore_ptb_checks(self) -> int:
+        """After a restart: the published values this journal already holds, oldest first,
+        so the estimate is corrected and checked at once instead of after an hour."""
+        if self.journal is None or not self.journal.exists():
+            return 0
+        rows = journal_tail_rows(self.journal, b'"ptb_official"', price_to_beat.ERROR_ROUNDS + price_to_beat.BASIS_ROUNDS)
+        for r in rows:
+            if r.get("result") == "ptb_official" and isinstance(r.get("official"), (int, float)):
+                self.ptb_calib.add(r.get("round_start"), r.get("raw"), r.get("est"),
+                                   int(r.get("basis_rounds") or 0), float(r["official"]))
+        return len(rows)
 
     def _dir_add(self, row: dict, beating, target: float, base: int, floor_shares: int, room: float,
                  limit: Decimal, fee_rate: float, fixed: bool) -> tuple[int, float]:
@@ -2393,7 +2518,7 @@ class Sniper:
         order's shares and target; journals dir_base_shares, dir_add_shares and, when
         nothing is added, dir_add_why."""
         row["dir_base_shares"] = base
-        why = ("price to beat unknown" if beating is None else
+        why = ((row.get("ptb_why") or "price to beat unknown") if beating is None else
                "side not beating the price to beat" if not beating else
                "fixed-size order" if fixed else
                "sniper order outside its own room" if base < floor_shares or base > room + 1e-9 else None)
@@ -5856,6 +5981,16 @@ class Sniper:
         if self.own_rounds and self.trade_rows is not None:
             self._spawn(self._round_watch())
         self._spawn(self._prefetch_rules())
+        # the price to beat's checks against Polymarket's published values (direction add-on)
+        try:
+            restored = await asyncio.to_thread(self._restore_ptb_checks)
+        except Exception as exc:  # noqa: BLE001 - checks then start from nothing: no add-on until enough
+            restored = 0
+            self.on_event("sniper", f"price to beat checks not restored: {type(exc).__name__}", "warn")
+        if restored:
+            self.on_event("sniper", f"price to beat: {self.ptb_calib.checks} checks against Polymarket's published "
+                                    f"values restored from the journal", "info")
+        self._spawn(self._ptb_official_loop())
         for name in self.s.extra_feeds:
             self._spawn(self._extra_feed(name))
         self._spawn(self._loop_lag_probe())

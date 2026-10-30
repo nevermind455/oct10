@@ -187,6 +187,8 @@ def main() -> int:
         print("  a group whose wins fall well under 'expected' (sigma <= -2) is where the fair value overrates its edge")
         for line in direction_summary(done):
             print(line)
+    for line in ptb_check_summary(rows):
+        print(line)
     m5 = [x["m5"] for x in out if x["m5"] is not None]
     if m5:
         print(f"\nMARKOUT 5s after the fill (market mid - price - fee, c/share): avg {statistics_mean(m5):+.1f}, "
@@ -272,6 +274,30 @@ def direction_summary(done, fractions=(0.25, 0.5)) -> list[str]:
         sniper_part = sum(x["pnl"] - add_part(x) for x in beating)
         lines.append("  estimate, add-on on every beating fill at the same prices (optimistic): "
                      + ", ".join(f"+{p:.0%} ${p * sniper_part:+.2f}" for p in fractions))
+    return lines
+
+
+def ptb_check_summary(rows, last: int = 24) -> list[str]:
+    """How exact the bot's price to beat was: Polymarket's published value (after each
+    round closed) against the estimate the bot used live, from the journal's ptb_official
+    rows - the error the add-on's margin is built from. Empty before any check."""
+    published = [r for r in rows if r.get("result") == "ptb_official"]
+    missing = sum(1 for r in rows if r.get("result") == "ptb_official_missing")
+    suspect = sum(1 for r in rows if r.get("result") == "ptb_official_suspect")
+    if not (published or missing or suspect):
+        return []
+    lines = [f"\nPRICE TO BEAT CHECKS (Polymarket's published value vs the bot's live estimate): "
+             f"{len(published)} published, {missing} never published, {suspect} set aside as implausible"]
+    errs = [float(r["err_bp"]) for r in published if isinstance(r.get("err_bp"), (int, float))]
+    if errs:
+        recent = errs[-last:]
+        lines.append(f"  estimate error, all {len(errs)}: avg {statistics_mean(errs):.2f}bp, largest {max(errs):.2f}bp; "
+                     f"last {len(recent)}: largest {max(recent):.2f}bp (the add-on's margin, with its floor)")
+    if published and published[-1].get("basis_now") is not None:
+        lines.append(f"  correction now: Polymarket's value - the trigger feed's TWAP = ${published[-1]['basis_now']:+.2f}")
+    if missing:
+        keys = next((r.get("metadata_keys") for r in reversed(rows) if r.get("result") == "ptb_official_missing"), None)
+        lines.append(f"  never published: eventMetadata held {keys} - if priceToBeat is not among them, the field moved")
     return lines
 
 
