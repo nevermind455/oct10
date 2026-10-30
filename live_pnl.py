@@ -122,7 +122,9 @@ def main() -> int:
                     "left": d.get("left_s"), "target": d.get("target_shares"), "shares": t["shares"],
                     "price": price, "cost": cost, "won": won, "pnl": pnl,
                     "edge": (fair - price - fee_ps) if fair is not None and price else None,
-                    "m5": (marks.get(oid) or {}).get("markout_5s_c"), "feed": d.get("feed")})
+                    "m5": (marks.get(oid) or {}).get("markout_5s_c"), "feed": d.get("feed"),
+                    "ptb_dist": d.get("ptb_dist_bp"), "dir_add": d.get("dir_add_shares") or 0,
+                    "order_shares": d.get("order_shares")})
     out.sort(key=lambda x: x["wall"])
     kind = "PAPER" if args.paper else "LIVE"
     print(f"{kind}: journal {journal.name}, ledger {ledger_path.name}"
@@ -183,6 +185,8 @@ def main() -> int:
                                                             else "150s+"),
                   ("<60s", "60-150s", "150s+"))
         print("  a group whose wins fall well under 'expected' (sigma <= -2) is where the fair value overrates its edge")
+        for line in direction_summary(done):
+            print(line)
     m5 = [x["m5"] for x in out if x["m5"] is not None]
     if m5:
         print(f"\nMARKOUT 5s after the fill (market mid - price - fee, c/share): avg {statistics_mean(m5):+.1f}, "
@@ -236,6 +240,39 @@ def breakdown(title, done, key, order) -> None:
         print(f"  {label:>8s} {len(xs):6d} {sum(1 for x in xs if x['won']):5d} {exp:8.1f} "
               f"{(act - exp) / sd if fx else float('nan'):+6.1f} {pnl:+8.2f} {pnl / cost:+7.1%} "
               f"{'-' if m5 != m5 else f'{m5:+.1f}':>7s}")
+
+
+def direction_summary(done, fractions=(0.25, 0.5)) -> list[str]:
+    """The direction add-on (SNIPER_DIR_ADD) on resolved trades: the side beating the round's
+    price to beat or not, the add-on's own PnL apart from the sniper's (pro rata by shares:
+    one order, one average price), and - for the decision whether to turn it on or up -
+    what +25% / +50% on the beating fills would have made at the same prices (optimistic:
+    a bigger order goes deeper into the book). Empty before the journal records it."""
+    known = [x for x in done if x.get("ptb_dist") is not None]
+    if not known:
+        return []
+    lines = ["\nDIRECTION ADD-ON (price to beat = the trigger feed's BTC at the round's start):",
+             f"  price to beat known on {len(known)} of {len(done)} resolved trades"]
+    for label, xs in (("beating it", [x for x in known if x["ptb_dist"] > 0]),
+                      ("not beating", [x for x in known if x["ptb_dist"] <= 0])):
+        if xs:
+            won = sum(1 for x in xs if x["won"])
+            lines.append(f"  side {label:11s}: {len(xs):4d} trades, won {won} ({won / len(xs):.0%}), "
+                         f"PnL ${sum(x['pnl'] for x in xs):+.2f}")
+
+    def add_part(x):
+        return x["pnl"] * x["dir_add"] / x["order_shares"] if x.get("dir_add") and x.get("order_shares") else 0.0
+    added = [x for x in done if add_part(x)]
+    if added:
+        add = sum(add_part(x) for x in added)
+        lines.append(f"  add-on bought on {len(added)} orders: its own PnL ${add:+.2f}, the sniper's part of "
+                     f"those orders ${sum(x['pnl'] for x in added) - add:+.2f}")
+    beating = [x for x in known if x["ptb_dist"] > 0]
+    if beating:
+        sniper_part = sum(x["pnl"] - add_part(x) for x in beating)
+        lines.append("  estimate, add-on on every beating fill at the same prices (optimistic): "
+                     + ", ".join(f"+{p:.0%} ${p * sniper_part:+.2f}" for p in fractions))
+    return lines
 
 
 def statistics_mean(xs):

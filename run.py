@@ -1997,9 +1997,14 @@ class DashView:
             # start: an approximation (the market's strike is Chainlink's price)
             self._btc_start_round = start
             self._btc_start = trig["mid"] if now_wall - float(start) <= 5.0 else None
+        end = hub.window_end
+        ptb = sn.price_to_beat(end) if sn is not None and hasattr(sn, "price_to_beat") else None
+        if ptb is not None:
+            # the sniper's own price to beat (the direction add-on's): the same idea, taken
+            # from the first trusted tick of the round instead of this screen's refresh
+            self._btc_start = ptb
         if trig:
             trig["btc_start"] = getattr(self, "_btc_start", None)
-        end = hub.window_end
         market = {"slug": f"btc-updown-5m-{hub.window_start}" if hub.window_start and hub.up_token else None,
                   "end": end,
                   "btc_now": trig.get("mid"), "btc_start": getattr(self, "_btc_start", None),

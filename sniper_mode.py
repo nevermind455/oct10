@@ -546,6 +546,8 @@ FAIR_MIN_SAMPLES = 60         # 1s volatility samples before a fair value is tru
 FAIR_MIN_VOL_BP = 0.2         # volatility floor, bp per sqrt(second): a dead-calm minute is not zero risk
 FAIR_MID_CLAMP = 0.005        # a market mid is read as a probability inside [0.005, 0.995]
 KELLY_MIN_SHARES = 5          # the venue's minimum order size
+ROUND_S = 300                 # btc-updown-5m: each round starts on a multiple of 300s of wall time
+PTB_MID_MAX_AGE_S = 2.0       # direction add-on: the trigger mid compared with the price to beat, at most this old
 _NORMAL = statistics.NormalDist()
 
 
@@ -1199,6 +1201,21 @@ class Settings:
         # (Sniper._live_test_on). The wallet is the hard cap.
         self.wide_cap_live = _env_bool("SNIPER_WIDE_CAP_LIVE", False)
         self.wide_cap_live_stop_usd = _env_float("SNIPER_WIDE_CAP_LIVE_STOP_USD", 25)
+        # Direction add-on (2026-10-30, the operator's request): the sniper decides and sizes
+        # every order exactly as without it. When the side it buys is already beating the
+        # round's price to beat (the trigger feed's BTC mid at the round's start - an
+        # approximation: the market settles on Chainlink's price), the same order buys this
+        # fraction of its Kelly target more (0.5 = +50%), only from the room the sniper's own
+        # limits leave. Never a new trade, a skipped one or a smaller one; Kelly sizes the
+        # sniper's later orders without the add-on's shares. 0 = off - the price to beat and
+        # the distance are journalled on every signal anyway. Live records 10-15..25: fills on
+        # the side beating it +$93.11 on 538, the others -$64.48 on 363 (not yet proven).
+        self.dir_add = _env_float("SNIPER_DIR_ADD", 0)
+        # LIVE refuses SNIPER_DIR_ADD without this explicit opt-in, and accepts at most 0.5.
+        self.dir_add_live = _env_bool("SNIPER_DIR_ADD_LIVE", False)
+        # A round's price to beat is the trigger feed's first fresh mid in it, when heard
+        # within this many seconds of the start; else (a start mid-round) unknown: no add-on.
+        self.ptb_max_gap_s = _env_float("SNIPER_PTB_MAX_GAP_S", 5)
         # The share minimum an order is held to (2026-10-29, the operator's
         # request): 0 = the venue's published one (the market's `mos`, 5 on the
         # BTC 5-minute markets). A whole number replaces it - the live test of
@@ -1425,7 +1442,13 @@ class Settings:
             (0 <= self.fair_fee_rate < 0.25, f"SNIPER_FAIR_FEE_RATE={self.fair_fee_rate:g} (must be 0 to 0.25)"),
             (0 < self.kelly_fraction <= 1, f"SNIPER_KELLY_FRACTION={self.kelly_fraction:g} (must be above 0, at most 1)"),
             (0 <= self.min_entry_max_drawdown < 1,
-             f"SNIPER_MIN_ENTRY_MAX_DRAWDOWN={self.min_entry_max_drawdown:g} (a fraction: 0 to below 1)")) if not ok]
+             f"SNIPER_MIN_ENTRY_MAX_DRAWDOWN={self.min_entry_max_drawdown:g} (a fraction: 0 to below 1)"),
+            (0 <= self.dir_add <= 1, f"SNIPER_DIR_ADD={self.dir_add:g} (a fraction of the sniper's shares: 0 to 1)"),
+            (self.dir_add == 0 or (self.fair and self.kelly and self.order_type == "FAK"
+                                   and self.order_sizing == "shares"),
+             "SNIPER_DIR_ADD needs SNIPER_FAIR=1, SNIPER_KELLY=1, SNIPER_ORDER_TYPE=FAK and SNIPER_ORDER_SIZING=shares"),
+            (0 < self.ptb_max_gap_s <= 60, f"SNIPER_PTB_MAX_GAP_S={self.ptb_max_gap_s:g} (seconds: above 0, at most 60)"))
+               if not ok]
         if bad:
             raise ValueError("invalid SNIPER_* settings: " + "; ".join(bad))
 
@@ -1495,6 +1518,14 @@ class Settings:
                 + (f"; {self.paper_cash_note}" if self.paper_cash_note and self.kelly and self.order_type == "FAK"
                    else ""))
 
+    def dir_text(self, live: bool = False) -> str:
+        """The direction add-on (SNIPER_DIR_ADD), when on. Off: nothing - the start line is unchanged."""
+        if self.dir_add <= 0:
+            return ""
+        return (f"; DIRECTION ADD-ON{' (LIVE TEST, SNIPER_DIR_ADD_LIVE)' if live else ''}: +{self.dir_add:.0%} of the "
+                f"Kelly target when the side bought is beating the round's price to beat (the trigger feed's mid "
+                f"<= {self.ptb_max_gap_s:g}s after the start), only from the room the sniper's limits leave")
+
     def lines(self, live: bool = False) -> list[str]:
         if live:
             return [f"SNIPER LIVE CANARY{self.lead_text()}: spot mid >= {self.k_bp}bp within {self.window_ms:.0f}ms -> real {self.order_type} "
@@ -1502,6 +1533,7 @@ class Settings:
                     f"cooldown {self.cooldown_ms:.0f}ms per side, "
                     f">= {self.min_left_s:.0f}s left, <= {self.max_fills_round} fills and "
                     f"{self.max_side_shares:.0f} sh/side per round" + self.fair_text(live=True)
+                    + self.dir_text(live=True)
                     + (f"; shadow fills at {','.join(map(str, self.shadow_ms))}ms (arithmetic only)"
                        if self.shadow_ms else "") + self.feeds_text()]
         return [f"SNIPER paper-only{self.lead_text()}: spot mid >= {self.k_bp}bp within {self.window_ms:.0f}ms -> {self.order_type} "
@@ -1512,7 +1544,7 @@ class Settings:
                    f"+ {self.server_ms:.0f}ms server allowance{self.extra_text()}; ")
                 + f"cooldown {self.cooldown_ms:.0f}ms per side, >= {self.min_left_s:.0f}s left, "
                 f"<= {self.max_fills_round} fills and {self.max_side_shares:.0f} sh/side per round"
-                + self.fair_text()
+                + self.fair_text() + self.dir_text()
                 + (f"; shadow fills at {','.join(map(str, self.shadow_ms))}ms (arithmetic only)"
                    if self.shadow_ms else "")
                 + ("" if self.fixed_latency else
@@ -1815,6 +1847,14 @@ class Sniper:
                              "Kraken only with SNIPER_KRAKEN_LIVE=1 set")
         self.trigger = Trigger(self.s.k_bp, self.s.window_ms)       # the primary feed's mid
         self.last_mid: float | None = None         # the Kraken / Coinbase mid last heard
+        # The direction add-on (SNIPER_DIR_ADD): each round's price to beat - its start ->
+        # (the trigger feed's first trusted mid in it or None, seconds after the start it came) -,
+        # the latest trusted trigger mid (mid, monotonic s), and the add-on's filled shares per
+        # (condition, token) -> [shares, round end], which Kelly leaves out of the sniper's inventory.
+        self.ptb_rounds: dict[float, tuple[float | None, float]] = {}
+        self._ptb_start: float | None = None
+        self.primary_mid: tuple[float, float] | None = None
+        self._dir_filled: dict[tuple[str, str], list] = {}
         # Kraken feed quality (summary rows): arrival lag, gaps, the venue's own status.
         self.kraken_lag: collections.deque = collections.deque(maxlen=3000)
         self.kraken_gap_max = 0.0
@@ -2313,6 +2353,88 @@ class Sniper:
             return float(rd[side])
         return float(self.round_baseline.get(str(token), (0.0, 0))[0])
 
+    # ---------------------------------------------------------------- direction add-on (SNIPER_DIR_ADD)
+    def _note_primary_mid(self, mid: float, wall: float, mono: float) -> None:
+        """A trusted trigger-feed mid (the ones the volatility model takes). Each round's
+        price to beat is the first one at or after its start, if heard within
+        SNIPER_PTB_MAX_GAP_S of it - else unknown for that round (no guess)."""
+        self.primary_mid = (mid, mono)
+        start = wall - wall % ROUND_S
+        if start != self._ptb_start:
+            self._ptb_start = start
+            gap = wall - start
+            self.ptb_rounds[start] = (mid if gap <= self.s.ptb_max_gap_s else None, gap)
+            for old in sorted(self.ptb_rounds)[:-4]:
+                del self.ptb_rounds[old]
+
+    def price_to_beat(self, end) -> float | None:
+        """The round ending at `end`: the trigger feed's BTC mid at its start, None if unknown."""
+        rec = self.ptb_rounds.get(float(end) - ROUND_S) if end else None
+        return rec[0] if rec else None
+
+    def _ptb_view(self, side: str, end) -> tuple[bool | None, dict]:
+        """Is the side bought beating the round's price to beat (None: unknown), and the
+        journal fields - on every decided signal, whether or not the add-on is on."""
+        ptb = self.price_to_beat(end)
+        if ptb is None:
+            return None, {"ptb": None}
+        now = self.primary_mid
+        if now is None or time.monotonic() - now[1] > PTB_MID_MAX_AGE_S:
+            return None, {"ptb": round(ptb, 2), "ptb_dist_bp": None}
+        dist = (now[0] - ptb) / ptb * 1e4 * (1.0 if side == "UP" else -1.0)
+        return dist > 0, {"ptb": round(ptb, 2), "ptb_dist_bp": round(dist, 3)}
+
+    def _dir_add(self, row: dict, beating, target: float, base: int, floor_shares: int, room: float,
+                 limit: Decimal, fee_rate: float, fixed: bool) -> tuple[int, float]:
+        """The sniper's own order (base shares, already sized and bounded) plus SNIPER_DIR_ADD
+        of its Kelly target when the side is beating the price to beat - only from the room
+        its own limits leave, and in LIVE only where the send checks the sniper's own order
+        passes still pass with it. Never changes whether the sniper trades. Returns the
+        order's shares and target; journals dir_base_shares, dir_add_shares and, when
+        nothing is added, dir_add_why."""
+        row["dir_base_shares"] = base
+        why = ("price to beat unknown" if beating is None else
+               "side not beating the price to beat" if not beating else
+               "fixed-size order" if fixed else
+               "sniper order outside its own room" if base < floor_shares or base > room + 1e-9 else None)
+        shares = base
+        if why is None:
+            want = math.floor(float(target) * self.s.dir_add + 1e-9)
+            shares = cent_compatible_shares(min(float(target) + want, math.floor(room + 1e-9)), limit)
+            if shares <= base:
+                why = "no room left by the sniper's limits"
+        if why is None:
+            fits = getattr(self.live, "addon_headroom", None) if self.live is not None else None
+            if callable(fits):
+                problem = fits(float(Decimal(shares) * limit), float(fee_rate))
+                if problem:
+                    why = f"live limits: {problem}"
+        if why is not None:
+            row.update(dir_add_shares=0, dir_add_why=why)
+            return base, target
+        row["dir_add_shares"] = shares - base
+        return shares, float(target) + (shares - base)
+
+    def _dir_book(self, plan: dict, filled, sign: float = 1.0) -> None:
+        """The add-on's part of a fill (pro rata: an FAK fills part of its stake, or more
+        shares when cheaper), or of a retracted one (sign -1)."""
+        add, total = plan.get("dir_add_shares") or 0, plan.get("shares") or 0
+        try:
+            part = float(filled or 0) * add / float(total) if add and total else 0.0
+        except (TypeError, ValueError):
+            return
+        if part <= 0:
+            return
+        rec = self._dir_filled.setdefault((str(plan["cond"]), str(plan["token"])), [0.0, float(plan["end"])])
+        rec[0] = max(0.0, rec[0] + sign * part)
+        if len(self._dir_filled) > 64:
+            for key in [k for k, v in self._dir_filled.items() if v[1] < time.time() - 3600]:
+                del self._dir_filled[key]
+
+    def _dir_held(self, condition, token) -> float:
+        rec = self._dir_filled.get((str(condition), str(token)))
+        return rec[0] if rec else 0.0
+
     def _kelly_inventory(self, condition, end, side: str, token, opposite_token) -> tuple[float, float]:
         """Same-side risk and guaranteed opposing shares, with no venue I/O.
 
@@ -2338,6 +2460,11 @@ class Sniper:
             for gated in getattr(self, "_paper_gated", {}).values():
                 if gated.get("cond") == str(condition) and gated.get("side") == side:
                     own += float(gated.get("risk_shares") or 0.0)   # met the book, waiting on its odds
+        if self._dir_filled:
+            # The direction add-on's filled shares are not the sniper's position: Kelly sizes
+            # the sniper's next order as without them (no smaller order, no hedge credit).
+            own = max(0.0, own - self._dir_held(condition, token))
+            opposite = max(0.0, opposite - self._dir_held(condition, opposite_token))
         if not all(math.isfinite(v) and v >= 0 for v in (own, opposite)):
             raise ValueError("invalid Kelly inventory")
         return own, opposite
@@ -2969,6 +3096,7 @@ class Sniper:
             self.n["binance ticks ignored (not the trigger)"] += 1
             return
         self.vol_model.observe(t / 1000.0, mid)
+        self._note_primary_mid(mid, time.time(), t / 1000.0)
         self._signal("binance", self.trigger, mid, t, t_pc)
 
     def on_coinbase(self, raw) -> str:
@@ -3039,6 +3167,7 @@ class Sniper:
             self.last_mid = mid
             if fresh_enough:
                 self.vol_model.observe(t / 1000.0, mid)
+                self._note_primary_mid(mid, wall, t / 1000.0)
         q = trig.q
         reset = bool(q) and t - q[-1][0] > trig.max_gap_ms      # no match for that long: the rule restarts
         self._signal("coinbase", trig, mid, t, t_pc)
@@ -3151,6 +3280,7 @@ class Sniper:
         q = self.trigger.q
         reset = bool(q) and t - q[-1][0] > self.trigger.max_gap_ms     # no tick and no heartbeat for that long
         self.vol_model.observe(t / 1000.0, mid)
+        self._note_primary_mid(mid, time.time(), t / 1000.0)
         self._signal("kraken", self.trigger, mid, t, t_pc)
         # Feed quality, measured after the decision so it costs the decision nothing:
         # gaps between updates (one longer than the max gap resets the rule) and how
@@ -4211,6 +4341,7 @@ class Sniper:
                                  filled=shares > 0)
         if shares > 0:
             rd[side] += shares
+            self._dir_book(plan, shares)
             self._note_fill(plan["end"], side, shares, float(fill["cost"]) + float(fill.get("fee", 0) or 0))
             self._note_over_target(row, plan, shares)
             self.n["filled"] += 1
@@ -4245,6 +4376,7 @@ class Sniper:
         side, rd, shares = row["side"], plan["rd"], float(previous["shares"])
         rd["fills"] = max(0, rd["fills"] - 1)
         rd[side] = max(0.0, rd[side] - shares)
+        self._dir_book(plan, shares, sign=-1.0)
         total = self._round_fills.get((plan["end"], side))
         if total is not None:
             total["shares"] = max(0.0, total["shares"] - shares)
@@ -4372,6 +4504,8 @@ class Sniper:
                 return self._skip("awaiting FAK fill size", row)
         left = float(end) - time.time()
         row.update(round_end=end, left_s=round(left, 1), condition_id=str(cond))
+        beating, ptb_fields = self._ptb_view(side, end)
+        row.update(ptb_fields)
         first, last = self._window()
         if left > first:
             return self._skip("before trade window", row)
@@ -4597,6 +4731,9 @@ class Sniper:
             limit = (Decimal(str(min(cap, hi))) / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
             floor_shares = share_floor or self._share_order_floor(cond, view, limit)
             order_shares = cent_compatible_shares(target, limit)
+            if kelly and self.s.dir_add > 0:
+                order_shares, target = self._dir_add(row, beating, target, order_shares, floor_shares, room,
+                                                     limit, fee_rate, fixed=above_fair or minimum_entry)
             if kelly and (order_shares < floor_shares or order_shares > room + 1e-9):
                 row.update(ask_seen=ask, order_shares=order_shares, room_shares=round(room, 4))
                 return self._skip("kelly room under venue minimum at price cap", row)
@@ -4677,6 +4814,7 @@ class Sniper:
                 "venue_min_shares": (int(getattr(self.s, "venue_min_shares", 0) or 0) or None
                                      if order_shares is not None else None),
                 "minimum_entry": minimum_entry, "minimum_entry_key": minimum_key,
+                "dir_add_shares": row.get("dir_add_shares") or 0,       # the direction add-on's part of `shares`
                 "hybrid_check": self._check_hybrid_order if hybrid is not None else None,
                 # a Kelly-sized order carries nothing to the next: each is sized fresh
                 "target": target, "carry_market": self.carry_market if target is not None and not kelly else None,
@@ -4744,6 +4882,7 @@ class Sniper:
                 self.n["filled"] += 1
                 rd["fills"] += 1
                 rd[side] += float(fill.get("shares") or 0)
+                self._dir_book(plan, fill.get("shares"))
                 self._note_over_target(row, plan, fill.get("shares"))
                 self._settle_carry(plan, side, fill.get("shares"))
                 if plan.get("target") is not None:

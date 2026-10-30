@@ -1653,9 +1653,17 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # learned from the live journal's own orders and shadow rows); the side is free while it waits
     # and its shares count as Kelly risk; paper matches run on their own 32 threads. Live's order path
     # is unchanged.
-    "sniper_mode.py": "ae7648d9fa31f648c4f88b5bf6b20935356442b8f9e514813d0d5807de93744a",
+    # 2026-10-30 (the operator's request "keep the sniper the same, add a little direction",
+    # tests/tests_dir_add.py): every decided signal journals the round's price to beat (the trigger
+    # feed's first trusted mid <= SNIPER_PTB_MAX_GAP_S after the start) and ptb_dist_bp. Off by
+    # default (SNIPER_DIR_ADD=0) nothing else changes. On, an order whose side is beating it buys
+    # SNIPER_DIR_ADD of its Kelly target more, only from the room the sniper's own limits leave
+    # (live: also LiveExecution.addon_headroom); the sniper's trades and their sizes are unchanged,
+    # Kelly leaves the add-on's filled shares out of its inventory.
+    "sniper_mode.py": "7aa59215c7cc843fbf88fd0a1d02716bd02d290aca5583d5cbb2db29d62d46b3",
     # Read-only reference schema, configuration checks and freshness validation for paper.
-    "paper_parity.py": "7c5935e641ca4147d0551da53a4ab16efef64a2fd7dcff323d554382584269c5",
+    # 2026-10-30: the direction add-on's three settings are compared with live's as well.
+    "paper_parity.py": "8df7fff91c64011e40d6bd7d0bc444573c8a466b1551e58c899f7cbce4156684",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
@@ -1766,7 +1774,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # 2026-10-29 (tests/tests_venue_min.py): a size refusal of an order under the published minimum
     # (Prepared.below_published_minimum) is marked venue_min_refused - not an order error, no rules
     # reload. Every other refusal is handled as before.
-    "sniper_live.py": "291255e617e23f16ba9cd79f2861d66cb743fd32fd7e7264ca21f1d2a53f9756",
+    # 2026-10-30 (tests/tests_dir_add.py): LiveExecution.addon_headroom - read-only: would a bigger
+    # order (the sniper's direction add-on) still pass prepare's collateral, canary exposure and loss
+    # budget checks? Nothing on the order path changed.
+    "sniper_live.py": "678941ac89173c424620f10c8dc3416f2130c80d22a59391061c968774a56c44",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads

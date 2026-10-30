@@ -126,6 +126,27 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
     apply. There is no carry in Kelly mode. See [hybrid sizing](docs/HYBRID_SIZING.md)
     for formulas, settings and limitations. The fair model still needs empirical
     probability calibration; passing formula tests does not establish a profitable edge.
+  - **Direction add-on (off by default, `SNIPER_DIR_ADD`).** The sniper decides and
+    sizes every order exactly as above. When the side it buys is already beating the
+    round's price to beat, the same order buys `SNIPER_DIR_ADD` of its Kelly target
+    more (0.5 = +50%). The price to beat is the trigger feed's first trusted mid at
+    or after the round's start, within `SNIPER_PTB_MAX_GAP_S` (5s); it is an
+    approximation, because the market settles on Chainlink's price. After a start
+    mid-round it is unknown, and no add-on is bought that round. The add-on only
+    uses room the sniper's own limits leave (side cap, cash, hybrid risk budget,
+    canary per-order cap). In LIVE it also checks free collateral, the canary
+    exposure cap and the loss budget first, and is dropped rather than letting
+    the bigger order be refused or pause the canary. It never adds, skips or
+    shrinks a sniper trade. Kelly sizes the sniper's later orders without the
+    add-on's filled shares. Every signal journals `ptb` and `ptb_dist_bp` (BTC
+    past it, in the signal's direction, in bp) even when the add-on is off;
+    orders carry `dir_base_shares`, `dir_add_shares` and `dir_add_why`.
+    `live_pnl.py` prints a DIRECTION ADD-ON section: beating vs not, the add-on's
+    own PnL apart from the sniper's, and what +25% / +50% would have made.
+    LIVE refuses it without `SNIPER_DIR_ADD_LIVE=1` and above 0.5. On the live
+    records of 10-15..25 (Coinbase price at the round start), fills on the side
+    beating it made +$93.11 on 538, the others -$64.48 on 363. That is suggestive,
+    not proven; see [the review](docs/DIRECTION_ADDON_2026-10-30.md).
   - **FOK.** `SNIPER_ORDER_TYPE=FOK` keeps the old all-or-nothing order with no carry.
 - **Paper fills.** Paper fills against Polymarket's book at the modelled match
   instant. With `SNIPER_DELAY_SOURCE=live`, each order's delay is drawn from real
@@ -355,6 +376,9 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | `SNIPER_HYBRID_DRAWDOWN_STOP` | 0.20 | allocation scales linearly to zero at this realized-equity drawdown from its persisted high-water mark |
 | `SNIPER_HYBRID_RISK_FRACTION` | 0 | optional maximum all-in new-order spend as a fraction of realized equity; 0 disables |
 | `SNIPER_HYBRID_MAX_ORDER_USD` | 0 | optional maximum all-in new-order spend in dollars; 0 disables; the tighter enabled cap applies |
+| `SNIPER_DIR_ADD` | 0 | direction add-on: + this fraction of the Kelly target when the side bought is beating the round's price to beat (0.5 = +50%); 0 = off, the price to beat still journalled. Paper only unless `SNIPER_DIR_ADD_LIVE=1`, which allows at most 0.5 |
+| `SNIPER_DIR_ADD_LIVE` | 0 | 1 = explicit opt-in to the direction add-on in LIVE |
+| `SNIPER_PTB_MAX_GAP_S` | 5 | a round's price to beat is the trigger feed's first trusted mid at most this many seconds after its start; later = unknown, no add-on that round |
 | `SNIPER_FAIR_VOL_S` / `SNIPER_FAIR_FEE_RATE` | 300 / 0.07 | the volatility window (s) and the taker fee rate the fair limit uses |
 | `SNIPER_COOLDOWN_MS` | 300 | per side: an order starts a pause on ITS side only, from its submission |
 | `SNIPER_MIN_LEFT_S` | 10 | no order with fewer seconds left in the round |
