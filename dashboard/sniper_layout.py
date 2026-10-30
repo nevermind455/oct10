@@ -93,6 +93,14 @@ def _num(v):
     return f if math.isfinite(f) else None
 
 
+def _beat_text(t: dict) -> str:
+    """The round's price to beat and how far the BTC mid is past it, in bp."""
+    beat, mid = _num(t.get("btc_start")), _num(t.get("mid"))
+    if beat is None or beat <= 0:
+        return "  to beat N/A"
+    return f"  to beat ~{beat:,.0f}" + (f" ({(mid - beat) / beat * 1e4:+.1f}bp)" if mid is not None else "")
+
+
 def money(v, sign: bool = False) -> str:
     f = _num(v)
     if f is None:
@@ -214,10 +222,10 @@ def _trigger_body(t: dict, w: int) -> list[Row]:
                 else "", Style("blue"))], w),
         _runs([(fit("BTC mid", 9), DIM), (" ", PAPER),
                (f"{_num(t['mid']):,.2f}" if _num(t.get("mid")) is not None else MISSING, Style("ink", bold=True)),
-               # the trigger feed at the round's start, when this process saw it begin (approximate:
-               # the market's strike is Chainlink's price); N/A after joining mid-round
-               ((f"  start ~{_num(t['btc_start']):,.0f}" if _num(t.get("btc_start")) is not None
-                 else "  start N/A") if "btc_start" in t else "", FAINT)], w),
+               # the price to beat: the trigger feed at the round's start, when this process saw it
+               # begin (approximate: the market settles on Chainlink's price), and how far BTC is
+               # past it; N/A after joining mid-round
+               (_beat_text(t) if "btc_start" in t else "", FAINT)], w),
     ]
     if fair is not None:
         # the fair-value gate (SNIPER_FAIR): its volatility and the last decision -

@@ -126,6 +126,42 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
     apply. There is no carry in Kelly mode. See [hybrid sizing](docs/HYBRID_SIZING.md)
     for formulas, settings and limitations. The fair model still needs empirical
     probability calibration; passing formula tests does not establish a profitable edge.
+  - **Direction add-on (off by default, `SNIPER_DIR_ADD`).** The sniper decides and
+    sizes every order exactly as above. When the side it buys is past the round's
+    price to beat by more than the bot's estimate of it can be wrong, the same order
+    buys `SNIPER_DIR_ADD` of its Kelly target more (0.5 = +50%).
+    - *The price to beat* is what the market settles against: Chainlink's BTC/USD
+      60-second TWAP at the round's start (Gamma's `cryptoMarketConfig`).
+      Polymarket publishes it (`eventMetadata.priceToBeat`) only 30s-5min after
+      the round closes, so live it is estimated. The estimate is the trigger feed's
+      own 60s TWAP ending at the start, plus a correction: the median difference
+      from Polymarket's published values over the last 12 rounds.
+    - *Checks.* After every round closes, the bot reads Polymarket's published
+      value from Gamma and journals it with the estimate's error (`ptb_official`).
+      After a restart it restores those checks from the journal.
+    - *When it buys.* The add-on needs the side past the estimate by more than
+      `SNIPER_PTB_MARGIN_BP` (1bp) and by more than the largest error of the last
+      24 checks, after at least `SNIPER_PTB_MIN_CHECKS` (6) checks. So an
+      estimate error cannot turn "beating" into "not beating". Without 60s of
+      trigger prices before the start (gaps under `SNIPER_PTB_MAX_GAP_S`, 5s), the
+      round's price to beat is unknown and nothing is added.
+    - *Limits.* The add-on only uses room the sniper's own limits leave (side
+      cap, cash, hybrid risk budget, canary per-order cap). In LIVE it also checks
+      free collateral, the canary exposure cap and the loss budget first, and is
+      dropped rather than letting the bigger order be refused or pause the
+      canary. It never adds, skips or shrinks a sniper trade. Kelly sizes the
+      sniper's later orders without the add-on's filled shares.
+    - *Journal and reports.* Every signal journals `ptb`, `ptb_dist_bp` (BTC past
+      it, in the signal's direction, in bp), `ptb_margin_bp` and `ptb_checks`,
+      even with the add-on off. Orders carry `dir_base_shares`, `dir_add_shares`
+      and `dir_add_why`. `live_pnl.py` prints PRICE TO BEAT CHECKS (how far the
+      estimate was from the published values) and DIRECTION ADD-ON (beating vs
+      not, the add-on's own PnL, and what +25% / +50% would have made).
+    - LIVE refuses it without `SNIPER_DIR_ADD_LIVE=1`, and above 0.5.
+    - *Evidence.* On the live records of 10-15..25 (Coinbase's price at the round
+      start as a stand-in), fills on the side beating it made +$93.11 on 538, and
+      the others -$64.48 on 363. That is suggestive, not proven; see
+      [the review](docs/DIRECTION_ADDON_2026-10-30.md).
   - **FOK.** `SNIPER_ORDER_TYPE=FOK` keeps the old all-or-nothing order with no carry.
 - **Paper fills.** Paper fills against Polymarket's book at the modelled match
   instant. With `SNIPER_DELAY_SOURCE=live`, each order's delay is drawn from real
@@ -355,6 +391,11 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | `SNIPER_HYBRID_DRAWDOWN_STOP` | 0.20 | allocation scales linearly to zero at this realized-equity drawdown from its persisted high-water mark |
 | `SNIPER_HYBRID_RISK_FRACTION` | 0 | optional maximum all-in new-order spend as a fraction of realized equity; 0 disables |
 | `SNIPER_HYBRID_MAX_ORDER_USD` | 0 | optional maximum all-in new-order spend in dollars; 0 disables; the tighter enabled cap applies |
+| `SNIPER_DIR_ADD` | 0 | direction add-on: + this fraction of the Kelly target when the side bought is beating the round's price to beat (0.5 = +50%); 0 = off, the price to beat still journalled. Paper only unless `SNIPER_DIR_ADD_LIVE=1`, which allows at most 0.5 |
+| `SNIPER_DIR_ADD_LIVE` | 0 | 1 = explicit opt-in to the direction add-on in LIVE |
+| `SNIPER_PTB_MAX_GAP_S` | 5 | the price to beat's 60s TWAP needs trusted trigger prices with no longer gap (s) in its window; else unknown, no add-on that round |
+| `SNIPER_PTB_MARGIN_BP` | 1.0 | the add-on needs the side past the estimated price to beat by more than this (bp) and by more than the estimate's largest error over the last 24 published rounds |
+| `SNIPER_PTB_MIN_CHECKS` | 6 | published rounds the estimate must have been checked against first (restored from the journal after a restart) |
 | `SNIPER_FAIR_VOL_S` / `SNIPER_FAIR_FEE_RATE` | 300 / 0.07 | the volatility window (s) and the taker fee rate the fair limit uses |
 | `SNIPER_COOLDOWN_MS` | 300 | per side: an order starts a pause on ITS side only, from its submission |
 | `SNIPER_MIN_LEFT_S` | 10 | no order with fewer seconds left in the round |

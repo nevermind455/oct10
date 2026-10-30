@@ -20,7 +20,8 @@ def load_strategy():
     tree = ast.parse(pathlib.Path(__file__).resolve().parent.parent.joinpath("sniper_mode.py").read_text())
     helpers = {"taker_fee", "anchored_fair", "fair_limit", "kelly_shares"}
     methods = {"_side_held", "_kelly_inventory", "_fair_fee_parameters", "_fair_anchor", "_decide", "ioc_spend",
-               "_mirror_on", "_wide_cap_now", "_slip_now", "_paper_parity_problem", "_order_share_cap"}
+               "_mirror_on", "_wide_cap_now", "_slip_now", "_paper_parity_problem", "_order_share_cap",
+               "price_to_beat", "_ptb_view", "_dir_held"}
     nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in helpers]
     sniper = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Sniper")
     cls = ast.ClassDef(name="Decision", bases=[], keywords=[], decorator_list=[],
@@ -28,7 +29,8 @@ def load_strategy():
     nodes.append(cls)
     clock = types.SimpleNamespace(time=lambda: 1000.0, monotonic=lambda: 10.0, perf_counter_ns=lambda: 1)
     ns = dict(math=math, Decimal=Decimal, ROUND_FLOOR=ROUND_FLOOR, time=clock,
-              _NORMAL=statistics.NormalDist(), FAIR_MID_CLAMP=0.005, KELLY_MIN_SHARES=5, MIN_ORDER_USD=1.0)
+              _NORMAL=statistics.NormalDist(), FAIR_MID_CLAMP=0.005, KELLY_MIN_SHARES=5, MIN_ORDER_USD=1.0,
+              ROUND_S=300, PTB_MID_MAX_AGE_S=2.0)
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])),
                  "<production_strategy>", "exec"), ns)
     return types.SimpleNamespace(**{name: ns[name] for name in helpers | {"Decision"}})
@@ -97,7 +99,9 @@ class DecisionPath(unittest.TestCase):
                                               _rules_cache={"market": (self.rules, 1000.0)}, _rules_cache_ttl=600)
         self.sn.s = types.SimpleNamespace(fair=True, kelly=True, fair_margin=.01, fair_fee_rate=0,
                                          stale_ms=2000, slip=.05, order_type="FAK", max_side_shares=200,
-                                         kelly_fraction=1, max_fills_round=20, order_sizing="dollars")
+                                         kelly_fraction=1, max_fills_round=20, order_sizing="dollars",
+                                         dir_add=0)
+        self.sn.ptb_rounds, self.sn.primary_mid, self.sn._dir_filled = {}, None, {}   # direction add-on: off
         self.sn.live = None
         self.sn._fak_pending = {}
         self.sn.inflight = {"UP": None, "DOWN": None}

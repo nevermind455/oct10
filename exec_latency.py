@@ -130,6 +130,13 @@ def spec_violations(settings, canary_max_shares=None) -> list[str]:
     if str(getattr(settings, "paper_cash_from", "") or "").strip():
         out.append(f"paper cash mirror: SNIPER_PAPER_CASH_FROM={settings.paper_cash_from} - paper only "
                    f"(live sizes from its own wallet)")
+    # The direction add-on (2026-10-30): paper until the operator opts in, then at most +50%.
+    dir_add = float(getattr(settings, "dir_add", 0) or 0)
+    if dir_add > 0 and not getattr(settings, "dir_add_live", False):
+        out.append(f"direction add-on: SNIPER_DIR_ADD={dir_add:g} - paper only until approved "
+                   f"(SNIPER_DIR_ADD_LIVE=1 makes it a live test, at most 0.5)")
+    elif dir_add > 0.5 + 1e-9:
+        out.append(f"direction add-on: SNIPER_DIR_ADD={dir_add:g} - live accepts at most 0.5")
     wide_c = float(getattr(settings, "wide_cap_c", 0) or 0)
     if wide_c > 0 and not wide_live:
         out.append(f"wide cap experiment: SNIPER_WIDE_CAP_C={settings.wide_cap_c:g} - paper only "

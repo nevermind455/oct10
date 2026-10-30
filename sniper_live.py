@@ -2890,6 +2890,29 @@ class LiveExecution:
         risk = self._risk_budget_used() + additional
         self.sender.limits.check_loss_budget(risk, self.kill)
 
+    def addon_headroom(self, spend: float, fee_rate: float) -> str | None:
+        """The sniper's direction add-on (SNIPER_DIR_ADD) asks before enlarging an order:
+        would an order of this signed spend still pass the send checks below (prepare)?
+        None if so, else the first that would refuse it or pause the canary - the add-on
+        is then dropped and the sniper's own order goes as it was. Reads only: no cap is
+        tripped here (a corrupt reservation state stops trading as prepare's check would).
+        The reservation is the spend plus fee_rate x spend, an upper bound on the venue fee
+        (prepare reserves exactly that)."""
+        limits = self.sender.limits
+        reserve = float(spend) * (1.0 + float(fee_rate))
+        free = (self.balance or 0.0) - self.reserved
+        if reserve > free + 1e-9:
+            return f"collateral ${free:.2f} below ${reserve:.2f}"
+        if limits.exposure_usd + float(spend) > limits.max_exposure_usd + 1e-9:
+            return f"canary exposure cap ${limits.max_exposure_usd:.2f}"
+        try:
+            used = self._risk_budget_used()
+        except Exception as exc:  # noqa: BLE001 - unknown risk: never enlarge an order
+            return f"loss budget unknown ({type(exc).__name__})"
+        if used + reserve > limits.max_daily_loss_usd + 1e-9:
+            return f"canary loss budget ${limits.max_daily_loss_usd:.2f}"
+        return None
+
     def _check_accounting_integrity(self) -> None:
         error = getattr(self.ledger, "integrity_error", None)
         if error:

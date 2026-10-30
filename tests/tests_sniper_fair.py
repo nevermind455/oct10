@@ -227,6 +227,9 @@ class Gate(I.PaperIOCBase):
         """The 16:57 trades: the market said UP 0.22-0.30 while the old model said
         0.43-0.54. Anchored, a +0.68bp move is worth a few cents over the
         market - not 20 - and an ask well over the market is refused."""
+        # 120s left, as in the trades: with the real round's time left, a run in its last
+        # ~20s priced the same move at 0.3006 (2026-10-30 full-suite flake)
+        self.pin_time_left(120.0)
         r = self.order("UP", [(0.31, 200)], mid=0.25, move_bp=0.68)
         self.check_fair(r, 0.25, 0.68)
         self.assertLess(r["fair"], 0.30)

@@ -1460,7 +1460,9 @@ TRADING_FILES = ["sniper_mode.py", "sniper_live.py", "paper_trade.py", "paper_pa
                  # Added 2026-10-20: since the unified-SDK migration these sign, build and post
                  # every order (they replaced the external py-clob-client), and hybrid_sizing.py
                  # sizes every Kelly order. They belong under the same review lock.
-                 "clob_client.py", "clob_signing.py", "clob_sdk.py", "hybrid_sizing.py"]
+                 "clob_client.py", "clob_signing.py", "clob_sdk.py", "hybrid_sizing.py",
+                 # Added 2026-10-30: the price to beat it computes decides the direction add-on's size.
+                 "price_to_beat.py"]
 BASELINE_SHA = {  # approved trading-file baseline; intentional changes require review
     # Reviewed 2026-10-11 deep audit: transport/dispatch ambiguity, freshness,
     # subscription and REST recovery races, paper slot publication, accounting
@@ -1653,9 +1655,26 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # learned from the live journal's own orders and shadow rows); the side is free while it waits
     # and its shares count as Kelly risk; paper matches run on their own 32 threads. Live's order path
     # is unchanged.
-    "sniper_mode.py": "ae7648d9fa31f648c4f88b5bf6b20935356442b8f9e514813d0d5807de93744a",
+    # 2026-10-30 (the operator's request "keep the sniper the same, add a little direction",
+    # tests/tests_dir_add.py): every decided signal journals the round's price to beat (the trigger
+    # feed's first trusted mid <= SNIPER_PTB_MAX_GAP_S after the start) and ptb_dist_bp. Off by
+    # default (SNIPER_DIR_ADD=0) nothing else changes. On, an order whose side is beating it buys
+    # SNIPER_DIR_ADD of its Kelly target more, only from the room the sniper's own limits leave
+    # (live: also LiveExecution.addon_headroom); the sniper's trades and their sizes are unchanged,
+    # Kelly leaves the add-on's filled shares out of its inventory.
+    # 2026-10-30 (the operator: "make sure price to beat is exact", tests/tests_dir_add.py): the price to
+    # beat is Chainlink's 60s TWAP at the start (Gamma cryptoMarketConfig), estimated as the trigger feed's
+    # own 60s TWAP plus a basis learned from Polymarket's published eventMetadata.priceToBeat (read after
+    # each close, journalled as ptb_official, restored from the journal); the add-on needs the side past it
+    # by more than SNIPER_PTB_MARGIN_BP and the estimate's largest error of the last 24 checks, after
+    # SNIPER_PTB_MIN_CHECKS checks. Off by default nothing trades differently.
+    "sniper_mode.py": "0e7c980c0119e839647eb39897495981c2859a2b658c3112d90231b2d6fcdae8",
     # Read-only reference schema, configuration checks and freshness validation for paper.
-    "paper_parity.py": "7c5935e641ca4147d0551da53a4ab16efef64a2fd7dcff323d554382584269c5",
+    # 2026-10-30: the direction add-on's five settings are compared with live's as well.
+    "paper_parity.py": "8a7d4d8a3c83b794fd66ff49c5986da098c2490023a4bd2cc6e048dccece269e",
+    # 2026-10-30 (tests/tests_dir_add.py): pure - the 60s TWAP, the published value from a Gamma
+    # event, and the basis / error bookkeeping the direction add-on's margin rests on.
+    "price_to_beat.py": "44d3617aebbea9532c6c08256bac8b6b8746c8649cb21f1d73371258255cd6ad",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
@@ -1766,7 +1785,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # 2026-10-29 (tests/tests_venue_min.py): a size refusal of an order under the published minimum
     # (Prepared.below_published_minimum) is marked venue_min_refused - not an order error, no rules
     # reload. Every other refusal is handled as before.
-    "sniper_live.py": "291255e617e23f16ba9cd79f2861d66cb743fd32fd7e7264ca21f1d2a53f9756",
+    # 2026-10-30 (tests/tests_dir_add.py): LiveExecution.addon_headroom - read-only: would a bigger
+    # order (the sniper's direction add-on) still pass prepare's collateral, canary exposure and loss
+    # budget checks? Nothing on the order path changed.
+    "sniper_live.py": "678941ac89173c424620f10c8dc3416f2130c80d22a59391061c968774a56c44",
     # Re-approved: one entry in flight per TOKEN (UP and DOWN may overlap; booking stays
     # atomic under _lock); last_fill / last_error / last_timing also per thread.
     # Re-approved (settlement audit): _net_of_own_fills, called on the event loop, reads
