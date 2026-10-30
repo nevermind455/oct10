@@ -1,19 +1,19 @@
-"""The round's price to beat, for the sniper's direction add-on (SNIPER_DIR_ADD).
+"""Published reference parsing and legacy exchange-TWAP calibration.
 
 A btc-updown-5m market resolves Up when Chainlink's BTC/USD 60-second TWAP at the
 round's end is at or above the same TWAP at its start: that start value is the
 price to beat (Gamma's `cryptoMarketConfig` declares the TWAP, and discovery
 refuses any other lookback: market_discovery.EXPECTED_TWAP_LOOKBACK_SECONDS).
-Polymarket publishes the exact value (`eventMetadata.priceToBeat`) only after
-the round has closed, so while it is live the bot can only estimate it:
+The runner uses polymarket_prices.PolymarketPrices for the actual Chainlink
+stream and published opening reference. The exchange-feed calculation here
+remains useful for diagnostics and historical calibration:
 
   1. twap(): the trigger feed's own 60s time-weighted mid ending at the round's
      start - the same calculation on a different venue's prices;
   2. Calibration: once Polymarket publishes a round's value, the difference
      between it and our TWAP (the basis) corrects the next estimates, and the
-     estimate's error is measured. The add-on is bought only when the side is
-     past the estimate by more than the largest recent error, so an estimate
-     error cannot turn "beating" into "not beating".
+     estimate's error is measured. The add-on retains its configured warmup
+     and historical error margin when using the official reference as well.
 
 Pure functions and a small state class: no network, clock or file access.
 """
@@ -66,6 +66,8 @@ def official_from_event(event) -> tuple[float | None, float | None]:
         return None, None
 
     def num(v):
+        if isinstance(v, bool):
+            return None
         try:
             f = float(v)
         except (TypeError, ValueError, OverflowError):

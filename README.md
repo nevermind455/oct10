@@ -128,23 +128,27 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
     probability calibration; passing formula tests does not establish a profitable edge.
   - **Direction add-on (off by default, `SNIPER_DIR_ADD`).** The sniper decides and
     sizes every order exactly as above. When the side it buys is past the round's
-    price to beat by more than the bot's estimate of it can be wrong, the same order
+    price to beat by more than the configured margin, the same order
     buys `SNIPER_DIR_ADD` of its Kelly target more (0.5 = +50%).
     - *The price to beat* is what the market settles against: Chainlink's BTC/USD
       60-second TWAP at the round's start (Gamma's `cryptoMarketConfig`).
-      Polymarket publishes it (`eventMetadata.priceToBeat`) only 30s-5min after
-      the round closes, so live it is estimated. The estimate is the trigger feed's
-      own 60s TWAP ending at the start, plus a correction: the median difference
-      from Polymarket's published values over the last 12 rounds.
+      The runner now consumes Polymarket's actual Chainlink TWAP stream. Its
+      report stamped exactly at the round start supplies the opening reference;
+      Gamma's exact-round `eventMetadata.priceToBeat` takes precedence when
+      published. A mid-round restart can also recover the opening from the
+      preceding contiguous round's published `finalPrice`, after validating its
+      asset, window and TWAP configuration. Missing boundaries remain unknown.
     - *Checks.* After every round closes, the bot reads Polymarket's published
       value from Gamma and journals it with the estimate's error (`ptb_official`).
       After a restart it restores those checks from the journal.
-    - *When it buys.* The add-on needs the side past the estimate by more than
-      `SNIPER_PTB_MARGIN_BP` (1bp) and by more than the largest error of the last
-      24 checks, after at least `SNIPER_PTB_MIN_CHECKS` (6) checks. So an
-      estimate error cannot turn "beating" into "not beating". Without 60s of
-      trigger prices before the start (gaps under `SNIPER_PTB_MAX_GAP_S`, 5s), the
-      round's price to beat is unknown and nothing is added.
+    - *When it buys.* Both the current price and the opening reference now come
+      from Polymarket, rather than comparing an exchange mid to a different
+      venue's strike. The add-on retains its existing conservative gates:
+      a distance greater than `SNIPER_PTB_MARGIN_BP` (1bp) and the largest error of the last
+      24 checks, after at least `SNIPER_PTB_MIN_CHECKS` (6) checks. The trigger
+      feed's historical estimate is still measured for these checks; it is
+      never substituted for a missing official reference by the runner. Missing
+      official prices, a disconnected stream or a TWAP over 2s old block the add-on.
     - *Limits.* The add-on only uses room the sniper's own limits leave (side
       cap, cash, hybrid risk budget, canary per-order cap). In LIVE it also checks
       free collateral, the canary exposure cap and the loss budget first, and is
@@ -172,6 +176,21 @@ and the tests for those. The old main strategy (`main_bot.py`, `strategy.py`,
   sample from the live journal now and then (`refresh_delays.py`): an old, fast
   sample makes paper fill more than live.
 - **Exit.** Every position is held to settlement.
+
+The dashboard has a separate **POLYMARKET BTC** section showing the current
+Chainlink BTC/USD 60s TWAP and **Price to Beat**, both to the cent, with stream
+status and source age. The TRIGGER section continues to show the exchange mid.
+An unavailable official value displays `N/A`; the previous round's price or an
+exchange estimate is never carried forward. These two feeds can have different
+prices because they measure different sources.
+
+Live reuses its existing CLOB API credentials for Polymarket's PolyBolt price
+stream. Paper does not derive wallet credentials: it uses the legacy public
+TWAP stream while available, or explicitly configured `POLY_API_KEY`,
+`POLY_API_SECRET`, and `POLY_API_PASSPHRASE` for the authenticated, read-only price
+subscription. If the public feed is retired and no L2 credentials are supplied,
+the section remains unavailable and a `poly_price` event explains why. See
+[Polymarket's reference-price protocol](https://docs.polymarket.com/api-reference/wss/polybolt).
 
 ## Execution latency
 

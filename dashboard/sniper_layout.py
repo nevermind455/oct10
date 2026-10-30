@@ -221,11 +221,7 @@ def _trigger_body(t: dict, w: int) -> list[Row]:
                (f"  busy {t['in_flight']}" if isinstance(t.get("in_flight"), str) else "  busy" if t.get("in_flight")
                 else "", Style("blue"))], w),
         _runs([(fit("BTC mid", 9), DIM), (" ", PAPER),
-               (f"{_num(t['mid']):,.2f}" if _num(t.get("mid")) is not None else MISSING, Style("ink", bold=True)),
-               # the price to beat: the trigger feed at the round's start, when this process saw it
-               # begin (approximate: the market settles on Chainlink's price), and how far BTC is
-               # past it; N/A after joining mid-round
-               (_beat_text(t) if "btc_start" in t else "", FAINT)], w),
+               (f"{_num(t['mid']):,.2f}" if _num(t.get("mid")) is not None else MISSING, Style("ink", bold=True))], w),
     ]
     if fair is not None:
         # the fair-value gate (SNIPER_FAIR): its volatility and the last decision -
@@ -894,6 +890,28 @@ def _settlement_band(snap: dict, cols: int, h: int, g: Glyphs) -> list[Row]:
 
 
 # ------------------------------------------------------------------- frame
+def _polymarket_body(p: dict, w: int) -> list[Row]:
+    current, beat = _num(p.get("current")), _num(p.get("price_to_beat"))
+    price_text = lambda v: "N/A" if v is None else f"${v:,.2f}"
+    values = [("Current ", DIM), (price_text(current), Style("ink", bold=True))]
+    strike = [("Price to Beat ", DIM), (price_text(beat), Style("ink", bold=True))]
+    distance = _num(p.get("distance_bp"))
+    delta = ([(f"  {distance:+.2f}bp", Style("green" if distance >= 0 else "red"))]
+             if distance is not None else [])
+    status = _text(p.get("status"), "WAITING")
+    source_name = "60s TWAP" if w < 38 else _text(p.get("source"), "Chainlink BTC/USD 60s TWAP")
+    source = [(f"{source_name}  ", FAINT),
+              (status, state_fg(status))]
+    age = _num(p.get("age_s"))
+    if age is not None:
+        source += [(f"  age {age:.1f}s", FAINT)]
+    if w >= 78:
+        return [_runs(values + [("    ", PAPER)] + strike + delta, w), _runs(source, w)]
+    if w < 38:
+        return [_runs(values, w), _runs(strike, w), _runs(source, w)] + ([_runs(delta, w)] if delta else [])
+    return [_runs(values, w), _runs(strike + delta, w), _runs(source, w)]
+
+
 def build(snap: dict, cols: int, rows: int, g: Glyphs) -> list[Row]:
     """The whole frame. Never raises: a layout fault is drawn, not thrown."""
     cols, rows = max(1, int(cols)), max(1, int(rows))
@@ -913,22 +931,35 @@ def _build(snap: dict, cols: int, rows: int, g: Glyphs) -> list[Row]:
     remaining = rows - 1
     if remaining <= 0:
         return out
+    reference_top = "polymarket" in snap and cols >= 112
+    if "polymarket" in snap and not reference_top:
+        reference_h = min(4 if cols >= 80 else 5, remaining)
+        out += panel("POLYMARKET BTC", _polymarket_body(snap.get("polymarket") or {}, cols - 2),
+                     cols, reference_h, g)
+        remaining -= reference_h
+        if remaining <= 0:
+            return out
     # top band: TRIGGER | MARKET | ACCOUNT, 8 body rows when there is room
     top_h = min(10, remaining)
-    w = hsplit(cols, (1.0, 1.1, 0.9), (26, 30, 24))
+    w = (hsplit(cols, (1.0, 1.1, 0.9, 1.0), (26, 28, 24, 26)) if reference_top
+         else hsplit(cols, (1.0, 1.1, 0.9), (26, 30, 24)))
     body_h = max(0, top_h - 2)
     trig = panel("TRIGGER", _trigger_body(snap.get("trigger") or {}, w[0] - 2)[:body_h], w[0], top_h, g)
     mkt = panel("MARKET", _market_body(snap.get("market") or {}, w[1] - 2, g)[:body_h], w[1], top_h, g)
     acct = (snap.get("account") or {})
     acc = panel("ACCOUNT " + str(acct.get("kind") or snap.get("mode") or "").upper(),
                 _account_body(acct, w[2] - 2)[:body_h], w[2], top_h, g)
-    out += join([trig, mkt, acc], w, top_h)
+    panels = [trig, mkt, acc]
+    if reference_top:
+        panels.append(panel("POLYMARKET BTC", _polymarket_body(snap.get("polymarket") or {}, w[3] - 2),
+                            w[3], top_h, g))
+    out += join(panels, w, top_h)
     remaining -= top_h
     if remaining <= 2:
         return out
     # middle band: ORDERS | CANARY + HEALTH, then POSITION | SETTLEMENT | MARKETS
     # (full when there is room, three rows when tight - before EVENTS either way)
-    settle_h = 9 if remaining >= 15 else 5 if remaining >= 11 else 0
+    settle_h = 9 if remaining >= 15 else 5 if remaining >= 11 else 3 if "polymarket" in snap and remaining >= 8 else 0
     side_rows = _side_body(snap, 1, 99)          # how many rows the side panel wants
     room = remaining - settle_h
     # SNIPER EXECUTION LATENCY | EXECUTION QUALITY when it still leaves the
@@ -981,6 +1012,7 @@ def plain_line(snap: dict) -> str:
     t = snap.get("trigger") or {}
     m = snap.get("market") or {}
     a = snap.get("account") or {}
+    p = snap.get("polymarket") or {}
     left = _num(m.get("seconds_left"))
     return terminal_text(
         f"[DASH] {snap.get('mode')} {_text(m.get('slug'), 'no-round')} T-{left:.0f}s "
@@ -988,6 +1020,8 @@ def plain_line(snap: dict) -> str:
         terminal_text(f"btc={_text(t.get('status'))} mid={t.get('mid') or MISSING} signals={count(t.get('signals'))} "
                       f"orders={count(t.get('orders'))} filled={count(t.get('filled'))} "
                       f"pnl={money(a.get('pnl') if a.get('kind') != 'LIVE' else a.get('realized'), sign=True)}"
+                      + f" poly_btc={p.get('current') or 'N/A'} ptb={p.get('price_to_beat') or 'N/A'}"
+                      + f" poly_status={p.get('status') or 'WAITING'}"
                       + _plain_settlement(snap), 2000)
 
 

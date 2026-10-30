@@ -647,6 +647,7 @@ class Runtime:
     settler: object = None
     pm: object = None                     # position_manager.PositionManager (off unless enabled)
     net_probe: object = None              # BinanceProbe: the dashboard's Binance round trip (display only)
+    reference_prices: object = None       # Polymarket's Chainlink TWAP and exact-round opening reference
     new_canary_session: bool = False      # LIVE: start a new canary budget deliberately (audit F3)
     stop_request: Path | None = None      # a file here asks for a clean shutdown (see _wait_until_stopped)
     journal_path: Path | None = None
@@ -1107,6 +1108,18 @@ async def run_runtime(rt: Runtime, *, dash: bool = False, paper_balance: float |
         # The sniper runs its own trigger socket, so the hub's Binance trade
         # feed would be a second, unused BTC socket on a 1-vCPU box.
         rt.tasks += rt.hub.start(user=rt.cfg.user_ws == "on", binance=False)
+        # The market's Chainlink reference is a separate feed from the exchange
+        # socket that triggers orders. Paper never derives wallet credentials.
+        from polymarket_prices import PolymarketPrices
+        reference_creds = creds_from(getattr(getattr(rt.hub, "user", None), "_creds", None))
+        if not reference_creds:
+            reference_creds = creds_from({"apiKey": os.environ.get("POLY_API_KEY"),
+                                          "secret": os.environ.get("POLY_API_SECRET"),
+                                          "passphrase": os.environ.get("POLY_API_PASSPHRASE")})
+        rt.reference_prices = PolymarketPrices(rt.hub, creds=reference_creds, on_event=on_event)
+        rt.sniper.reference_prices = rt.reference_prices
+        rt.tasks.append(asyncio.create_task(rt.reference_prices.stream(), name="poly-reference"))
+        rt.tasks.append(asyncio.create_task(rt.reference_prices.metadata_loop(), name="poly-reference-metadata"))
         rt.sniper_task = asyncio.create_task(rt.sniper.run(), name="sniper")
         rt.tasks.append(rt.sniper_task)
         if rt.reconciler is not None:
@@ -1991,23 +2004,15 @@ class DashView:
         snap["trigger"] = trig
         snap["exec"] = {"latency": summary.get("exec_latency") or {}, "quality": summary.get("exec_quality") or {},
                         "paper": rt.paper}
-        start = getattr(hub, "window_start", None)
-        if start and trig.get("mid") and start != getattr(self, "_btc_start_round", None):
-            # the trigger feed's mid when this process first saw the round, if that was at its
-            # start: an approximation (the market's strike is Chainlink's price)
-            self._btc_start_round = start
-            self._btc_start = trig["mid"] if now_wall - float(start) <= 5.0 else None
         end = hub.window_end
-        ptb = sn.price_to_beat(end) if sn is not None and hasattr(sn, "price_to_beat") else None
-        if ptb is not None:
-            # the sniper's own price to beat (the direction add-on's): Chainlink's 60s TWAP at
-            # the start, estimated from the trigger feed and checked against Polymarket's values
-            self._btc_start = ptb
-        if trig:
-            trig["btc_start"] = getattr(self, "_btc_start", None)
+        reference = getattr(rt, "reference_prices", None)
+        snap["polymarket"] = reference.snapshot(end) if reference is not None else {}
+        # Never carry a previous round's strike or an exchange estimate onto the
+        # Polymarket display. Both values come from the same reference source.
+        poly = snap["polymarket"]
         market = {"slug": f"btc-updown-5m-{hub.window_start}" if hub.window_start and hub.up_token else None,
                   "end": end,
-                  "btc_now": trig.get("mid"), "btc_start": getattr(self, "_btc_start", None),
+                  "btc_now": poly.get("current"), "btc_start": poly.get("price_to_beat"),
                   "seconds_left": (float(end) - now_wall) if end else None,
                   "book_status": (health.get("book") or {}).get("status")}
         for side, token in (("up", hub.up_token), ("down", hub.down_token)):

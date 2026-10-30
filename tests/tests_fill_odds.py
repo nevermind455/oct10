@@ -41,6 +41,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 import testing_env  # noqa: E402,F401 - first: tests never read the bot's .env
 import paper_trade  # noqa: E402
 import sniper_mode as S  # noqa: E402
+import tests_sniper_fair as F  # noqa: E402
 import tests_sniper_ioc as I  # noqa: E402
 
 FILL = {"sh": 10.0, "px": 0.5, "fee": 0.1}
@@ -372,6 +373,88 @@ class Loading(unittest.TestCase):
         self.assertIs(sn._fill_odds, odds)
         self.assertIn("[refresh failed, odds kept", sn.s.fill_odds_note)
         self.assertEqual(sn.n["fill odds refresh failed"], 1)
+
+
+class WithDirectionAddOn(F.Gate):
+    """The two paper strategies together (2026-10-30): the direction add-on (SNIPER_DIR_ADD)
+    enlarges an order, then live's fill odds decide whether it filled at all. A miss must
+    leave no add-on shares behind; a kept fill books them; while it waits, Kelly counts the
+    whole order (add-on included) as the side's risk."""
+
+    PTB = 60_000.0
+
+    def setUp(self):
+        super().setUp()
+        m, test = self.m, self
+
+        def view(token, levels):
+            v = HView(str(token), levels)
+            v.mid = test.mids.get(str(token), v.mid)
+            return v
+        m.book = type("History", (), {
+            "view": staticmethod(lambda token: view(token, m.decision[str(token)])),
+            "view_at_mono": staticmethod(lambda token, mono: view(token, m.decision[str(token)])),
+            "view_at": staticmethod(lambda token, ms: (HView(str(token), m.match[str(token)]), {})),
+        })()
+        self.during = {}
+
+    def make(self, **env):
+        super().make(**{"SNIPER_ORDER_SIZING": "shares", "SNIPER_DIR_ADD": "0.5", **env})
+        self.sn._read_bankroll = lambda: 100.0          # Kelly wants tens of shares: room for an add-on
+        self.sn.SHADOW_MARK_S = 0.05
+        test = self
+
+        def mid_at(token, venue_ms, mono):
+            deadline = time.monotonic() + 2.0
+            while not test.sn._paper_gated and time.monotonic() < deadline:
+                time.sleep(0.005)
+            cond, end = test.m.condition_id, test.m.window_end
+            test.during["own"] = test.sn._kelly_inventory(cond, end, "UP", I.UP, I.DOWN)[0]
+            return 0.60
+        self.sn._mid_at = mid_at
+        self.sn.ptb_calib.errors.extend([0.2] * 6)       # the estimate checked on 6 published rounds
+
+    def odds(self, p):
+        self.sn._fill_odds = {"odds": {"all": p}}
+
+    def fire_up(self):
+        self.pin_time_left()
+        # this round's price to beat, and BTC 5bp past it (UP's way), fresh at the decision
+        self.sn.ptb_rounds[float(self.m.window_end) - S.ROUND_S] = {"est": self.PTB, "raw": self.PTB,
+                                                                      "basis_rounds": 12, "why": None}
+        self.sn.primary_mid = (self.PTB * (1 + 5e-4), time.monotonic())
+        r = self.order("UP", [(0.41, 1000)], mid=0.40, move_bp=5.0)
+        self.assertGreater(r["dir_add_shares"], 0, r.get("dir_add_why"))
+        return r
+
+    def test_a_kept_fill_books_the_add_on_and_kelly_saw_the_whole_order_while_it_waited(self):
+        self.make()
+        self.odds(1.0)
+        r = self.fire_up()
+        self.assertEqual(r["result"], "filled", r)
+        self.assertGreater(r["dir_add_shares"], 0)
+        self.assertTrue(r["fill_odds"]["kept"])
+        # the priced shares (a FAK spends shares x cap, so a cheaper fill buys more), add-on included, once
+        self.assertAlmostEqual(self.during["own"], r["shares"], places=6)
+        self.assertGreater(r["shares"], r["order_shares"])
+        held = self.sn._dir_held(self.m.condition_id, I.UP)
+        self.assertAlmostEqual(held, r["shares"] * r["dir_add_shares"] / r["order_shares"], places=6)
+        self.assertEqual((self.sn.inflight["UP"], self.sn._paper_gated), (None, {}))
+
+    def test_a_miss_at_live_odds_leaves_no_add_on_shares(self):
+        self.make()
+        self.odds(0.0)
+        r = self.fire_up()
+        self.assertEqual((r["result"], r["outcome"]), ("refused", "LIVE_ODDS_MISS"))
+        self.assertGreater(r["dir_add_shares"], 0)                                  # it was asked for
+        self.assertEqual(self.sn._dir_filled, {})                                   # nothing booked
+        self.assertEqual(self.held(I.UP), 0.0)
+        own, _ = self.sn._kelly_inventory(self.m.condition_id, self.m.window_end, "UP", I.UP, I.DOWN)
+        self.assertEqual(own, 0.0)
+
+
+for _name in [n for n in dir(F.Gate) if n.startswith("test")]:
+    setattr(WithDirectionAddOn, _name, None)     # the harness only: its own tests run in tests_sniper_fair.py
 
 
 if __name__ == "__main__":
