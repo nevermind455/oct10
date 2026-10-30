@@ -313,19 +313,83 @@ class Stream(unittest.IsolatedAsyncioTestCase):
 
         creds = {"apiKey": "fixture", "secret": "fixture", "passphrase": "fixture"}
         ref = P.PolymarketPrices(types.SimpleNamespace(window_end=T0 + 300), creds=creds)
-        with patch.object(P.websockets, "connect", return_value=Socket()) as connect, \
-                patch.object(P, "ws_ssl", return_value=None), patch.object(P.time, "time", return_value=T0 + 1):
+        real_sleep = asyncio.sleep
+
+        async def no_wait(_seconds):
+            await real_sleep(0)
+        # 2026-10-30: the public feed comes first even with credentials; PolyBolt
+        # only after an RTDS attempt delivered nothing (here: it could not connect)
+        with patch.object(P.websockets, "connect", side_effect=[OSError("refused"), Socket()]) as connect, \
+                patch.object(P, "ws_ssl", return_value=None), patch.object(P.time, "time", return_value=T0 + 1), \
+                patch.object(P.asyncio, "sleep", no_wait):
             task = asyncio.create_task(ref.stream())
             await asyncio.wait_for(ready.wait(), 1)
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
-        self.assertEqual(connect.call_args.args[0], P.POLYBOLT)
+        self.assertEqual([c.args[0] for c in connect.call_args_list], [P.RTDS, P.POLYBOLT])
+        self.assertEqual(ref.transport, "PolyBolt")
         self.assertEqual([s["op"] for s in sent], ["auth", "subscribe"])
         self.assertEqual(sent[1]["rid"], "reference-prices")
         self.assertEqual(sent[1]["subscriptions"][0]["channel"], "price.crypto.twap")
         self.assertNotIn("fixture", repr(ref))
         self.assertFalse(ref.connected)
+
+    async def test_public_feed_first_with_credentials_and_a_working_feed_is_kept_after_a_drop(self):
+        """The VPS, 2026-10-30: with credentials the reader used PolyBolt only, which
+        refused the subscription; the public feed carried BTC/USD every second."""
+        sent, waits, connects = [], [], []
+        update = {"topic": "crypto_prices_twap_sixty", "type": "update", "payload": {
+            "symbol": "btc/usd", "timestamp": T0 * 1000, "window_s": 60,
+            "value": 80000.12, "full_accuracy_value": "80000123456780000000000"}}
+        ready = asyncio.Event()
+
+        class Socket:
+            def __init__(self, drop):
+                self.drop, self.frames = drop, [update]
+
+            async def send(self, raw):
+                sent.append(raw)
+
+            async def recv(self):
+                if self.frames:
+                    return json.dumps(self.frames.pop(0))
+                if self.drop:
+                    raise ConnectionError("dropped")
+                ready.set()
+                await asyncio.Future()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        def connect(url, **_kw):
+            connects.append(url)
+            return Socket(drop=len(connects) == 1)
+        real_sleep = asyncio.sleep
+
+        async def record(seconds):
+            waits.append(seconds)
+            await real_sleep(0)
+
+        async def no_heartbeat(ws):
+            await asyncio.Future()
+        creds = {"apiKey": "fixture", "secret": "fixture", "passphrase": "fixture"}
+        ref = P.PolymarketPrices(types.SimpleNamespace(window_end=T0 + 300), creds=creds)
+        ref._legacy_ping = no_heartbeat
+        with patch.object(P.websockets, "connect", side_effect=connect), \
+                patch.object(P, "ws_ssl", return_value=None), patch.object(P.time, "time", return_value=T0 + 1), \
+                patch.object(P.asyncio, "sleep", record):
+            task = asyncio.create_task(ref.stream())
+            await asyncio.wait_for(ready.wait(), 1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertEqual(connects, [P.RTDS, P.RTDS])          # never PolyBolt: the public feed delivered
+        self.assertEqual(waits[0], 1.0)                       # back in a second, not a growing backoff
+        self.assertNotIn("auth", "".join(sent))
 
 
 class Display(unittest.TestCase):
