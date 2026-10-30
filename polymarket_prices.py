@@ -67,7 +67,7 @@ class PolymarketPrices:
         self.beats = {}                    # round start -> (USD, provenance)
         self.connected = False
         self.state = "CONNECTING"
-        self.transport = "PolyBolt" if all(self._creds.get(k) for k in ("apiKey", "secret", "passphrase")) else "public RTDS"
+        self.transport = "public RTDS"     # always first; PolyBolt is the fallback (stream)
         self.detail = f"connecting to {self.transport}"
         self.metadata_detail = "waiting for round metadata"
         self._metadata_warning = None
@@ -256,14 +256,22 @@ class PolymarketPrices:
     async def stream(self):
         """Reference data only; never creates credentials, signs or places orders.
 
-        Live reuses its existing CLOB credentials for PolyBolt. Paper can use
-        explicitly supplied L2 credentials, or the legacy public TWAP feed while
-        Polymarket keeps it available. A failure is visible without stopping orders.
+        The public RTDS feed comes first. It needs no credentials, and on the VPS
+        (2026-10-30) it carried BTC/USD every second while PolyBolt refused the
+        bot's subscription, which left the price to beat unavailable on every
+        signal. PolyBolt (live's CLOB credentials, or POLY_API_* for paper) is
+        the fallback when an attempt delivers no price; the next such failure
+        goes back to RTDS. A feed that was delivering reconnects the same way at
+        once, so a drop does not miss the next round's boundary report. A failure
+        is visible without stopping orders.
         """
-        authed = all(self._creds.get(k) for k in ("apiKey", "secret", "passphrase"))
-        url = POLYBOLT if authed else RTDS
+        can_auth = all(self._creds.get(k) for k in ("apiKey", "secret", "passphrase"))
+        authed = False
         retry = 1.0
         while True:
+            url = POLYBOLT if authed else RTDS
+            self.transport = "PolyBolt" if authed else "public RTDS"
+            self.accepted = 0
             try:
                 if self.state not in ("ERROR", "AUTH REQUIRED"):
                     self.state = "CONNECTING"
@@ -303,10 +311,13 @@ class PolymarketPrices:
             except Exception as exc:
                 self.state = "AUTH REQUIRED" if isinstance(exc, ReferenceFeedError) and exc.auth else "ERROR"
                 self.detail = str(exc) if isinstance(exc, ReferenceFeedError) else f"{self.transport} connection failed ({type(exc).__name__})"
-                if not authed:
+                if not authed and not can_auth:
                     self.detail += "; if RTDS is retired, configure L2 price-feed credentials"
                 self._event("poly_price", self.detail, "warn")
             finally:
                 self.connected = False
-            await asyncio.sleep(retry)
-            retry = min(30.0, retry * 2)
+            delivered = self.accepted > 0
+            if not delivered and can_auth:
+                authed = not authed             # nothing came this way: the other transport next
+            await asyncio.sleep(1.0 if delivered else retry)
+            retry = 1.0 if delivered else min(30.0, retry * 2)

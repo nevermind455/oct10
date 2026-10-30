@@ -1685,7 +1685,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # 2026-10-30: empty PAPER feed follow-up. Use the pinned SDK's public
     # update subscription with local BTC filtering; surface safe transport,
     # authentication and metadata diagnostics; include PolyBolt subscription rid.
-    "polymarket_prices.py": "b1b8c8250beb045eb31eba61d37e416a10562288732441eef4e10b457bd28868",
+    # 2026-10-30 (the VPS: "Polymarket rejected the price subscription" on PolyBolt while the public
+    # feed carried BTC/USD every second): the public RTDS feed first, PolyBolt the fallback after an
+    # attempt that delivered nothing; a delivering feed reconnects the same way after 1s.
+    "polymarket_prices.py": "47569153d43a39fd31b2c3f420bec9c173df46c81b4e19c63c59f486c898485b",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
