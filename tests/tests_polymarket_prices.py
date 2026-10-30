@@ -141,6 +141,33 @@ class Prices(unittest.TestCase):
         self.assertEqual(self.ref.price_to_beat(T0 + 300), 80000)
         self.assertIsNone(self.ref.price_to_beat(self.hub.window_end))
 
+    def test_metadata_failures_are_visible_and_do_not_log_exception_secrets(self):
+        events = []
+        self.ref._event = lambda *args: events.append(args)
+
+        def fail(slug):
+            raise RuntimeError("exception fixture secret must stay private")
+
+        self.ref._fetch_event = fail
+        asyncio.run(self.ref.metadata_once())
+        asyncio.run(self.ref.metadata_once())
+        snap = self.snapshot()
+        self.assertEqual(snap["ptb_detail"], "PTB metadata read failed (RuntimeError)")
+        self.assertEqual(len(events), 1)
+        self.assertNotIn("fixture secret", str(events) + str(snap))
+
+    def test_unpublished_metadata_is_distinct_from_a_connection_error(self):
+        self.ref._fetch_event = lambda slug: event(int(slug.rsplit("-", 1)[1]))
+        asyncio.run(self.ref.metadata_once())
+        self.assertIn("has not published", self.snapshot()["ptb_detail"])
+
+    def test_legacy_error_frames_do_not_get_silently_ignored(self):
+        for msg in ({"op": "error", "code": "auth_required"},
+                    {"type": "error", "payload": {"code": "auth_failed"}}):
+            with self.assertRaises(P.ReferenceFeedError) as error:
+                P._check_error(msg)
+            self.assertTrue(error.exception.auth)
+
     def test_storage_stays_bounded(self):
         for n in range(20):
             self.ingest(message(T0 + n * 300), wall=T0 + n * 300 + 1)
@@ -173,12 +200,23 @@ class Prices(unittest.TestCase):
 class Stream(unittest.IsolatedAsyncioTestCase):
     async def test_public_paper_stream_has_no_auth_and_cancels_its_heartbeat(self):
         sent, ready, cleaned = [], asyncio.Event(), asyncio.Event()
+        frames = [{"topic": "crypto_prices_twap_sixty", "type": "update", "payload": {
+            "symbol": "btc/usd", "timestamp": T0 * 1000, "window_s": 60,
+            "value": 80000.12, "full_accuracy_value": "80000123456780000000000"}}]
 
         class Socket:
             async def send(self, raw):
                 sent.append(raw)
 
             async def recv(self):
+                sub = json.loads(sent[0])
+                # The simulated venue accepts the SDK's update subscription.
+                # The old wildcard + filter must fail this end-to-end check.
+                if sub != {"action": "subscribe", "subscriptions": [
+                        {"topic": "crypto_prices_twap_sixty", "type": "update"}]}:
+                    return json.dumps({"type": "error", "code": "invalid_type"})
+                if frames:
+                    return json.dumps(frames.pop(0))
                 ready.set()
                 await asyncio.Future()
 
@@ -199,9 +237,10 @@ class Stream(unittest.IsolatedAsyncioTestCase):
 
         ref._legacy_ping = heartbeat
         with patch.object(P.websockets, "connect", return_value=Socket()) as connect, \
-                patch.object(P, "ws_ssl", return_value=None):
+                patch.object(P, "ws_ssl", return_value=None), patch.object(P.time, "time", return_value=T0 + 1):
             task = asyncio.create_task(ref.stream())
             await asyncio.wait_for(ready.wait(), 1)
+            self.assertEqual(ref.snapshot(T0 + 300)["current"], 80000.12345678)
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
@@ -209,9 +248,47 @@ class Stream(unittest.IsolatedAsyncioTestCase):
         sub = json.loads(sent[0])
         self.assertNotIn("auth", sub)
         self.assertEqual(sub["subscriptions"][0]["topic"], "crypto_prices_twap_sixty")
+        self.assertEqual(sub["subscriptions"][0]["type"], "update")
+        self.assertNotIn("filters", sub["subscriptions"][0])
         self.assertIn("PING", sent)
         self.assertTrue(cleaned.is_set())
         self.assertFalse(ref.connected)
+
+    async def test_auth_rejection_surfaces_without_logging_server_text_or_credentials(self):
+        warned = asyncio.Event()
+        events = []
+
+        def on_event(*args):
+            events.append(args)
+            if args[-1] == "warn":
+                warned.set()
+
+        class Socket:
+            async def send(self, raw):
+                pass
+
+            async def recv(self):
+                return json.dumps({"op": "error", "code": "auth_failed", "message": "server-fixture-secret"})
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        creds = {"apiKey": "credential-fixture", "secret": "credential-fixture", "passphrase": "credential-fixture"}
+        ref = P.PolymarketPrices(types.SimpleNamespace(window_end=T0 + 300), creds=creds, on_event=on_event)
+        with patch.object(P.websockets, "connect", return_value=Socket()), patch.object(P, "ws_ssl", return_value=None):
+            task = asyncio.create_task(ref.stream())
+            await asyncio.wait_for(warned.wait(), 1)
+            snap = ref.snapshot(T0 + 300)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertEqual(snap["status"], "AUTH REQUIRED")
+        self.assertIn("valid L2", snap["detail"])
+        self.assertNotIn("server-fixture-secret", str(events) + str(snap))
+        self.assertNotIn("credential-fixture", str(events) + str(snap))
 
     async def test_polybolt_auth_then_subscribe_and_cancel_cleans_connection(self):
         sent = []
@@ -245,12 +322,28 @@ class Stream(unittest.IsolatedAsyncioTestCase):
                 await task
         self.assertEqual(connect.call_args.args[0], P.POLYBOLT)
         self.assertEqual([s["op"] for s in sent], ["auth", "subscribe"])
+        self.assertEqual(sent[1]["rid"], "reference-prices")
         self.assertEqual(sent[1]["subscriptions"][0]["channel"], "price.crypto.twap")
         self.assertNotIn("fixture", repr(ref))
         self.assertFalse(ref.connected)
 
 
 class Display(unittest.TestCase):
+    def test_waiting_reason_is_visible_in_the_panel_and_plain_status(self):
+        snap = {"polymarket": {"current": None, "price_to_beat": None, "status": "ERROR",
+                               "detail": "public RTDS connection failed (TimeoutError)",
+                               "ptb_detail": "Gamma has not published this round's price to beat"}}
+        for cols, rows in ((80, 24), (120, 40), (200, 40), (56, 24), (3, 2)):
+            frame = build(snap, cols, rows, UNICODE)
+            text = "\n".join("".join(s for s, _ in row) for row in frame)
+            self.assertNotIn("layout error", text)
+            self.assertEqual(len(frame), rows)
+            if cols >= 80:
+                self.assertIn("public RTDS", text)
+                self.assertIn("TimeoutError", text)
+                self.assertIn("ERROR", text)
+        self.assertIn("poly_detail=public RTDS", plain_line(snap))
+
     def test_new_panel_keeps_settlement_and_execution_panels_visible(self):
         from tests_dashboard import populated
         snap = populated("LIVE")

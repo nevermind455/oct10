@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import math
 import textwrap
+import textwrap
 import time
 
 from .safety import terminal_text
@@ -905,11 +906,17 @@ def _polymarket_body(p: dict, w: int) -> list[Row]:
     age = _num(p.get("age_s"))
     if age is not None:
         source += [(f"  age {age:.1f}s", FAINT)]
+    details = []
+    for key, prefix in (("detail", "Feed: "), ("ptb_detail", "PTB: ")):
+        if p.get(key):
+            for line in textwrap.wrap(prefix + _text(p[key]), width=max(1, w),
+                                      max_lines=1 if w >= 78 else 2, placeholder="..." if w >= 3 else ""):
+                details.append(_runs([(line, Style("amber"))], w))
     if w >= 78:
-        return [_runs(values + [("    ", PAPER)] + strike + delta, w), _runs(source, w)]
+        return [_runs(values + [("    ", PAPER)] + strike + delta, w), _runs(source, w)] + details
     if w < 38:
-        return [_runs(values, w), _runs(strike, w), _runs(source, w)] + ([_runs(delta, w)] if delta else [])
-    return [_runs(values, w), _runs(strike + delta, w), _runs(source, w)]
+        return [_runs(values, w), _runs(strike, w), _runs(source, w)] + ([_runs(delta, w)] if delta else []) + details
+    return [_runs(values, w), _runs(strike + delta, w), _runs(source, w)] + details
 
 
 def build(snap: dict, cols: int, rows: int, g: Glyphs) -> list[Row]:
@@ -932,15 +939,19 @@ def _build(snap: dict, cols: int, rows: int, g: Glyphs) -> list[Row]:
     if remaining <= 0:
         return out
     reference_top = "polymarket" in snap and cols >= 112
+    reference_extra = 0
     if "polymarket" in snap and not reference_top:
-        reference_h = min(4 if cols >= 80 else 5, remaining)
-        out += panel("POLYMARKET BTC", _polymarket_body(snap.get("polymarket") or {}, cols - 2),
+        reference_body = _polymarket_body(snap.get("polymarket") or {}, cols - 2)
+        base_h = 4 if cols >= 80 else 5
+        reference_h = min(6, len(reference_body) + 2, remaining)
+        reference_extra = max(0, reference_h - base_h)
+        out += panel("POLYMARKET BTC", reference_body,
                      cols, reference_h, g)
         remaining -= reference_h
         if remaining <= 0:
             return out
     # top band: TRIGGER | MARKET | ACCOUNT, 8 body rows when there is room
-    top_h = min(10, remaining)
+    top_h = min(10 - reference_extra, remaining)
     w = (hsplit(cols, (1.0, 1.1, 0.9, 1.0), (26, 28, 24, 26)) if reference_top
          else hsplit(cols, (1.0, 1.1, 0.9), (26, 30, 24)))
     body_h = max(0, top_h - 2)
@@ -1022,6 +1033,7 @@ def plain_line(snap: dict) -> str:
                       f"pnl={money(a.get('pnl') if a.get('kind') != 'LIVE' else a.get('realized'), sign=True)}"
                       + f" poly_btc={p.get('current') or 'N/A'} ptb={p.get('price_to_beat') or 'N/A'}"
                       + f" poly_status={p.get('status') or 'WAITING'}"
+                      + (f" poly_detail={p.get('detail') or p.get('ptb_detail')}" if p.get("detail") or p.get("ptb_detail") else "")
                       + _plain_settlement(snap), 2000)
 
 

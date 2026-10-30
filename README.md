@@ -192,6 +192,14 @@ subscription. If the public feed is retired and no L2 credentials are supplied,
 the section remains unavailable and a `poly_price` event explains why. See
 [Polymarket's reference-price protocol](https://docs.polymarket.com/api-reference/wss/polybolt).
 
+If the Polymarket section is empty, its Feed/PTB lines now show the connection,
+authentication or metadata error directly. The public TWAP subscription matches
+the pinned SDK's `type: update` frame and filters BTC locally. For a short,
+read-only diagnostic on the bot host, run
+`.venv/bin/python -I handoff_scripts/poly_price_probe.py` (Windows:
+`.venv\Scripts\python.exe -I handoff_scripts\poly_price_probe.py`). It does not
+load `.env` or wallet credentials and does not place orders.
+
 ## Execution latency
 
 Every order records T0..T7 (`exec_latency.py`): feed event received, trigger fired,
