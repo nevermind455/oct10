@@ -28,6 +28,25 @@ STALE_S = 10.0
 META_POLL_S = 10.0
 
 
+class ReferenceFeedError(RuntimeError):
+    """Only fixed, credential-free diagnostics may be displayed or logged."""
+    def __init__(self, detail, *, auth=False):
+        super().__init__(detail)
+        self.auth = auth
+
+
+def _check_error(message):
+    if not isinstance(message, dict):
+        return
+    if message.get("op") != "error" and message.get("type") != "error":
+        return
+    payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
+    code = message.get("code") or payload.get("code")
+    if code in ("auth_required", "auth_failed", "invalid_credentials", "unauthorized"):
+        raise ReferenceFeedError("Polymarket requires valid L2 API credentials", auth=True)
+    raise ReferenceFeedError("Polymarket rejected the price subscription")
+
+
 def _positive(value):
     if isinstance(value, bool):
         return None
@@ -47,7 +66,13 @@ class PolymarketPrices:
         self.latest = None                 # (source timestamp seconds, USD, receipt monotonic)
         self.beats = {}                    # round start -> (USD, provenance)
         self.connected = False
-        self.detail = "waiting for Polymarket's Chainlink TWAP"
+        self.state = "CONNECTING"
+        self.transport = "PolyBolt" if all(self._creds.get(k) for k in ("apiKey", "secret", "passphrase")) else "public RTDS"
+        self.detail = f"connecting to {self.transport}"
+        self.metadata_detail = "waiting for round metadata"
+        self._metadata_warning = None
+        self.frames = 0
+        self.accepted = 0
 
     def __repr__(self):
         return "PolymarketPrices()"       # credentials never reach logs
@@ -97,6 +122,7 @@ class PolymarketPrices:
             price = _positive(raw)
             if price is None:
                 continue
+            self.accepted += 1
             if self.latest is None or stamp > self.latest[0]:
                 self.latest = (stamp, price, mono)
             if stamp % ROUND_S == 0:
@@ -116,11 +142,21 @@ class PolymarketPrices:
         fresh = (self.connected and age is not None and age <= STALE_S
                  and end is not None and float(end) - ROUND_S <= latest[0] < float(end))
         current = latest[1] if fresh else None
+        status = ("LIVE" if fresh else self.state if self.state in ("ERROR", "AUTH REQUIRED")
+                  else "STALE" if latest else "WAITING" if self.connected else "CONNECTING")
         return {"current": current, "price_to_beat": beat, "ptb_source": source,
-                "status": "LIVE" if fresh else "STALE" if latest else "WAITING",
+                "status": status,
                 "age_s": age, "source": "Chainlink BTC/USD 60s TWAP",
                 "distance_bp": (current - beat) / beat * 1e4 if current and beat else None,
-                "detail": self.detail if not fresh else ""}
+                "detail": self.detail if not fresh else "",
+                "ptb_detail": self.metadata_detail if beat is None else "",
+                "transport": self.transport, "frames": self.frames, "accepted": self.accepted}
+
+    def _metadata_failed(self, detail):
+        self.metadata_detail = detail
+        if self._metadata_warning != detail:
+            self._event("poly_price", detail, "warn")
+            self._metadata_warning = detail
 
     async def metadata_once(self):
         """Read exact-round metadata, including after a mid-round restart.
@@ -134,36 +170,52 @@ class PolymarketPrices:
 
         end = getattr(self.hub, "window_end", None)
         if end is None or not math.isfinite(float(end)) or float(end) % ROUND_S:
+            self.metadata_detail = "waiting for market discovery"
             return
         start = int(end) - ROUND_S
         if self.beats.get(start, (None, None))[1] == "Gamma priceToBeat":
+            self.metadata_detail = ""
             return
         fetch = self._fetch_event or discovery._fetch_slug
+        problem = None
         for boundary in (start, start - ROUND_S):
             if boundary != start and start in self.beats:
                 break
             slug = f"btc-updown-5m-{boundary}"
-            event = await asyncio.to_thread(fetch, slug)
+            try:
+                event = await asyncio.to_thread(fetch, slug)
+            except Exception as exc:
+                problem = f"PTB metadata read failed ({type(exc).__name__})"
+                continue
             if not isinstance(event, dict) or event.get("slug") != slug:
+                problem = problem or "Gamma round metadata unavailable"
                 continue
             markets = [m for m in discovery._as_list(event.get("markets"))
                        if isinstance(m, dict) and discovery._valid_window(m, boundary)
                        and discovery._valid_crypto_market_config(m)]
             if len(markets) != 1:
+                problem = problem or "Gamma oracle/window validation failed"
                 continue
             opening, final = price_to_beat.official_from_event(event)
             value = opening if boundary == start else final
             if value is not None:
                 self._remember(start, value, "Gamma priceToBeat" if boundary == start else "Gamma previous finalPrice")
+                self.metadata_detail = ""
+                self._metadata_warning = None
                 break
+        if start not in self.beats:
+            if problem:
+                self._metadata_failed(problem)
+            else:
+                self.metadata_detail = "Gamma has not published this round's price to beat"
+                self._metadata_warning = None
 
     async def metadata_loop(self):
         while True:
             try:
                 await self.metadata_once()
-            except Exception:
-                # The read is retried; no exception text can disclose credentials.
-                pass
+            except Exception as exc:
+                self._metadata_failed(f"PTB metadata read failed ({type(exc).__name__})")
             await asyncio.sleep(META_POLL_S)
 
     async def _legacy_ping(self, ws):
@@ -176,17 +228,25 @@ class PolymarketPrices:
         started = time.monotonic()
         try:
             while True:
-                raw = await asyncio.wait_for(ws.recv(), 30)
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), 30)
+                except asyncio.TimeoutError:
+                    raise ReferenceFeedError(f"no BTC/USD TWAP data in 30s ({self.frames} frames received)") from None
                 if raw in ("PING", "PONG", "ping", "pong", ""):
                     if raw in ("PING", "ping"):
                         await ws.send("PONG" if raw == "PING" else "pong")
                 else:
                     message = json.loads(raw)
-                    if isinstance(message, dict) and message.get("op") == "error":
-                        raise ValueError("reference subscription refused")
+                    self.frames += 1
+                    _check_error(message)
+                    previous = self.accepted
                     self.ingest(message)
+                    if self.accepted > previous and self.state != "LIVE":
+                        self.state = "LIVE"
+                        self.detail = ""
+                        self._event("poly_price", f"receiving BTC/USD 60s TWAP via {self.transport}", "good")
                 if time.monotonic() - max(started, self.latest[2] if self.latest else started) > 30:
-                    raise TimeoutError("reference stream stale")
+                    raise ReferenceFeedError(f"no fresh BTC/USD TWAP in 30s ({self.frames} frames received)")
         finally:
             if heartbeat is not None:
                 heartbeat.cancel()
@@ -205,31 +265,46 @@ class PolymarketPrices:
         retry = 1.0
         while True:
             try:
+                if self.state not in ("ERROR", "AUTH REQUIRED"):
+                    self.state = "CONNECTING"
+                    self.detail = f"connecting to {self.transport}"
                 async with websockets.connect(url, ssl=ws_ssl(url), open_timeout=10,
                                               close_timeout=2, ping_interval=20,
                                               max_size=262144) as ws:
                     if authed:
                         await ws.send(json.dumps({"op": "auth", "rid": "reference-auth", "auth": self._creds}))
-                        reply = json.loads(await asyncio.wait_for(ws.recv(), 10))
-                        if not isinstance(reply, dict) or reply.get("op") != "authed":
-                            raise ValueError("reference authentication not accepted")
-                        sub = {"op": "subscribe", "subscriptions": [{"channel": "price.crypto.twap",
+                        deadline = time.monotonic() + 10
+                        while True:
+                            reply = json.loads(await asyncio.wait_for(ws.recv(), max(0.01, deadline - time.monotonic())))
+                            _check_error(reply)
+                            if isinstance(reply, dict) and reply.get("op") == "authed":
+                                break
+                            if time.monotonic() >= deadline:
+                                raise ReferenceFeedError("Polymarket authentication was not accepted", auth=True)
+                        sub = {"op": "subscribe", "rid": "reference-prices", "subscriptions": [{"channel": "price.crypto.twap",
                                "filter": {"symbol": "btcusd", "window_seconds": 60, "provider": "chainlink"}}]}
                     else:
+                        # Match polymarket-client's RtdsServerSubscription exactly.
+                        # Subscribe to updates for all symbols, filter BTC locally.
+                        # A wildcard type / server-side symbol filter can leave
+                        # this legacy TWAP topic connected without any updates.
                         sub = {"action": "subscribe", "subscriptions": [{"topic": "crypto_prices_twap_sixty",
-                               "type": "*", "filters": json.dumps({"symbol": "btc/usd"})}]}
+                               "type": "update"}]}
                     await ws.send(json.dumps(sub))
                     self.latest = None          # a reconnect needs a new report/snapshot
                     self.connected = True
-                    self.detail = "waiting for a fresh Chainlink TWAP report"
-                    self._event("poly_price", "connected to Polymarket Chainlink 60s TWAP", "info")
+                    self.state = "WAITING"
+                    self.frames = self.accepted = 0
+                    self.detail = f"{self.transport}: subscription sent; waiting for BTC/USD TWAP"
+                    self._event("poly_price", self.detail, "info")
                     await self._receive(ws, authed)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self.detail = f"Polymarket feed reconnecting ({type(exc).__name__})"
+                self.state = "AUTH REQUIRED" if isinstance(exc, ReferenceFeedError) and exc.auth else "ERROR"
+                self.detail = str(exc) if isinstance(exc, ReferenceFeedError) else f"{self.transport} connection failed ({type(exc).__name__})"
                 if not authed:
-                    self.detail += "; PolyBolt requires L2 API credentials if public RTDS is unavailable"
+                    self.detail += "; if RTDS is retired, configure L2 price-feed credentials"
                 self._event("poly_price", self.detail, "warn")
             finally:
                 self.connected = False

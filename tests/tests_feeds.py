@@ -1682,7 +1682,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     "price_to_beat.py": "c655c6acae0d9da46f4cce5cf42804246cb2d2755d68c9cef3f8484a86eecc06",
     # 2026-10-30: read-only Polymarket TWAP stream (PolyBolt / public RTDS), exact
     # boundary and metadata recovery, E18/decimal units, staleness and round keys.
-    "polymarket_prices.py": "cafeba6ca948f358d531f0ea91e60d72a7af6b660332a88982b0b9ccbbc98c3b",
+    # 2026-10-30: empty PAPER feed follow-up. Use the pinned SDK's public
+    # update subscription with local BTC filtering; surface safe transport,
+    # authentication and metadata diagnostics; include PolyBolt subscription rid.
+    "polymarket_prices.py": "b1b8c8250beb045eb31eba61d37e416a10562288732441eef4e10b457bd28868",
     # Re-approved: stakes signed via signing_amount; an unresolved FAK holds only its own
     # token; fills carry seen_mono (when the quantity became known).
     # Re-approved (latency audit): LeanSender.prepare records the builder's T3/T4 stamps.
