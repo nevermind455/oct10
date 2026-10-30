@@ -1564,7 +1564,7 @@ class Settings:
             return ""
         return (f"; DIRECTION ADD-ON{' (LIVE TEST, SNIPER_DIR_ADD_LIVE)' if live else ''}: +{self.dir_add:.0%} of the "
                 f"Kelly target when the side bought is past the round's price to beat (Chainlink's 60s TWAP, "
-                f"estimated and checked on >= {self.ptb_min_checks:g} published rounds) by more than "
+                f"Polymarket reference; >= {self.ptb_min_checks:g} published checks) by more than "
                 f"{self.ptb_margin_bp:g}bp and the estimate's largest error, only from the room the sniper's limits leave")
 
     def lines(self, live: bool = False) -> list[str]:
@@ -2423,7 +2423,10 @@ class Sniper:
             hist.popleft()
 
     def price_to_beat(self, end) -> float | None:
-        """The round ending at `end`: our estimate of its price to beat, None if unknown."""
+        """The round's official reference when attached; standalone legacy estimate otherwise."""
+        reference = getattr(self, "reference_prices", None)
+        if reference is not None:
+            return reference.price_to_beat(end)
         rec = self.ptb_rounds.get(float(end) - ROUND_S) if end else None
         return rec["est"] if rec else None
 
@@ -2432,6 +2435,30 @@ class Sniper:
         wrong? True; False when not past it at all; None when unknown, not yet checked on
         enough published rounds, or too close to call (ptb_why says which). With the journal
         fields - on every decided signal, whether or not the add-on is on."""
+        reference = getattr(self, "reference_prices", None)
+        if reference is not None:
+            view = reference.snapshot(end)
+            ptb, current = view["price_to_beat"], view["current"]
+            if view["age_s"] is not None and view["age_s"] > PTB_MID_MAX_AGE_S:
+                current = None               # retain the add-on's original 2s freshness gate
+            fields = {"ptb": round(ptb, 2) if ptb else None, "ptb_source": view["ptb_source"]}
+            if ptb is None or current is None:
+                fields["ptb_why"] = "Polymarket price to beat unavailable" if ptb is None else "no fresh Polymarket TWAP"
+                return None, fields
+            dist = (current - ptb) / ptb * 1e4 * (1 if side == "UP" else -1)
+            margin, checks = self.ptb_calib.margin_bp(self.s.ptb_margin_bp), self.ptb_calib.checks
+            fields.update(ptb_dist_bp=round(dist, 3), ptb_margin_bp=round(margin, 3), ptb_checks=checks)
+            if dist <= 0:
+                return False, fields
+            # Retain the configured add-on's existing warmup and error margin;
+            # fixing the source must not also loosen its sizing gates.
+            if checks < self.s.ptb_min_checks:
+                fields["ptb_why"] = f"price to beat checks warming up ({checks}/{self.s.ptb_min_checks:g})"
+                return None, fields
+            if dist <= margin:
+                fields["ptb_why"] = "within the price to beat margin"
+                return None, fields
+            return True, fields
         rec = self.ptb_rounds.get(float(end) - ROUND_S) if end else None
         if rec is None or rec["est"] is None:
             return None, {"ptb": None, "ptb_why": (rec or {}).get("why") or "this process did not see the round start"}
