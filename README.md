@@ -392,6 +392,7 @@ All settings live in `.env`; `.env.example` lists them with the values in use. W
 | `SNIPER_HYBRID_RISK_FRACTION` | 0 | optional maximum all-in new-order spend as a fraction of realized equity; 0 disables |
 | `SNIPER_HYBRID_MAX_ORDER_USD` | 0 | optional maximum all-in new-order spend in dollars; 0 disables; the tighter enabled cap applies |
 | `SNIPER_DIR_ADD` | 0 | direction add-on: + this fraction of the Kelly target when the side bought is beating the round's price to beat (0.5 = +50%); 0 = off, the price to beat still journalled. Paper only unless `SNIPER_DIR_ADD_LIVE=1`, which allows at most 0.5 |
+| `SNIPER_WIDE_CAP_DIR` | 0 | 1 = the wide limit (`SNIPER_WIDE_CAP_C`) only for an order whose side is past the round's price to beat (the direction add-on's check); other orders keep ask + slip and the fair limit, and an ask above the fair limit is still skipped. In LIVE only with `SNIPER_WIDE_CAP_LIVE=1`, whose loss stop then also ends the direction add-on |
 | `SNIPER_DIR_ADD_LIVE` | 0 | 1 = explicit opt-in to the direction add-on in LIVE |
 | `SNIPER_PTB_MAX_GAP_S` | 5 | the price to beat's 60s TWAP needs trusted trigger prices with no longer gap (s) in its window; else unknown, no add-on that round |
 | `SNIPER_PTB_MARGIN_BP` | 1.0 | the add-on needs the side past the estimated price to beat by more than this (bp) and by more than the estimate's largest error over the last 24 published rounds |

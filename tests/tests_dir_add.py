@@ -396,6 +396,57 @@ for _name in [n for n in dir(F.Gate) if n.startswith("test") and n not in Decisi
     setattr(Decision, _name, None)
 
 
+class DirectionWide(F.Gate):
+    """SNIPER_WIDE_CAP_DIR: the wide limit only for a side past the price to beat (2026-10-31)."""
+
+    def make(self, **env):
+        super().make(**{"SNIPER_ORDER_SIZING": "shares", "SNIPER_WIDE_CAP_C": "10", "SNIPER_WIDE_CAP_DIR": "1", **env})
+        self.sn._read_bankroll = lambda: 100.0
+
+    def beat(self, bp: float) -> None:
+        self.sn.ptb_rounds[float(self.m.window_end) - S.ROUND_S] = {"est": PTB, "raw": PTB, "basis_rounds": 12,
+                                                                      "why": None}
+        self.sn.ptb_calib.errors.extend([0.2] * 6)
+        self.sn.primary_mid = (PTB * (1 + bp / 1e4), time.monotonic())
+
+    def test_a_side_past_the_price_to_beat_gets_the_wide_limit(self):
+        self.pin_time_left()
+        self.beat(+5.0)
+        r = self.order("UP", [(0.53, 1000)], mid=0.52, move_bp=5.0)
+        self.assertEqual(r["result"], "filled", r)
+        self.assertEqual((r["wide_cap_c"], r["wide_cap_mode"]), (10.0, "direction"))
+        self.assertAlmostEqual(r["cap"], 0.63)                      # ask + 10c, not min(ask + 5c, fair limit)
+
+    def keeps_the_snipers_limit(self, bp, why):
+        self.pin_time_left()
+        if bp is not None:
+            self.beat(bp)
+        r = self.order("UP", [(0.53, 1000)], mid=0.52, move_bp=5.0)
+        self.assertEqual(r["result"], "filled", r)
+        self.assertNotIn("wide_cap_c", r)
+        self.assertEqual(r["wide_cap_dir_why"], why)
+        self.assertAlmostEqual(r["cap"], min(0.58, r["fair_limit"]))
+
+    def test_a_side_not_past_it_keeps_the_snipers_limit(self):
+        self.keeps_the_snipers_limit(-5.0, "side not beating the price to beat")
+
+    def test_a_side_too_close_to_call_keeps_the_snipers_limit(self):
+        self.keeps_the_snipers_limit(+0.5, "within the estimate's error (+-1.00bp)")
+
+    def test_an_unknown_price_to_beat_keeps_the_snipers_limit(self):
+        self.keeps_the_snipers_limit(None, "this process did not see the round start")
+
+    def test_it_never_buys_above_the_fair_limit(self):
+        self.pin_time_left()
+        self.beat(+5.0)
+        r = self.order("UP", [(0.31, 200)], mid=0.25, move_bp=0.68)    # the plain wide cap buys this at a fixed size
+        self.assertEqual((r["result"], r["reason"]), ("skipped", "ask not below fair value"))
+
+
+for _name in [n for n in dir(F.Gate) if n.startswith("test") and n not in DirectionWide.__dict__]:
+    setattr(DirectionWide, _name, None)
+
+
 class AddOnRules(unittest.TestCase):
     """Sniper._dir_add on its own: the sniper's order in, the order with or without the add-on out."""
 
@@ -444,6 +495,18 @@ class AddOnRules(unittest.TestCase):
         self.assertEqual(asked, [(7.5, 0.07)])                    # 15 shares at the 0.50 limit
         self.sn.live = types.SimpleNamespace(addon_headroom=lambda spend, fee_rate: None)
         self.assertEqual(self.add()[:2], (15, 15.0))
+
+    def test_the_live_tests_stop_also_ends_the_add_on(self):
+        on = [True]
+        self.sn = S.Sniper(I.Market(T0 + 300), None, settings=I.settings(
+            SNIPER_DIR_ADD="0.5", SNIPER_FAIR="1", SNIPER_KELLY="1", SNIPER_ORDER_SIZING="shares",
+            SNIPER_WIDE_CAP_C="10", SNIPER_WIDE_CAP_DIR="1", SNIPER_WIDE_CAP_LIVE="1"))
+        self.sn.live = types.SimpleNamespace(addon_headroom=lambda spend, fee_rate: None)
+        self.sn._live_test_on = lambda: on[0]
+        self.assertEqual(self.add()[:2], (15, 15.0))
+        on[0] = False
+        shares, target, row = self.add()
+        self.assertEqual((shares, target, row["dir_add_why"]), (10, 10.0, "the live test was stopped"))
 
     def test_fills_are_booked_pro_rata_and_retracted(self):
         plan = {"dir_add_shares": 5, "shares": 15, "cond": "c", "token": "t", "end": time.time() + 100}
@@ -505,8 +568,19 @@ class SettingsAndLive(unittest.TestCase):
         self.assertIn("DIRECTION ADD-ON (LIVE TEST, SNIPER_DIR_ADD_LIVE)", on.lines(live=True)[0])
         self.assertNotIn("DIRECTION", off.lines()[0] + off.lines(live=True)[0])
 
+    def test_the_direction_gate_needs_the_wide_limit_and_says_so(self):
+        with self.assertRaises(ValueError):
+            I.settings(**{**self.ON, "SNIPER_WIDE_CAP_DIR": "1"})               # no SNIPER_WIDE_CAP_C
+        s = I.settings(**{**self.ON, "SNIPER_WIDE_CAP_C": "10", "SNIPER_WIDE_CAP_DIR": "1", "SNIPER_WIDE_CAP_LIVE": "1",
+                          "SNIPER_DIR_ADD_LIVE": "1"})
+        self.assertIn("limit ask+10c only when the side is past the round's price to beat", s.lines(live=True)[0])
+        self.assertIn("the stop also ends the direction add-on", s.lines(live=True)[0])
+        self.assertEqual([v for v in X.spec_violations(s) if "wide cap" in v or "direction" in v], [])
+        self.assertTrue(any("wide cap experiment" in v for v in X.spec_violations(
+            I.settings(**{**self.ON, "SNIPER_WIDE_CAP_C": "10", "SNIPER_WIDE_CAP_DIR": "1"}))))   # live needs the opt-in
+
     def test_strict_paper_comparison_matches_it_with_live(self):
-        for key in ("dir_add", "dir_add_live", "ptb_max_gap_s", "ptb_margin_bp", "ptb_min_checks"):
+        for key in ("wide_cap_dir", "dir_add", "dir_add_live", "ptb_max_gap_s", "ptb_margin_bp", "ptb_min_checks"):
             self.assertIn(key, paper_parity.CONFIG_FIELDS)
 
     def test_the_pnl_report_splits_the_add_on_from_the_sniper(self):

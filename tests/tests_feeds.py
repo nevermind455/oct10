@@ -1668,10 +1668,15 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # each close, journalled as ptb_official, restored from the journal); the add-on needs the side past it
     # by more than SNIPER_PTB_MARGIN_BP and the estimate's largest error of the last 24 checks, after
     # SNIPER_PTB_MIN_CHECKS checks. Off by default nothing trades differently.
-    "sniper_mode.py": "0e7c980c0119e839647eb39897495981c2859a2b658c3112d90231b2d6fcdae8",
+    # 2026-10-31 (the operator: a direct live experiment, tests/tests_dir_add.py DirectionWide):
+    # SNIPER_WIDE_CAP_DIR gates the wide limit to orders whose side is past the price to beat
+    # (_ptb_view); other orders keep ask + slip and the fair limit, and an ask above the fair limit
+    # is skipped as before. Under SNIPER_WIDE_CAP_LIVE its stop also ends the direction add-on.
+    "sniper_mode.py": "de9113813cfc1cfadeb4c2399abc9bf0aade86abecaabeb71488d3ce1bd2d168",
     # Read-only reference schema, configuration checks and freshness validation for paper.
     # 2026-10-30: the direction add-on's five settings are compared with live's as well.
-    "paper_parity.py": "8a7d4d8a3c83b794fd66ff49c5986da098c2490023a4bd2cc6e048dccece269e",
+    # 2026-10-31: SNIPER_WIDE_CAP_DIR is compared with live's as well.
+    "paper_parity.py": "3c7fa65213c478b9096b6ab14a2c5a4b3b8b84443a334adfaae62d02e9be79f6",
     # 2026-10-30 (tests/tests_dir_add.py): pure - the 60s TWAP, the published value from a Gamma
     # event, and the basis / error bookkeeping the direction add-on's margin rests on.
     "price_to_beat.py": "44d3617aebbea9532c6c08256bac8b6b8746c8649cb21f1d73371258255cd6ad",

@@ -1231,6 +1231,16 @@ class Settings:
         # (Sniper._live_test_on). The wallet is the hard cap.
         self.wide_cap_live = _env_bool("SNIPER_WIDE_CAP_LIVE", False)
         self.wide_cap_live_stop_usd = _env_float("SNIPER_WIDE_CAP_LIVE_STOP_USD", 25)
+        # Direction gate on the wide limit (2026-10-31, the operator's request for a direct live
+        # experiment): with SNIPER_WIDE_CAP_C, the wide limit applies only to an order whose side
+        # is past the round's price to beat by more than its estimate can be wrong (the direction
+        # add-on's own check, Sniper._ptb_view). Every other order keeps ask + slip and the fair
+        # limit, and an ask above the fair limit is skipped as without the wide limit. Replayed
+        # on 3,858 live orders of 10-15..25 (the book at the venue's reply, real winners): the
+        # wide limit's extra fills made +$129.69 where the side was past it by over 1bp and lost
+        # -$231.60 elsewhere. Under the capped live test (SNIPER_WIDE_CAP_LIVE=1) its stop also
+        # ends the direction add-on.
+        self.wide_cap_dir = _env_bool("SNIPER_WIDE_CAP_DIR", False)
         # Direction add-on (2026-10-30, the operator's request): the sniper decides and sizes
         # every order exactly as without it. When the side it buys is beating the round's
         # price to beat (Chainlink's BTC/USD 60s TWAP at the round's start, which Polymarket
@@ -1486,6 +1496,10 @@ class Settings:
              "SNIPER_DIR_ADD needs SNIPER_FAIR=1, SNIPER_KELLY=1, SNIPER_ORDER_TYPE=FAK and SNIPER_ORDER_SIZING=shares"),
             (0 < self.ptb_max_gap_s <= 60, f"SNIPER_PTB_MAX_GAP_S={self.ptb_max_gap_s:g} (seconds: above 0, at most 60)"),
             (0 <= self.ptb_margin_bp <= 50, f"SNIPER_PTB_MARGIN_BP={self.ptb_margin_bp:g} (bp: 0 to 50)"),
+            (not self.wide_cap_dir or (self.wide_cap_c > 0 and self.fair and self.kelly and self.order_type == "FAK"
+                                       and self.order_sizing == "shares"),
+             "SNIPER_WIDE_CAP_DIR needs SNIPER_WIDE_CAP_C, SNIPER_FAIR=1, SNIPER_KELLY=1, SNIPER_ORDER_TYPE=FAK "
+             "and SNIPER_ORDER_SIZING=shares"),
             (1 <= self.ptb_min_checks <= price_to_beat.ERROR_ROUNDS and self.ptb_min_checks == int(self.ptb_min_checks),
              f"SNIPER_PTB_MIN_CHECKS={self.ptb_min_checks:g} (whole rounds, 1 to {price_to_beat.ERROR_ROUNDS})"))
                if not ok]
@@ -1545,12 +1559,18 @@ class Settings:
                       f"minimum)" if self.venue_min_shares > 0 else f"{KELLY_MIN_SHARES} sh") + f", {cap_text} "
                    f"(<= {self.max_side_shares:.0f} sh/side per round)"
                    if self.kelly and self.order_type == "FAK" else "") + hybrid
-                + ((f"; WIDE CAP LIVE TEST: limit ask+{self.wide_cap_c:g}c whatever the fair value says, an ask "
-                    f"above the fair limit buys a fixed minimum-size order; stops after a "
-                    f"${self.wide_cap_live_stop_usd:g} realized loss since the test began (SNIPER_WIDE_CAP_LIVE)"
+                + ((f"; WIDE CAP LIVE TEST: limit ask+{self.wide_cap_c:g}c "
+                    + (f"only when the side is past the round's price to beat (SNIPER_WIDE_CAP_DIR; the fair "
+                       f"value still checked; the stop also ends the direction add-on)" if self.wide_cap_dir else
+                       f"whatever the fair value says, an ask above the fair limit buys a fixed minimum-size order")
+                    + f"; stops after a ${self.wide_cap_live_stop_usd:g} realized loss since the test began "
+                      f"(SNIPER_WIDE_CAP_LIVE)"
                     if live and self.wide_cap_live else
-                    f"; WIDE CAP EXPERIMENT (paper only): limit ask+{self.wide_cap_c:g}c whatever the fair value says, "
-                    f"and an ask above the fair limit still buys a fixed minimum-size order")
+                    f"; WIDE CAP EXPERIMENT (paper only): limit ask+{self.wide_cap_c:g}c "
+                    + ("only when the side is past the round's price to beat (SNIPER_WIDE_CAP_DIR; the fair value "
+                       "still checked)" if self.wide_cap_dir else
+                       "whatever the fair value says, and an ask above the fair limit still buys a fixed "
+                       "minimum-size order"))
                    if self.wide_cap_c > 0 else
                    (f"; LIVE TEST: limit ask+{self.slip:.2f}, the fair value still checked; back to the frozen "
                     f"ask+0.05 after a ${self.wide_cap_live_stop_usd:g} realized loss since the test began "
@@ -2522,6 +2542,8 @@ class Sniper:
                "side not beating the price to beat" if not beating else
                "fixed-size order" if fixed else
                "sniper order outside its own room" if base < floor_shares or base > room + 1e-9 else None)
+        if why is None and getattr(self.s, "wide_cap_live", False) and not self._direction_test_on():
+            why = "the live test was stopped"
         shares = base
         if why is None:
             want = math.floor(float(target) * self.s.dir_add + 1e-9)
@@ -2539,6 +2561,14 @@ class Sniper:
             return base, target
         row["dir_add_shares"] = shares - base
         return shares, float(target) + (shares - base)
+
+    def _direction_test_on(self) -> bool:
+        """Under the capped live test (SNIPER_WIDE_CAP_LIVE=1) the direction add-on runs only
+        while the test does: live, its own stop state; strict paper, live's published state;
+        an independent paper run, always."""
+        if getattr(self, "_paper_parity", False):
+            return bool((self._paper_reference or {}).get("wide_active"))
+        return self._live_test_on() if self.live is not None else True
 
     def _dir_book(self, plan: dict, filled, sign: float = 1.0) -> None:
         """The add-on's part of a fill (pro rata: an FAK fills part of its stake, or more
@@ -4664,6 +4694,11 @@ class Sniper:
         cap = min(0.99, round(ask + self._slip_now(), 4))
         above_fair = False
         wide_c = self._wide_cap_now()           # the wide limit: paper experiment / capped live test; 0 = off
+        dir_wide = bool(wide_c > 0 and getattr(self.s, "wide_cap_dir", False))
+        if dir_wide and beating is not True:
+            # SNIPER_WIDE_CAP_DIR: the wide limit only for a side past the price to beat
+            row["wide_cap_dir_why"] = row.get("ptb_why") or "side not beating the price to beat"
+            wide_c = 0.0
         fair = None
         fee_rate = fee_exponent = None
         if self.s.fair:
@@ -4693,7 +4728,7 @@ class Sniper:
             self.last_fair = {"side": side, "market_mid": round(float(mkt), 4), "anchor": anchor, "fair": round(fair, 4),
                               "limit": limit, "ask": ask, "wall": time.time()}
             if ask > limit + 1e-9:
-                if wide_c <= 0:
+                if wide_c <= 0 or dir_wide:          # the direction gate never buys above the fair limit
                     row.update(ask_seen=ask)
                     return self._skip("ask not below fair value", row)
                 above_fair = True                       # the wide-cap experiment buys it anyway, fixed size
@@ -4702,7 +4737,8 @@ class Sniper:
         if wide_c > 0:
             # PAPER EXPERIMENT: ask + SNIPER_WIDE_CAP_C cents, never past the account's MAX_BUY_PRICE
             cap = min(hi, round(ask + wide_c / 100.0, 4))
-            row.update(wide_cap_c=wide_c, wide_cap_mode="above_fair_fixed" if above_fair else "kelly")
+            row.update(wide_cap_c=wide_c,
+                       wide_cap_mode="direction" if dir_wide else "above_fair_fixed" if above_fair else "kelly")
         if lo > 0 and cap <= lo + 1e-9:
             # An ask at MIN_BUY_PRICE whose ceiling is that same price: the paper
             # broker refuses a cap at or below the floor ("order price cap ... is at

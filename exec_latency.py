@@ -187,7 +187,9 @@ def effective_config_lines(settings, *, live: bool, canary_max_shares=None) -> l
     wide_c = float(getattr(settings, "wide_cap_c", 0) or 0)
     if getattr(settings, "wide_cap_live", False):
         lines.append(f"  {'live test':13s} "
-                     + (f"ask+{wide_c:g}c whatever the fair value says" if wide_c > 0 else
+                     + ((f"ask+{wide_c:g}c only when the side is past the price to beat (SNIPER_WIDE_CAP_DIR)"
+                         if getattr(settings, "wide_cap_dir", False) else
+                         f"ask+{wide_c:g}c whatever the fair value says") if wide_c > 0 else
                         f"ask+${float(getattr(settings, 'slip', 0.05)):.2f}, the fair value still checked")
                      + f" (SNIPER_WIDE_CAP_LIVE=1): back to the frozen ask+$0.05 after a "
                        f"${getattr(settings, 'wide_cap_live_stop_usd', 0):g} realized loss "

@@ -139,6 +139,39 @@ exact the estimate is on the VPS.
 
    The dashboard shows the price to beat and the distance.
 
+## The direction-gated wide limit (2026-10-31)
+
+The operator asked for a wide limit with direction, tested directly in live. A replay
+of 3,858 live orders (10-15..25) estimated it. Each order was priced against the book
+the bot had when the venue replied, and scored with the real winners. At the actual
+limits, the replay agreed with the venue's fill or miss on 93.8% of orders. It came
+to +$63.60 where live made +$54.71, so it reads somewhat high.
+
+| Same orders, replayed | Fills | PnL | First half | Second half |
+|---|---:|---:|---:|---:|
+| the actual limit | 1,029 | +$65.01 | +$45.63 | +$19.38 |
+| ask + 0.10 for every order | 3,007 | -$47.89 | -$0.05 | -$47.85 |
+| ask + 0.10 only when the side is past the price to beat by over 1bp | 1,690 | +$197.58 | +$150.96 | +$46.62 |
+| that, plus the add-on at +50% | 1,690 | +$272.69 | +$211.57 | +$61.12 |
+
+Halves split at 10-23 00:53 UTC. The price to beat in this replay is Coinbase's price
+at the round's start (within 10s); live uses the checked 60s TWAP estimate. The wide
+limit's extra fills by side vs the price to beat:
+
+| Side vs the price to beat | Fills | Won | PnL |
+|---|---:|---:|---:|
+| past it by over 5bp | 192 | 86.5% | +$37.55 |
+| 1-5bp | 469 | 72.7% | +$92.14 |
+| 0-1bp | 228 | 53.5% | -$48.32 |
+| not past it | 621 | 41.2% | -$115.06 |
+| unknown | 468 | 62.6% | -$68.22 |
+
+`SNIPER_WIDE_CAP_DIR=1` applies the wide limit only when `_ptb_view` says the side is
+past the estimate by more than its margin. Orders whose ask is above the fair limit
+are still skipped; the replay could not price them. Run under `SNIPER_WIDE_CAP_LIVE=1`,
+its loss stop (`SNIPER_WIDE_CAP_LIVE_STOP_USD`, state file `wide_cap_live_test.json`)
+also ends the direction add-on.
+
 ## Rollout
 
 1. **One week:** live with `SNIPER_DIR_ADD=0`, which only journals the price to
